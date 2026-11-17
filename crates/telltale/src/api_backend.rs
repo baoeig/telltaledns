@@ -6352,10 +6352,9 @@ mod router_secret_tests {
         let current = router(serde_json::json!({"name": "udm", "type": "unifi",
             "url": "https://192.168.1.1", "api_key_file": "/data/secrets/router-udm.api_key"}));
         let mut b = serde_json::json!({"type": "unifi", "url": "https://10.0.0.1", "api_key": ""});
-        assert!(
-            router_secrets("/data", "udm", Some(&current), &mut b)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            router_secrets("/data", "udm", Some(&current), &mut b).unwrap(),
+            Vec::new()
         );
         assert_eq!(b["api_key_file"], "/data/secrets/router-udm.api_key");
 
