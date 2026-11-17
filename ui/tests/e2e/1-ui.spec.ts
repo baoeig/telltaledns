@@ -1660,7 +1660,7 @@ test('t8_2 routers are added and changed in the UI', async () => {
   await editor.getByRole('button', { name: 'Add router' }).click();
   await page.getByLabel('Name', { exact: true }).fill('udm-e2e');
   await page.getByLabel('Address', { exact: true }).fill('https://192.0.2.1');
-  await expect(page.getByLabel('API key file', { exact: true })).toHaveAttribute('placeholder', 'default: secrets/router-udm-e2e.api_key');
+  await expect(page.getByLabel('API key file', { exact: true })).toHaveAttribute('placeholder', 'default: secrets/router-udm-e2e.api_key.…');
   await page.getByLabel('API key', { exact: true }).fill('e2e-secret-key');
   await page.getByLabel("Don't check the certificate", { exact: true }).check();
   await page.getByRole('button', { name: 'Check', exact: true }).click();
@@ -1674,8 +1674,14 @@ test('t8_2 routers are added and changed in the UI', async () => {
   const key = page.getByLabel('API key', { exact: true });
   await expect(key).toHaveValue('');
   await expect(key).toHaveAttribute('placeholder', 'Saved. Type a new API key to replace it.');
-  await expect(page.getByLabel('API key file', { exact: true })).toHaveValue(/secrets\/router-udm-e2e\.api_key$/);
+  await expect(page.getByLabel('API key file', { exact: true })).toHaveValue(/secrets\/router-udm-e2e\.api_key\.[0-9a-f]+$/);
+  // A new address needs the key again (it isn't sent to an endpoint it wasn't entered for).
   await page.getByLabel('Address', { exact: true }).fill('https://192.0.2.2');
+  await page.getByRole('button', { name: 'Check', exact: true }).click();
+  await expect(page.getByText(/enter it again/)).toBeVisible();
+  // That refusal is expected: not a page problem.
+  for (let i = problems.length - 1; i >= 0; i--) if (problems[i].includes('status of 422')) problems.splice(i, 1);
+  await key.fill('e2e-secret-key-2');
   await page.getByRole('button', { name: 'Check', exact: true }).click();
   await page.getByRole('button', { name: 'Apply' }).click();
   await expect(row).toContainText('unifi · https://192.0.2.2');

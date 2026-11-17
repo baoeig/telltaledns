@@ -154,7 +154,7 @@ match = ["10.0.5.0/24"]       # no groups: its network's group, else "default"</
 <section id="router">
   <h2>Names from your router and mDNS</h2>
   <p>Your router's DHCP hands out addresses; TelltaleDNS can read its client list, so devices show up by name without any typing.</p>
-  <p><b>In the UI:</b> Clients → Discovered → <b>Routers</b> → Add router. Pick UniFi or OPNsense, give its address, and paste the API key. TelltaleDNS saves it to a file only it can read (<code>secrets/router-&lt;name&gt;.api_key</code> in the data folder by default, or a path you give) and never shows it again. Changes apply within seconds, without a restart. Or in the configuration file:</p>
+  <p><b>In the UI</b> (admins): Clients → Discovered → <b>Routers</b> → Add router. Pick UniFi or OPNsense, give its address, and paste the API key. TelltaleDNS saves it to a new file only it can read, under <code>secrets/</code> in the data folder, and never shows it again; changing the address or TLS settings needs it typed again. Changes apply within seconds, without a restart. Or in the configuration file:</p>
 <pre><code>[[router]]
 name = "udm"
 type = "unifi"                         # UniFi OS consoles and the Network application

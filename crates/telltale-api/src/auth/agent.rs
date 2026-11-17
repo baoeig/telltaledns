@@ -54,10 +54,11 @@ pub const SCOPES: &[(&str, &str)] = &[
         "config:write:groups",
         "add, change, and remove client groups",
     ),
-    // REQ: T8.2 (ADR-171) — routers hold credentials, so they have their own scope.
+    // REQ: T8.2 (ADR-171) — routers hold credentials and say where they're sent: their own
+    // scope, for an admin's token, and not part of `config:write:*`.
     (
         "config:write:routers",
-        "add, change, and remove router integrations (UniFi, OPNsense) and their credentials",
+        "add, change, and remove router integrations (UniFi, OPNsense) and their credentials (admin; not in config:write:*)",
     ),
     (
         "config:write:ratelimit",
@@ -99,12 +100,15 @@ pub const SCOPES: &[(&str, &str)] = &[
     ),
 ];
 
+/// REQ: T8.2 (ADR-171) — the routers' scope: an admin's, and not in `config:write:*`.
+const ROUTERS: &str = "config:write:routers";
+
 /// What an agent token gets when none are named: read-only, without the query log.
 pub const DEFAULT_SCOPES: &[&str] = &["analytics:read", "config:read"];
 
 /// The role a scope needs from the token's owner (a token never exceeds its owner).
 fn scope_role(scope: &str) -> Role {
-    if scope == "cluster:admin" {
+    if scope == "cluster:admin" || scope == ROUTERS {
         Role::Admin
     } else if scope.starts_with("config:write:") || scope.starts_with("ops:") {
         Role::Operator
@@ -122,7 +126,7 @@ pub fn parse_scopes(list: &[String]) -> Result<BTreeSet<String>, Problem> {
             out.extend(
                 SCOPES
                     .iter()
-                    .filter(|(n, _)| n.starts_with("config:write:"))
+                    .filter(|(n, _)| n.starts_with("config:write:") && *n != ROUTERS)
                     .map(|(n, _)| (*n).to_owned()),
             );
         } else if SCOPES.iter().any(|(n, _)| *n == s) {
@@ -820,10 +824,16 @@ mod tests {
         let s = parse_scopes(&["config:write:*".into(), "analytics:read".into()]).unwrap();
         assert_eq!(
             s.len(),
-            14,
-            "thirteen write areas (clients, records, forwards, rules, upstreams, lists, groups, routers, alerts, ratelimit, anomalies, exclusions, simulate) + analytics"
+            13,
+            "twelve write areas (clients, records, forwards, rules, upstreams, lists, groups, alerts, ratelimit, anomalies, exclusions, simulate; not routers) + analytics"
         );
         assert!(s.contains("config:write:upstreams") && s.contains("config:write:lists"));
+        // REQ: T8.2 (ADR-171) — routers only when named, and only for an admin's token.
+        assert!(!s.contains("config:write:routers"));
+        assert_eq!(
+            implied_role(&parse_scopes(&["config:write:routers".into()]).unwrap()),
+            Role::Admin
+        );
         assert!(s.contains("config:write:rules"));
         assert_eq!(implied_role(&s), Role::Operator);
         assert_eq!(

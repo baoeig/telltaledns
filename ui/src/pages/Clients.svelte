@@ -32,20 +32,21 @@
   // REQ: T8.2, T8.3 (T8.6) — devices found by the routers' DHCP or mDNS.
   let found = $state<S['DhcpLease'][]>([]);
   const sourceText: Record<string, string> = { router: 'router', mdns: 'mDNS' };
-  // REQ: T8.2, API-002 (ADR-171) — the routers, added and changed here. A key or password is
-  // typed once: the server saves it to a file (the path field, default under the data folder)
-  // and never shows it again.
+  // REQ: T8.2, API-002 (ADR-171) — the routers, added and changed here (admins). A key or
+  // password is typed once: the server saves it to a new file under secrets/ in the data
+  // folder and never shows it again. Changing the address, type, or TLS settings needs it
+  // typed again.
   const slug = (name: string) => name.replace(/[^A-Za-z0-9_-]/g, '_');
   const defaultFile = (field: string) => (_: Record<string, unknown>, name: string) =>
-    `default: secrets/router-${name ? slug(name) + (slug(name) === name ? '' : '-…') : '<name>'}.${field}`;
+    `default: secrets/router-${name ? slug(name) + (slug(name) === name ? '' : '-…') : '<name>'}.${field}.…`;
   const kept = (fileKey: string, what: string) => (v: Record<string, unknown>) =>
     v[fileKey] ? `Saved. Type a new ${what} to replace it.` : `Paste the ${what}`;
   const fileHelp =
-    'Relative paths are in the data folder (/var/lib/telltale by default). A pasted value is saved here, under secrets/. To use a file you keep yourself, give its full path and leave the field above empty.';
+    'In the data folder\u2019s secrets/ (relative paths are in the data folder, /var/lib/telltale by default). Leave it empty for a new file there; or name a new one; or name a file you put in secrets/ yourself and leave the field above empty. A file elsewhere is set in telltale.toml.';
   const routerFields: Field[] = [
     { key: 'type', label: 'Type', type: 'select', options: ['unifi', 'opnsense'], initial: 'unifi' },
     { key: 'url', label: 'Address', type: 'text', placeholder: 'https://192.168.1.1',
-      help: 'UniFi OS consoles: https://192.168.1.1. The classic Network application: https://controller:8443. OPNsense: https://opnsense.lan.' },
+      help: 'UniFi OS consoles: https://192.168.1.1. The classic Network application: https://controller:8443. OPNsense: https://opnsense.lan. Changing it (or the type or TLS settings) needs the key typed again.' },
     { key: 'api_key', label: 'API key', type: 'secret', placeholderFor: kept('api_key_file', 'API key'),
       help: 'UniFi Network 9+: Settings → Control Plane → Integrations. OPNsense: System → Access → Users → API keys.' },
     { key: 'api_key_file', label: 'API key file', type: 'text', placeholderFor: defaultFile('api_key'), help: fileHelp },
@@ -315,7 +316,7 @@
         </div>
       {/if}
     </section>
-    <ConfigEditor kind="router" path="routers" title="Routers" noun="router" fields={routerFields}
+    <ConfigEditor kind="router" path="routers" title="Routers" noun="router" fields={routerFields} role="admin"
       summary={(d) => `${String(d.type ?? '')} · ${String(d.url ?? '')}`}
       onchanged={load} />
   {/if}

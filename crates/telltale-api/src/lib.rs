@@ -1021,6 +1021,11 @@ fn rest_router(backend: Shared, auth: Arc<auth::Auth>) -> Router {
             blocking_api::write_routes(Arc::clone(&backend), Arc::clone(&auth))
                 .route_layer(from_fn(auth::routes::require_operator)),
         )
+        // REQ: T8.2 (ADR-171) — routers hold credentials and say where they're sent: admin.
+        .merge(
+            config_api::router_routes(Arc::clone(&backend), Arc::clone(&auth))
+                .route_layer(from_fn(auth::routes::require_admin)),
+        )
         // REQ: CLU-013 — the rollout settings decide what every node serves: admin (agents:
         // cluster:admin).
         .merge(

@@ -4972,8 +4972,7 @@ impl ApiBackend {
             // valid and together not: the reload would then fall back to the files alone).
             let one_at_a_time = src.config_writes.lock().await;
             // REQ: T8.2 (ADR-171) — a router's secrets, swapped for their files' paths.
-            let secrets = take_router_secrets(&src, &mut w)?;
-            let forget = router_files_to_forget(&src, &w);
+            let secrets = crate::router_secrets::prepare(&src, &mut w)?;
             let state = src
                 .auth
                 .get()
@@ -5029,7 +5028,8 @@ impl ApiBackend {
                 }
                 return Ok(out);
             }
-            write_secrets(&secrets)?;
+            // ADR-171 — new files, removed again unless the change applies.
+            let written = secrets.write()?;
             let stored = {
                 let (state, w, name, body, also) = (
                     Arc::clone(&state),
@@ -5075,224 +5075,10 @@ impl ApiBackend {
                     "the change was saved but couldn't be applied; the server log says why",
                 ));
             }
-            remove_router_secrets(&src, &forget);
+            written.keep();
+            secrets.prune(&src);
             Ok(change(true, version))
         })
-    }
-}
-
-/// REQ: T8.2 (ADR-171) — a router write's secrets, swapped for their files in the body
-/// (nothing for other kinds).
-fn take_router_secrets(
-    src: &Sources,
-    w: &mut ManagedWrite,
-) -> Result<Vec<(std::path::PathBuf, String)>, Problem> {
-    let (ManagedKind::Router, Some(b)) = (w.kind, w.body.as_mut()) else {
-        return Ok(Vec::new());
-    };
-    let cfg = src.config.load();
-    router_secrets(
-        cfg.node.data_dir.as_str(),
-        &w.name,
-        cfg.router.iter().find(|r| r.name.as_str() == w.name),
-        b,
-    )
-}
-
-/// ADR-171 — the secrets are written once the change is known to be valid, before it's
-/// stored (a deleted router's files go once the delete is applied).
-fn write_secrets(secrets: &[(std::path::PathBuf, String)]) -> Result<(), Problem> {
-    for (path, value) in secrets {
-        write_secret(path, value).map_err(|e| {
-            Problem::internal(format!(
-                "{}: couldn't write the secret: {e}",
-                path.display()
-            ))
-        })?;
-    }
-    Ok(())
-}
-
-/// The fields of a router body that carry a secret, and the `[[router]]` field naming the file
-/// each is written to.
-const ROUTER_SECRET_FIELDS: [(&str, &str); 3] = [
-    ("api_key", "api_key_file"),
-    ("api_secret", "api_secret_file"),
-    ("password", "password_file"),
-];
-
-/// Where pasted secrets are written: `<data_dir>/secrets/`.
-fn secrets_dir(data_dir: &str) -> std::path::PathBuf {
-    Path::new(data_dir).join("secrets")
-}
-
-/// A router's default file for a pasted secret: `<data_dir>/secrets/router-<name>.<field>`
-/// (a name with characters a file name can't safely hold gets a hash, so two can't meet).
-fn default_secret_file(data_dir: &str, name: &str, field: &str) -> std::path::PathBuf {
-    let slug: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let slug = if slug == name {
-        slug
-    } else {
-        let hash = blake3::hash(name.as_bytes()).to_hex();
-        format!("{slug}-{}", hash.as_str().get(..8).unwrap_or_default())
-    };
-    secrets_dir(data_dir).join(format!("router-{slug}.{field}"))
-}
-
-/// A file path from a router body: a relative one is under the data directory (the UI's
-/// defaults are `secrets/…`); `..` isn't allowed, so a path says where it is.
-fn router_file(data_dir: &str, field: &str, v: &str) -> Result<std::path::PathBuf, Problem> {
-    let p = Path::new(v.trim());
-    if p.components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err(Problem::new(
-            Code::InvalidConfig,
-            format!("`{field}`: a path without `..`"),
-        ));
-    }
-    Ok(if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        Path::new(data_dir).join(p)
-    })
-}
-
-/// REQ: T8.2 (ADR-171) — a router body's files and secrets. Each credential file
-/// (`api_key_file`, `api_secret_file`, `password_file`) that's relative is made absolute
-/// under the data directory. A pasted secret (`api_key`, `api_secret`, `password`) is
-/// swapped for its file: the one the body names, else the default, and either way under
-/// `<data_dir>/secrets/` (a pasted secret is never written anywhere else: a file elsewhere is
-/// the operator's to put there). A credential the body leaves out entirely keeps the current
-/// router's file, so changing another field doesn't drop the key. Returns what to write.
-fn router_secrets(
-    data_dir: &str,
-    name: &str,
-    current: Option<&telltale_config::RouterConfig>,
-    body: &mut serde_json::Value,
-) -> Result<Vec<(std::path::PathBuf, String)>, Problem> {
-    use serde_json::Value;
-    let Some(o) = body.as_object_mut() else {
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::new();
-    for (field, file_field) in ROUTER_SECRET_FIELDS {
-        let file = match o.get(file_field) {
-            Some(Value::String(v)) if !v.trim().is_empty() => {
-                Some(router_file(data_dir, file_field, v)?)
-            }
-            _ => None,
-        };
-        if file.is_none() {
-            o.remove(file_field);
-        }
-        let secret = match o.remove(field) {
-            Some(Value::String(v)) if !v.trim().is_empty() => Some(v.trim().to_owned()),
-            Some(Value::String(_) | Value::Null) | None => None,
-            Some(_) => {
-                return Err(Problem::new(
-                    Code::InvalidConfig,
-                    format!("`{field}` must be a string"),
-                ));
-            }
-        };
-        let file = match (file, &secret) {
-            (Some(f), Some(_)) if !f.starts_with(secrets_dir(data_dir)) => {
-                return Err(Problem::new(
-                    Code::InvalidConfig,
-                    format!(
-                        "`{file_field}`: a pasted {field} is saved under {}; to keep it elsewhere, put the file there yourself and leave `{field}` empty",
-                        secrets_dir(data_dir).display()
-                    ),
-                ));
-            }
-            (None, Some(_)) => Some(default_secret_file(data_dir, name, field)),
-            (f, _) => f,
-        };
-        if let Some(f) = file {
-            o.insert(
-                file_field.into(),
-                Value::String(f.to_string_lossy().into_owned()),
-            );
-            if let Some(s) = secret {
-                out.push((f, s));
-            }
-        } else if let Some(f) = current.and_then(|c| match file_field {
-            "api_key_file" => c.api_key_file.as_ref(),
-            "api_secret_file" => c.api_secret_file.as_ref(),
-            _ => c.password_file.as_ref(),
-        }) {
-            o.insert(file_field.into(), Value::String(f.to_string()));
-        }
-    }
-    Ok(out)
-}
-
-/// Writes a secret so only this user can read it (0600 in a 0700 directory), replacing the
-/// file whole.
-fn write_secret(path: &Path, value: &str) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(dir)?;
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = std::path::PathBuf::from(tmp);
-    let mut o = std::fs::OpenOptions::new();
-    o.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-        o.mode(0o600);
-    }
-    let mut f = o.open(&tmp)?;
-    f.write_all(value.as_bytes())?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, path)
-}
-
-/// ADR-171 — the secret files a router delete would leave unused: the deleted router's
-/// files under `<data_dir>/secrets/` (files elsewhere are the operator's). Nothing for other
-/// writes.
-fn router_files_to_forget(src: &Sources, w: &ManagedWrite) -> Vec<std::path::PathBuf> {
-    if w.kind != ManagedKind::Router || w.body.is_some() {
-        return Vec::new();
-    }
-    let cfg = src.config.load();
-    let dir = secrets_dir(cfg.node.data_dir.as_str());
-    cfg.router
-        .iter()
-        .filter(|r| r.name.as_str() == w.name)
-        .flat_map(|r| [&r.api_key_file, &r.api_secret_file, &r.password_file])
-        .flatten()
-        .map(|f| std::path::PathBuf::from(f.as_str()))
-        .filter(|f| f.starts_with(&dir))
-        .collect()
-}
-
-/// After a router delete: its secret files go, unless a router in effect still names one (a
-/// files' router of the same name that's back). Best effort: a file left is only untidy.
-fn remove_router_secrets(src: &Sources, files: &[std::path::PathBuf]) {
-    let cfg = src.config.load();
-    for f in files {
-        let used = cfg
-            .router
-            .iter()
-            .flat_map(|r| [&r.api_key_file, &r.api_secret_file, &r.password_file])
-            .flatten()
-            .any(|x| Path::new(x.as_str()) == f);
-        if !used {
-            let _ = std::fs::remove_file(f);
-        }
     }
 }
 
@@ -6316,86 +6102,5 @@ mod rule_edit_tests {
         .unwrap();
         assert_eq!(maker(&taken), Some("bob"));
         assert!(taken.created.is_some());
-    }
-}
-
-#[cfg(test)]
-mod router_secret_tests {
-    use super::*;
-
-    fn router(v: serde_json::Value) -> telltale_config::RouterConfig {
-        serde_json::from_value(v).unwrap()
-    }
-
-    /// REQ: T8.2 (ADR-171) — a pasted key goes to the default file (or one named under the
-    /// secrets directory), never into the body; relative paths are under the data directory;
-    /// a credential left out keeps the current file; a pasted secret can't be written
-    /// outside the secrets directory.
-    #[test]
-    fn t8_2_router_secrets_become_files() {
-        let mut b =
-            serde_json::json!({"type": "unifi", "url": "https://192.168.1.1", "api_key": " k1 "});
-        let w = router_secrets("/data", "udm", None, &mut b).unwrap();
-        assert_eq!(
-            w,
-            vec![("/data/secrets/router-udm.api_key".into(), "k1".to_owned())]
-        );
-        assert_eq!(b["api_key_file"], "/data/secrets/router-udm.api_key");
-        assert!(b.get("api_key").is_none());
-
-        let mut b = serde_json::json!({"type": "opnsense", "url": "https://fw", "api_key": "k",
-            "api_key_file": "secrets/fw-key", "api_secret_file": "/etc/telltale/opn-secret"});
-        let w = router_secrets("/data", "fw", None, &mut b).unwrap();
-        assert_eq!(w, vec![("/data/secrets/fw-key".into(), "k".to_owned())]);
-        assert_eq!(b["api_secret_file"], "/etc/telltale/opn-secret");
-
-        let current = router(serde_json::json!({"name": "udm", "type": "unifi",
-            "url": "https://192.168.1.1", "api_key_file": "/data/secrets/router-udm.api_key"}));
-        let mut b = serde_json::json!({"type": "unifi", "url": "https://10.0.0.1", "api_key": ""});
-        assert_eq!(
-            router_secrets("/data", "udm", Some(&current), &mut b).unwrap(),
-            Vec::new()
-        );
-        assert_eq!(b["api_key_file"], "/data/secrets/router-udm.api_key");
-
-        for bad in [
-            serde_json::json!({"api_key": "k", "api_key_file": "/etc/passwd"}),
-            serde_json::json!({"api_key": "k", "api_key_file": "secrets/../telltale.toml"}),
-            serde_json::json!({"api_key": 5}),
-        ] {
-            let mut b = bad;
-            assert!(router_secrets("/data", "udm", None, &mut b).is_err(), "{b}");
-        }
-        assert_eq!(
-            default_secret_file("/data", "my router", "password"),
-            Path::new("/data/secrets").join(format!(
-                "router-my_router-{}.password",
-                &blake3::hash(b"my router").to_hex().as_str()[..8]
-            ))
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn t8_2_secret_files_are_private() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let d = std::env::temp_dir().join(format!("telltale-secret-{}", std::process::id()));
-        let f = d.join("secrets").join("router-udm.api_key");
-        write_secret(&f, "k1").unwrap();
-        write_secret(&f, "k2").unwrap();
-        assert_eq!(std::fs::read_to_string(&f).unwrap(), "k2");
-        assert_eq!(
-            std::fs::metadata(&f).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert_eq!(
-            std::fs::metadata(d.join("secrets"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
-        let _ = std::fs::remove_dir_all(&d);
     }
 }

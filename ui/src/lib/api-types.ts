@@ -2139,12 +2139,15 @@ export interface paths {
          * Add or change a router integration (T8.2, API-002).
          * @description The body has the same fields as `[[router]]` (the name comes from the path), e.g. a UniFi
          *     console: `{"type": "unifi", "url": "https://192.168.1.1", "api_key": "…",
-         *     "tls_insecure_skip_verify": true}`. Instead of a file, the UniFi API key, the OPNsense key
-         *     and secret, or a UniFi password may be sent as `api_key`, `api_secret`, and `password`:
-         *     TelltaleDNS writes each to a file only it can read (`<data_dir>/secrets/`) and stores
-         *     that file's path; the value is never stored, logged, or returned (ADR-171). Leave them out
-         *     to keep the current ones. The routers are read again within seconds; a router the config
-         *     files define is overridden until this one is deleted.
+         *     "tls_insecure_skip_verify": true}`. The UniFi API key, the OPNsense key and secret, or a
+         *     UniFi password are sent as `api_key`, `api_secret`, and `password`: TelltaleDNS writes
+         *     each to a new file only it can read under `<data_dir>/secrets/` and stores that file's
+         *     path; the value is never stored, logged, or returned (ADR-171). Credential files named
+         *     here (`api_key_file`, …) must be under `<data_dir>/secrets/` too. Leave a credential out to
+         *     keep the current one, unless the type, address, site, or TLS settings change: then it must
+         *     be entered again. Admins only (agents: `config:write:routers`, which `config:write:*`
+         *     doesn't include). The routers are read again within seconds; a router the config files
+         *     define is overridden until this one is deleted.
          */
         put: operations["put_router"];
         post?: never;

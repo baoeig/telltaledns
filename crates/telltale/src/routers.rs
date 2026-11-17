@@ -431,15 +431,19 @@ pub(crate) async fn run(
         Arc::new(telltale_filter::fetch::SystemResolver);
     let mut parts: HashMap<String, Polled> = HashMap::new();
     let mut failing: HashMap<String, bool> = HashMap::new();
-    // What each router's last answer was read with: a router removed or changed (in the UI,
-    // ADR-171) drops its answer, so no names linger from settings that are gone.
+    // The routers last read: one removed, or now pointing at another device (type, address,
+    // site), drops its answer, so no names linger from a router that's gone (ADR-171). Other
+    // changes (credentials, TLS, timing) keep it until the next answer replaces it.
     let mut read_with: Vec<RouterConfig> = Vec::new();
     loop {
         let routers = routers_now();
+        let same_device = |a: &RouterConfig, b: &RouterConfig| {
+            a.name == b.name && a.kind == b.kind && a.url == b.url && a.site == b.site
+        };
         let kept = |n: &str| {
             routers
                 .iter()
-                .any(|r| r.name.as_str() == n && read_with.iter().any(|w| w == r))
+                .any(|r| r.name.as_str() == n && read_with.iter().any(|w| same_device(w, r)))
         };
         parts.retain(|n, _| kept(n));
         failing.retain(|n, _| kept(n));

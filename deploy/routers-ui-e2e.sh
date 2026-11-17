@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # REQ: T8.2, API-002 (ADR-171) — a router added through the API, as the UI does: its API key is
-# saved to a private file under the data directory (never stored, listed, or audited), the
-# router is read without a restart, a change to another field keeps the key, a pasted key
-# can't be written outside the secrets directory, and a delete removes the router and its key.
+# saved to a new private file under <data_dir>/secrets/ (never stored, listed, or audited), the
+# router is read without a restart, credential files outside secrets/ are refused, a change to
+# another field keeps the key but a new address needs it again, a refused change writes
+# nothing, a new key switches files, and a delete removes the router and only the files the
+# API wrote.
 # Needs python3, curl.
 # Usage: deploy/routers-ui-e2e.sh [path/to/telltale]   (default: target/debug/telltale)
 set -euo pipefail
@@ -75,16 +77,25 @@ CSRF=$(curl -sf -c "$E/jar" -H 'content-type: application/json' \
   "$API/api/v1/auth/setup" | field 'd["csrfToken"]')
 put() { curl -s -o "$E/out" -w '%{http_code}' -X PUT -b "$E/jar" -H "x-csrf-token: $CSRF" -H 'content-type: application/json' -d "$2" "$API/api/v1/routers/$1"; }
 
-# A pasted key outside the secrets directory is refused, and nothing is written.
-code=$(put udm "{\"type\":\"unifi\",\"url\":\"http://127.0.0.1:26984\",\"api_key\":\"$KEY\",\"api_key_file\":\"$E/elsewhere\"}")
-[ "$code" = 422 ] || fail "a key outside secrets/ wasn't refused ($code): $(cat "$E/out")"
+keyfile() { curl -sf -b "$E/jar" "$API/api/v1/config/entries?kind=router" | python3 -c '
+import json, sys
+items = [x for x in json.load(sys.stdin)["items"] if x["name"] == "udm"]
+print(items[0]["definition"].get("api_key_file", "") if items else "")'; }
+
+# Credential files outside secrets/ are refused, pasted or not (the poll would send them).
+for body in "{\"type\":\"unifi\",\"url\":\"http://127.0.0.1:26984\",\"api_key\":\"$KEY\",\"api_key_file\":\"$E/elsewhere\"}" \
+            "{\"type\":\"unifi\",\"url\":\"http://127.0.0.1:26984\",\"api_key_file\":\"$E/telltale.toml\"}"; do
+  code=$(put udm "$body")
+  [ "$code" = 422 ] || fail "a credential file outside secrets/ wasn't refused ($code): $(cat "$E/out")"
+done
 [ ! -e "$E/elsewhere" ] || fail "the key was written outside secrets/"
 
-# Added with a pasted key: saved to the default file, 0600, and read without a restart.
+# Added with a pasted key: a new file under secrets/, 0600, read without a restart.
 code=$(put udm "{\"type\":\"unifi\",\"url\":\"http://127.0.0.1:26984\",\"api_key\":\"$KEY\",\"offline_days\":0}")
 [ "$code" = 200 ] || fail "PUT /routers/udm: $code $(cat "$E/out")"
-F="$E/data/secrets/router-udm.api_key"
-[ "$(cat "$F")" = "$KEY" ] || fail "the key file"
+F=$(keyfile)
+case "$F" in "$E/data/secrets/router-udm.api_key."*) ;; *) fail "the key file is $F" ;; esac
+[ "$(cat "$F")" = "$KEY" ] || fail "the key file's content"
 [ "$(stat -c %a "$F")" = 600 ] || fail "the key file is $(stat -c %a "$F"), not 600"
 [ "$(stat -c %a "$E/data/secrets")" = 700 ] || fail "the secrets directory isn't 700"
 for _ in $(seq 50); do grep -q 'router="udm".*devices read\|router=udm.*devices read' "$E/node.log" && break; sleep 0.2; done
@@ -93,24 +104,43 @@ import json, sys
 items = {x["ip"]: x for x in json.load(sys.stdin)["items"]}
 assert items["192.168.7.20"]["hostname"] == "Hall tablet", items
 ' || fail "the router added through the API wasn't read"
-echo "added: key saved to secrets/router-udm.api_key (0600), router read without a restart"
+echo "added: key saved to a new file under secrets/ (0600), router read without a restart"
 
 # The key is nowhere the API can show it.
 curl -sf -b "$E/jar" "$API/api/v1/config/entries?kind=router" > "$E/entries"
-grep -q "router-udm.api_key" "$E/entries" || fail "the entry doesn't name its key file: $(cat "$E/entries")"
 curl -sf -b "$E/jar" "$API/api/v1/audit" > "$E/audit"
 ! grep -q "$KEY" "$E/entries" "$E/audit" "$E/node.log" || fail "the key shows up in the API or the log"
 
-# Changing another field keeps the key.
+# Changing another field keeps the key; a new address needs it again.
 code=$(put udm '{"type":"unifi","url":"http://127.0.0.1:26984","interval_secs":60,"offline_days":0}')
 [ "$code" = 200 ] || fail "PUT without the key: $code $(cat "$E/out")"
-curl -sf -b "$E/jar" "$API/api/v1/config/entries?kind=router" | grep -q "router-udm.api_key" || fail "the key file was dropped"
-echo "changed: the key is kept, and never shown"
+[ "$(keyfile)" = "$F" ] || fail "the key file changed"
+code=$(put udm '{"type":"unifi","url":"http://127.0.0.2:26984","offline_days":0}')
+[ "$code" = 422 ] && grep -q "enter it again" "$E/out" || fail "a new address reused the saved key ($code): $(cat "$E/out")"
+echo "changed: the key is kept, never shown, and not sent to a new address"
 
-# Deleting it removes the router, its names, and its key file.
+# A stale If-Match leaves the key in use alone and writes nothing.
+before=$(ls "$E/data/secrets")
+code=$(curl -s -o "$E/out" -w '%{http_code}' -X PUT -b "$E/jar" -H "x-csrf-token: $CSRF" -H 'if-match: "1"' \
+  -H 'content-type: application/json' -d '{"type":"unifi","url":"http://127.0.0.1:26984","api_key":"other-key","offline_days":0}' \
+  "$API/api/v1/routers/udm")
+[ "$code" = 412 ] || fail "stale If-Match: $code $(cat "$E/out")"
+[ "$(ls "$E/data/secrets")" = "$before" ] || fail "a refused change left a file: $(ls "$E/data/secrets")"
+[ "$(cat "$F")" = "$KEY" ] || fail "a refused change replaced the key"
+
+# A new key goes to a new file; the old one is removed once the change applies.
+code=$(put udm "{\"type\":\"unifi\",\"url\":\"http://127.0.0.1:26984\",\"api_key\":\"$KEY\",\"offline_days\":0}")
+[ "$code" = 200 ] || fail "PUT with a new key: $code $(cat "$E/out")"
+F2=$(keyfile)
+[ "$F2" != "$F" ] && [ -f "$F2" ] && [ ! -e "$F" ] || fail "the key wasn't switched to a new file ($F -> $F2)"
+echo "replaced: a new file, the old one removed after the change applied; a refused change touched nothing"
+
+# Deleting it removes the router, its names, and the key file it wrote, and nothing else.
+echo keep > "$E/data/secrets/mine"
 code=$(curl -s -o "$E/out" -w '%{http_code}' -X DELETE -b "$E/jar" -H "x-csrf-token: $CSRF" "$API/api/v1/routers/udm")
 [ "$code" = 200 ] || fail "DELETE: $code $(cat "$E/out")"
-[ ! -e "$F" ] || fail "the key file is still there"
+[ ! -e "$F2" ] || fail "the key file is still there"
+[ -f "$E/data/secrets/mine" ] || fail "a file the API didn't write was removed"
 for _ in $(seq 50); do
   curl -sf -b "$E/jar" "$API/api/v1/dhcp/leases" | grep -q 192.168.7.20 || break
   sleep 0.2

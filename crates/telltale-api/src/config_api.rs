@@ -132,11 +132,6 @@ pub(crate) fn routes(backend: Arc<dyn Backend>, auth: Arc<Auth>) -> Router {
             "/api/v1/schedules/{name}",
             put(put_schedule).delete(delete_schedule),
         )
-        // REQ: T8.2, API-002 (ADR-171)
-        .route(
-            "/api/v1/routers/{name}",
-            put(put_router).delete(delete_router),
-        )
         // REQ: OBS-038 (ADR-161)
         .route(
             "/api/v1/anomaly-mutes/{name}",
@@ -966,12 +961,15 @@ pub(crate) const ROUTER_SECRETS: [&str; 3] = ["api_key", "api_secret", "password
 ///
 /// The body has the same fields as `[[router]]` (the name comes from the path), e.g. a UniFi
 /// console: `{"type": "unifi", "url": "https://192.168.1.1", "api_key": "…",
-/// "tls_insecure_skip_verify": true}`. Instead of a file, the UniFi API key, the OPNsense key
-/// and secret, or a UniFi password may be sent as `api_key`, `api_secret`, and `password`:
-/// TelltaleDNS writes each to a file only it can read (`<data_dir>/secrets/`) and stores
-/// that file's path; the value is never stored, logged, or returned (ADR-171). Leave them out
-/// to keep the current ones. The routers are read again within seconds; a router the config
-/// files define is overridden until this one is deleted.
+/// "tls_insecure_skip_verify": true}`. The UniFi API key, the OPNsense key and secret, or a
+/// UniFi password are sent as `api_key`, `api_secret`, and `password`: TelltaleDNS writes
+/// each to a new file only it can read under `<data_dir>/secrets/` and stores that file's
+/// path; the value is never stored, logged, or returned (ADR-171). Credential files named
+/// here (`api_key_file`, …) must be under `<data_dir>/secrets/` too. Leave a credential out to
+/// keep the current one, unless the type, address, site, or TLS settings change: then it must
+/// be entered again. Admins only (agents: `config:write:routers`, which `config:write:*`
+/// doesn't include). The routers are read again within seconds; a router the config files
+/// define is overridden until this one is deleted.
 #[utoipa::path(put, path = "/api/v1/routers/{name}", tag = "config",
     params(("name" = String, Path, description = "The name."), DryRun),
     request_body = Object,
@@ -1376,6 +1374,17 @@ pub(crate) async fn delete_exclusions(
         Op::Managed(ManagedKind::Exclusions, None),
     )
     .await
+}
+
+/// REQ: T8.2, API-002 (ADR-171) — routers, for admins (merged with `require_admin`): a
+/// router holds credentials and is told where to send them.
+pub(crate) fn router_routes(backend: Arc<dyn Backend>, auth: Arc<Auth>) -> Router {
+    Router::new()
+        .route(
+            "/api/v1/routers/{name}",
+            axum::routing::put(put_router).delete(delete_router),
+        )
+        .with_state((backend, auth))
 }
 
 /// REQ: CLU-013 — `[cluster.rollout]`, for admins (merged with `require_admin`).
