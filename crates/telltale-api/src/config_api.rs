@@ -132,6 +132,11 @@ pub(crate) fn routes(backend: Arc<dyn Backend>, auth: Arc<Auth>) -> Router {
             "/api/v1/schedules/{name}",
             put(put_schedule).delete(delete_schedule),
         )
+        // REQ: T8.2, API-002 (ADR-171)
+        .route(
+            "/api/v1/routers/{name}",
+            put(put_router).delete(delete_router),
+        )
         // REQ: OBS-038 (ADR-161)
         .route(
             "/api/v1/anomaly-mutes/{name}",
@@ -954,6 +959,98 @@ pub(crate) async fn put_schedule(
     .await
 }
 
+/// The fields of a router body that carry a secret, written to a file and never stored.
+pub(crate) const ROUTER_SECRETS: [&str; 3] = ["api_key", "api_secret", "password"];
+
+/// Add or change a router integration (T8.2, API-002).
+///
+/// The body has the same fields as `[[router]]` (the name comes from the path), e.g. a UniFi
+/// console: `{"type": "unifi", "url": "https://192.168.1.1", "api_key": "…",
+/// "tls_insecure_skip_verify": true}`. Instead of a file, the UniFi API key, the OPNsense key
+/// and secret, or a UniFi password may be sent as `api_key`, `api_secret`, and `password`:
+/// TelltaleDNS writes each to a file only it can read (`<data_dir>/secrets/`) and stores
+/// that file's path; the value is never stored, logged, or returned (ADR-171). Leave them out
+/// to keep the current ones. The routers are read again within seconds; a router the config
+/// files define is overridden until this one is deleted.
+#[utoipa::path(put, path = "/api/v1/routers/{name}", tag = "config",
+    params(("name" = String, Path, description = "The name."), DryRun),
+    request_body = Object,
+    responses(
+        (status = 200, body = ConfigChange, description = "Applied (or, with dryRun, what would change)."),
+        (status = 412, body = Problem, description = "The configuration changed since the If-Match version: re-read it and retry."),
+        (status = 422, body = Problem, description = "A field is wrong (the URL, missing credentials), or the configuration wouldn't be valid."),
+    ))]
+pub(crate) async fn put_router(
+    State((backend, auth)): State<Ctx>,
+    Path(name): Path<String>,
+    Query(q): Query<DryRun>,
+    headers: HeaderMap,
+    ext: axum::http::Extensions,
+    b: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Response {
+    let input = match body(b) {
+        Ok(i) => i,
+        Err(p) => return p.into_response(),
+    };
+    // ADR-171 — the idempotency record keeps the request: a secret is kept as its hash.
+    let mut shown = input.clone();
+    if let Some(o) = shown.as_object_mut() {
+        for k in ROUTER_SECRETS {
+            if let Some(v) = o.get_mut(k)
+                && let Some(s) = v.as_str()
+            {
+                *v = serde_json::Value::String(format!(
+                    "blake3:{}",
+                    blake3::hash(s.as_bytes()).to_hex()
+                ));
+            }
+        }
+    }
+    let request = format!("PUT /routers/{name} {}", json_of(&shown));
+    write(
+        backend,
+        auth,
+        headers,
+        ext,
+        dry(&q),
+        request,
+        name,
+        Op::Managed(ManagedKind::Router, Some(input)),
+    )
+    .await
+}
+
+/// Remove a router integration (T8.2, API-002).
+///
+/// Its devices lose the names it gave them at the next read. A router the config files define
+/// is hidden until the files' entry is brought back (DELETE again, or Revert to the file).
+#[utoipa::path(delete, path = "/api/v1/routers/{name}", tag = "config",
+    params(("name" = String, Path, description = "The name."), DryRun),
+    responses(
+        (status = 200, body = ConfigChange, description = "The result."),
+        (status = 404, body = Problem, description = "No entry by that name."),
+    ))]
+pub(crate) async fn delete_router(
+    State((backend, auth)): State<Ctx>,
+    Path(name): Path<String>,
+    Query(q): Query<DryRun>,
+    headers: HeaderMap,
+    ext: axum::http::Extensions,
+) -> Response {
+    let request = format!("DELETE /routers/{name}");
+    write(
+        backend,
+        auth,
+        headers,
+        ext,
+        dry(&q),
+        request,
+        name,
+        Op::Managed(ManagedKind::Router, None),
+    )
+    .await
+}
+
 /// Mute kinds of device anomaly for some devices or groups (OBS-038).
 ///
 /// The body has the same fields as `[[anomaly_mute]]` (the name comes from the path):
@@ -1455,6 +1552,7 @@ impl Op {
             Self::Managed(ManagedKind::Simulate, _) => "simulate",
             Self::Managed(ManagedKind::Rollout, _) => "rollout_settings",
             Self::Managed(ManagedKind::KubernetesMap, _) => "kubernetes_map",
+            Self::Managed(ManagedKind::Router, _) => "router",
         }
     }
     fn deleting(&self) -> bool {

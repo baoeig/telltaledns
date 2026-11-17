@@ -177,6 +177,7 @@ async fn apply(src: &Sources, local: &Shared, cluster: &Cluster, peer: &str, w: 
                 ManagedKind::Simulate => "simulate",
                 ManagedKind::Rollout => "rollout_settings",
                 ManagedKind::KubernetesMap => "kubernetes_map",
+                ManagedKind::Router => "router",
             };
             let deleting = body.is_none();
             let r = local

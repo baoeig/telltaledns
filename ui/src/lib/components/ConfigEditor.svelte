@@ -5,11 +5,14 @@
   export type Field = {
     key: string;
     label: string;
-    type: 'text' | 'number' | 'select' | 'multi' | 'lines' | 'bool';
+    /** `secret`: typed, never shown back (T8.2, ADR-171: a router's key or password). */
+    type: 'text' | 'number' | 'select' | 'multi' | 'lines' | 'bool' | 'secret';
     options?: string[];
     /** How `select`/`multi` options read (CLU-013: node IDs by their site or pod). */
     optionLabels?: Record<string, string>;
     placeholder?: string;
+    /** A placeholder from the draft and its name (T8.2: a key file's default path). */
+    placeholderFor?: (values: Record<string, unknown>, name: string) => string;
     help?: string;
     /** Only in the Advanced view. */
     advanced?: boolean;
@@ -47,8 +50,8 @@
     role,
     note,
   }: {
-    kind: 'upstream' | 'upstream_group' | 'list' | 'group' | 'alert_destination' | 'alert_rule' | 'schedule' | 'ratelimit' | 'exclusions' | 'simulate' | 'rollout';
-    path: 'upstreams' | 'upstream-groups' | 'lists' | 'groups' | 'alerts/destinations' | 'alerts/rules' | 'schedules' | 'ratelimit' | 'exclusions' | 'simulate-settings' | 'cluster/rollout-settings';
+    kind: 'upstream' | 'upstream_group' | 'list' | 'group' | 'alert_destination' | 'alert_rule' | 'schedule' | 'ratelimit' | 'exclusions' | 'simulate' | 'rollout' | 'router';
+    path: 'upstreams' | 'upstream-groups' | 'lists' | 'groups' | 'alerts/destinations' | 'alerts/rules' | 'schedules' | 'ratelimit' | 'exclusions' | 'simulate-settings' | 'cluster/rollout-settings' | 'routers';
     title: string;
     noun: string;
     fields: Field[];
@@ -300,8 +303,23 @@
             {:else if f.type === 'number'}
               <!-- step="any": thresholds such as 0.5 % are allowed. -->
               <input type="number" step="any" bind:value={editing.values[f.key]} placeholder={f.placeholder} aria-label={f.label} />
+            {:else if f.type === 'secret'}
+              <!-- T8.2 (ADR-171): sent once, saved to a file by the server, never read back. -->
+              <input
+                type="password"
+                autocomplete="new-password"
+                class="mono"
+                bind:value={editing.values[f.key]}
+                placeholder={f.placeholderFor?.(editing.values, editing.name) ?? f.placeholder}
+                aria-label={f.label}
+              />
             {:else}
-              <input class="mono" bind:value={editing.values[f.key]} placeholder={f.placeholder} aria-label={f.label} />
+              <input
+                class="mono"
+                bind:value={editing.values[f.key]}
+                placeholder={f.placeholderFor?.(editing.values, editing.name) ?? f.placeholder}
+                aria-label={f.label}
+              />
             {/if}
             {#if f.help}<span class="muted small">{f.help}</span>{/if}
           </label>

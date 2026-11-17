@@ -54,6 +54,11 @@ pub const SCOPES: &[(&str, &str)] = &[
         "config:write:groups",
         "add, change, and remove client groups",
     ),
+    // REQ: T8.2 (ADR-171) — routers hold credentials, so they have their own scope.
+    (
+        "config:write:routers",
+        "add, change, and remove router integrations (UniFi, OPNsense) and their credentials",
+    ),
     (
         "config:write:ratelimit",
         "change the per-client rate limit, or go back to the config file's",
@@ -234,6 +239,10 @@ pub fn required(method: &Method, path: &str) -> Need {
         // Schedules are group settings (FLT-010, T9.7).
         if under("/api/v1/groups") || under("/api/v1/schedules") {
             return Need::Scope("config:write:groups");
+        }
+        // REQ: T8.2 (ADR-171)
+        if under("/api/v1/routers") {
+            return Need::Scope("config:write:routers");
         }
         // REQ: OBS-010 (T9.6)
         if under("/api/v1/alerts") {
@@ -811,8 +820,8 @@ mod tests {
         let s = parse_scopes(&["config:write:*".into(), "analytics:read".into()]).unwrap();
         assert_eq!(
             s.len(),
-            13,
-            "twelve write areas (clients, records, forwards, rules, upstreams, lists, groups, alerts, ratelimit, anomalies, exclusions, simulate) + analytics"
+            14,
+            "thirteen write areas (clients, records, forwards, rules, upstreams, lists, groups, routers, alerts, ratelimit, anomalies, exclusions, simulate) + analytics"
         );
         assert!(s.contains("config:write:upstreams") && s.contains("config:write:lists"));
         assert!(s.contains("config:write:rules"));

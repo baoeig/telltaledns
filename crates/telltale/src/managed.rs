@@ -49,6 +49,8 @@ pub(crate) const SIMULATE: &str = "simulate";
 pub(crate) const ROLLOUT: &str = "rollout";
 /// REQ: FLT-017 (T15.1) — `[[kubernetes.map]]` rules, by key (`namespace/kind/name`).
 pub(crate) const KUBERNETES_MAP: &str = "kubernetes_map";
+/// REQ: T8.2, API-002 (ADR-171) — router integrations (they override the files' too).
+pub(crate) const ROUTER: &str = "router";
 
 /// An API entry for a kind that can override the files (ADR-069): a definition, or the
 /// files' entry of that name left out.
@@ -91,6 +93,11 @@ impl Named for telltale_config::AlertDestination {
     }
 }
 impl Named for telltale_config::ScheduleConfig {
+    fn name(&self) -> &str {
+        self.name.as_str()
+    }
+}
+impl Named for telltale_config::RouterConfig {
     fn name(&self) -> &str {
         self.name.as_str()
     }
@@ -154,6 +161,8 @@ pub(crate) struct Entries {
     pub(crate) rollout: Option<telltale_config::RolloutConfig>,
     /// REQ: FLT-017 — `[[kubernetes.map]]` rules by key; they come before the files' rules.
     pub(crate) kubernetes_map: Vec<(String, Ovr<telltale_config::KubernetesMapRule>)>,
+    /// REQ: T8.2 (ADR-171) — router integrations.
+    pub(crate) routers: Vec<(String, Ovr<telltale_config::RouterConfig>)>,
 }
 
 /// Where the state database lives.
@@ -248,6 +257,7 @@ pub(crate) fn entries(state: &State) -> Entries {
             .next()
             .map(|(_, x)| x),
         kubernetes_map: decode_ovr(state, KUBERNETES_MAP),
+        routers: decode_ovr(state, ROUTER),
     }
 }
 
@@ -348,6 +358,7 @@ pub(crate) fn merge(file: &Config, e: &Entries) -> Result<Config, Vec<String>> {
     apply_ovr(&mut cfg.alerts.rule, &e.alert_rules);
     apply_ovr(&mut cfg.schedule, &e.schedules);
     apply_ovr(&mut cfg.anomaly_mute, &e.anomaly_mutes);
+    apply_ovr(&mut cfg.router, &e.routers);
     apply_kubernetes_map(&mut cfg, &e.kubernetes_map);
     apply_one_of(&mut cfg, e);
     for c in &e.clients {

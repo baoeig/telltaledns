@@ -24,6 +24,9 @@ use tracing::{debug, info, warn};
 
 use crate::devices::{Lease, Leases};
 
+/// How often the routers in effect are compared with the ones last read (ADR-171).
+const CHANGE_CHECK: Duration = Duration::from_secs(5);
+
 /// Most bytes one answer may have.
 const MAX_ANSWER: u64 = 16 << 20;
 
@@ -418,24 +421,34 @@ fn rebuild(parts: &HashMap<String, Polled>, view: &ArcSwap<Leases>) {
 /// routers' settings but not their key files (ADR-120), logs its failures as info; the
 /// controller, which serves the names in the UI, warns.
 pub(crate) async fn run(
-    routers: Vec<RouterConfig>,
+    sources: Arc<crate::http::Sources>,
     view: Arc<ArcSwap<Leases>>,
     mut stop: tokio::sync::watch::Receiver<bool>,
     resolver_pod: bool,
 ) {
-    if routers.is_empty() {
-        return;
-    }
+    let routers_now = || sources.config.load().router.clone();
     let resolver: Arc<dyn telltale_filter::fetch::Resolve> =
         Arc::new(telltale_filter::fetch::SystemResolver);
     let mut parts: HashMap<String, Polled> = HashMap::new();
     let mut failing: HashMap<String, bool> = HashMap::new();
-    let interval = routers
-        .iter()
-        .map(|r| r.interval_secs.max(30))
-        .min()
-        .unwrap_or(300);
+    // What each router's last answer was read with: a router removed or changed (in the UI,
+    // ADR-171) drops its answer, so no names linger from settings that are gone.
+    let mut read_with: Vec<RouterConfig> = Vec::new();
     loop {
+        let routers = routers_now();
+        let kept = |n: &str| {
+            routers
+                .iter()
+                .any(|r| r.name.as_str() == n && read_with.iter().any(|w| w == r))
+        };
+        parts.retain(|n, _| kept(n));
+        failing.retain(|n, _| kept(n));
+        read_with.clone_from(&routers);
+        let interval = routers
+            .iter()
+            .map(|r| r.interval_secs.max(30))
+            .min()
+            .unwrap_or(300);
         for r in &routers {
             let client = if r.tls_insecure_skip_verify {
                 telltale_filter::fetch::Client::insecure(Arc::clone(&resolver))
@@ -498,9 +511,16 @@ pub(crate) async fn run(
         } else {
             interval
         };
-        tokio::select! {
-            _ = stop.changed() => return,
-            () = tokio::time::sleep(Duration::from_secs(u64::from(wait))) => {}
+        // REQ: T8.2 (ADR-171) — until the next read, or sooner when the routers change.
+        let until = tokio::time::Instant::now() + Duration::from_secs(u64::from(wait));
+        while tokio::time::Instant::now() < until {
+            tokio::select! {
+                _ = stop.changed() => return,
+                () = tokio::time::sleep(CHANGE_CHECK.min(until - tokio::time::Instant::now())) => {}
+            }
+            if routers_now() != read_with {
+                break;
+            }
         }
     }
 }
