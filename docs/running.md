@@ -1766,6 +1766,13 @@ version the replica applied, which covers a node promoted since) and, under auto
 the other voters. So a link like this one doesn't leave `TelltaleDNSClusterPeerDown` firing. A
 replica that is really down is reported by the primary.
 
+This is true of the Prometheus metrics and the peers in `/api/v1/system/info`. The Cluster
+page, `/api/v1/health` and the in-app node-down alert also list the nodes the cluster registry
+has and this node has no entry for, as down with no link.
+On a replica that includes the other replica once it has been forgotten, as it already does for
+a replica that never had a stream to it. The link-less row appears after the node you're on has
+been up for about a minute and a half.
+
 **One view of the whole cluster.** Open any node's UI and the dashboard, top lists, latency,
 groups, query log, and live query stream cover every node:
 - The node you're on asks its peers over the cluster link and merges what they send:
