@@ -313,7 +313,7 @@ the chart's schema rejects a mistyped value with its path.
 - **The UI and API**: `service.api.type: LoadBalancer`, or `ingress.enabled` with `ingress.host` (set `[api] trusted_proxies` in `config` to your ingress's network).
 - **Configuration**: `config:` is merged after the chart's own settings (listeners, data directory, ports): upstreams, lists, groups, `[auth.oidc]`, everything in `docs/configuration.md`.
 - **Secrets**: `auth.bootstrapAdmin.existingSecret` creates the first admin (keys `username` and `password` or `password-hash`); `secretMounts` mounts Secrets at `/etc/telltale-secrets/<name>` (for example an OIDC `client_secret_file`).
-- **Monitoring**: `serviceMonitor.enabled`, `prometheusRule.enabled` (down, all upstreams down, SERVFAIL rate, stale lists, dropped telemetry, masked client IPs, device anomalies), and `grafanaDashboard.enabled` (a ConfigMap for the Grafana sidecar).
+- **Monitoring**: `serviceMonitor.enabled`, `prometheusRule.enabled` (down, all upstreams down, SERVFAIL rate, lists that failed to refresh for 48 hours, dropped telemetry, masked client IPs, device anomalies), and `grafanaDashboard.enabled` (a ConfigMap for the Grafana sidecar).
 - **`networkPolicy.enabled`** limits who may query (`dnsFrom`), reach the UI (`apiFrom`), and scrape (`metricsFrom`).
 - **Encrypted DNS**: `encrypted.dot.enabled` (853), `encrypted.doh.enabled` (443, plus `encrypted.doh.http3`), and `encrypted.doq.enabled` add DoT, DoH, and DoQ to the DNS Service; the certificate comes from `encrypted.tls.secretName` or a cert-manager `Certificate` (`encrypted.tls.certManager.issuerRef` and `dnsNames`; add a wildcard for client IDs) and is reloaded when renewed. `encrypted.proxyProtocol` accepts PROXY protocol v2 on TCP, DoT, and DoH.
 - **One replica or many.** `mode: allInOne` (the default) is one StatefulSet with a volume for lists, the query log, and users. **`mode: scaled`** adds resolver pods:
@@ -984,10 +984,18 @@ Among rules of the same kind, the one reported is an exact-name rule first, then
 
 Lookups take well under a microsecond: about 0.3 µs typically and under 1 µs at p99 on an x86 server with 2.6M blocked names. They use an in-memory index built from the snapshot (about 10 bytes per name, on top of the snapshot's 9). A new snapshot is served the moment it's loaded, and the index is swapped in about a second later, without pausing queries. Memory with HaGeZi Pro + TIF + OISD big + StevenBlack + AdGuard (2.7M names): about 85 MiB in total; HaGeZi Pro alone (227k names): about 10 MiB.
 
-Metrics: `telltale_queries_total{status="blocked"}` (including CNAME blocks), `telltale_filter_paused_until_seconds{group}`, `telltale_filter_lookup_index_bytes` (0 while the index is being built), `telltale_filter_snapshot_version`, `telltale_filter_rules`, `telltale_filter_compile_seconds`, `telltale_list_entries{list}`, `telltale_list_source_bytes`, `telltale_list_last_success_timestamp_seconds`, `telltale_list_last_change_timestamp_seconds`, and `telltale_list_fetch_consecutive_failures`, each labeled `{list}`. Inline lists (`rules = [...]`) are never fetched, so they have no `telltale_list_last_success_timestamp_seconds`. To alert on a list that has failed for two days:
+Metrics: `telltale_queries_total{status="blocked"}` (including CNAME blocks), `telltale_filter_paused_until_seconds{group}`, `telltale_filter_lookup_index_bytes` (0 while the index is being built), `telltale_filter_snapshot_version`, `telltale_filter_rules`, `telltale_filter_compile_seconds`, `telltale_list_entries{list}`, `telltale_list_source_bytes`, `telltale_list_last_success_timestamp_seconds`, `telltale_list_last_change_timestamp_seconds`, and `telltale_list_fetch_consecutive_failures`, each labeled `{list}`. Inline lists (`rules = [...]`) are never fetched, so they have no `telltale_list_last_success_timestamp_seconds`. To alert on a list whose last good copy is over two days old and whose latest refresh failed (the Helm chart's `TelltaleDNSListStale` does this):
 ```
-time() - telltale_list_last_success_timestamp_seconds > 172800
+(time() - telltale_list_last_success_timestamp_seconds > 172800)
+  and on(instance, list) (telltale_list_fetch_consecutive_failures > 0)
 ```
+Age alone isn't enough: a list with `refresh_secs` over two days is legitimately older than that between refreshes, and a list disabled while the server runs keeps its last value until a restart.
+
+What this alert covers, so you know when to rely on it:
+- It fires (after 30 minutes, with the chart's `for: 30m`) when the last success is over 48 hours ago **and** the latest refresh failed. It isn't a literal "failing for 48 hours": with the default `refresh_secs` (one day) it fires about a day after the first failed refresh, and for a list refreshed less often than every two days, shortly after its first failed refresh. The last good copy keeps blocking meanwhile.
+- A list that has **never succeeded** (a new list with a mistyped URL, or an empty data directory) has no `telltale_list_last_success_timestamp_seconds`, so it isn't covered. A list **held** by `max_shrink_percent` isn't a failed refresh (its failure count stays 0), so it isn't covered either. The in-app alert rule `list_failing` reports both.
+- A list that was failing when you disabled it keeps alerting until the node restarts (the metrics of a disabled list are kept until then).
+- It is unrelated to the in-app `list_stale` (content unchanged for 30 days, see [Lists that stopped changing](#lists-that-stopped-changing)): that one is about a source that keeps answering with the same content.
 
 ### Lists that stopped changing
 A list whose maintainer gave up can keep answering HTTP 200 with the same content forever: it downloads fine, so nothing fails, but it stops keeping up. A URL list whose content hasn't changed in 30 days is called **stale**:
