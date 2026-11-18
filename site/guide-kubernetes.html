@@ -116,7 +116,7 @@ config: |
   config_source = "gitops"
 
   [api]
-  trusted_proxies = ["10.0.0.0/8"]
+  trusted_proxies = ["10.42.0.5/32"]   # your ingress controller's address
 
   [auth.oidc]
   public_url = "https://dns.example.com"

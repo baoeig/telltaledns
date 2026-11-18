@@ -3339,7 +3339,7 @@ tls = { self_signed = true }                 # a certificate made on first start
 **Behind a reverse proxy or ingress,** tell TelltaleDNS which addresses are proxies so sign-in lockouts, break-glass networks, and the audit log use the real client address from `X-Forwarded-For` (otherwise everyone looks like the proxy, and one person's failed sign-ins lock out everyone):
 ```toml
 [api]
-trusted_proxies = ["10.0.0.0/8"]   # e.g. the Kubernetes pod network your ingress runs in
+trusted_proxies = ["10.42.0.5/32"]   # your ingress controller's address
 ```
 The same list decides whose `X-Forwarded-Proto: https` counts: it is what lets HTTP Basic work and marks the session cookie `Secure` behind a TLS-terminating proxy. From anyone else the header is ignored, so a client on plain HTTP can't claim HTTPS. A proxy on the same host (Caddy or nginx on `127.0.0.1`) counts for that header without being listed, but not for `X-Forwarded-For`: to have the client address from it, list `127.0.0.1/32`. List only the proxies themselves, never your LAN, or any machine on it can forge the header. How this matters for break-glass sign-in is under **Break-glass sign-in** above.
 

@@ -284,7 +284,7 @@ session_idle_hours = 24
 allow_insecure_basic = false</code></pre>
   <div class="callout warn"><p><b>Behind a reverse proxy or ingress,</b> list the proxies, or everyone looks like the proxy and one person's failed sign-ins lock out everyone. The same list lets HTTP Basic work and marks the cookie <code>Secure</code> behind a TLS-terminating proxy. A proxy on the same host (<code>127.0.0.1</code>) counts for that header without being listed, but not for <code>X-Forwarded-For</code>: to have the client address from it, list <code>127.0.0.1/32</code>. List only the proxies themselves, never your LAN, or any machine on it can forge the header.</p></div>
 <pre><code>[api]
-trusted_proxies = ["10.0.0.0/8"]   # e.g. the Kubernetes pod network your ingress runs in</code></pre>
+trusted_proxies = ["10.42.0.5/32"]   # your ingress controller's address</code></pre>
 </section>
 
 <section id="cluster">
