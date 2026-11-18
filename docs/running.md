@@ -1794,6 +1794,12 @@ groups, query log, and live query stream cover every node:
   - query-log rows interleave by time, and each row shows the node that answered it.
 - A node that doesn't answer within 2 seconds is left out, and the page says so ("Partial
   results: pi didn't answer"). It never hangs. The API lists those nodes in `missingNodes`.
+- Other nodes are asked about a range of time up to a limit: a request for more than 256
+  windows of 240 buckets a node (over 17 hours of seconds, 42 days of minutes, or 7 years of
+  hours) is answered from this node alone, with the other nodes in `missingNodes`. Every range
+  the API documents (15 minutes of seconds, 7 days of minutes, 400 days of hours, and every
+  day) is well under it. A node that refuses cluster reads, because too many are waiting or
+  one asks for too much, says so in its log as a warning, once a minute at most.
 - `scope` on a stats or query-log request narrows it: `cluster` (the default, every node),
   `site:<name>` (the nodes of one site, e.g. `site:k8s`), `node:<name or ID>` (one node, by
   site, pod, or node ID), or `node:local` (the node you're asking). For example
@@ -1917,8 +1923,9 @@ what was added in its UI or API. Each node keeps its own `[node]`, `[[listen]]`,
 
 **Removing a node.** A node that is gone for good stays in the member list as a down node on the
 primary and, under automatic failover, on the other voters (any other replica forgets it within
-about 18 seconds, as above): it counts as a voter in automatic failover and keeps
-`TelltaleDNSClusterPeerDown` firing there. This
+about 18 seconds, as above, unless it was the primary: a primary that is rebuilt under a new node
+ID stays listed as down on a replica until that replica restarts): it counts as a voter in
+automatic failover and keeps `TelltaleDNSClusterPeerDown` firing there. This
 happens when you rebuild a machine and join it again, because it comes back under a new node
 ID. The Cluster page lists such a record as a down node (a record that hasn't connected since
 the node you're looking at started appears after about a minute and a half). Remove it:

@@ -935,6 +935,16 @@ impl Federated {
         ok
     }
 
+    /// REQ: CLU-004 (ADR-174) — lists `peers` among the nodes that didn't answer, for a read that
+    /// was not sent to them (it asked for too much), as one that failed would be.
+    fn not_asked(&self, peers: &[String]) {
+        let labels: Vec<String> = peers.iter().map(|p| self.label_of(p)).collect();
+        let mut missing = self.missing.lock().unwrap_or_else(PoisonError::into_inner);
+        missing.extend(labels);
+        missing.sort();
+        missing.dedup();
+    }
+
     /// Asks every reachable peer the same read; decoded answers with each peer's label.
     fn everyone_labelled<T: serde::de::DeserializeOwned>(
         &self,
@@ -1052,6 +1062,11 @@ impl Federated {
     /// of minutes is over the cluster channel's 1 MiB frame, and was dropped whole. Returns
     /// each answered window's buckets, and each peer that answered any window (`true` when it
     /// answered every one). Windows that fail list the peer in `missingNodes`.
+    ///
+    /// REQ: CLU-004, CLU-002 (ADR-174, final review F1) — a range of more than
+    /// [`federation::TIMESERIES_MAX_WINDOWS`] windows is asked of no peer: they are listed in
+    /// `missingNodes` (this node's own data and shipped minutes still answer), and the log says
+    /// so. The longest range any step documents is under half that.
     fn peer_timeseries(
         &self,
         peers: Vec<String>,
@@ -1059,7 +1074,18 @@ impl Federated {
         from_s: u64,
         to_s: u64,
     ) -> (Vec<Vec<TimeBucket>>, Vec<(String, bool)>) {
-        let windows = federation::timeseries_chunks(step, from_s, to_s);
+        // With nobody to ask there is nothing to chunk.
+        let windows = if peers.is_empty() {
+            Vec::new()
+        } else if let Some(w) = federation::timeseries_chunks(step, from_s, to_s) {
+            w
+        } else {
+            bridge::WAITS.refused(bridge::Refused::TooBig);
+            // Records who isn't connected, as a read does, and adds the peers that weren't asked.
+            let _ = self.gather(Vec::new());
+            self.not_asked(&peers);
+            return (Vec::new(), Vec::new());
+        };
         let reads = peers
             .iter()
             .flat_map(|p| {
@@ -2882,6 +2908,21 @@ mod bridge_tests {
     }
 
     fn two_nodes() -> Nodes {
+        let handler: RpcHandler = Arc::new(|_peer, _kind, body| {
+            Box::pin(async move {
+                match serde_json::from_slice::<Read>(&body) {
+                    Ok(Read::ConfigVersion) => {
+                        serde_json::to_vec(&4242_u64).map_err(|e| e.to_string())
+                    }
+                    _ => Err("a read these tests don't ask".to_owned()),
+                }
+            })
+        });
+        two_nodes_answering(handler)
+    }
+
+    /// As [`two_nodes`], with the primary answering with `handler`.
+    fn two_nodes_answering(handler: RpcHandler) -> Nodes {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -2928,16 +2969,6 @@ mod bridge_tests {
             Cluster::new(replica_id, "0.1.0"),
         );
         let primary_node = primary.identity.meta.node_id.clone();
-        let handler: RpcHandler = Arc::new(|_peer, _kind, body| {
-            Box::pin(async move {
-                match serde_json::from_slice::<Read>(&body) {
-                    Ok(Read::ConfigVersion) => {
-                        serde_json::to_vec(&4242_u64).map_err(|e| e.to_string())
-                    }
-                    _ => Err("a read these tests don't ask".to_owned()),
-                }
-            })
-        });
         primary.set_rpc_handler(handler);
         // The nodes' tasks run until the runtime is dropped (the sender stays in `Nodes`).
         let (stop_tx, stop) = tokio::sync::watch::channel(false);
@@ -3100,6 +3131,124 @@ mod bridge_tests {
         // A peer that errors is listed, and its error isn't an answer.
         let none = n.fed.gather(vec![(n.primary.clone(), Read::CacheStats)]);
         assert!(none.is_empty(), "an error is no answer");
+        assert_eq!(n.fed.missing_nodes(), [n.fed.label_of(&n.primary)]);
+    }
+
+    /// A primary that answers the time-bucket reads (with no buckets) and the configuration
+    /// version, and keeps every read it was asked.
+    fn recording_peer() -> (RpcHandler, Arc<Mutex<Vec<Read>>>) {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&asked);
+        let handler: RpcHandler = Arc::new(move |_peer, _kind, body| {
+            let log = Arc::clone(&log);
+            Box::pin(async move {
+                let r = serde_json::from_slice::<Read>(&body).map_err(|e| e.to_string())?;
+                let answer = match &r {
+                    Read::Timeseries { .. } => serde_json::to_vec(&Vec::<TimeBucket>::new()),
+                    Read::ConfigVersion => serde_json::to_vec(&4242_u64),
+                    _ => return Err("a read these tests don't ask".to_owned()),
+                };
+                log.lock().unwrap_or_else(PoisonError::into_inner).push(r);
+                answer.map_err(|e| e.to_string())
+            })
+        });
+        (handler, asked)
+    }
+
+    /// The time-bucket windows a peer was asked for, oldest first.
+    fn windows_asked(asked: &Mutex<Vec<Read>>) -> Vec<(u64, u64)> {
+        let mut w: Vec<(u64, u64)> = asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter_map(|r| match r {
+                Read::Timeseries { from_s, to_s, .. } => Some((*from_s, *to_s)),
+                _ => None,
+            })
+            .collect();
+        w.sort_unstable();
+        w
+    }
+
+    // REQ: CLU-004, CLU-002 (ADR-174, final review F1) — a time range of more windows than the
+    // cap (256 a peer) is asked of no peer: the peers are listed as not answering and the answer
+    // is this node's own, at once. Before: one read per window and peer, however long the range
+    // (from the epoch at one second a bucket, 7.5 million a peer; to the year 9999, a thousand
+    // million), all under one place of the cap on reads.
+    #[test]
+    fn clu_004_a_timeseries_over_the_window_cap_asks_no_peer() {
+        let (handler, asked) = recording_peer();
+        let n = two_nodes_answering(handler);
+        let _in = n.rt.enter();
+        let label = n.fed.label_of(&n.primary);
+        // 300 windows of 240 seconds: a little over the cap, so the test is small if it fails.
+        let from = 1_791_000_000;
+        let started = Instant::now();
+        let items = n.fed.timeseries(Step::Second, from, from + 300 * 240);
+        assert!(started.elapsed() < Duration::from_secs(5), "{items:?}");
+        assert!(
+            items.is_empty(),
+            "this node's own, which has none: {items:?}"
+        );
+        assert_eq!(windows_asked(&asked), [], "no peer was asked");
+        assert_eq!(n.fed.missing_nodes(), std::slice::from_ref(&label));
+        // The cases the report was about: from the epoch, and to the year 9999.
+        for (from, to) in [(0, 1_791_072_000), (1_791_072_000, 253_402_300_799)] {
+            let started = Instant::now();
+            let _ = n.fed.timeseries(Step::Second, from, to);
+            assert!(started.elapsed() < Duration::from_secs(5));
+            assert_eq!(windows_asked(&asked), [], "no peer was asked");
+            assert_eq!(n.fed.missing_nodes(), std::slice::from_ref(&label));
+        }
+    }
+
+    // REQ: CLU-002 (ADR-174, final review F1) — what the cap must not touch: the longest range
+    // each step documents is asked of a peer window by window, all of it, and nobody is listed
+    // as missing. `step=second` covers 15 minutes (4 windows), `minute` 7 days (43), `hour` 400
+    // days (41), `day` everything, here since 1970 (87).
+    #[test]
+    fn clu_002_the_documented_ranges_are_asked_of_a_peer_in_full() {
+        let (handler, asked) = recording_peer();
+        let n = two_nodes_answering(handler);
+        let _in = n.rt.enter();
+        let now = 1_791_072_000;
+        let cases = [
+            (Step::Second, now - 900, now + 1, 4),
+            (Step::Minute, now - 7 * 86_400, now + 1, 43),
+            (Step::Hour, now - 400 * 86_400, now + 1, 41),
+            (Step::Day, 0, now + 1, 87),
+        ];
+        for (step, from, to, count) in cases {
+            asked.lock().unwrap_or_else(PoisonError::into_inner).clear();
+            let _ = n.fed.timeseries(step, from, to);
+            let w = windows_asked(&asked);
+            assert_eq!(w.len(), count, "{step:?}");
+            assert_eq!(w.first().map(|x| x.0), Some(from), "{step:?}");
+            assert_eq!(w.last().map(|x| x.1), Some(to), "{step:?}");
+            assert!(w.windows(2).all(|p| p[0].1 == p[1].0), "{step:?}: {w:?}");
+            assert_eq!(n.fed.missing_nodes(), Vec::<String>::new(), "{step:?}");
+        }
+    }
+
+    // REQ: CLU-004 (ADR-174, final review F1) — the bridge's own bound covers any other caller: a
+    // gathered read of over 1024 calls asks nobody and lists the peer as not answering.
+    #[test]
+    fn clu_004_a_gathered_read_over_the_call_cap_asks_no_peer() {
+        let (handler, asked) = recording_peer();
+        let n = two_nodes_answering(handler);
+        let _in = n.rt.enter();
+        let reads: Vec<(String, Read)> = (0..=bridge::MAX_CALLS)
+            .map(|_| (n.primary.clone(), Read::ConfigVersion))
+            .collect();
+        let answers = n.fed.gather(reads);
+        assert!(answers.is_empty(), "{} answers", answers.len());
+        assert!(
+            asked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "no peer was asked"
+        );
         assert_eq!(n.fed.missing_nodes(), [n.fed.label_of(&n.primary)]);
     }
 }
