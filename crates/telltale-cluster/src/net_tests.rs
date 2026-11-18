@@ -2068,8 +2068,9 @@ fn clu_001_the_removed_list_keeps_the_newest() {
     );
 }
 
-// REQ: CLU-001 (ADR-173) — the silent peers a node keeps: the primary keeps everyone, a replica
-// keeps the primary and, under automatic failover, its fellow voters; nothing else.
+// REQ: CLU-001, CLU-005, CLU-008 (ADR-173) — the silent peers a node keeps: the primary keeps
+// everyone, a replica keeps the primary and, under automatic failover, its fellow voters;
+// nothing else.
 #[test]
 fn clu_001_which_silent_peers_a_node_keeps() {
     assert!(
@@ -2090,10 +2091,10 @@ fn clu_001_which_silent_peers_a_node_keeps() {
     );
 }
 
-// REQ: CLU-001 (ADR-173) — two replicas that streamed to each other for a while (one fell back
-// to the other while the primary didn't answer) forget each other once the stream has ended
-// and they've been silent past the up window. They used to keep each other for good as down
-// peers, and `TelltaleDNSClusterPeerDown` fired on both until they restarted. The stream is
+// REQ: CLU-001, CLU-008 (ADR-173) — two replicas that streamed to each other for a while (one
+// fell back to the other while the primary didn't answer) forget each other once the stream has
+// ended and they've been silent past the up window. They used to keep each other for good as
+// down peers, and `TelltaleDNSClusterPeerDown` fired on both until they restarted. The stream is
 // ended the way a replica leaves a peer for the primary (`switch`), which used to skip marking
 // the peer disconnected on the side that dialed. The primary still counts as a peer they
 // keep, and the primary forgets no one.

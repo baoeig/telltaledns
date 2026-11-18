@@ -85,13 +85,13 @@ fn defers_to_git(
             .any(|(git, up, eligible)| git && up && eligible)
 }
 
-/// REQ: CLU-001 (ADR-173) — whether a node keeps a peer that has gone silent in its member list
-/// (and so in `telltale_cluster_peer_up`, as down). The primary keeps every peer: each one is
-/// meant to dial it. A replica keeps the primary (`peer_primary`: its Hello said so, or the last
-/// version this node applied names it, see [`applied_primary`]), and under automatic failover the
-/// other voters (`voter_link`: [`mesh`] keeps a stream to each). Any other peer was a passing
-/// stream, such as one replica's fallback to another while the primary didn't answer, and is
-/// forgotten.
+/// REQ: CLU-001, CLU-005, CLU-008 (ADR-173) — whether a node keeps a peer that has gone silent
+/// in its member list (and so in `telltale_cluster_peer_up`, as down). The primary keeps every
+/// peer: each one is meant to dial it. A replica keeps the primary (`peer_primary`: its Hello
+/// said so, or the last version this node applied names it, see [`applied_primary`]), and under
+/// automatic failover the other voters (`voter_link`: [`mesh`] keeps a stream to each). Any
+/// other peer was a passing stream, such as one replica's fallback to another while the primary
+/// didn't answer, and is forgotten.
 fn keeps_silent_peer(self_primary: bool, peer_primary: bool, voter_link: bool) -> bool {
     self_primary || peer_primary || voter_link
 }
@@ -1061,12 +1061,14 @@ impl Cluster {
         (!s.is_empty()).then(|| s.to_owned())
     }
 
-    /// REQ: CLU-001 (ADR-173) — forgets the peers this node has no standing link to once their
-    /// stream has ended and they've been silent past [`Member::up`]'s window (see
-    /// [`keeps_silent_peer`]). Without this, a replica that streamed to another replica for a
-    /// while (it fell back to it while the primary didn't answer, or the other dialed in) kept
-    /// it for good as a down peer, and `TelltaleDNSClusterPeerDown` fired on both of them.
-    /// `id` is the current identity (failover mode and registry). Returns the IDs forgotten.
+    /// REQ: CLU-001, CLU-005, CLU-008 (ADR-173) — forgets the peers this node has no standing
+    /// link to once their stream has ended and they've been silent past [`Member::up`]'s window
+    /// (see [`keeps_silent_peer`]); a peer it has a stream open to is never forgotten. Without
+    /// this, a replica that streamed to another replica for a while (it fell back to it while
+    /// the primary didn't answer, or the other dialed in) kept it for good as a down peer, and
+    /// `TelltaleDNSClusterPeerDown` fired on both of them. `id` is the current identity
+    /// (failover mode and registry). Returns the IDs forgotten. With automatic failover and a
+    /// registry that can't be read, it forgets nothing.
     pub fn forget_stray_peers(&self, id: &Identity) -> Vec<String> {
         self.forget_stray_peers_at(id, now_ms())
     }
@@ -1117,7 +1119,16 @@ impl Cluster {
             .collect();
         for g in &gone {
             members.remove(g);
-            debug!(peer = %g, "cluster: forgot a peer this node has no standing link to");
+        }
+        drop(members);
+        // Not under the lock. At `info`: a node leaving this list is what an operator looking at
+        // a replica's metrics or peer list (`/api/v1/system/info`) wants an explanation for.
+        for g in &gone {
+            info!(
+                peer = %g,
+                "cluster: forgot a peer this node keeps no link to: its stream has ended and it \
+                 has been silent past the up window"
+            );
         }
         gone
     }
@@ -2395,9 +2406,9 @@ async fn read_frames(
     echo: &EchoSlot,
     switch: Option<&Notify>,
 ) -> Result<(), String> {
-    // REQ: CLU-001 (ADR-173) — a stream the caller ends (a replica moving back to the primary)
-    // is marked disconnected too: ending it from outside used to skip the clean-up below, and
-    // the replica it had been on stayed connected (and listed, down) for good.
+    // REQ: CLU-001, CLU-008 (ADR-173) — a stream the caller ends (a replica moving back to the
+    // primary) is marked disconnected too: ending it from outside used to skip the clean-up
+    // below, and the replica it had been on stayed connected (and listed, down) for good.
     let result = match switch {
         Some(s) => tokio::select! {
             r = read_loop(cluster, body, &mut peer, via, echo) => r,
@@ -2902,8 +2913,12 @@ async fn join_one(
     serde_json::from_slice(&bytes).map_err(|e| format!("{url}: bad join response: {e}"))
 }
 
-/// In automatic failover, keeps a stream to every other voter (ADR-056): votes need one.
-/// Of each pair, the node with the lower ID dials; the other side gets an inbound stream.
+/// The loop that runs every `MESH_EVERY` on every node, whatever the failover mode:
+/// - REQ: CLU-001, CLU-008 (ADR-173) — forgets the peers this node keeps no link to once they're
+///   silent ([`Cluster::forget_stray_peers`]);
+/// - REQ: CLU-005 (ADR-056) — in automatic failover, keeps a stream to every other voter: votes
+///   need one. Of each pair, the node with the lower ID dials; the other side gets an inbound
+///   stream.
 pub async fn mesh(cluster: Arc<Cluster>, mut stop: watch::Receiver<bool>) {
     let dialing: Arc<Mutex<std::collections::HashSet<String>>> = Arc::default();
     loop {
@@ -2912,8 +2927,8 @@ pub async fn mesh(cluster: Arc<Cluster>, mut stop: watch::Receiver<bool>) {
             () = tokio::time::sleep(MESH_EVERY) => {}
         }
         let id = cluster.identity.reload();
-        // REQ: CLU-001 (ADR-173) — the peers this node keeps no link to leave its member list
-        // once they're silent, in any failover mode.
+        // REQ: CLU-001, CLU-008 (ADR-173) — the peers this node keeps no link to leave its member
+        // list once they're silent, in any failover mode.
         cluster.forget_stray_peers(&id);
         let Ok(cfg) = client_config(&id) else {
             continue;

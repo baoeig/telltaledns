@@ -1760,9 +1760,11 @@ files always come from the primary (another replica has none to give), over the 
 link when that's to the primary, else from the primary's addresses directly. Each time the
 link comes up the log says where: `cluster: linked to a peer` with its URL and node ID.
 Once it has moved back, the two replicas drop each other from their peer lists within about
-18 seconds: a replica only reports the primary (and, under automatic failover, the other
-voters) as peers it expects to hear from, so a link like this one doesn't leave
-`TelltaleDNSClusterPeerDown` firing. A replica that is really down is reported by the primary.
+18 seconds: a replica keeps a silent peer it has no stream to only if it expects to hear from
+it, the primary (the node that said so when its stream opened, or the one named by the last
+version the replica applied, which covers a node promoted since) and, under automatic failover,
+the other voters. So a link like this one doesn't leave `TelltaleDNSClusterPeerDown` firing. A
+replica that is really down is reported by the primary.
 
 **One view of the whole cluster.** Open any node's UI and the dashboard, top lists, latency,
 groups, query log, and live query stream cover every node:
@@ -1896,8 +1898,10 @@ what was added in its UI or API. Each node keeps its own `[node]`, `[[listen]]`,
   **Conflicts** on that node's Cluster page, with the settings they touched, so you can make them
   again on the current primary.
 
-**Removing a node.** A node that is gone for good stays in the member list as a down node: it
-counts as a voter in automatic failover and keeps `TelltaleDNSClusterPeerDown` firing. This
+**Removing a node.** A node that is gone for good stays in the member list as a down node on the
+primary and, under automatic failover, on the other voters (any other replica forgets it within
+about 18 seconds, as above): it counts as a voter in automatic failover and keeps
+`TelltaleDNSClusterPeerDown` firing there. This
 happens when you rebuild a machine and join it again, because it comes back under a new node
 ID. The Cluster page lists such a record as a down node (a record that hasn't connected since
 the node you're looking at started appears after about a minute and a half). Remove it:
