@@ -1027,39 +1027,73 @@ test('api_004 settings shows where password sign-in is allowed', async () => {
   try {
     // The flag off (what this server really says): nothing about it.
     await expect(await show(null)).toHaveCount(0);
-    await expect(await show({ restricted: false, networks: [], reachesBeyondLoopback: false, trustedProxiesSet: false })).toHaveCount(0);
+    const block = (over: Record<string, unknown>) => ({
+      restricted: true,
+      networks: [] as string[],
+      coversWholeNetworks: false,
+      includesLoopback: false,
+      loopbackIsTrustedProxy: false,
+      ...over,
+    });
+    await expect(await show(block({ restricted: false }))).toHaveCount(0);
 
-    // The default-shaped list: each network, a warning that it reaches past this machine, and where to change it.
+    // The default-shaped list: each network, a warning that it includes whole networks, and where to change it.
     const lan = ['10.0.0.0/8', '192.168.0.0/16', '127.0.0.0/8', '::1/128'];
-    let card = await show({ restricted: true, networks: lan, reachesBeyondLoopback: true, trustedProxiesSet: false });
+    let card = await show(block({ networks: lan, coversWholeNetworks: true, includesLoopback: true }));
     await expect(card).toBeVisible();
     await expect(card.getByRole('heading', { name: 'Password sign-in' })).toBeVisible();
     await expect(card).toContainText('Password sign-in is limited to admins on these networks:');
     await expect(card.getByRole('listitem')).toHaveText(lan);
-    await expect(card.getByText('Not only this machine')).toBeVisible();
+    await expect(card.getByText('Includes whole networks')).toBeVisible();
+    await expect(card).toContainText('not just the machines you name');
     await expect(card).toContainText('allowed_admin_networks');
     await expect(card).toContainText('[auth.oidc]');
     await expect(card.getByRole('link', { name: 'Users and sign-in' })).toHaveAttribute('href', /running\.md#users-and-sign-in$/);
     await expect(card.getByText('reverse proxy')).toHaveCount(0);
+    await expect(card.getByText('Only the machines listed')).toHaveCount(0);
 
-    // This machine only, no proxy listed: no warning, and the hint about a proxy on this machine.
-    card = await show({ restricted: true, networks: ['127.0.0.0/8', '::1/128'], reachesBeyondLoopback: false, trustedProxiesSet: false });
+    // A list of single hosts, which is what the guide recommends: information, no warning, no proxy hint (this
+    // machine is not in it).
+    const hosts = ['192.168.1.10/32', 'fd00::5/128'];
+    card = await show(block({ networks: hosts }));
+    await expect(card.getByRole('listitem')).toHaveText(hosts);
+    await expect(card.getByText('Includes whole networks')).toHaveCount(0);
+    await expect(card.locator('.badge')).toHaveCount(0);
+    await expect(card).toContainText('Only the machines listed are shown the sign-in form');
+    await expect(card.getByText('reverse proxy')).toHaveCount(0);
+    await expect(card).toContainText('allowed_admin_networks');
+
+    // This machine only, no proxy covers it: no warning, and the hint about a proxy on this machine.
+    card = await show(block({ networks: ['127.0.0.0/8', '::1/128'], includesLoopback: true }));
     await expect(card.getByRole('listitem')).toHaveText(['127.0.0.0/8', '::1/128']);
-    await expect(card.getByText('Not only this machine')).toHaveCount(0);
+    await expect(card.getByText('Includes whole networks')).toHaveCount(0);
     await expect(card.getByText('reverse proxy')).toBeVisible();
     await expect(card).toContainText('trusted_proxies');
 
-    // This machine only, with a proxy listed: nothing to add.
-    card = await show({ restricted: true, networks: ['127.0.0.0/8', '::1/128'], reachesBeyondLoopback: false, trustedProxiesSet: true });
+    // This machine and a workstation: hosts, so no warning, and the same hint while no proxy covers loopback.
+    card = await show(block({ networks: ['127.0.0.1/32', '192.168.1.10/32'], includesLoopback: true }));
+    await expect(card.getByText('Includes whole networks')).toHaveCount(0);
+    await expect(card.getByText('reverse proxy')).toBeVisible();
+
+    // A proxy is listed but 127.0.0.1 is not inside it (the field the page reads says so): the hint stays.
+    card = await show(block({ networks: ['127.0.0.0/8', '::1/128'], includesLoopback: true, loopbackIsTrustedProxy: false }));
+    await expect(card.getByText('reverse proxy')).toBeVisible();
+
+    // This machine only, with loopback a trusted proxy: nothing to add.
+    card = await show(block({ networks: ['127.0.0.0/8', '::1/128'], includesLoopback: true, loopbackIsTrustedProxy: true }));
     await expect(card.getByRole('listitem')).toHaveCount(2);
-    await expect(card.getByText('Not only this machine')).toHaveCount(0);
+    await expect(card.getByText('Includes whole networks')).toHaveCount(0);
+    await expect(card.getByText('reverse proxy')).toHaveCount(0);
+
+    // Whole networks and loopback: the warning, and no hint (the list is open to more than this machine anyway).
+    card = await show(block({ networks: lan, coversWholeNetworks: true, includesLoopback: true }));
     await expect(card.getByText('reverse proxy')).toHaveCount(0);
 
     // No network at all: said plainly, with no empty list.
-    card = await show({ restricted: true, networks: [], reachesBeyondLoopback: false, trustedProxiesSet: false });
+    card = await show(block({ networks: [] }));
     await expect(card).toContainText('nobody can sign in with a password');
     await expect(card.getByRole('listitem')).toHaveCount(0);
-    await expect(card.getByText('Not only this machine')).toHaveCount(0);
+    await expect(card.getByText('Includes whole networks')).toHaveCount(0);
   } finally {
     await page.unroute('**/api/v1/users');
   }

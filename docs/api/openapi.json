@@ -17468,10 +17468,23 @@
         "required": [
           "restricted",
           "networks",
-          "reachesBeyondLoopback",
-          "trustedProxiesSet"
+          "coversWholeNetworks",
+          "includesLoopback",
+          "loopbackIsTrustedProxy"
         ],
         "properties": {
+          "coversWholeNetworks": {
+            "type": "boolean",
+            "description": "While `restricted`: some network is a range of more than one address that is not this\nmachine (not a single host such as `192.168.1.10/32`, not loopback), so everyone in it is\nshown the password form, not only the machines you name. False for a list of single hosts\nand loopback, and when not restricted."
+          },
+          "includesLoopback": {
+            "type": "boolean",
+            "description": "While `restricted`: some network is this machine (`127.0.0.0/8` or a part of it, or\n`::1`). With a proxy on this machine in front of the UI, everyone it serves arrives from\nthere unless `loopbackIsTrustedProxy` is true. False when not restricted."
+          },
+          "loopbackIsTrustedProxy": {
+            "type": "boolean",
+            "description": "While `restricted`: `127.0.0.1` is inside a network of `[api] trusted_proxies`, so a proxy\non this machine is believed about its clients' addresses (`X-Forwarded-For`). False\notherwise: a proxy there hides its clients behind its own address. (This node can't tell\nwhether such a proxy exists; one that connects over `::1` is not looked for.)"
+          },
           "networks": {
             "type": "array",
             "items": {
@@ -17479,17 +17492,9 @@
             },
             "description": "While `restricted`: the networks (`address/prefix`, in the order of\n`allowed_admin_networks`) admins may use a password from. Empty means nobody can: if the\nsign-in provider is down, nobody can sign in with a password. Empty when not restricted."
           },
-          "reachesBeyondLoopback": {
-            "type": "boolean",
-            "description": "While `restricted`: some network is wider than this machine (not only loopback), so people\nelsewhere on your network are still shown the password form. False when not restricted."
-          },
           "restricted": {
             "type": "boolean",
             "description": "`[auth.oidc] disable_local_login` is on: password sign-in and HTTP Basic work only for\nadmins from `networks`."
-          },
-          "trustedProxiesSet": {
-            "type": "boolean",
-            "description": "`[api] trusted_proxies` has entries. Without it a reverse proxy in front of this node hides\nits clients' addresses, so a loopback-only list is open to everyone the proxy serves.\n(Whether a proxy exists is not something this node can tell.)"
           }
         }
       },

@@ -1028,8 +1028,9 @@ async fn api_004_the_policy_detail_is_admin_only() {
         serde_json::json!({
             "restricted": true,
             "networks": ["10.0.0.0/8", "192.168.0.0/16", "127.0.0.0/8", "fc00::/7", "::1/128"],
-            "reachesBeyondLoopback": true,
-            "trustedProxiesSet": false
+            "coversWholeNetworks": true,
+            "includesLoopback": true,
+            "loopbackIsTrustedProxy": false
         })
     );
 
@@ -1047,8 +1048,9 @@ async fn api_004_the_policy_detail_is_admin_only() {
         serde_json::json!({
             "restricted": true,
             "networks": ["127.0.0.0/8", "::1/128"],
-            "reachesBeyondLoopback": false,
-            "trustedProxiesSet": true
+            "coversWholeNetworks": false,
+            "includesLoopback": true,
+            "loopbackIsTrustedProxy": true
         })
     );
 
@@ -1064,8 +1066,9 @@ async fn api_004_the_policy_detail_is_admin_only() {
         serde_json::json!({
             "restricted": true,
             "networks": [],
-            "reachesBeyondLoopback": false,
-            "trustedProxiesSet": false
+            "coversWholeNetworks": false,
+            "includesLoopback": false,
+            "loopbackIsTrustedProxy": false
         })
     );
 
@@ -1081,10 +1084,108 @@ async fn api_004_the_policy_detail_is_admin_only() {
         serde_json::json!({
             "restricted": false,
             "networks": [],
-            "reachesBeyondLoopback": false,
-            "trustedProxiesSet": false
+            "coversWholeNetworks": false,
+            "includesLoopback": false,
+            "loopbackIsTrustedProxy": false
         })
     );
+}
+
+/// REQ: API-004 (ADR-175) — what the admin's block says about a list of single hosts and about
+/// the proxy list. A host (`/32`, `/128`) is not a whole network, so `coversWholeNetworks` stays
+/// false for a list of hosts, and for hosts beside loopback; a `/31` (two hosts), a `/24`, or any
+/// range is one. `loopbackIsTrustedProxy` is true exactly when `127.0.0.1` is inside a listed
+/// proxy network, the test `remote()` applies to the peer (a proxy on this machine arrives from
+/// it): a pod network does not count, a `/32` of it or a `/8` around it does.
+#[tokio::test]
+async fn api_004_the_policy_reports_single_hosts_and_the_loopback_proxy() {
+    let case = |networks: Vec<(std::net::IpAddr, u8)>, proxies: Vec<(std::net::IpAddr, u8)>| {
+        harness(Settings {
+            disable_local_login: true,
+            admin_networks: networks,
+            trusted_proxies: proxies,
+            ..Settings::default()
+        })
+    };
+    let block = |h: &Harness| {
+        let cookie = cookie_for(h, "root");
+        let app = h.app.clone();
+        async move { users_as(&app, Some(&cookie)).await.1["passwordLogin"].clone() }
+    };
+    let flags = |v: &serde_json::Value| {
+        (
+            v["coversWholeNetworks"].as_bool(),
+            v["includesLoopback"].as_bool(),
+            v["loopbackIsTrustedProxy"].as_bool(),
+        )
+    };
+
+    // Hosts only: not whole networks. The LAN host is not loopback.
+    let v = block(&case(vec![net("192.168.1.10", 32)], Vec::new())).await;
+    assert_eq!(v["networks"], serde_json::json!(["192.168.1.10/32"]), "{v}");
+    assert_eq!(flags(&v), (Some(false), Some(false), Some(false)), "{v}");
+    let v = block(&case(
+        vec![net("fd00::5", 128), net("10.0.0.7", 32)],
+        Vec::new(),
+    ))
+    .await;
+    assert_eq!(flags(&v), (Some(false), Some(false), Some(false)), "{v}");
+
+    // Hosts beside loopback: still hosts, and loopback is listed.
+    let v = block(&case(
+        vec![net("127.0.0.1", 32), net("192.168.1.10", 32)],
+        Vec::new(),
+    ))
+    .await;
+    assert_eq!(flags(&v), (Some(false), Some(true), Some(false)), "{v}");
+    let v = block(&case(
+        vec![
+            net("127.0.0.0", 8),
+            net("::1", 128),
+            net("192.168.1.10", 32),
+        ],
+        Vec::new(),
+    ))
+    .await;
+    assert_eq!(flags(&v), (Some(false), Some(true), Some(false)), "{v}");
+
+    // A range is a whole network, however small: a /31, a /24, a v6 /127 and /64.
+    for wide in [
+        net("192.168.1.10", 31),
+        net("192.168.1.0", 24),
+        net("fd00::4", 127),
+        net("fd00::", 64),
+        net("0.0.0.0", 0),
+    ] {
+        let v = block(&case(vec![net("192.168.1.10", 32), wide], Vec::new())).await;
+        assert_eq!(v["coversWholeNetworks"], true, "{wide:?}: {v}");
+    }
+    // Loopback ranges are this machine, not whole networks; a /7 around 127.0.0.0 is a network.
+    let v = block(&case(
+        vec![net("127.0.0.0", 8), net("127.1.2.3", 32)],
+        Vec::new(),
+    ))
+    .await;
+    assert_eq!(flags(&v), (Some(false), Some(true), Some(false)), "{v}");
+    let v = block(&case(vec![net("127.0.0.0", 7)], Vec::new())).await;
+    assert_eq!(v["coversWholeNetworks"], true, "{v}");
+    assert_eq!(v["includesLoopback"], false, "{v}");
+
+    // Is loopback a trusted proxy? Only when 127.0.0.1 is inside a listed network.
+    for (proxies, trusted) in [
+        (Vec::new(), false),
+        (vec![net("10.42.0.0", 16)], false),
+        (vec![net("10.42.0.5", 32)], false),
+        (vec![net("::1", 128)], false),
+        (vec![net("127.0.0.2", 32)], false),
+        (vec![net("127.0.0.1", 32)], true),
+        (vec![net("127.0.0.0", 8)], true),
+        (vec![net("10.42.0.0", 16), net("127.0.0.1", 32)], true),
+        (vec![net("0.0.0.0", 0)], true),
+    ] {
+        let v = block(&case(vec![net("127.0.0.1", 32)], proxies.clone())).await;
+        assert_eq!(v["loopbackIsTrustedProxy"], trusted, "{proxies:?}: {v}");
+    }
 }
 
 /// An access token from the fake provider, signed with its key.
