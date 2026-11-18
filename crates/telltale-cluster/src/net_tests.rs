@@ -2302,6 +2302,31 @@ fn listed(c: &Cluster) -> Vec<String> {
     c.members().into_iter().map(|m| m.node_id).collect()
 }
 
+fn record(node_id: &str, eligible: bool, witness: bool) -> crate::node::NodeRecord {
+    crate::node::NodeRecord {
+        node_id: node_id.into(),
+        site: "k8s".into(),
+        eligible,
+        advertise: vec![],
+        joined: 1,
+        witness,
+        ephemeral: false,
+    }
+}
+
+/// A replica in a cluster whose failover is automatic: `others` are in its registry too.
+fn auto_replica(
+    eligible: bool,
+    others: &[crate::node::NodeRecord],
+) -> (Arc<Cluster>, tempfile::TempDir) {
+    let (c, dir) = lone_replica(eligible);
+    let mut nodes = c.identity.registry();
+    nodes.extend(others.iter().cloned());
+    c.identity.save_registry(&nodes).unwrap();
+    c.identity.save_failover("auto").unwrap();
+    (c, dir)
+}
+
 // REQ: CLU-001, CLU-008 (ADR-173) — a Hello says whether its sender is the primary, once, and a
 // stream stays open through a promotion, so the flag stays false on the replica that heard it.
 // The replica keeps whoever the last manifest it applied names the primary: the promoted node
@@ -2364,4 +2389,62 @@ fn clu_001_a_peer_with_an_open_stream_is_never_forgotten() {
         vec!["streaming".to_owned()]
     );
     assert_eq!(listed(&c), Vec::<String>::new());
+}
+
+// REQ: CLU-005, CLU-008 (ADR-173) — who the voters are comes from the registry file, and a read
+// that fails leaves only this node in it, which reads as "no automatic failover". That must not
+// make a node forget the voters it keeps a stream to: with the registry unreadable in an
+// automatic cluster, the sweep leaves everything alone until it can read it.
+#[test]
+fn clu_005_a_failed_registry_read_forgets_nothing() {
+    let (c, _dir) = auto_replica(
+        true,
+        &[
+            record("v2", true, false),
+            record("v3", true, false),
+            record("plain", false, false),
+        ],
+    );
+    for n in ["v2", "v3", "plain"] {
+        meet(&c, n, false);
+        stream_ended(&c, n);
+    }
+    let later = after_the_up_window();
+    let registry = c.identity.dir.join("nodes.json");
+    let good = std::fs::read(&registry).unwrap();
+    std::fs::write(&registry, b"{ not json").unwrap();
+    assert_eq!(
+        c.forget_stray_peers_at(&c.identity.reload(), later),
+        Vec::<String>::new()
+    );
+    assert_eq!(listed(&c), ["plain", "v2", "v3"]);
+    // Read again: the voters are kept and the plain node is not.
+    std::fs::write(&registry, good).unwrap();
+    assert_eq!(
+        c.forget_stray_peers_at(&c.identity.reload(), later),
+        vec!["plain".to_owned()]
+    );
+    assert_eq!(listed(&c), ["v2", "v3"]);
+}
+
+// REQ: CLU-005, CLU-008 (ADR-173) — a node that doesn't vote (a replica that isn't eligible, in
+// an automatic cluster) keeps no stream to the voters, so it forgets a silent one like any
+// other stray peer. Failing closed on an unreadable registry must not switch this off.
+#[test]
+fn clu_005_a_node_that_does_not_vote_forgets_voters_it_has_no_link_to() {
+    let (c, _dir) = auto_replica(
+        false,
+        &[
+            record("v2", true, false),
+            record("v3", true, false),
+            record("v4", true, false),
+        ],
+    );
+    assert!(!crate::failover::active(&c.identity.reload()));
+    meet(&c, "v2", false);
+    stream_ended(&c, "v2");
+    assert_eq!(
+        c.forget_stray_peers_at(&c.identity.reload(), after_the_up_window()),
+        vec!["v2".to_owned()]
+    );
 }

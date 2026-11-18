@@ -1067,13 +1067,28 @@ impl Cluster {
 
     fn forget_stray_peers_at(&self, id: &Identity, now: u64) -> Vec<String> {
         let primary = self.is_primary();
-        let voters = if crate::failover::active(id) {
-            crate::failover::voters(id)
+        // REQ: CLU-001, CLU-005 (ADR-173) — what a replica keeps is read, once, before `members`
+        // is locked (the registry and `applied.json` are files). The primary keeps everyone and
+        // reads nothing.
+        let (voters, named) = if primary {
+            (Vec::new(), None)
         } else {
-            Vec::new()
+            let registry = id.registry();
+            let all = crate::failover::voters_in(&registry);
+            if id.meta.failover == "auto" && registry.len() < 2 {
+                // Fails closed: a registry that lists no node but this one couldn't be read (a
+                // replica always lists the primary), so who the voters are isn't known, and a
+                // voter must not be forgotten for that. `registry()` falls back to this node
+                // alone, which reads as "automatic failover isn't active".
+                return Vec::new();
+            }
+            let voters = if crate::failover::active_among(id, &all) {
+                all
+            } else {
+                Vec::new()
+            };
+            (voters, applied_primary(id))
         };
-        // REQ: CLU-001 (ADR-173) — read before `members` is locked, and only by a replica.
-        let named = if primary { None } else { applied_primary(id) };
         // REQ: CLU-001, CLU-008 (ADR-173) — a peer with a stream still open is never forgotten:
         // `connected` is one flag per node, cleared by whichever of its streams ends, and a
         // heartbeat never adds a member that is missing (only a Hello does), so forgetting a
