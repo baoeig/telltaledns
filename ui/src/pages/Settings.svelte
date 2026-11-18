@@ -601,7 +601,8 @@
         {#if passwordLogin.networks.length}
           <p>Password sign-in is limited to admins on these networks:</p>
           <ul class="nets mono">
-            {#each passwordLogin.networks as n (n)}<li>{n}</li>{/each}
+            <!-- Not keyed on `n`: allowed_admin_networks may repeat an entry, and Svelte throws on a duplicate key. -->
+            {#each passwordLogin.networks as n}<li>{n}</li>{/each}
           </ul>
           {#if passwordLogin.coversWholeNetworks}
             <p class="small"><span class="badge warn">Includes whole networks</span> Anyone on these networks is still shown the sign-in form, not just the machines you name. To limit it to the machines you manage from, list each as a single address, such as <code>192.168.1.10/32</code>.</p>

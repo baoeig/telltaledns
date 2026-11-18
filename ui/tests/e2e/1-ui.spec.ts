@@ -1103,6 +1103,56 @@ test('api_004 settings shows where password sign-in is allowed', async () => {
   await expect(page.getByTestId('password-sign-in')).toHaveCount(0);
 });
 
+// REQ: API-004 (ADR-175) — `allowed_admin_networks` may repeat an entry (the configuration check does not
+// refuse it), and the card lists what the server sends: both rows, and no error. The list used to be keyed on
+// the network's text, which Svelte refuses when two keys are equal (an error in a development build, a row
+// lost or misplaced in a production one). Read through `GET /users` rewritten as in the test above.
+test('api_004 settings shows a repeated network on both of its rows', async () => {
+  const errors: string[] = [];
+  const onConsole = (m: { type(): string; text(): string }) => {
+    if (m.type() === 'error') errors.push(m.text());
+  };
+  const onPageError = (e: Error) => errors.push(String(e));
+  page.on('console', onConsole);
+  page.on('pageerror', onPageError);
+  const rows = ['192.168.1.10/32', '10.0.0.7/32', '192.168.1.10/32'];
+  await page.route('**/api/v1/users', async (route) => {
+    const r = await route.fetch();
+    const body = await r.json();
+    body.passwordLogin = {
+      restricted: true,
+      networks: rows,
+      coversWholeNetworks: false,
+      includesLoopback: false,
+      loopbackIsTrustedProxy: false,
+    };
+    await route.fulfill({ response: r, json: body });
+  });
+  try {
+    await page.goto('/#/settings?tab=users');
+    await page.reload();
+    await expect(page.locator('main table')).toContainText(ADMIN.user);
+    const card = page.getByTestId('password-sign-in');
+    await expect(card.getByRole('listitem')).toHaveText(rows);
+    // Away and back: the card is drawn from what the page already holds, and the page then loads the list
+    // again, which redraws the rows from the same text.
+    await page.goto('/#/settings?tab=account');
+    await expect(page.getByTestId('password-sign-in')).toHaveCount(0);
+    await page.goto('/#/settings?tab=users');
+    await expect(card.getByRole('listitem')).toHaveText(rows);
+    await expect(page.locator('main table')).toContainText(ADMIN.user);
+    await expect(card.getByRole('listitem')).toHaveText(rows);
+    expect(errors, 'no error in the console').toEqual([]);
+  } finally {
+    page.off('console', onConsole);
+    page.off('pageerror', onPageError);
+    await page.unroute('**/api/v1/users');
+  }
+  await page.reload();
+  await expect(page.locator('main table')).toContainText(ADMIN.user);
+  await expect(page.getByTestId('password-sign-in')).toHaveCount(0);
+});
+
 // REQ: OBS-003 (ADR-171) — "everything except": each negated filter keeps exactly the rows its filter
 // leaves out (the two add up to the whole window), a flag without its filter is refused, and the
 // Queries page writes and reads the flags: the Match menu's "is not", and the "not" chip for statuses.
