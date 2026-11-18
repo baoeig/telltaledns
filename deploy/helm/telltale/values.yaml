@@ -257,7 +257,7 @@ serviceMonitor:
   scrapeTimeout: 10s
   labels: {}
 
-# Default alerts: down, upstreams down, SERVFAIL rate, stale lists, dropped telemetry.
+# Default alerts: down, upstreams down, SERVFAIL rate, lists that failed to refresh for 48 hours, dropped telemetry.
 prometheusRule:
   enabled: false
   labels: {}
