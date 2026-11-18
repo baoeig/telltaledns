@@ -32,6 +32,18 @@ async fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
     panic!("not met in time: {what}");
 }
 
+/// [`wait_until`] for what takes up to a heartbeat (and some slack): a stream's writer finds out
+/// that nobody reads it only when it next sends.
+async fn wait_a_heartbeat(what: &str, mut f: impl FnMut() -> bool) {
+    for _ in 0..(3 * HEARTBEAT.as_millis() / 25) {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("not met in time: {what}");
+}
+
 // REQ: CLU-009 — resolver pods join with the shared bootstrap secret: they trust the CA only
 // after the primary proves it knows the secret, join as ephemeral members, and leave the
 // registry once they're gone for the TTL.
@@ -2177,6 +2189,13 @@ async fn clu_001_replicas_forget_each_other_after_a_passing_stream() {
         || knows(&a, &b_id, false) && knows(&b, &a_id, false),
     )
     .await;
+    // The replica that served the stream (`b`) learns that its writer has no reader only when
+    // the writer next sends, within a heartbeat; until then its sender looks open, and a peer
+    // with an open sender is never forgotten (the real wait is the 15 s window, longer).
+    wait_a_heartbeat("b's writer to a has ended", || {
+        !b.reachable_peers().contains(&a_id)
+    })
+    .await;
     // Not silent long enough yet: kept (it shows as down for at most the up window).
     assert_eq!(a.forget_stray_peers(&a.identity.reload()), none);
     assert_eq!(b.forget_stray_peers(&b.identity.reload()), none);
@@ -2317,4 +2336,32 @@ fn clu_001_a_promoted_peer_is_kept_though_its_hello_said_replica() {
         vec!["sibling".to_owned()]
     );
     assert_eq!(listed(&c), vec!["promoted".to_owned()]);
+}
+
+// REQ: CLU-001, CLU-008 (ADR-173) — `connected` is one flag per node, cleared by whichever of its
+// streams ends, and a heartbeat never adds a peer that was forgotten. A peer with a stream still
+// open (its sender is in the outbox) is therefore never forgotten, however long it has been
+// silent; once the stream is gone too, it goes.
+#[test]
+fn clu_001_a_peer_with_an_open_stream_is_never_forgotten() {
+    let (c, _dir) = lone_replica(true);
+    meet(&c, "streaming", false);
+    meet(&c, "gone", false);
+    stream_ended(&c, "streaming");
+    stream_ended(&c, "gone");
+    let (tx, rx) = tokio::sync::mpsc::channel::<Frame>(1);
+    c.outbox.lock().unwrap().insert("streaming".into(), tx);
+    let later = after_the_up_window();
+    assert_eq!(
+        c.forget_stray_peers_at(&c.identity.reload(), later),
+        vec!["gone".to_owned()]
+    );
+    assert_eq!(listed(&c), vec!["streaming".to_owned()]);
+    // Its writer ends: nothing holds the peer any more.
+    drop(rx);
+    assert_eq!(
+        c.forget_stray_peers_at(&c.identity.reload(), later),
+        vec!["streaming".to_owned()]
+    );
+    assert_eq!(listed(&c), Vec::<String>::new());
 }

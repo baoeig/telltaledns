@@ -1074,12 +1074,18 @@ impl Cluster {
         };
         // REQ: CLU-001 (ADR-173) — read before `members` is locked, and only by a replica.
         let named = if primary { None } else { applied_primary(id) };
+        // REQ: CLU-001, CLU-008 (ADR-173) — a peer with a stream still open is never forgotten:
+        // `connected` is one flag per node, cleared by whichever of its streams ends, and a
+        // heartbeat never adds a member that is missing (only a Hello does), so forgetting a
+        // peer that is still talking would drop it from the list and the metrics for good.
+        let open = self.reachable_peers();
         let mut members = self.members.lock().unwrap_or_else(PoisonError::into_inner);
         let gone: Vec<String> = members
             .values()
             .filter(|m| {
                 !m.connected
                     && !m.up(now)
+                    && !open.contains(&m.node_id)
                     && !keeps_silent_peer(
                         primary,
                         m.primary || named.as_deref() == Some(m.node_id.as_str()),
