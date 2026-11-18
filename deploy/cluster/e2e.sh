@@ -274,14 +274,14 @@ echo "== a long range of time isn't fanned out to the peers (CLU-004)"
 t0=$(date +%s)
 for r in 'step=second&from=-20h' 'step=second&from=-99999999d' 'step=second&to=9999-12-31T00:00:00Z' \
   'step=minute&from=-99999999d' 'step=hour&from=-99999999d'; do
-  m=$(get "/api/v1/stats/timeseries?$r" | field '",".join(d["missingNodes"])') \
+  m=$(get "/api/v1/stats/timeseries?$r" | field '",".join(d.get("missingNodes", []))') \
     || fail "the timeseries read '$r' failed"
   [ "$m" = r ] || fail "the timeseries read '$r' listed '$m' as missing, not the replica"
 done
 took=$(($(date +%s) - t0))
 [ "$took" -lt 20 ] || fail "the refused ranges took $took s"
 for r in 'step=second&from=-15m' 'step=minute&from=-7d' 'step=hour&from=-400d' 'step=day&from=-99999999d'; do
-  m=$(get "/api/v1/stats/timeseries?$r" | field '",".join(d["missingNodes"])') \
+  m=$(get "/api/v1/stats/timeseries?$r" | field '",".join(d.get("missingNodes", []))') \
     || fail "the timeseries read '$r' failed"
   [ -z "$m" ] || fail "the documented range '$r' listed '$m' as missing"
 done
