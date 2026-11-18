@@ -1923,8 +1923,9 @@ what was added in its UI or API. Each node keeps its own `[node]`, `[[listen]]`,
 
 **Removing a node.** A node that is gone for good stays in the member list as a down node on the
 primary and, under automatic failover, on the other voters (any other replica forgets it within
-about 18 seconds, as above): it counts as a voter in automatic failover and keeps
-`TelltaleDNSClusterPeerDown` firing there. This
+about 18 seconds, as above, unless it was the primary: a primary that is rebuilt under a new node
+ID stays listed as down on a replica until that replica restarts): it counts as a voter in
+automatic failover and keeps `TelltaleDNSClusterPeerDown` firing there. This
 happens when you rebuild a machine and join it again, because it comes back under a new node
 ID. The Cluster page lists such a record as a down node (a record that hasn't connected since
 the node you're looking at started appears after about a minute and a half). Remove it:

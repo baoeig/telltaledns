@@ -23,6 +23,12 @@
 //! A read that is refused is counted and said in the log, as a warning at most once a minute
 //! ([`Limiter::refused`]).
 //!
+//! What this does not do: a read made on a worker thread of a multi-thread runtime costs its
+//! deadline even when the runtime is healthy. Tokio puts a task a worker spawns in that worker's
+//! own LIFO slot, which no other worker steals, and the worker is the one parked in
+//! `recv_timeout`, so the task (the last, or only, call of the read) never runs. No caller does
+//! that: every one is under `blocking()` or `spawn_blocking`. This is for the next handler.
+//!
 //! No `block_in_place`: it panics outside a worker (the release profile aborts on a panic) and
 //! ties the runtime's own liveness to the blocking pool.
 
