@@ -601,12 +601,16 @@
         {#if passwordLogin.networks.length}
           <p>Password sign-in is limited to admins on these networks:</p>
           <ul class="nets mono">
-            {#each passwordLogin.networks as n (n)}<li>{n}</li>{/each}
+            <!-- Not keyed on `n`: allowed_admin_networks may repeat an entry, and Svelte throws on a duplicate key. -->
+            {#each passwordLogin.networks as n}<li>{n}</li>{/each}
           </ul>
-          {#if passwordLogin.reachesBeyondLoopback}
-            <p class="small"><span class="badge warn">Not only this machine</span> Anyone on these networks is still shown the sign-in form. If you manage this server from one machine, list only that machine.</p>
-          {:else if !passwordLogin.trustedProxiesSet}
-            <p class="muted small">If a reverse proxy on this machine serves this page, add it to <code>trusted_proxies</code> under <code>[api]</code>. Until then everyone it serves looks like this machine and can use a password.</p>
+          {#if passwordLogin.coversWholeNetworks}
+            <p class="small"><span class="badge warn">Includes whole networks</span> Anyone on these networks is still shown the sign-in form, not just the machines you name. To limit it to the machines you manage from, list each as a single address, such as <code>192.168.1.10/32</code>.</p>
+          {:else}
+            <p class="muted small">Only the machines listed are shown the sign-in form.</p>
+            {#if passwordLogin.includesLoopback && !passwordLogin.loopbackIsTrustedProxy}
+              <p class="muted small">If a reverse proxy on this machine serves this page, add <code>127.0.0.1/32</code> to <code>trusted_proxies</code> under <code>[api]</code>. Until then everyone it serves looks like this machine and can use a password.</p>
+            {/if}
           {/if}
         {:else}
           <p>Password sign-in is limited to admins on no network, so if your sign-in provider is down, nobody can sign in with a password.</p>

@@ -8,7 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use telltale_api::auth::{Auth, Role, Settings, crypto, reaches_beyond_loopback};
+use telltale_api::auth::{
+    Auth, Role, Settings, covers_whole_networks, crypto, includes_loopback, is_loopback_network,
+    loopback_is_trusted_proxy,
+};
 use telltale_config::{Cidr, Config, OidcConfig, UserRole};
 use telltale_store::state::State;
 use tracing::{error, info, warn};
@@ -50,16 +53,18 @@ fn settings(cfg: &Config) -> Settings {
 }
 
 /// REQ: API-004 (issue #63) — what start-up says when `disable_local_login` is on, and how loudly.
-/// A list that reaches beyond this machine (the default does: private networks and loopback)
-/// leaves password sign-in open to admins there, and the form is still shown: that is a warning,
-/// because the flag's name says otherwise. A list that is loopback only is information, with a
-/// pointer to `trusted_proxies` unless it is set (a proxy on this host makes every browser look
-/// like loopback). An empty list means nobody can use a password: a warning. Returns whether it
-/// is a warning, and the line.
+/// A list that covers whole networks (the default does: private networks and loopback) leaves
+/// password sign-in open to every admin there, and the form is still shown: that is a warning,
+/// because the flag's name says otherwise. A list of this machine and single hosts (`/32`,
+/// `/128`: the machines you manage from, as the guide recommends) is information. A list that
+/// names this machine gets a pointer to `trusted_proxies` unless loopback is already a trusted
+/// proxy (a proxy on this host makes every browser look like loopback). An empty list means
+/// nobody can use a password: a warning. Returns whether it is a warning, and the line.
 ///
-/// REQ: API-004 (ADR-175) — "reaches beyond this machine" is `telltale_api::auth::
-/// reaches_beyond_loopback`, the rule the Settings note (`GET /users`, `passwordLogin`) is built
-/// from too, so the log line and the page can't disagree.
+/// REQ: API-004 (ADR-175) — "covers whole networks", "names this machine" and "loopback is a
+/// trusted proxy" are `telltale_api::auth::{covers_whole_networks, includes_loopback,
+/// loopback_is_trusted_proxy}`, the rules the Settings note (`GET /users`, `passwordLogin`) is
+/// built from too, so the log line and the page can't disagree.
 fn break_glass_notice(networks: &[Cidr], trusted_proxies: &[Cidr]) -> (bool, String) {
     if networks.is_empty() {
         return (
@@ -73,16 +78,24 @@ fn break_glass_notice(networks: &[Cidr], trusted_proxies: &[Cidr]) -> (bool, Str
         .collect::<Vec<_>>()
         .join(", ");
     let pairs: Vec<(IpAddr, u8)> = networks.iter().map(|n| (n.addr, n.prefix)).collect();
-    if !reaches_beyond_loopback(&pairs) {
-        let proxy = if trusted_proxies.is_empty() {
+    if !covers_whole_networks(&pairs) {
+        let proxies: Vec<(IpAddr, u8)> =
+            trusted_proxies.iter().map(|n| (n.addr, n.prefix)).collect();
+        let proxy = if includes_loopback(&pairs) && !loopback_is_trusted_proxy(&proxies) {
             "; if a reverse proxy on this machine serves the UI, list it in [api] trusted_proxies (127.0.0.1/32): otherwise every browser it serves looks like loopback and may use a password"
         } else {
             ""
         };
+        let only = if pairs.iter().all(|(n, p)| is_loopback_network(*n, *p)) {
+            "loopback".to_owned()
+        } else {
+            let n = pairs.len();
+            format!("{n} host{}", if n == 1 { "" } else { "s" })
+        };
         return (
             false,
             format!(
-                "disable_local_login is on: password sign-in is restricted to loopback ({list}){proxy}"
+                "disable_local_login is on: password sign-in is restricted to {only} ({list}){proxy}"
             ),
         );
     }
@@ -94,7 +107,7 @@ fn break_glass_notice(networks: &[Cidr], trusted_proxies: &[Cidr]) -> (bool, Str
     (
         true,
         format!(
-            "disable_local_login is on, but password sign-in is still open to admins from {list} ({which}), and the sign-in form is still shown there: narrow allowed_admin_networks to the machines you manage from, or set it to [] to turn password sign-in off"
+            "disable_local_login is on, but password sign-in is still open to admins from {list} ({which}), and the sign-in form is still shown there: narrow allowed_admin_networks to the machines you manage from (one address each, such as 192.168.1.10/32), or set it to [] to turn password sign-in off"
         ),
     )
 }

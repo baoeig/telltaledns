@@ -112,18 +112,24 @@ fn temp_dir() -> PathBuf {
     std::env::temp_dir().join(format!("tt-auth-{}", crypto::random_id()))
 }
 
-// REQ: API-004 (issue #63) — with the flag on and a list that reaches beyond this machine,
-// password sign-in is still open to those networks, so start-up warns (it used to be an INFO
-// line that read "password sign-in is off"), and says which networks and that it is the default.
+// REQ: API-004 (issue #63, ADR-175) — with the flag on and a list that covers whole networks (a
+// range of more than one host, not only this machine), password sign-in is still open to everyone
+// on them, so start-up warns (it used to be an INFO line that read "password sign-in is off"), and
+// says which networks and that it is the default.
 #[test]
 fn api_004_start_up_warns_when_break_glass_reaches_beyond_loopback() {
     let default = Config::default().auth.oidc.allowed_admin_networks;
     for (what, networks) in [
         ("the default list", default.clone()),
         (
-            "loopback and one LAN host",
-            cidrs(&["127.0.0.0/8", "192.168.1.5/32"]),
+            "loopback and one LAN range",
+            cidrs(&["127.0.0.0/8", "192.168.1.0/24"]),
         ),
+        (
+            "a LAN host and a LAN range",
+            cidrs(&["192.168.1.5/32", "10.0.0.0/8"]),
+        ),
+        ("two hosts and no more (a /31)", cidrs(&["192.168.1.10/31"])),
         ("every address", cidrs(&["0.0.0.0/0"])),
     ] {
         let dir = temp_dir();
@@ -180,6 +186,125 @@ fn api_004_start_up_is_quiet_about_a_loopback_only_list() {
     assert_eq!(lines[0].0, tracing::Level::INFO);
     assert!(lines[0].1.contains("restricted to loopback"), "{lines:?}");
     assert!(!lines[0].1.contains("trusted_proxies"), "{lines:?}");
+}
+
+// REQ: API-004 (ADR-175) — a list of single hosts (/32, /128) names the machines you manage from,
+// which is what the docs recommend, so it is information ("restricted to N hosts"), not the
+// warning for a list that opens password sign-in to whole networks. Hosts beside loopback count
+// as hosts. A single host from a range (a /31) or any network is not.
+#[test]
+fn api_004_a_list_of_single_hosts_is_information() {
+    for (what, networks, says) in [
+        (
+            "one workstation",
+            cidrs(&["192.168.1.10/32"]),
+            "restricted to 1 host (",
+        ),
+        (
+            "two workstations",
+            cidrs(&["192.168.1.10/32", "192.168.1.11/32"]),
+            "restricted to 2 hosts (",
+        ),
+        (
+            "an IPv6 workstation",
+            cidrs(&["fd00::5/128"]),
+            "restricted to 1 host (",
+        ),
+        (
+            "an IPv4 and an IPv6 workstation",
+            cidrs(&["192.168.1.10/32", "fd00::5/128"]),
+            "restricted to 2 hosts (",
+        ),
+        (
+            "loopback hosts and a workstation",
+            cidrs(&["127.0.0.1/32", "::1/128", "192.168.1.10/32"]),
+            "restricted to 3 hosts (",
+        ),
+        (
+            "the loopback network and a workstation",
+            cidrs(&["127.0.0.0/8", "192.168.1.10/32"]),
+            "restricted to 2 hosts (",
+        ),
+    ] {
+        let dir = temp_dir();
+        let (lines, _) = start_up(&break_glass(&dir, networks.clone(), None));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(lines.len(), 1, "{what}: {lines:?}");
+        let (level, line) = &lines[0];
+        assert_eq!(*level, tracing::Level::INFO, "{what}: {line}");
+        assert!(line.contains(says), "{what}: {line}");
+        for n in &networks {
+            assert!(line.contains(&n.to_string()), "{what}: {line} names {n}");
+        }
+        for not in ["still open", "narrow", "default"] {
+            assert!(!line.contains(not), "{what}: says `{not}`: {line}");
+        }
+    }
+    // Not hosts: a /31 is two machines, a /30 four; they are ranges, like a /24.
+    for networks in [
+        cidrs(&["192.168.1.10/31"]),
+        cidrs(&["192.168.1.8/30"]),
+        cidrs(&["192.168.1.10/32", "192.168.1.0/24"]),
+        cidrs(&["fd00::4/127"]),
+    ] {
+        let (warning, line) = break_glass_notice(&networks, &[]);
+        assert!(warning, "{networks:?}: {line}");
+        assert!(line.contains("still open"), "{line}");
+    }
+}
+
+// REQ: API-004 (ADR-175) — the reminder about a proxy on this machine is for a list that names this
+// machine, and it is not made when loopback is already a trusted proxy: `127.0.0.1` has to fall
+// inside a listed network, as `remote()` tests the peer of a proxy on this machine. Another proxy
+// network (an ingress), one address that isn't `127.0.0.1`, or `::1` does not count. A list with no
+// loopback in it never gets it: a proxy on this machine would only be refused there. The page
+// asks the same of the API (`loopbackIsTrustedProxy`), so the line and the card agree.
+#[test]
+fn api_004_the_loopback_hint_follows_the_trusted_proxy_list() {
+    let with_loopback = [
+        ("this machine", cidrs(&["127.0.0.0/8", "::1/128"])),
+        ("one loopback host", cidrs(&["127.0.0.1/32"])),
+        (
+            "a loopback host and a workstation",
+            cidrs(&["127.0.0.1/32", "192.168.1.10/32"]),
+        ),
+    ];
+    let proxies: [(&[&str], bool); 8] = [
+        (&[], false),
+        (&["10.42.0.0/16"], false),
+        (&["10.42.0.5/32"], false),
+        (&["::1/128"], false),
+        (&["127.0.0.2/32"], false),
+        (&["127.0.0.1/32"], true),
+        (&["127.0.0.0/8"], true),
+        (&["10.42.0.0/16", "127.0.0.1/32"], true),
+    ];
+    for (what, networks) in &with_loopback {
+        for (listed, trusted) in &proxies {
+            let trusted_proxies = cidrs(listed);
+            let (warning, line) = break_glass_notice(networks, &trusted_proxies);
+            let ctx = format!("{what}, proxies {listed:?}: {line}");
+            assert!(!warning, "{ctx}");
+            assert_eq!(line.contains("trusted_proxies"), !trusted, "{ctx}");
+
+            let mut c = break_glass(Path::new("/nonexistent/tt-hint"), networks.clone(), None);
+            c.api.trusted_proxies = trusted_proxies;
+            let policy = serde_json::to_value(settings(&c).password_login()).unwrap();
+            assert_eq!(policy["includesLoopback"], true, "{ctx}");
+            assert_eq!(policy["loopbackIsTrustedProxy"], *trusted, "{ctx}");
+        }
+    }
+    // No loopback in the list: nothing to say, whatever the proxies.
+    for networks in [
+        cidrs(&["192.168.1.10/32"]),
+        cidrs(&["192.168.1.10/32", "fd00::5/128"]),
+    ] {
+        for (listed, _) in &proxies {
+            let (warning, line) = break_glass_notice(&networks, &cidrs(listed));
+            assert!(!warning, "{networks:?}: {line}");
+            assert!(!line.contains("trusted_proxies"), "{networks:?}: {line}");
+        }
+    }
 }
 
 // REQ: API-004 (issue #63) — a provider that can't be set up (a missing secret file) is exactly
@@ -281,9 +406,11 @@ fn api_004_start_up_does_not_warn_a_resolver_pod() {
     }
 }
 
-// REQ: API-004 (issue #63) — the notice names every network and says when it is the default list;
-// only a list wholly inside loopback counts as "this machine" (anything wider, an IPv4-mapped
-// form, or a /7 around 127.0.0.0 is not).
+// REQ: API-004 (issue #63, ADR-175) — the notice names every network and says when it is the
+// default list. Which lists warn: any network that is neither this machine (127.0.0.0/8 or a part
+// of it, `::1`) nor a single host (/32, /128), so a /7 around 127.0.0.0, `::1/64`, a /31 and the
+// whole Internet do, and a workstation does not. (An IPv4-mapped form is a single host, which
+// names a machine nobody connects from, not a network.)
 #[test]
 fn api_004_start_up_says_where_password_sign_in_is_still_open() {
     let default = Config::default().auth.oidc.allowed_admin_networks;
@@ -292,7 +419,7 @@ fn api_004_start_up_says_where_password_sign_in_is_still_open() {
         "the default break-glass list is not empty"
     );
     let (warning, line) = break_glass_notice(&default, &[]);
-    assert!(warning, "the default list reaches beyond this machine");
+    assert!(warning, "the default list covers whole networks");
     for n in &default {
         assert!(line.contains(&n.to_string()), "{line} should name {n}");
     }
@@ -303,30 +430,39 @@ fn api_004_start_up_says_where_password_sign_in_is_still_open() {
     let (warning, line) = break_glass_notice(&[], &[]);
     assert!(warning, "no break-glass network at all is a warning");
     assert!(line.contains("nobody can sign in with a password"));
-    for (list, only_this_machine) in [
-        ("127.0.0.1/32", true),
-        ("127.0.0.0/8, ::1/128", true),
-        ("127.1.2.3/32", true),
-        ("127.0.0.0/7", false),
-        ("0.0.0.0/0", false),
-        ("::1/64", false),
-        ("::/0", false),
-        ("::ffff:127.0.0.1/128", false),
-        ("127.0.0.0/8, 10.0.0.0/8", false),
+    for (list, warns) in [
+        ("127.0.0.1/32", false),
+        ("127.0.0.0/8, ::1/128", false),
+        ("127.1.2.3/32", false),
         ("192.168.1.10/32", false),
+        ("fd00::5/128", false),
+        ("127.0.0.0/8, 192.168.1.10/32", false),
+        ("::ffff:127.0.0.1/128", false),
+        ("127.0.0.0/7", true),
+        ("0.0.0.0/0", true),
+        ("::1/64", true),
+        ("::/0", true),
+        ("127.0.0.0/8, 10.0.0.0/8", true),
+        ("192.168.1.10/31", true),
+        ("192.168.1.0/24", true),
+        ("192.168.1.10/32, 192.168.1.0/24", true),
+        ("fd00::/64", true),
     ] {
         let nets = cidrs(&list.split(", ").collect::<Vec<_>>());
         let (warning, line) = break_glass_notice(&nets, &[]);
-        assert_eq!(!warning, only_this_machine, "{list}: {line}");
+        assert_eq!(warning, warns, "{list}: {line}");
     }
 }
 
 // REQ: API-004 (issue #63, ADR-175) — what start-up says and what an admin is shown in Settings
 // (`GET /users`, `passwordLogin`) are one fact: the same networks in the same order, the same
-// answer to "does the list reach beyond this machine", and the same proxy hint. Both read it from
-// `telltale_api::auth`, and this test is what keeps them from drifting apart.
+// answer to "does the list cover whole networks", and the same proxy hint. Both read it from
+// `telltale_api::auth`, and this test is what keeps them from drifting apart. The block is read
+// as the JSON the page gets, so the names the page reads are the ones pinned here.
 #[test]
+#[allow(clippy::too_many_lines)] // one story: every list against every proxy list, then the flag off
 fn api_004_the_start_up_line_and_the_policy_agree() {
+    use telltale_api::auth::{in_network, is_loopback_network};
     let lists: Vec<(&str, Vec<Cidr>)> = vec![
         (
             "the default list",
@@ -334,9 +470,19 @@ fn api_004_the_start_up_line_and_the_policy_agree() {
         ),
         ("loopback", cidrs(&["127.0.0.0/8", "::1/128"])),
         ("one loopback host", cidrs(&["127.0.0.1/32"])),
+        ("one LAN host", cidrs(&["192.168.1.10/32"])),
+        (
+            "two LAN hosts, v4 and v6",
+            cidrs(&["192.168.1.10/32", "fd00::5/128"]),
+        ),
         (
             "loopback and one LAN host",
             cidrs(&["127.0.0.0/8", "192.168.1.5/32"]),
+        ),
+        ("a /31", cidrs(&["192.168.1.10/31"])),
+        (
+            "a LAN host and a /24",
+            cidrs(&["192.168.1.10/32", "10.0.0.0/24"]),
         ),
         ("every address", cidrs(&["0.0.0.0/0"])),
         ("a /7 around 127.0.0.0", cidrs(&["127.0.0.0/7"])),
@@ -345,36 +491,64 @@ fn api_004_the_start_up_line_and_the_policy_agree() {
         ("an empty list", Vec::new()),
     ];
     for (what, networks) in lists {
-        for proxies in [Vec::new(), cidrs(&["127.0.0.1/32"])] {
+        for proxies in [
+            Vec::new(),
+            cidrs(&["127.0.0.1/32"]),
+            cidrs(&["10.42.0.0/16"]),
+        ] {
             let mut c = break_glass(Path::new("/nonexistent/tt-agree"), networks.clone(), None);
             c.api.trusted_proxies = proxies.clone();
-            let policy = settings(&c).password_login();
+            let policy = serde_json::to_value(settings(&c).password_login()).unwrap();
             let (warning, line) = break_glass_notice(&networks, &proxies);
             let ctx = format!("{what}, {} proxies: {line}", proxies.len());
 
-            assert!(policy.restricted, "{ctx}");
+            assert_eq!(policy["restricted"], true, "{ctx}");
             let listed: Vec<String> = networks.iter().map(ToString::to_string).collect();
-            assert_eq!(policy.networks, listed, "the same networks: {ctx}");
             assert_eq!(
-                policy.trusted_proxies_set,
-                !proxies.is_empty(),
-                "the proxy list: {ctx}"
+                policy["networks"],
+                serde_json::json!(listed),
+                "the same networks: {ctx}"
             );
-            let loopback = line.contains("restricted to loopback");
+            let whole = policy["coversWholeNetworks"].as_bool().unwrap_or(false);
+            let on_this_machine = policy["includesLoopback"].as_bool().unwrap_or(false);
+            let proxy = policy["loopbackIsTrustedProxy"].as_bool().unwrap_or(false);
             assert_eq!(
-                loopback,
-                !networks.is_empty() && !policy.reaches_beyond_loopback,
-                "'restricted to loopback' is what the policy says: {ctx}"
+                proxy,
+                proxies
+                    .iter()
+                    .any(|p| in_network(IpAddr::from([127, 0, 0, 1]), p.addr, p.prefix)),
+                "loopback is a proxy when 127.0.0.1 is inside a listed network: {ctx}"
+            );
+            assert_eq!(
+                on_this_machine,
+                networks
+                    .iter()
+                    .any(|n| is_loopback_network(n.addr, n.prefix)),
+                "the list names this machine: {ctx}"
+            );
+            let loopback_only = !networks.is_empty()
+                && networks
+                    .iter()
+                    .all(|n| is_loopback_network(n.addr, n.prefix));
+            assert_eq!(
+                line.contains("restricted to loopback"),
+                loopback_only,
+                "'restricted to loopback' is a list of nothing but this machine: {ctx}"
+            );
+            assert_eq!(
+                line.contains(" host"),
+                !networks.is_empty() && !whole && !loopback_only,
+                "'restricted to N hosts' is a list of hosts, loopback among them or not: {ctx}"
             );
             assert_eq!(
                 warning,
-                networks.is_empty() || policy.reaches_beyond_loopback,
-                "a warning when it reaches past this machine, or reaches nobody: {ctx}"
+                networks.is_empty() || whole,
+                "a warning when the list covers whole networks, or reaches nobody: {ctx}"
             );
             assert_eq!(
                 line.contains("trusted_proxies"),
-                loopback && !policy.trusted_proxies_set,
-                "the proxy hint shows when the policy says no proxy is listed: {ctx}"
+                !warning && on_this_machine && !proxy,
+                "the hint shows for a list that names this machine while no proxy covers it: {ctx}"
             );
         }
     }
@@ -386,6 +560,16 @@ fn api_004_the_start_up_line_and_the_policy_agree() {
         None,
     );
     off.auth.oidc.disable_local_login = false;
-    let policy = settings(&off).password_login();
-    assert!(!policy.restricted && policy.networks.is_empty() && !policy.reaches_beyond_loopback);
+    off.api.trusted_proxies = cidrs(&["127.0.0.1/32"]);
+    let policy = serde_json::to_value(settings(&off).password_login()).unwrap();
+    assert_eq!(
+        policy,
+        serde_json::json!({
+            "restricted": false,
+            "networks": [],
+            "coversWholeNetworks": false,
+            "includesLoopback": false,
+            "loopbackIsTrustedProxy": false
+        })
+    );
 }
