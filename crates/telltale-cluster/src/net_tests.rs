@@ -2197,9 +2197,26 @@ async fn clu_001_replicas_forget_each_other_after_a_passing_stream() {
         !b.reachable_peers().contains(&a_id)
     })
     .await;
-    // Not silent long enough yet: kept (it shows as down for at most the up window).
-    assert_eq!(a.forget_stray_peers(&a.identity.reload()), none);
-    assert_eq!(b.forget_stray_peers(&b.identity.reload()), none);
+    // Not silent past the up window yet: kept (it shows as down for at most the up window). Judged
+    // at the moment each was last heard from plus the whole window, not by the wall clock: that
+    // took the time since the last heartbeat (up to two heartbeats here) off a 15 s margin, and
+    // a CI machine that stalled for the rest would have flipped it.
+    let heard = |c: &Arc<Cluster>, id: &str| {
+        c.members()
+            .into_iter()
+            .find(|m| m.node_id == id)
+            .map(|m| m.last_seen_ms)
+            .unwrap()
+    };
+    let window = 3 * u64::try_from(HEARTBEAT.as_millis()).unwrap();
+    assert_eq!(
+        a.forget_stray_peers_at(&a.identity.reload(), heard(&a, &b_id) + window),
+        none
+    );
+    assert_eq!(
+        b.forget_stray_peers_at(&b.identity.reload(), heard(&b, &a_id) + window),
+        none
+    );
 
     // Silent past the up window: each forgets the other. The primary stays, and so does its
     // stream; the primary itself forgets no one.
