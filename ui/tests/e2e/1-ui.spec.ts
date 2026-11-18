@@ -2958,17 +2958,20 @@ test('obs_035 wall helpers', async () => {
 // Esc goes back to the dashboard.
 test('obs_035 wall', async () => {
   await page.setViewportSize({ width: 1280, height: 800 });
-  await page.goto('/#/wall?panels=slo,flow&every=5');
+  // `layout=single`: at this size the default layout shows both panels at once and nothing rotates.
+  // The one slot lists the big panel first and the small one (`slo`) after it, so `flow` shows
+  // first and `slo` takes over after 5 s (the dots below keep the address's order).
+  await page.goto('/#/wall?layout=single&panels=slo,flow&every=5');
   const wall = page.getByTestId('wall');
   await expect(wall).toBeVisible();
   await expect(page.locator('nav.side')).toHaveCount(0);
   await expect(page.locator('header.top')).toHaveCount(0);
   await expect(page.getByTestId('wall-order').locator('li')).toHaveCount(2);
   expect(await page.getByTestId('wall-order').locator('li').evaluateAll((els) => els.map((e) => (e as HTMLElement).dataset.panel))).toEqual(['slo', 'flow']);
-  await expect(page.getByTestId('wall-panel-slo')).toBeVisible();
+  await expect(page.getByTestId('wall-panel-flow')).toBeVisible();
   await expect(page.getByTestId('wall-tail')).toBeVisible();
   // Rotates after 5 s.
-  await expect(page.getByTestId('wall-panel-flow')).toBeVisible({ timeout: 9000 });
+  await expect(page.getByTestId('wall-panel-slo')).toBeVisible({ timeout: 9000 });
   // Every panel renders.
   // One at a time (`layout=single`): every panel renders in turn.
   await page.goto('/#/wall?layout=single');
@@ -2995,6 +2998,75 @@ test('obs_035 wall', async () => {
   await page.keyboard.press('Escape');
   await expect(page).toHaveURL(/#\/$/);
   await expect(page.locator('nav.side')).toBeVisible();
+});
+
+// REQ: OBS-035 (#69) — a panel the viewer moved to stays put when the wall's area is measured
+// again. A resize rebuilds the layout object, and that must not send the slot back to its first
+// panel (only a different address, or a different set of panels per slot, does).
+test('obs_035 wall keeps its place when remeasured', async () => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.goto('/#/wall?layout=single&every=600');
+  const slot = page.getByTestId('wall-slot');
+  await expect(slot).toHaveAttribute('data-panel', 'map');
+  await page.keyboard.press('ArrowRight');
+  await expect(slot).toHaveAttribute('data-panel', 'flow');
+  // Each resize changes the panel area's size, so the layout is computed again; two frames let
+  // the browser's resize notification reach the page (it comes after the first frame's callbacks).
+  for (const [width, height] of [[1100, 700], [1280, 800], [1200, 760]]) {
+    await page.setViewportSize({ width, height });
+    await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+    await expect(slot).toHaveAttribute('data-panel', 'flow');
+  }
+  await page.keyboard.press('ArrowRight');
+  await expect(slot).toHaveAttribute('data-panel', 'slo');
+  // The shared page goes back as the next test expects it.
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.goto('/#/');
+});
+
+// REQ: OBS-035 (#69) — the order CI hit: the address changes to `layout=single` and the viewer
+// presses a key before the page has measured its panel area again (the one-panel title that
+// appears shrinks it). One task does the address change and the key press, so no frame, and so
+// no resize notification, can come between them; the measure always lands after the key.
+test('obs_035 wall keeps its panel when the area is measured after a key press', async () => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.goto('/#/wall?panels=slo,flow&every=600');
+  const slot = page.getByTestId('wall-slot');
+  const area = page.getByTestId('wall-area');
+  await expect(slot).toHaveCount(2);
+  const frames = (n: number) =>
+    page.evaluate(
+      (n) =>
+        new Promise<void>((done) => {
+          const next = (left: number) => (left === 0 ? done() : requestAnimationFrame(() => next(left - 1)));
+          next(n);
+        }),
+      n,
+    );
+  await frames(2); // measured and settled with both panels showing
+  const before = await area.evaluate((e) => e.clientHeight);
+  const seen = await page.evaluate(async () => {
+    const panel = () => document.querySelector('[data-testid="wall-slot"]')?.getAttribute('data-panel') ?? '';
+    const slots = () => document.querySelectorAll('[data-testid="wall-slot"]').length;
+    // Svelte updates in a microtask: wait for it by yielding microtasks only (never a frame).
+    const until = async (done: () => boolean) => {
+      for (let i = 0; i < 1000 && !done(); i++) await Promise.resolve();
+      return done();
+    };
+    history.replaceState(null, '', '#/wall?layout=single&every=600');
+    window.dispatchEvent(new HashChangeEvent('hashchange'));
+    const single = await until(() => slots() === 1 && panel() === 'map' && !!document.querySelector('h1.title'));
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight' }));
+    const moved = await until(() => panel() === 'flow');
+    return { single, moved };
+  });
+  expect(seen, 'the one-panel wall, then flow, before any frame').toEqual({ single: true, moved: true });
+  await frames(2); // the resize notification for the shorter area arrives here
+  expect(await area.evaluate((e) => e.clientHeight), 'the title made the area shorter').toBeLessThan(before);
+  await expect(slot).toHaveAttribute('data-panel', 'flow');
+  // The shared page goes back as the next test expects it.
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.goto('/#/');
 });
 
 // REQ: OBS-036 — a chatty loop is shown with its strip and marked informational, and the
