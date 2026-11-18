@@ -2203,3 +2203,118 @@ async fn clu_001_replicas_forget_each_other_after_a_passing_stream() {
     assert_eq!(primary.members().len(), 2);
     stop_tx.send(true).unwrap();
 }
+
+// ---- ADR-173: what a replica keeps, on plain facts (no streams) ----
+
+/// The time to give [`Cluster::forget_stray_peers_at`] so that every peer heard from now has
+/// been silent past the up window: no sleeping.
+fn after_the_up_window() -> u64 {
+    now_ms() + 3 * u64::try_from(HEARTBEAT.as_millis()).unwrap() + 1_000
+}
+
+/// A replica that joined a primary (which isn't running here). Its member table is filled by
+/// [`meet`] and emptied by [`Cluster::forget_stray_peers_at`]; there are no streams.
+fn lone_replica(eligible: bool) -> (Arc<Cluster>, tempfile::TempDir) {
+    let (pdir, rdir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let primary = Identity::init(
+        pdir.path(),
+        "home",
+        vec!["https://127.0.0.1:1".into()],
+        "k8s",
+    )
+    .unwrap();
+    let grants = crate::node::TokenGrants {
+        eligible,
+        witness: false,
+    };
+    let token = primary.create_token_for(60, None, grants).unwrap();
+    let key = pki::new_node_key().unwrap();
+    let req = JoinRequest {
+        witness: false,
+        ephemeral: false,
+        secret: token.secret.clone(),
+        csr_pem: key.csr_pem.clone(),
+        advertise: vec![],
+        site: "pi".into(),
+        eligible,
+        version: "0.1.0".into(),
+    };
+    let resp = primary.accept_join(&req, None).unwrap();
+    let id =
+        Identity::save_joined(rdir.path(), &key.key_pem, &resp, "pi", eligible, vec![]).unwrap();
+    (Cluster::new(id, "0.1.0"), rdir)
+}
+
+/// `node`'s Hello arrives on a stream: it is listed, connected, and says whether it is the
+/// primary (a Hello is sent once, when the stream opens).
+fn meet(c: &Arc<Cluster>, node: &str, primary: bool) {
+    let mut peer = Some(node.to_owned());
+    c.on_frame(
+        &mut peer,
+        Frame {
+            body: Some(Body::Hello(Hello {
+                protocol: PROTOCOL,
+                cluster_id: c.identity.meta.cluster_id.clone(),
+                node_id: node.to_owned(),
+                version: "0.1.0".into(),
+                site: "k8s".into(),
+                eligible: true,
+                advertise: vec![],
+                epoch: 1,
+                applied_seq: 0,
+                primary,
+                config_source: String::new(),
+                source_commit: String::new(),
+            })),
+        },
+        "inbound",
+        &EchoSlot::default(),
+    )
+    .unwrap();
+}
+
+/// What `read_frames` does as a stream ends: the peer is no longer connected.
+fn stream_ended(c: &Cluster, node: &str) {
+    c.members.lock().unwrap().get_mut(node).unwrap().connected = false;
+}
+
+/// The node IDs in the member table.
+fn listed(c: &Cluster) -> Vec<String> {
+    c.members().into_iter().map(|m| m.node_id).collect()
+}
+
+// REQ: CLU-001, CLU-008 (ADR-173) — a Hello says whether its sender is the primary, once, and a
+// stream stays open through a promotion, so the flag stays false on the replica that heard it.
+// The replica keeps whoever the last manifest it applied names the primary: the promoted node
+// that goes silent is the one whose outage matters most, and it is still reported, while
+// another replica is forgotten.
+#[test]
+fn clu_001_a_promoted_peer_is_kept_though_its_hello_said_replica() {
+    let (c, _dir) = lone_replica(true);
+    meet(&c, "promoted", false);
+    meet(&c, "sibling", false);
+    assert!(
+        c.members().iter().all(|m| !m.primary),
+        "the Hello flag is stale after a live promotion"
+    );
+    // The promoted node publishes; this replica applies the version, which names it.
+    let applied = ClusterManifest {
+        primary: "promoted".into(),
+        epoch: 2,
+        seq: 5,
+        ..ClusterManifest::default()
+    };
+    std::fs::write(
+        c.identity.dir.join("applied.json"),
+        serde_json::to_vec(&applied).unwrap(),
+    )
+    .unwrap();
+    // Both streams end and both peers fall silent.
+    stream_ended(&c, "promoted");
+    stream_ended(&c, "sibling");
+    assert_eq!(
+        c.forget_stray_peers_at(&c.identity.reload(), after_the_up_window()),
+        vec!["sibling".to_owned()]
+    );
+    assert_eq!(listed(&c), vec!["promoted".to_owned()]);
+}

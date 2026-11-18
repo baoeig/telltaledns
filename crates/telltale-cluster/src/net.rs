@@ -81,11 +81,29 @@ fn defers_to_git(
 
 /// REQ: CLU-001 (ADR-173) — whether a node keeps a peer that has gone silent in its member list
 /// (and so in `telltale_cluster_peer_up`, as down). The primary keeps every peer: each one is
-/// meant to dial it. A replica keeps the primary, and under automatic failover the other voters
-/// (`voter_link`: [`mesh`] keeps a stream to each). Any other peer was a passing stream, such as
-/// one replica's fallback to another while the primary didn't answer, and is forgotten.
+/// meant to dial it. A replica keeps the primary (`peer_primary`: its Hello said so, or the last
+/// version this node applied names it, see [`applied_primary`]), and under automatic failover the
+/// other voters (`voter_link`: [`mesh`] keeps a stream to each). Any other peer was a passing
+/// stream, such as one replica's fallback to another while the primary didn't answer, and is
+/// forgotten.
 fn keeps_silent_peer(self_primary: bool, peer_primary: bool, voter_link: bool) -> bool {
     self_primary || peer_primary || voter_link
+}
+
+/// REQ: CLU-001 (ADR-173) — the node the last version this node applied names as the primary
+/// (`applied.json`, which replication writes next to the identity), if any. A member's `primary`
+/// flag comes from its Hello and stays as it was when the stream opened, so a node promoted on a
+/// stream that was already open still reads as a replica (see [`Cluster::defers_to_git_node`]);
+/// the version it publishes next names it, and a replica applies that one.
+fn applied_primary(id: &Identity) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Applied {
+        #[serde(default)]
+        primary: String,
+    }
+    let bytes = std::fs::read(id.dir.join("applied.json")).ok()?;
+    let applied: Applied = serde_json::from_slice(&bytes).ok()?;
+    (!applied.primary.is_empty()).then_some(applied.primary)
 }
 
 /// REQ: CLU-005 (ADR-154) — how long a node leaves the election to a Git-managed node while no
@@ -1054,13 +1072,19 @@ impl Cluster {
         } else {
             Vec::new()
         };
+        // REQ: CLU-001 (ADR-173) — read before `members` is locked, and only by a replica.
+        let named = if primary { None } else { applied_primary(id) };
         let mut members = self.members.lock().unwrap_or_else(PoisonError::into_inner);
         let gone: Vec<String> = members
             .values()
             .filter(|m| {
                 !m.connected
                     && !m.up(now)
-                    && !keeps_silent_peer(primary, m.primary, voters.contains(&m.node_id))
+                    && !keeps_silent_peer(
+                        primary,
+                        m.primary || named.as_deref() == Some(m.node_id.as_str()),
+                        voters.contains(&m.node_id),
+                    )
             })
             .map(|m| m.node_id.clone())
             .collect();
