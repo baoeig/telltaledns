@@ -2958,17 +2958,20 @@ test('obs_035 wall helpers', async () => {
 // Esc goes back to the dashboard.
 test('obs_035 wall', async () => {
   await page.setViewportSize({ width: 1280, height: 800 });
-  await page.goto('/#/wall?panels=slo,flow&every=5');
+  // `layout=single`: at this size the default layout shows both panels at once and nothing rotates.
+  // The one slot lists the big panel first and the small one (`slo`) after it, so `flow` shows
+  // first and `slo` takes over after 5 s (the dots below keep the address's order).
+  await page.goto('/#/wall?layout=single&panels=slo,flow&every=5');
   const wall = page.getByTestId('wall');
   await expect(wall).toBeVisible();
   await expect(page.locator('nav.side')).toHaveCount(0);
   await expect(page.locator('header.top')).toHaveCount(0);
   await expect(page.getByTestId('wall-order').locator('li')).toHaveCount(2);
   expect(await page.getByTestId('wall-order').locator('li').evaluateAll((els) => els.map((e) => (e as HTMLElement).dataset.panel))).toEqual(['slo', 'flow']);
-  await expect(page.getByTestId('wall-panel-slo')).toBeVisible();
+  await expect(page.getByTestId('wall-panel-flow')).toBeVisible();
   await expect(page.getByTestId('wall-tail')).toBeVisible();
   // Rotates after 5 s.
-  await expect(page.getByTestId('wall-panel-flow')).toBeVisible({ timeout: 9000 });
+  await expect(page.getByTestId('wall-panel-slo')).toBeVisible({ timeout: 9000 });
   // Every panel renders.
   // One at a time (`layout=single`): every panel renders in turn.
   await page.goto('/#/wall?layout=single');
