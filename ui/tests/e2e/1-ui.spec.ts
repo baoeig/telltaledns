@@ -881,30 +881,67 @@ function totpAt(secretBase32: string, ms: number): string {
   return String(n % 1_000_000).padStart(6, '0');
 }
 
+// REQ: API-003 (issue #64) — this file is one serial group on one admin, and every test after the one
+// below signs in with the password alone. If it fails while two-factor is on (and maybe signed out),
+// the rest would fail in a cascade that hides the real failure. So whatever happened, this puts the
+// admin back: signed in (with a recovery code, which needs no clock) and without a second factor.
+// It is quiet: the error that brought us here is the one to read.
+async function leaveWithoutTwoFactor(recoveryCodes: string[]) {
+  try {
+    const status = await (await page.request.get('/api/v1/auth/status')).json();
+    let csrf: string | undefined = status.csrfToken;
+    let on: boolean = status.user?.totpEnabled === true;
+    if (!status.authenticated) {
+      // No code was ever shown to us: two-factor never got turned on.
+      if (!recoveryCodes.length) return;
+      const r = await page.request.post('/api/v1/auth/login', {
+        data: { username: ADMIN.user, password: ADMIN.pass, recoveryCode: recoveryCodes[0] },
+      });
+      if (!r.ok()) return;
+      const signedIn = await r.json();
+      csrf = signedIn.csrfToken;
+      on = signedIn.user?.totpEnabled === true;
+    }
+    if (on && csrf) {
+      await page.request.post('/api/v1/auth/totp/disable', { data: { password: ADMIN.pass }, headers: { 'x-csrf-token': csrf } });
+    }
+  } catch {
+    // Nothing more can be done from here.
+  }
+}
+
 test('api_003 two-factor works from the browser: turn it on, sign in with a code, turn it off', async () => {
   // The helper first: RFC 6238's own secret ("12345678901234567890") at 59 s gives 94287082.
   expect(totpAt('GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ', 59_000)).toBe('287082');
-  await page.goto('/#/settings?tab=account');
-  await page.getByRole('button', { name: 'Set up two-factor sign-in' }).click();
-  const secret = ((await page.locator('div.mono.key').textContent()) ?? '').replace(/\s/g, '');
-  expect(secret).toMatch(/^[A-Z2-7]{32}$/);
-  await page.getByPlaceholder('123456').fill(totpAt(secret, Date.now()));
-  await page.getByRole('button', { name: 'Turn on' }).click();
-  await expect(page.getByText('Save these recovery codes now.')).toBeVisible();
-  // Sign in again: the password, then the code. The server takes each time step's code once, so
-  // this one is the next step's (it accepts one step of clock skew).
-  await page.getByRole('button', { name: 'Sign out' }).click();
-  await expect(page.getByRole('heading', { name: 'Sign in' })).toBeVisible();
-  await signIn(ADMIN.user, ADMIN.pass);
-  await expect(page.getByText('Enter the 6-digit code from your authenticator app.')).toBeVisible();
-  await page.locator('input[name="totp"]').fill(totpAt(secret, Date.now() + 30_000));
-  await page.getByRole('button', { name: 'Sign in' }).click();
-  await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
-  await expect(page.getByText('recovery codes left')).toBeVisible();
-  // Leave the admin as the other tests expect it: no second factor.
-  await page.getByLabel('Password, to turn it off').fill(ADMIN.pass);
-  await page.getByRole('button', { name: 'Turn off two-factor' }).click();
-  await expect(page.getByRole('button', { name: 'Set up two-factor sign-in' })).toBeVisible();
+  let recoveryCodes: string[] = [];
+  let turnedOff = false;
+  try {
+    await page.goto('/#/settings?tab=account');
+    await page.getByRole('button', { name: 'Set up two-factor sign-in' }).click();
+    const secret = ((await page.locator('div.mono.key').textContent()) ?? '').replace(/\s/g, '');
+    expect(secret).toMatch(/^[A-Z2-7]{32}$/);
+    await page.getByPlaceholder('123456').fill(totpAt(secret, Date.now()));
+    await page.getByRole('button', { name: 'Turn on' }).click();
+    await expect(page.getByText('Save these recovery codes now.')).toBeVisible();
+    recoveryCodes = (await page.locator('ul.codes li').allTextContents()).map((c) => c.trim());
+    // Sign in again: the password, then the code. The server takes each time step's code once, so
+    // this one is the next step's (it accepts one step of clock skew).
+    await page.getByRole('button', { name: 'Sign out' }).click();
+    await expect(page.getByRole('heading', { name: 'Sign in' })).toBeVisible();
+    await signIn(ADMIN.user, ADMIN.pass);
+    await expect(page.getByText('Enter the 6-digit code from your authenticator app.')).toBeVisible();
+    await page.locator('input[name="totp"]').fill(totpAt(secret, Date.now() + 30_000));
+    await page.getByRole('button', { name: 'Sign in' }).click();
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+    await expect(page.getByText('recovery codes left')).toBeVisible();
+    // Leave the admin as the other tests expect it: no second factor.
+    await page.getByLabel('Password, to turn it off').fill(ADMIN.pass);
+    await page.getByRole('button', { name: 'Turn off two-factor' }).click();
+    await expect(page.getByRole('button', { name: 'Set up two-factor sign-in' })).toBeVisible();
+    turnedOff = true;
+  } finally {
+    if (!turnedOff) await leaveWithoutTwoFactor(recoveryCodes);
+  }
 });
 
 // REQ: OBS-003 (ADR-171) — "everything except": each negated filter keeps exactly the rows its filter
