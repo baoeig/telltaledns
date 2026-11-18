@@ -944,6 +944,131 @@ test('api_003 two-factor works from the browser: turn it on, sign in with a code
   }
 });
 
+// REQ: API-004, API-005 (issue #63, ADR-175) — with `disable_local_login` on, a client in the break-glass
+// networks still sees the password form, which looked the same as with the flag off. The page now says
+// what the form is. The server here has no provider and the flag off, so a fresh browser context gets
+// the answers of `GET /auth/status` that a server with them would give (the shared page is left alone).
+test('api_004 the sign-in page says when password sign-in is restricted', async () => {
+  const keycloak = [{ id: 'kc', name: 'Keycloak' }];
+  const answer = (over: Record<string, unknown>) => ({ setupRequired: false, authenticated: false, localLogin: true, oidc: keycloak, ...over });
+  const signInPage = async (body: Record<string, unknown>) => {
+    const ctx = await page.context().browser()!.newContext({ baseURL: page.url().split('/#')[0] });
+    const p = await ctx.newPage();
+    await p.route('**/api/v1/auth/status', (route) => route.fulfill({ json: body }));
+    await p.goto('/#/');
+    await expect(p.getByRole('heading', { name: 'Sign in' })).toBeVisible();
+    return { p, close: () => ctx.close() };
+  };
+  const restricted = 'or, as an admin on a trusted network, with a password';
+  const plain = 'or with a password';
+
+  // The flag on, and this client is in the list: the form is there, and says what it is for.
+  let w = await signInPage(answer({ passwordLoginRestricted: true }));
+  await expect(w.p.getByRole('link', { name: 'Sign in with Keycloak' })).toBeVisible();
+  await expect(w.p.getByText(restricted, { exact: true })).toBeVisible();
+  await expect(w.p.getByText(plain, { exact: true })).toHaveCount(0);
+  await expect(w.p.getByLabel('Username', { exact: true })).toBeVisible();
+  await expect(w.p.getByLabel('Password', { exact: true })).toBeVisible();
+  await expect(w.p.getByTestId('password-restricted')).toHaveText(
+    'Password sign-in is limited to admins on trusted networks. Use it when your sign-in provider is down.',
+  );
+  await w.close();
+
+  // The flag on and no provider button (it could not be set up): the line is still there.
+  w = await signInPage(answer({ passwordLoginRestricted: true, oidc: [] }));
+  await expect(w.p.getByTestId('password-restricted')).toBeVisible();
+  await expect(w.p.getByLabel('Username', { exact: true })).toBeVisible();
+  await w.close();
+
+  // The flag off: the page is as it was, with no note.
+  w = await signInPage(answer({ passwordLoginRestricted: false }));
+  await expect(w.p.getByText(plain, { exact: true })).toBeVisible();
+  await expect(w.p.getByText(restricted, { exact: true })).toHaveCount(0);
+  await expect(w.p.getByTestId('password-restricted')).toHaveCount(0);
+  await expect(w.p.getByLabel('Username', { exact: true })).toBeVisible();
+  await w.close();
+
+  // A server that does not send the field (an older one) reads as the flag off.
+  w = await signInPage(answer({}));
+  await expect(w.p.getByText(plain, { exact: true })).toBeVisible();
+  await expect(w.p.getByTestId('password-restricted')).toHaveCount(0);
+  await w.close();
+
+  // Restricted, and this client is not in the list: the form is not offered, and the page says what it
+  // said before (no note about a form that is not there).
+  w = await signInPage(answer({ passwordLoginRestricted: true, localLogin: false }));
+  await expect(w.p.getByText('Password sign-in is turned off on this server.')).toBeVisible();
+  await expect(w.p.getByLabel('Username', { exact: true })).toHaveCount(0);
+  await expect(w.p.getByTestId('password-restricted')).toHaveCount(0);
+  await w.close();
+});
+
+// REQ: API-004, API-005 (issue #63, ADR-175) — an admin sees, under Settings -> Users, where password
+// sign-in is allowed, from the `passwordLogin` block of `GET /users` (admins only, so not in the public
+// status). The test server runs with the flag off, so the answer is rewritten per case and the route is
+// taken away at the end.
+test('api_004 settings shows where password sign-in is allowed', async () => {
+  let policy: Record<string, unknown> | null = null;
+  await page.route('**/api/v1/users', async (route) => {
+    const r = await route.fetch();
+    const body = await r.json();
+    if (policy) body.passwordLogin = policy;
+    else delete body.passwordLogin;
+    await route.fulfill({ response: r, json: body });
+  });
+  const show = async (p: Record<string, unknown> | null) => {
+    policy = p;
+    await page.goto('/#/settings?tab=users');
+    await page.reload();
+    await expect(page.getByRole('heading', { name: /^Users/ })).toBeVisible();
+    await expect(page.locator('main table')).toContainText(ADMIN.user);
+    return page.getByTestId('password-sign-in');
+  };
+  try {
+    // The flag off (what this server really says): nothing about it.
+    await expect(await show(null)).toHaveCount(0);
+    await expect(await show({ restricted: false, networks: [], reachesBeyondLoopback: false, trustedProxiesSet: false })).toHaveCount(0);
+
+    // The default-shaped list: each network, a warning that it reaches past this machine, and where to change it.
+    const lan = ['10.0.0.0/8', '192.168.0.0/16', '127.0.0.0/8', '::1/128'];
+    let card = await show({ restricted: true, networks: lan, reachesBeyondLoopback: true, trustedProxiesSet: false });
+    await expect(card).toBeVisible();
+    await expect(card.getByRole('heading', { name: 'Password sign-in' })).toBeVisible();
+    await expect(card).toContainText('Password sign-in is limited to admins on these networks:');
+    await expect(card.getByRole('listitem')).toHaveText(lan);
+    await expect(card.getByText('Not only this machine')).toBeVisible();
+    await expect(card).toContainText('allowed_admin_networks');
+    await expect(card).toContainText('[auth.oidc]');
+    await expect(card.getByRole('link', { name: 'Users and sign-in' })).toHaveAttribute('href', /running\.md#users-and-sign-in$/);
+    await expect(card.getByText('reverse proxy')).toHaveCount(0);
+
+    // This machine only, no proxy listed: no warning, and the hint about a proxy on this machine.
+    card = await show({ restricted: true, networks: ['127.0.0.0/8', '::1/128'], reachesBeyondLoopback: false, trustedProxiesSet: false });
+    await expect(card.getByRole('listitem')).toHaveText(['127.0.0.0/8', '::1/128']);
+    await expect(card.getByText('Not only this machine')).toHaveCount(0);
+    await expect(card.getByText('reverse proxy')).toBeVisible();
+    await expect(card).toContainText('trusted_proxies');
+
+    // This machine only, with a proxy listed: nothing to add.
+    card = await show({ restricted: true, networks: ['127.0.0.0/8', '::1/128'], reachesBeyondLoopback: false, trustedProxiesSet: true });
+    await expect(card.getByRole('listitem')).toHaveCount(2);
+    await expect(card.getByText('Not only this machine')).toHaveCount(0);
+    await expect(card.getByText('reverse proxy')).toHaveCount(0);
+
+    // No network at all: said plainly, with no empty list.
+    card = await show({ restricted: true, networks: [], reachesBeyondLoopback: false, trustedProxiesSet: false });
+    await expect(card).toContainText('nobody can sign in with a password');
+    await expect(card.getByRole('listitem')).toHaveCount(0);
+    await expect(card.getByText('Not only this machine')).toHaveCount(0);
+  } finally {
+    await page.unroute('**/api/v1/users');
+  }
+  // The route is gone: the real answer again, and no card.
+  await page.reload();
+  await expect(page.locator('main table')).toContainText(ADMIN.user);
+  await expect(page.getByTestId('password-sign-in')).toHaveCount(0);
+});
+
 // REQ: OBS-003 (ADR-171) — "everything except": each negated filter keeps exactly the rows its filter
 // leaves out (the two add up to the whole window), a flag without its filter is refused, and the
 // Queries page writes and reads the flags: the Match menu's "is not", and the "not" chip for statuses.
