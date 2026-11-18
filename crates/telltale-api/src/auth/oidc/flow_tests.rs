@@ -605,6 +605,244 @@ async fn api_004_disable_local_login_keeps_a_break_glass_admin() {
     ));
 }
 
+// ---- the break-glass gate (issue #63). These tests pin what the code does today, so a change to
+// it (the owner's decisions on the default list and on `X-Forwarded-For`) shows up here.
+
+/// `req` as if it arrived from `peer` (the listener puts the connection's address there).
+fn from_peer(peer: &str, mut req: Request<Body>) -> Request<Body> {
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::new(
+            peer.parse().unwrap(),
+            40_000,
+        )));
+    req
+}
+
+async fn answer(app: &Router, req: Request<Body>) -> (StatusCode, serde_json::Value) {
+    let r = app.clone().oneshot(req).await.unwrap();
+    let status = r.status();
+    let bytes = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+/// The sign-in form's request: `root`, with the right password.
+fn form_login(peer: &str, forwarded_for: Option<&str>) -> Request<Body> {
+    let mut b = Request::post("/api/v1/auth/login").header("content-type", "application/json");
+    if let Some(f) = forwarded_for {
+        b = b.header("x-forwarded-for", f);
+    }
+    from_peer(
+        peer,
+        b.body(Body::from(
+            serde_json::json!({"username": "root", "password": "correct horse battery"})
+                .to_string(),
+        ))
+        .unwrap(),
+    )
+}
+
+/// What the sign-in page is told: `localLogin` from `GET /auth/status`.
+async fn form_offered(app: &Router, peer: &str, forwarded_for: Option<&str>) -> bool {
+    let mut b = Request::get("/api/v1/auth/status");
+    if let Some(f) = forwarded_for {
+        b = b.header("x-forwarded-for", f);
+    }
+    let (s, v) = answer(app, from_peer(peer, b.body(Body::empty()).unwrap())).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    v["localLogin"].as_bool().unwrap()
+}
+
+fn net(s: &str, prefix: u8) -> (std::net::IpAddr, u8) {
+    (s.parse().unwrap(), prefix)
+}
+
+fn refused(v: &serde_json::Value) -> bool {
+    v.to_string()
+        .contains("password sign-in is off on this server")
+}
+
+/// REQ: API-004 (issue #63) — HTTP Basic obeys the same flag and list as the form, and the check
+/// comes before the one-minute cache of verified credentials: an admin from inside the list gets
+/// in, and the same credentials from outside it, right after, do not; a non-admin never does.
+#[tokio::test]
+async fn api_004_basic_is_gated_like_the_form() {
+    use base64::Engine as _;
+    let h = harness(Settings {
+        disable_local_login: true,
+        admin_networks: vec![net("192.168.1.0", 24)],
+        ..Settings::default()
+    });
+    h.auth
+        .create_user("ops", "correct horse battery", Role::Admin, true, 1)
+        .unwrap();
+    h.auth
+        .create_user("kid", "another long password", Role::Viewer, true, 1)
+        .unwrap();
+    let basic = |u: &str, p: &str| {
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{u}:{p}"))
+        )
+    };
+    let me = |peer: &str, credentials: &str| {
+        let mut r = from_peer(
+            peer,
+            Request::get("/api/v1/auth/me")
+                .header("authorization", credentials)
+                .body(Body::empty())
+                .unwrap(),
+        );
+        // Over the listener's own TLS, so that Basic is allowed at all.
+        r.extensions_mut()
+            .insert(crate::auth::routes::TlsConnection);
+        r
+    };
+    let ops = basic("ops", "correct horse battery");
+    let kid = basic("kid", "another long password");
+
+    let (s, v) = answer(&h.app, me("192.168.1.5", &ops)).await;
+    assert_eq!(s, StatusCode::OK, "an admin from inside the list: {v}");
+    let (s, v) = answer(&h.app, me("192.168.1.5", &kid)).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "a viewer from inside: {v}");
+    assert!(refused(&v), "it says why: {v}");
+    let (s, v) = answer(&h.app, me("10.9.9.9", &ops)).await;
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "the same admin from outside, with the credentials cached: {v}"
+    );
+    assert!(refused(&v), "{v}");
+    let (s, v) = answer(&h.app, me("10.9.9.9", &kid)).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "a viewer from outside: {v}");
+    // The page agrees: the form is offered inside the list only.
+    assert!(form_offered(&h.app, "192.168.1.5", None).await);
+    assert!(!form_offered(&h.app, "10.9.9.9", None).await);
+}
+
+/// REQ: API-004 (issue #63) — `allowed_admin_networks = []` leaves no address that may use a
+/// password: not loopback, not the LAN, for the form or for Basic, and the page hides the form.
+#[tokio::test]
+async fn api_004_empty_break_glass_list_refuses_everyone() {
+    use base64::Engine as _;
+    let h = harness(Settings {
+        disable_local_login: true,
+        admin_networks: Vec::new(),
+        ..Settings::default()
+    });
+    h.auth
+        .create_user("ops", "correct horse battery", Role::Admin, true, 1)
+        .unwrap();
+    for peer in ["127.0.0.1", "::1", "192.168.1.5", "203.0.113.9"] {
+        let (s, v) = answer(&h.app, form_login(peer, None)).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "form from {peer}: {v}");
+        assert!(refused(&v), "{peer}: {v}");
+        assert!(!form_offered(&h.app, peer, None).await, "{peer}");
+        let mut r = from_peer(
+            peer,
+            Request::get("/api/v1/auth/me")
+                .header(
+                    "authorization",
+                    format!(
+                        "Basic {}",
+                        base64::engine::general_purpose::STANDARD
+                            .encode("ops:correct horse battery")
+                    ),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        );
+        r.extensions_mut()
+            .insert(crate::auth::routes::TlsConnection);
+        let (s, v) = answer(&h.app, r).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "Basic from {peer}: {v}");
+    }
+}
+
+/// REQ: API-004 (issue #63) — `X-Forwarded-For` is read only from `[api] trusted_proxies`: a
+/// client that is not a proxy can't claim to be loopback, and from a proxy it is the rightmost
+/// entry that counts (the one the proxy added), not a forged one on the left.
+#[tokio::test]
+async fn api_004_forwarded_for_from_a_non_proxy_is_ignored_for_break_glass() {
+    let h = harness(Settings {
+        disable_local_login: true,
+        admin_networks: vec![net("127.0.0.0", 8), net("::1", 128)],
+        trusted_proxies: vec![net("10.0.0.1", 32)],
+        ..Settings::default()
+    });
+    // A LAN host sending the header itself.
+    let (s, v) = answer(&h.app, form_login("192.168.1.50", Some("127.0.0.1"))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+    assert!(!form_offered(&h.app, "192.168.1.50", Some("127.0.0.1")).await);
+    // Through the proxy: a forged `127.0.0.1` on the left, the real client added on the right.
+    let (s, v) = answer(
+        &h.app,
+        form_login("10.0.0.1", Some("127.0.0.1, 192.168.1.50")),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+    assert!(!form_offered(&h.app, "10.0.0.1", Some("127.0.0.1, 192.168.1.50")).await);
+    // The machine itself, with no proxy in between, is still let in.
+    let (s, v) = answer(&h.app, form_login("127.0.0.1", None)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(form_offered(&h.app, "127.0.0.1", None).await);
+}
+
+/// REQ: API-004 (issue #63) — the reason the docs say a proxy on the same host needs
+/// `trusted_proxies = ["127.0.0.1/32"]`: loopback is not trusted for `X-Forwarded-For` by itself,
+/// so with the list unset every browser the proxy serves looks like loopback and a loopback-only
+/// break-glass list is open to all of them; once the proxy is listed, the real client decides.
+#[tokio::test]
+async fn api_004_a_same_host_proxy_looks_like_loopback_until_it_is_listed() {
+    let loopback = || vec![net("127.0.0.0", 8), net("::1", 128)];
+    let h = harness(Settings {
+        disable_local_login: true,
+        admin_networks: loopback(),
+        trusted_proxies: Vec::new(),
+        ..Settings::default()
+    });
+    let (s, v) = answer(&h.app, form_login("127.0.0.1", Some("203.0.113.9"))).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "unset: the proxy's address is the client's, a stranger gets the form's answer: {v}"
+    );
+    assert!(form_offered(&h.app, "127.0.0.1", Some("203.0.113.9")).await);
+
+    let h = harness(Settings {
+        disable_local_login: true,
+        admin_networks: loopback(),
+        trusted_proxies: vec![net("127.0.0.1", 32)],
+        ..Settings::default()
+    });
+    let (s, v) = answer(&h.app, form_login("127.0.0.1", Some("203.0.113.9"))).await;
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "listed: the stranger is refused: {v}"
+    );
+    assert!(!form_offered(&h.app, "127.0.0.1", Some("203.0.113.9")).await);
+}
+
+/// REQ: API-004 (issue #63) — the reason the docs say `trusted_proxies` lists only the proxies,
+/// never the LAN: a machine inside a listed range can send `X-Forwarded-For: 127.0.0.1` itself and
+/// be believed. This is a misconfiguration, pinned here as what happens today (a hardening that
+/// ignores a forwarded loopback address from a non-loopback peer is the owner's decision).
+#[tokio::test]
+async fn api_004_a_trusted_range_that_covers_the_lan_believes_a_forged_loopback() {
+    let h = harness(Settings {
+        disable_local_login: true,
+        admin_networks: vec![net("127.0.0.0", 8), net("::1", 128)],
+        trusted_proxies: vec![net("10.0.0.0", 8)],
+        ..Settings::default()
+    });
+    let (s, v) = answer(&h.app, form_login("10.1.2.3", Some("127.0.0.1"))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(form_offered(&h.app, "10.1.2.3", Some("127.0.0.1")).await);
+}
+
 /// An access token from the fake provider, signed with its key.
 fn access_token(claims: &serde_json::Value) -> String {
     use base64::Engine as _;
