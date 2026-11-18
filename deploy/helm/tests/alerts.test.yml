@@ -301,4 +301,4 @@ tests:
         exp_alerts:
           - exp_labels: { severity: warning, job: telltale-metrics, instance: pi, list: broken }
             exp_annotations:
-              summary: Filter list broken has failed to refresh for over 48 hours (the last good copy is still in use).
+              summary: Filter list broken hasn't refreshed in over 48 hours and its latest refresh failed (the last good copy is still in use).
