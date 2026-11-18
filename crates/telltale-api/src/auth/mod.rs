@@ -245,6 +245,43 @@ pub struct Settings {
     pub trusted_proxies: Vec<(IpAddr, u8)>,
 }
 
+/// REQ: API-004 (issue #63, ADR-175) — every address in `net/prefix` is this machine's: 127.0.0.0/8
+/// or a part of it, or `::1`. (An IPv4-mapped form, or a network that only contains loopback among
+/// others, is not.) The start-up line and the Settings note both ask this, so they can't disagree.
+pub fn is_loopback_network(net: IpAddr, prefix: u8) -> bool {
+    match net {
+        IpAddr::V4(a) => a.is_loopback() && prefix >= 8,
+        IpAddr::V6(a) => a == std::net::Ipv6Addr::LOCALHOST && prefix == 128,
+    }
+}
+
+/// REQ: API-004 (issue #63, ADR-175) — some network in `networks` is more than this machine.
+pub fn reaches_beyond_loopback(networks: &[(IpAddr, u8)]) -> bool {
+    networks.iter().any(|(n, p)| !is_loopback_network(*n, *p))
+}
+
+// REQ: API-004 (issue #63, ADR-175)
+/// How password sign-in is restricted on this node: what an admin is shown under Settings, Users
+/// (`passwordLogin` in `GET /users`). It carries the networks, so it is never in a public answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PasswordLogin {
+    /// `[auth.oidc] disable_local_login` is on: password sign-in and HTTP Basic work only for
+    /// admins from `networks`.
+    pub restricted: bool,
+    /// While `restricted`: the networks (`address/prefix`, in the order of
+    /// `allowed_admin_networks`) admins may use a password from. Empty means nobody can: if the
+    /// sign-in provider is down, nobody can sign in with a password. Empty when not restricted.
+    pub networks: Vec<String>,
+    /// While `restricted`: some network is wider than this machine (not only loopback), so people
+    /// elsewhere on your network are still shown the password form. False when not restricted.
+    pub reaches_beyond_loopback: bool,
+    /// `[api] trusted_proxies` has entries. Without it a reverse proxy in front of this node hides
+    /// its clients' addresses, so a loopback-only list is open to everyone the proxy serves.
+    /// (Whether a proxy exists is not something this node can tell.)
+    pub trusted_proxies_set: bool,
+}
+
 /// `ip` is inside `net/len` (IPv4-mapped IPv6 addresses match IPv4 networks).
 pub fn in_network(ip: IpAddr, net: IpAddr, len: u8) -> bool {
     let ip = match ip {
@@ -265,6 +302,27 @@ pub fn in_network(ip: IpAddr, net: IpAddr, len: u8) -> bool {
             u128::from(a) & m == u128::from(n) & m
         }
         _ => false,
+    }
+}
+
+impl Settings {
+    /// REQ: API-004 (issue #63, ADR-175) — the password sign-in policy in force, for an admin.
+    pub fn password_login(&self) -> PasswordLogin {
+        let restricted = self.disable_local_login;
+        let networks: Vec<String> = if restricted {
+            self.admin_networks
+                .iter()
+                .map(|(a, p)| format!("{a}/{p}"))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        PasswordLogin {
+            restricted,
+            reaches_beyond_loopback: restricted && reaches_beyond_loopback(&self.admin_networks),
+            networks,
+            trusted_proxies_set: !self.trusted_proxies.is_empty(),
+        }
     }
 }
 

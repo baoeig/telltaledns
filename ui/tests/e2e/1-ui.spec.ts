@@ -881,30 +881,192 @@ function totpAt(secretBase32: string, ms: number): string {
   return String(n % 1_000_000).padStart(6, '0');
 }
 
+// REQ: API-003 (issue #64) — this file is one serial group on one admin, and every test after the one
+// below signs in with the password alone. If it fails while two-factor is on (and maybe signed out),
+// the rest would fail in a cascade that hides the real failure. So whatever happened, this puts the
+// admin back: signed in (with a recovery code, which needs no clock) and without a second factor.
+// It is quiet: the error that brought us here is the one to read.
+async function leaveWithoutTwoFactor(recoveryCodes: string[]) {
+  try {
+    const status = await (await page.request.get('/api/v1/auth/status')).json();
+    let csrf: string | undefined = status.csrfToken;
+    let on: boolean = status.user?.totpEnabled === true;
+    if (!status.authenticated) {
+      // No code was ever shown to us: two-factor never got turned on.
+      if (!recoveryCodes.length) return;
+      const r = await page.request.post('/api/v1/auth/login', {
+        data: { username: ADMIN.user, password: ADMIN.pass, recoveryCode: recoveryCodes[0] },
+      });
+      if (!r.ok()) return;
+      const signedIn = await r.json();
+      csrf = signedIn.csrfToken;
+      on = signedIn.user?.totpEnabled === true;
+    }
+    if (on && csrf) {
+      await page.request.post('/api/v1/auth/totp/disable', { data: { password: ADMIN.pass }, headers: { 'x-csrf-token': csrf } });
+    }
+  } catch {
+    // Nothing more can be done from here.
+  }
+}
+
 test('api_003 two-factor works from the browser: turn it on, sign in with a code, turn it off', async () => {
   // The helper first: RFC 6238's own secret ("12345678901234567890") at 59 s gives 94287082.
   expect(totpAt('GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ', 59_000)).toBe('287082');
-  await page.goto('/#/settings?tab=account');
-  await page.getByRole('button', { name: 'Set up two-factor sign-in' }).click();
-  const secret = ((await page.locator('div.mono.key').textContent()) ?? '').replace(/\s/g, '');
-  expect(secret).toMatch(/^[A-Z2-7]{32}$/);
-  await page.getByPlaceholder('123456').fill(totpAt(secret, Date.now()));
-  await page.getByRole('button', { name: 'Turn on' }).click();
-  await expect(page.getByText('Save these recovery codes now.')).toBeVisible();
-  // Sign in again: the password, then the code. The server takes each time step's code once, so
-  // this one is the next step's (it accepts one step of clock skew).
-  await page.getByRole('button', { name: 'Sign out' }).click();
-  await expect(page.getByRole('heading', { name: 'Sign in' })).toBeVisible();
-  await signIn(ADMIN.user, ADMIN.pass);
-  await expect(page.getByText('Enter the 6-digit code from your authenticator app.')).toBeVisible();
-  await page.locator('input[name="totp"]').fill(totpAt(secret, Date.now() + 30_000));
-  await page.getByRole('button', { name: 'Sign in' }).click();
-  await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
-  await expect(page.getByText('recovery codes left')).toBeVisible();
-  // Leave the admin as the other tests expect it: no second factor.
-  await page.getByLabel('Password, to turn it off').fill(ADMIN.pass);
-  await page.getByRole('button', { name: 'Turn off two-factor' }).click();
-  await expect(page.getByRole('button', { name: 'Set up two-factor sign-in' })).toBeVisible();
+  let recoveryCodes: string[] = [];
+  let turnedOff = false;
+  try {
+    await page.goto('/#/settings?tab=account');
+    await page.getByRole('button', { name: 'Set up two-factor sign-in' }).click();
+    const secret = ((await page.locator('div.mono.key').textContent()) ?? '').replace(/\s/g, '');
+    expect(secret).toMatch(/^[A-Z2-7]{32}$/);
+    await page.getByPlaceholder('123456').fill(totpAt(secret, Date.now()));
+    await page.getByRole('button', { name: 'Turn on' }).click();
+    await expect(page.getByText('Save these recovery codes now.')).toBeVisible();
+    recoveryCodes = (await page.locator('ul.codes li').allTextContents()).map((c) => c.trim());
+    // Sign in again: the password, then the code. The server takes each time step's code once, so
+    // this one is the next step's (it accepts one step of clock skew).
+    await page.getByRole('button', { name: 'Sign out' }).click();
+    await expect(page.getByRole('heading', { name: 'Sign in' })).toBeVisible();
+    await signIn(ADMIN.user, ADMIN.pass);
+    await expect(page.getByText('Enter the 6-digit code from your authenticator app.')).toBeVisible();
+    await page.locator('input[name="totp"]').fill(totpAt(secret, Date.now() + 30_000));
+    await page.getByRole('button', { name: 'Sign in' }).click();
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+    await expect(page.getByText('recovery codes left')).toBeVisible();
+    // Leave the admin as the other tests expect it: no second factor.
+    await page.getByLabel('Password, to turn it off').fill(ADMIN.pass);
+    await page.getByRole('button', { name: 'Turn off two-factor' }).click();
+    await expect(page.getByRole('button', { name: 'Set up two-factor sign-in' })).toBeVisible();
+    turnedOff = true;
+  } finally {
+    if (!turnedOff) await leaveWithoutTwoFactor(recoveryCodes);
+  }
+});
+
+// REQ: API-004, API-005 (issue #63, ADR-175) — with `disable_local_login` on, a client in the break-glass
+// networks still sees the password form, which looked the same as with the flag off. The page now says
+// what the form is. The server here has no provider and the flag off, so a fresh browser context gets
+// the answers of `GET /auth/status` that a server with them would give (the shared page is left alone).
+test('api_004 the sign-in page says when password sign-in is restricted', async () => {
+  const keycloak = [{ id: 'kc', name: 'Keycloak' }];
+  const answer = (over: Record<string, unknown>) => ({ setupRequired: false, authenticated: false, localLogin: true, oidc: keycloak, ...over });
+  const signInPage = async (body: Record<string, unknown>) => {
+    const ctx = await page.context().browser()!.newContext({ baseURL: page.url().split('/#')[0] });
+    const p = await ctx.newPage();
+    await p.route('**/api/v1/auth/status', (route) => route.fulfill({ json: body }));
+    await p.goto('/#/');
+    await expect(p.getByRole('heading', { name: 'Sign in' })).toBeVisible();
+    return { p, close: () => ctx.close() };
+  };
+  const restricted = 'or, as an admin on a trusted network, with a password';
+  const plain = 'or with a password';
+
+  // The flag on, and this client is in the list: the form is there, and says what it is for.
+  let w = await signInPage(answer({ passwordLoginRestricted: true }));
+  await expect(w.p.getByRole('link', { name: 'Sign in with Keycloak' })).toBeVisible();
+  await expect(w.p.getByText(restricted, { exact: true })).toBeVisible();
+  await expect(w.p.getByText(plain, { exact: true })).toHaveCount(0);
+  await expect(w.p.getByLabel('Username', { exact: true })).toBeVisible();
+  await expect(w.p.getByLabel('Password', { exact: true })).toBeVisible();
+  await expect(w.p.getByTestId('password-restricted')).toHaveText(
+    'Password sign-in is limited to admins on trusted networks. Use it when your sign-in provider is down.',
+  );
+  await w.close();
+
+  // The flag on and no provider button (it could not be set up): the line is still there.
+  w = await signInPage(answer({ passwordLoginRestricted: true, oidc: [] }));
+  await expect(w.p.getByTestId('password-restricted')).toBeVisible();
+  await expect(w.p.getByLabel('Username', { exact: true })).toBeVisible();
+  await w.close();
+
+  // The flag off: the page is as it was, with no note.
+  w = await signInPage(answer({ passwordLoginRestricted: false }));
+  await expect(w.p.getByText(plain, { exact: true })).toBeVisible();
+  await expect(w.p.getByText(restricted, { exact: true })).toHaveCount(0);
+  await expect(w.p.getByTestId('password-restricted')).toHaveCount(0);
+  await expect(w.p.getByLabel('Username', { exact: true })).toBeVisible();
+  await w.close();
+
+  // A server that does not send the field (an older one) reads as the flag off.
+  w = await signInPage(answer({}));
+  await expect(w.p.getByText(plain, { exact: true })).toBeVisible();
+  await expect(w.p.getByTestId('password-restricted')).toHaveCount(0);
+  await w.close();
+
+  // Restricted, and this client is not in the list: the form is not offered, and the page says what it
+  // said before (no note about a form that is not there).
+  w = await signInPage(answer({ passwordLoginRestricted: true, localLogin: false }));
+  await expect(w.p.getByText('Password sign-in is turned off on this server.')).toBeVisible();
+  await expect(w.p.getByLabel('Username', { exact: true })).toHaveCount(0);
+  await expect(w.p.getByTestId('password-restricted')).toHaveCount(0);
+  await w.close();
+});
+
+// REQ: API-004, API-005 (issue #63, ADR-175) — an admin sees, under Settings -> Users, where password
+// sign-in is allowed, from the `passwordLogin` block of `GET /users` (admins only, so not in the public
+// status). The test server runs with the flag off, so the answer is rewritten per case and the route is
+// taken away at the end.
+test('api_004 settings shows where password sign-in is allowed', async () => {
+  let policy: Record<string, unknown> | null = null;
+  await page.route('**/api/v1/users', async (route) => {
+    const r = await route.fetch();
+    const body = await r.json();
+    if (policy) body.passwordLogin = policy;
+    else delete body.passwordLogin;
+    await route.fulfill({ response: r, json: body });
+  });
+  const show = async (p: Record<string, unknown> | null) => {
+    policy = p;
+    await page.goto('/#/settings?tab=users');
+    await page.reload();
+    await expect(page.getByRole('heading', { name: /^Users/ })).toBeVisible();
+    await expect(page.locator('main table')).toContainText(ADMIN.user);
+    return page.getByTestId('password-sign-in');
+  };
+  try {
+    // The flag off (what this server really says): nothing about it.
+    await expect(await show(null)).toHaveCount(0);
+    await expect(await show({ restricted: false, networks: [], reachesBeyondLoopback: false, trustedProxiesSet: false })).toHaveCount(0);
+
+    // The default-shaped list: each network, a warning that it reaches past this machine, and where to change it.
+    const lan = ['10.0.0.0/8', '192.168.0.0/16', '127.0.0.0/8', '::1/128'];
+    let card = await show({ restricted: true, networks: lan, reachesBeyondLoopback: true, trustedProxiesSet: false });
+    await expect(card).toBeVisible();
+    await expect(card.getByRole('heading', { name: 'Password sign-in' })).toBeVisible();
+    await expect(card).toContainText('Password sign-in is limited to admins on these networks:');
+    await expect(card.getByRole('listitem')).toHaveText(lan);
+    await expect(card.getByText('Not only this machine')).toBeVisible();
+    await expect(card).toContainText('allowed_admin_networks');
+    await expect(card).toContainText('[auth.oidc]');
+    await expect(card.getByRole('link', { name: 'Users and sign-in' })).toHaveAttribute('href', /running\.md#users-and-sign-in$/);
+    await expect(card.getByText('reverse proxy')).toHaveCount(0);
+
+    // This machine only, no proxy listed: no warning, and the hint about a proxy on this machine.
+    card = await show({ restricted: true, networks: ['127.0.0.0/8', '::1/128'], reachesBeyondLoopback: false, trustedProxiesSet: false });
+    await expect(card.getByRole('listitem')).toHaveText(['127.0.0.0/8', '::1/128']);
+    await expect(card.getByText('Not only this machine')).toHaveCount(0);
+    await expect(card.getByText('reverse proxy')).toBeVisible();
+    await expect(card).toContainText('trusted_proxies');
+
+    // This machine only, with a proxy listed: nothing to add.
+    card = await show({ restricted: true, networks: ['127.0.0.0/8', '::1/128'], reachesBeyondLoopback: false, trustedProxiesSet: true });
+    await expect(card.getByRole('listitem')).toHaveCount(2);
+    await expect(card.getByText('Not only this machine')).toHaveCount(0);
+    await expect(card.getByText('reverse proxy')).toHaveCount(0);
+
+    // No network at all: said plainly, with no empty list.
+    card = await show({ restricted: true, networks: [], reachesBeyondLoopback: false, trustedProxiesSet: false });
+    await expect(card).toContainText('nobody can sign in with a password');
+    await expect(card.getByRole('listitem')).toHaveCount(0);
+    await expect(card.getByText('Not only this machine')).toHaveCount(0);
+  } finally {
+    await page.unroute('**/api/v1/users');
+  }
+  // The route is gone: the real answer again, and no card.
+  await page.reload();
+  await expect(page.locator('main table')).toContainText(ADMIN.user);
+  await expect(page.getByTestId('password-sign-in')).toHaveCount(0);
 });
 
 // REQ: OBS-003 (ADR-171) — "everything except": each negated filter keeps exactly the rows its filter
