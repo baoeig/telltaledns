@@ -1065,8 +1065,8 @@ impl Federated {
     ///
     /// REQ: CLU-004, CLU-002 (ADR-174, final review F1) — a range of more than
     /// [`federation::TIMESERIES_MAX_WINDOWS`] windows is asked of no peer: they are listed in
-    /// `missingNodes` (this node's own data and shipped minutes still answer). The longest
-    /// range any step documents is under half that.
+    /// `missingNodes` (this node's own data and shipped minutes still answer), and the log says
+    /// so. The longest range any step documents is under half that.
     fn peer_timeseries(
         &self,
         peers: Vec<String>,
@@ -1080,6 +1080,7 @@ impl Federated {
         } else if let Some(w) = federation::timeseries_chunks(step, from_s, to_s) {
             w
         } else {
+            bridge::WAITS.refused(bridge::Refused::TooBig);
             // Records who isn't connected, as a read does, and adds the peers that weren't asked.
             let _ = self.gather(Vec::new());
             self.not_asked(&peers);

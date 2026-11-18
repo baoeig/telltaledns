@@ -20,11 +20,14 @@
 //!    call per node and window of time (`telltale_api::federation::timeseries_chunks`, which
 //!    bounds that on its own, first).
 //!
+//! A read that is refused is counted and said in the log, as a warning at most once a minute
+//! ([`Limiter::refused`]).
+//!
 //! No `block_in_place`: it panics outside a worker (the release profile aborts on a panic) and
 //! ties the runtime's own liveness to the blocking pool.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, mpsc};
 use std::time::{Duration, Instant};
 
@@ -46,11 +49,76 @@ pub(super) const MAX_CALLS: usize = 1024;
 /// The cap every federated read of this process shares.
 pub(super) static WAITS: LazyLock<Limiter> = LazyLock::new(|| Limiter::new(MAX_WAITS));
 
+/// How often, at most, refused reads are said in the log.
+const SAY_EVERY_MS: u64 = 60_000;
+
+/// Why a read was not sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Refused {
+    /// [`MAX_WAITS`] reads were already waiting.
+    Full,
+    /// The read asked for too much at once: over [`MAX_CALLS`] calls, or a range of time of too
+    /// many windows.
+    TooBig,
+}
+
+/// How many reads were refused for each reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Tally {
+    full: u64,
+    too_big: u64,
+}
+
+/// What was refused since the last line said so, and when that was.
+#[derive(Debug, Default)]
+struct RefusalLog {
+    /// The clock (milliseconds, any origin) of the last line, plus one: zero is "never".
+    last: AtomicU64,
+    full: AtomicU64,
+    too_big: AtomicU64,
+}
+
+impl RefusalLog {
+    /// Counts a refused read. Returns what to say when a line is due: the first time, then once
+    /// a minute at most, with what was counted since the last line (which this resets). Of any
+    /// number of threads that find a line due, one gets it, and a refusal is in exactly one line.
+    fn note(&self, why: Refused, now_ms: u64) -> Option<Tally> {
+        match why {
+            Refused::Full => self.full.fetch_add(1, Ordering::AcqRel),
+            Refused::TooBig => self.too_big.fetch_add(1, Ordering::AcqRel),
+        };
+        let stamp = now_ms.saturating_add(1);
+        let last = self.last.load(Ordering::Acquire);
+        if last != 0 && stamp.saturating_sub(last) < SAY_EVERY_MS {
+            return None;
+        }
+        self.last
+            .compare_exchange(last, stamp, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(Tally {
+            full: self.full.swap(0, Ordering::AcqRel),
+            too_big: self.too_big.swap(0, Ordering::AcqRel),
+        })
+    }
+
+    /// What is counted and not yet said.
+    #[cfg(test)]
+    fn pending(&self) -> Tally {
+        Tally {
+            full: self.full.load(Ordering::Acquire),
+            too_big: self.too_big.load(Ordering::Acquire),
+        }
+    }
+}
+
 /// A count of federated waits in flight, with a cap.
 #[derive(Debug)]
 pub(super) struct Limiter {
     in_flight: Arc<AtomicUsize>,
     max: usize,
+    log: RefusalLog,
+    /// The refusal log's clock: monotonic, from when this was made.
+    since: Instant,
 }
 
 /// One wait's place under the cap. It is given back when the wait's last task ends (not when
@@ -69,6 +137,28 @@ impl Limiter {
         Self {
             in_flight: Arc::new(AtomicUsize::new(0)),
             max,
+            log: RefusalLog::default(),
+            since: Instant::now(),
+        }
+    }
+
+    /// REQ: CLU-004 (final review, F2) — counts a read that was not sent, and says so in the log
+    /// as a warning: the first time, then at most once a minute, with how many were refused
+    /// since the last line. A silent refusal showed as healthy peers in `missingNodes`.
+    pub(super) fn refused(&self, why: Refused) {
+        let now = u64::try_from(self.since.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let Some(n) = self.log.note(why, now) {
+            tracing::warn!(
+                "federated reads are being refused and were not sent: {} because {} reads were \
+                 already waiting (a slow or silent node), {} because they asked for too much at \
+                 once (over {MAX_CALLS} calls, or over {} windows of time a node); counted since \
+                 the last line of this kind, at most one a minute. The nodes they were for show \
+                 as not answering",
+                n.full,
+                self.max,
+                n.too_big,
+                telltale_api::federation::TIMESERIES_MAX_WINDOWS,
+            );
         }
     }
 
@@ -138,6 +228,7 @@ where
     // REQ: CLU-004, CLU-002 (final review, F1) — the places below count reads, not the tasks
     // each makes: a read of this many calls is not sent, and takes no place.
     if futures.len() > MAX_CALLS {
+        limiter.refused(Refused::TooBig);
         drop(futures);
         for (r, peer) in results.iter_mut().zip(&peers) {
             *r = Some(Err(format!(
@@ -147,6 +238,7 @@ where
         return pending(peers, results, None);
     }
     let Some(permit) = limiter.acquire() else {
+        limiter.refused(Refused::Full);
         for (r, peer) in results.iter_mut().zip(&peers) {
             *r = Some(Err(format!(
                 "{peer} wasn't asked: too many cluster reads are already waiting"
@@ -504,6 +596,113 @@ mod tests {
         );
         assert_eq!(sent.load(Ordering::SeqCst), MAX_CALLS);
         wait_until("every place is given back", || limiter.in_flight() == 0);
+    }
+
+    // REQ: CLU-004 (final review, F2) — a refused read is said out loud (a warning) the first
+    // time, then at most once a minute, with how many were refused for each reason since the
+    // last line. The clock is the test's own.
+    #[test]
+    fn clu_004_refused_reads_are_logged_once_a_minute_with_their_count() {
+        let log = RefusalLog::default();
+        let tally = |full, too_big| Some(Tally { full, too_big });
+        // The first one is said at once.
+        assert_eq!(log.note(Refused::Full, 5), tally(1, 0));
+        // Then a minute of counting and no line.
+        assert_eq!(log.note(Refused::Full, 6), None);
+        assert_eq!(log.note(Refused::TooBig, 30_000), None);
+        assert_eq!(log.note(Refused::Full, 59_004), None);
+        // A minute after the last line, one line with what came in since (and this one).
+        assert_eq!(log.note(Refused::TooBig, 60_005), tally(2, 2));
+        assert_eq!(log.pending(), Tally::default(), "a line resets the count");
+        // And quiet for another minute.
+        assert_eq!(log.note(Refused::Full, 60_006), None);
+        assert_eq!(log.note(Refused::Full, 120_004), None);
+        assert_eq!(log.note(Refused::Full, 120_005), tally(3, 0));
+    }
+
+    // REQ: CLU-004 (final review, F2) — however many threads refuse at once, no refusal is lost
+    // or counted twice: what the lines said, and what is still waiting for the next line, add up
+    // to every refusal.
+    #[test]
+    fn clu_004_refusals_are_counted_exactly_under_concurrency() {
+        let log = Arc::new(RefusalLog::default());
+        let (threads, each) = (8_u64, 2_000_u64);
+        let said: u64 = (0..threads)
+            .map(|t| {
+                let log = Arc::clone(&log);
+                std::thread::spawn(move || {
+                    let mut said = 0;
+                    for i in 0..each {
+                        // A virtual second per refusal, so a line is due about every 60th.
+                        let why = if (t + i) % 3 == 0 {
+                            Refused::TooBig
+                        } else {
+                            Refused::Full
+                        };
+                        if let Some(n) = log.note(why, i * 1000) {
+                            said += n.full + n.too_big;
+                        }
+                    }
+                    said
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .sum();
+        let waiting = log.pending();
+        assert_eq!(said + waiting.full + waiting.too_big, threads * each);
+    }
+
+    // REQ: CLU-004 (final review, F2) — a read that `start` does not send is counted for the
+    // line, for either reason.
+    #[test]
+    fn clu_004_a_refused_read_is_counted_for_the_log() {
+        let rt = runtime(2);
+        let limiter = Limiter::new(1);
+        // The first refusal is the one that is said at once; take it, so the next are only counted.
+        let _ = limiter.log.note(Refused::Full, 0);
+        let (open, shut) = tokio::sync::oneshot::channel::<()>();
+        let held: Vec<(String, Call)> = vec![(
+            "held".into(),
+            Box::pin(async move {
+                let _ = shut.await;
+                Ok(b"H".to_vec())
+            }),
+        )];
+        let first = start(&limiter, rt.handle(), held, Duration::from_secs(30));
+        let sent = Arc::new(AtomicUsize::new(0));
+        // Over the cap of reads.
+        let _ = start(
+            &limiter,
+            rt.handle(),
+            vec![("late".into(), counting(&sent))],
+            Duration::from_secs(30),
+        )
+        .wait();
+        assert_eq!(
+            limiter.log.pending(),
+            Tally {
+                full: 1,
+                too_big: 0
+            }
+        );
+        open.send(()).unwrap();
+        assert_eq!(first.wait()[0].1, Ok(b"H".to_vec()));
+        wait_until("the place is given back", || limiter.in_flight() == 0);
+        // Over the cap of calls.
+        let calls: Vec<(String, Call)> = (0..=MAX_CALLS)
+            .map(|i| (format!("p{i}"), counting(&sent)))
+            .collect();
+        let _ = start(&limiter, rt.handle(), calls, Duration::from_secs(30)).wait();
+        assert_eq!(
+            limiter.log.pending(),
+            Tally {
+                full: 1,
+                too_big: 1
+            }
+        );
+        assert_eq!(sent.load(Ordering::SeqCst), 0);
     }
 
     // REQ: CLU-004 (ADR-174) — any calling context: from a current-thread runtime's own thread
