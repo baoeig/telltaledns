@@ -1759,6 +1759,10 @@ links to eligible nodes, and one of those doesn't stop the search. Configuration
 files always come from the primary (another replica has none to give), over the node's own
 link when that's to the primary, else from the primary's addresses directly. Each time the
 link comes up the log says where: `cluster: linked to a peer` with its URL and node ID.
+Once it has moved back, the two replicas drop each other from their peer lists within about
+18 seconds: a replica only reports the primary (and, under automatic failover, the other
+voters) as peers it expects to hear from, so a link like this one doesn't leave
+`TelltaleDNSClusterPeerDown` firing. A replica that is really down is reported by the primary.
 
 **One view of the whole cluster.** Open any node's UI and the dashboard, top lists, latency,
 groups, query log, and live query stream cover every node:
@@ -2113,7 +2117,9 @@ telltale cluster status
 - **Metrics:**
   - `telltale_cluster_peers{state}`;
   - per peer: `telltale_cluster_peer_up`, `telltale_cluster_peer_rtt_seconds` and
-    `telltale_cluster_peer_config_lag`;
+    `telltale_cluster_peer_config_lag`. The primary lists every node; a replica lists the
+    primary, the other voters under automatic failover, and any other node only while a link
+    to it is open or it was heard from in the last 15 seconds;
   - this node: `telltale_cluster_config_seq`, `telltale_cluster_behind_seconds`,
     `telltale_cluster_sync_error` and `telltale_cluster_cert_expiry_timestamp_seconds`.
 

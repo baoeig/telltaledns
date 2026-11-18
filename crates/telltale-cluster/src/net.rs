@@ -79,6 +79,15 @@ fn defers_to_git(
             .any(|(git, up, eligible)| git && up && eligible)
 }
 
+/// REQ: CLU-001 (ADR-173) — whether a node keeps a peer that has gone silent in its member list
+/// (and so in `telltale_cluster_peer_up`, as down). The primary keeps every peer: each one is
+/// meant to dial it. A replica keeps the primary, and under automatic failover the other voters
+/// (`voter_link`: [`mesh`] keeps a stream to each). Any other peer was a passing stream, such as
+/// one replica's fallback to another while the primary didn't answer, and is forgotten.
+fn keeps_silent_peer(self_primary: bool, peer_primary: bool, voter_link: bool) -> bool {
+    self_primary || peer_primary || voter_link
+}
+
 /// REQ: CLU-005 (ADR-154) — how long a node leaves the election to a Git-managed node while no
 /// primary is up; after that it stands anyway, as it did before ADR-154 (an emergency primary
 /// is better than none).
@@ -1026,6 +1035,40 @@ impl Cluster {
         };
         let s = s.trim();
         (!s.is_empty()).then(|| s.to_owned())
+    }
+
+    /// REQ: CLU-001 (ADR-173) — forgets the peers this node has no standing link to once their
+    /// stream has ended and they've been silent past [`Member::up`]'s window (see
+    /// [`keeps_silent_peer`]). Without this, a replica that streamed to another replica for a
+    /// while (it fell back to it while the primary didn't answer, or the other dialed in) kept
+    /// it for good as a down peer, and `TelltaleDNSClusterPeerDown` fired on both of them.
+    /// `id` is the current identity (failover mode and registry). Returns the IDs forgotten.
+    pub fn forget_stray_peers(&self, id: &Identity) -> Vec<String> {
+        self.forget_stray_peers_at(id, now_ms())
+    }
+
+    fn forget_stray_peers_at(&self, id: &Identity, now: u64) -> Vec<String> {
+        let primary = self.is_primary();
+        let voters = if crate::failover::active(id) {
+            crate::failover::voters(id)
+        } else {
+            Vec::new()
+        };
+        let mut members = self.members.lock().unwrap_or_else(PoisonError::into_inner);
+        let gone: Vec<String> = members
+            .values()
+            .filter(|m| {
+                !m.connected
+                    && !m.up(now)
+                    && !keeps_silent_peer(primary, m.primary, voters.contains(&m.node_id))
+            })
+            .map(|m| m.node_id.clone())
+            .collect();
+        for g in &gone {
+            members.remove(g);
+            debug!(peer = %g, "cluster: forgot a peer this node has no standing link to");
+        }
+        gone
     }
 
     /// Drops ephemeral members not heard from for `ttl` from the registry (primary only, CLU-009).
@@ -2291,15 +2334,26 @@ impl Cluster {
     }
 }
 
-/// Reads frames from `body` into `cluster` until it ends.
+/// Reads frames from `body` into `cluster` until it ends, or until `switch` (when given) is
+/// notified; either way the peer is marked disconnected.
 async fn read_frames(
     cluster: &Arc<Cluster>,
     body: Incoming,
     mut peer: Option<String>,
     via: &'static str,
     echo: &EchoSlot,
+    switch: Option<&Notify>,
 ) -> Result<(), String> {
-    let result = read_loop(cluster, body, &mut peer, via, echo).await;
+    // REQ: CLU-001 (ADR-173) — a stream the caller ends (a replica moving back to the primary)
+    // is marked disconnected too: ending it from outside used to skip the clean-up below, and
+    // the replica it had been on stayed connected (and listed, down) for good.
+    let result = match switch {
+        Some(s) => tokio::select! {
+            r = read_loop(cluster, body, &mut peer, via, echo) => r,
+            () = s.notified() => Ok(()),
+        },
+        None => read_loop(cluster, body, &mut peer, via, echo).await,
+    };
     // Streams that ended can't carry RPCs any more.
     cluster
         .outbox
@@ -2560,8 +2614,15 @@ async fn handle(
                 Some(id.clone()),
             ));
             tokio::spawn(async move {
-                if let Err(e) =
-                    read_frames(&c, req.into_body(), Some(id.clone()), "inbound", &echo).await
+                if let Err(e) = read_frames(
+                    &c,
+                    req.into_body(),
+                    Some(id.clone()),
+                    "inbound",
+                    &echo,
+                    None,
+                )
+                .await
                 {
                     debug!(peer = %id, "cluster stream ended: {e}");
                 }
@@ -2800,6 +2861,9 @@ pub async fn mesh(cluster: Arc<Cluster>, mut stop: watch::Receiver<bool>) {
             () = tokio::time::sleep(Duration::from_secs(3)) => {}
         }
         let id = cluster.identity.reload();
+        // REQ: CLU-001 (ADR-173) — the peers this node keeps no link to leave its member list
+        // once they're silent, in any failover mode.
+        cluster.forget_stray_peers(&id);
         let Ok(cfg) = client_config(&id) else {
             continue;
         };
@@ -3013,10 +3077,15 @@ async fn stream_once(
             node: server_id.clone(),
         });
     }
-    let result = tokio::select! {
-        done = read_frames(&cluster, r.into_body(), server_id, "outbound", &echo) => done,
-        () = switch.notified() => Ok(()),
-    };
+    let result = read_frames(
+        &cluster,
+        r.into_body(),
+        server_id,
+        "outbound",
+        &echo,
+        Some(&switch),
+    )
+    .await;
     writer.abort();
     cluster
         .connected
