@@ -460,6 +460,7 @@ fn api_004_start_up_says_where_password_sign_in_is_still_open() {
 // `telltale_api::auth`, and this test is what keeps them from drifting apart. The block is read
 // as the JSON the page gets, so the names the page reads are the ones pinned here.
 #[test]
+#[allow(clippy::too_many_lines)] // one story: every list against every proxy list, then the flag off
 fn api_004_the_start_up_line_and_the_policy_agree() {
     use telltale_api::auth::{in_network, is_loopback_network};
     let lists: Vec<(&str, Vec<Cidr>)> = vec![
