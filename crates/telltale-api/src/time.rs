@@ -27,6 +27,17 @@ pub fn parse_time(text: &str, now_s: u64) -> Result<u64, String> {
     })
 }
 
+/// REQ: OBS-024 (T13.1) — an end time the request may leave to the endpoint's default: `None`
+/// for no text, an empty one, or `now`, since whole-second `now` ([`parse_time`]) ends at the
+/// start of the second the request is in and leaves out what was logged in it (issue #69).
+/// Anything else is an exact end, as [`parse_time`] reads it.
+pub fn parse_until(text: Option<&str>, now_s: u64) -> Result<Option<u64>, String> {
+    match text.map(str::trim) {
+        None | Some("" | "now") => Ok(None),
+        Some(t) => parse_time(t, now_s).map(Some),
+    }
+}
+
 /// REQ: OBS-033 — like [`parse_time`], in Unix milliseconds: an RFC 3339 time keeps its
 /// milliseconds (a page cursor must not round to the second).
 pub fn parse_time_ms(text: &str, now_ms: u64) -> Result<u64, String> {

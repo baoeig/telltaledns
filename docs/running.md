@@ -1475,7 +1475,7 @@ Explain answers for one name. A simulation answers for a whole change: before yo
   # "simulation": {"rows": 183204, "newlyBlocked": {"queries": 412, "devices": 2,
   #   "topNames": [{"name": "www.tiktok.com", "queries": 300, "devices": 2, "list": "quick rule: tiktok.com"}]}, ...}
   ```
-  The window ends now, including the second the request arrives in, so a query logged a moment ago is replayed. `simulateUntil` moves the end back (`-24h`, or an RFC 3339 time). A change that can't affect an answer, such as an alert rule or the exclusions, answers `"applicable": false` instead of replaying anything.
+  The window ends now, including the second the request arrives in, so a query logged a moment ago is replayed. `simulateUntil` moves the end back (`-24h`, or an RFC 3339 time); `now` is the same as leaving it out. A change that can't affect an answer, such as an alert rule or the exclusions, answers `"applicable": false` instead of replaying anything.
 - **A whole configuration:** `POST /api/v1/simulate` takes the shared sections as JSON, the way a Git commit's TOML becomes. `telltale config simulate` reads the TOML for you, so you can test a commit before pushing it:
   ```sh
   TELLTALE_TOKEN=... telltale config simulate shared.toml --window 24h --url https://dns.example.com:8053

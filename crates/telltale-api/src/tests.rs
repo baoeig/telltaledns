@@ -2448,6 +2448,37 @@ fn obs_024_simulate_parameters() {
     assert!(simulate_opts(&opts(true, Some("24h"), Some("soon")), NOW).is_err());
 }
 
+// REQ: OBS-024 (T13.1) — issue #69: an end of `now` (or an empty one) is no end at all, so the
+// backend's default applies: the end of the request's own second. Read as the whole second
+// `now`, it ended at the start of that second and left out what had just been logged. Any other
+// end stays exactly what it says.
+#[test]
+fn obs_024_until_now_is_the_default() {
+    use crate::config_api::{WriteOpts, simulate_opts};
+    let until_of = |until: Option<&str>| {
+        simulate_opts(
+            &WriteOpts {
+                dry_run: true,
+                simulate: Some("24h".to_owned()),
+                simulate_until: until.map(str::to_owned),
+            },
+            NOW,
+        )
+        .unwrap()
+        .unwrap()
+        .until_s
+    };
+    for given in [None, Some("now"), Some(" now "), Some("")] {
+        assert_eq!(until_of(given), None, "{given:?}");
+    }
+    assert_eq!(until_of(Some("-1h")), Some(NOW - 3600));
+    let at = "2026-10-03T12:00:00Z";
+    assert_eq!(
+        until_of(Some(at)),
+        Some(crate::time::parse_time(at, NOW).unwrap())
+    );
+}
+
 // REQ: AGT-005 — a change made through MCP is audited with the agent's address: the REST
 // call behind the tool runs in-process and has no peer address of its own.
 #[tokio::test]

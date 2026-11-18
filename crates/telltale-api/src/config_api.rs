@@ -1487,11 +1487,8 @@ pub(crate) fn simulate_opts(d: &WriteOpts, now_s: u64) -> Result<Option<Simulate
         return Err(Problem::invalid("`simulate` needs `dryRun=true`")
             .hint("A simulation previews a change: add dryRun=true."));
     }
-    let until_s = d
-        .simulate_until
-        .as_deref()
-        .map(|u| crate::time::parse_time(u, now_s))
-        .transpose()
+    // REQ: OBS-024 (T13.1) — `now` is no end given: the backend's default takes in this second.
+    let until_s = crate::time::parse_until(d.simulate_until.as_deref(), now_s)
         .map_err(|e| Problem::invalid(format!("`simulateUntil`: {e}")))?;
     let window =
         (!auto && !text.is_empty() && !text.eq_ignore_ascii_case("true")).then(|| text.to_owned());
