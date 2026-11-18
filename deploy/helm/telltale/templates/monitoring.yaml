@@ -61,12 +61,17 @@ spec:
           labels: { severity: warning }
           annotations:
             summary: More than 5% of answers are SERVFAIL on {{ "{{" }} $labels.instance {{ "}}" }}.
+        {{- /* REQ: FLT-004, `spec/06` §6 "list fetch failing for > 48 h" — failing, not merely
+        old: a list's refresh_secs may exceed 48 h, and a list disabled at runtime keeps its last
+        success, so either ages without anything being wrong. */}}
         - alert: TelltaleDNSListStale
-          expr: time() - telltale_list_last_success_timestamp_seconds{job=~"{{ include "telltale.fullname" . }}(-resolver)?-metrics"} > 172800
+          expr: |
+            (time() - telltale_list_last_success_timestamp_seconds{job=~"{{ include "telltale.fullname" . }}(-resolver)?-metrics"} > 172800)
+              and on(instance, list) (telltale_list_fetch_consecutive_failures{job=~"{{ include "telltale.fullname" . }}(-resolver)?-metrics"} > 0)
           for: 30m
           labels: { severity: warning }
           annotations:
-            summary: Filter list {{ "{{" }} $labels.list {{ "}}" }} hasn't refreshed in over 48 hours.
+            summary: Filter list {{ "{{" }} $labels.list {{ "}}" }} has failed to refresh for over 48 hours (the last good copy is still in use).
         - alert: TelltaleDNSTelemetryDropping
           expr: sum by (instance) (rate(telltale_telemetry_dropped_total{job=~"{{ include "telltale.fullname" . }}(-resolver)?-metrics"}[10m])) > 0
           for: 30m
