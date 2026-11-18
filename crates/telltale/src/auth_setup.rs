@@ -3,12 +3,12 @@
 //! first-run setup token in `<data_dir>/setup-token`, and ends stale sessions.
 
 use std::io::{self, Write as _};
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use telltale_api::auth::{Auth, Role, Settings, crypto};
+use telltale_api::auth::{Auth, Role, Settings, crypto, reaches_beyond_loopback};
 use telltale_config::{Cidr, Config, OidcConfig, UserRole};
 use telltale_store::state::State;
 use tracing::{error, info, warn};
@@ -49,14 +49,6 @@ fn settings(cfg: &Config) -> Settings {
     }
 }
 
-/// Whether every address in `net` is this machine's: 127.0.0.0/8 or a part of it, or `::1`.
-fn only_loopback(net: &Cidr) -> bool {
-    match net.addr {
-        IpAddr::V4(a) => a.is_loopback() && net.prefix >= 8,
-        IpAddr::V6(a) => a == Ipv6Addr::LOCALHOST && net.prefix == 128,
-    }
-}
-
 /// REQ: API-004 (issue #63) — what start-up says when `disable_local_login` is on, and how loudly.
 /// A list that reaches beyond this machine (the default does: private networks and loopback)
 /// leaves password sign-in open to admins there, and the form is still shown: that is a warning,
@@ -64,6 +56,10 @@ fn only_loopback(net: &Cidr) -> bool {
 /// pointer to `trusted_proxies` unless it is set (a proxy on this host makes every browser look
 /// like loopback). An empty list means nobody can use a password: a warning. Returns whether it
 /// is a warning, and the line.
+///
+/// REQ: API-004 (ADR-175) — "reaches beyond this machine" is `telltale_api::auth::
+/// reaches_beyond_loopback`, the rule the Settings note (`GET /users`, `passwordLogin`) is built
+/// from too, so the log line and the page can't disagree.
 fn break_glass_notice(networks: &[Cidr], trusted_proxies: &[Cidr]) -> (bool, String) {
     if networks.is_empty() {
         return (
@@ -76,7 +72,8 @@ fn break_glass_notice(networks: &[Cidr], trusted_proxies: &[Cidr]) -> (bool, Str
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ");
-    if networks.iter().all(only_loopback) {
+    let pairs: Vec<(IpAddr, u8)> = networks.iter().map(|n| (n.addr, n.prefix)).collect();
+    if !reaches_beyond_loopback(&pairs) {
         let proxy = if trusted_proxies.is_empty() {
             "; if a reverse proxy on this machine serves the UI, list it in [api] trusted_proxies (127.0.0.1/32): otherwise every browser it serves looks like loopback and may use a password"
         } else {

@@ -843,6 +843,250 @@ async fn api_004_a_trusted_range_that_covers_the_lan_believes_a_forged_loopback(
     assert!(form_offered(&h.app, "10.1.2.3", Some("127.0.0.1")).await);
 }
 
+// ---- the policy is visible (issue #63, ADR-175)
+
+/// The whole `GET /auth/status` answer for a client at `peer`.
+async fn status_for(app: &Router, peer: &str) -> serde_json::Value {
+    let (s, v) = answer(
+        app,
+        from_peer(
+            peer,
+            Request::get("/api/v1/auth/status")
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    v
+}
+
+/// REQ: API-004, API-005 (issue #63, ADR-175) — the public sign-in status says whether password
+/// sign-in is restricted (`disable_local_login`): the same for every client, whatever
+/// `localLogin` says for it, and without the networks (those are for admins).
+#[tokio::test]
+async fn api_004_status_says_when_password_sign_in_is_restricted() {
+    // The flag off: not restricted, offered to everyone.
+    let h = harness(Settings::default());
+    for peer in ["192.168.1.5", "203.0.113.9"] {
+        let v = status_for(&h.app, peer).await;
+        assert_eq!(v["passwordLoginRestricted"], false, "{peer}: {v}");
+        assert_eq!(v["localLogin"], true, "{peer}: {v}");
+    }
+
+    // The flag on, with a network: restricted for an allowed client and for one outside the list;
+    // `localLogin` keeps saying whether the form is offered to this client.
+    let h = harness(Settings {
+        disable_local_login: true,
+        admin_networks: vec![net("192.168.1.0", 24)],
+        ..Settings::default()
+    });
+    let inside = status_for(&h.app, "192.168.1.5").await;
+    assert_eq!(inside["passwordLoginRestricted"], true, "{inside}");
+    assert_eq!(inside["localLogin"], true, "{inside}");
+    let outside = status_for(&h.app, "10.9.9.9").await;
+    assert_eq!(outside["passwordLoginRestricted"], true, "{outside}");
+    assert_eq!(outside["localLogin"], false, "{outside}");
+
+    // The flag on and no network at all: still restricted, offered to nobody.
+    let h = harness(Settings {
+        disable_local_login: true,
+        admin_networks: Vec::new(),
+        ..Settings::default()
+    });
+    let v = status_for(&h.app, "127.0.0.1").await;
+    assert_eq!(v["passwordLoginRestricted"], true, "{v}");
+    assert_eq!(v["localLogin"], false, "{v}");
+
+    // Public: one boolean, and no network list anywhere in the answer.
+    let mut keys: Vec<&str> = inside
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "authenticated",
+            "localLogin",
+            "oidc",
+            "passwordLoginRestricted",
+            "setupRequired"
+        ],
+        "{inside}"
+    );
+    assert!(
+        !inside.to_string().contains("192.168.1.0"),
+        "a network must not appear in a public answer: {inside}"
+    );
+}
+
+/// A signed-in session's cookie for `username`, on the real clock.
+fn cookie_for(h: &Harness, username: &str) -> String {
+    let user = h.auth.state().user_by_name(username).unwrap().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let s = h
+        .auth
+        .start_session(&user, "127.0.0.1".parse().unwrap(), now)
+        .unwrap();
+    format!("{}={}", crate::auth::routes::COOKIE, s.cookie)
+}
+
+/// `GET /users` as `cookie` (none: anonymous).
+async fn users_as(app: &Router, cookie: Option<&str>) -> (StatusCode, serde_json::Value) {
+    let mut b = Request::get("/api/v1/users");
+    if let Some(c) = cookie {
+        b = b.header("cookie", c);
+    }
+    answer(app, b.body(Body::empty()).unwrap()).await
+}
+
+/// REQ: API-004, AGT-004 (issue #63, ADR-175) — the networks password sign-in is limited to are
+/// told to admins only, in the admin-only user list: an anonymous caller, a viewer, an operator,
+/// and a read token of an admin get a refusal that says nothing about them. An admin gets the
+/// block for the default-shaped list, a loopback-only list, and an empty one.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one story: who is refused, then what an admin is told
+async fn api_004_the_policy_detail_is_admin_only() {
+    let reach = vec![
+        net("10.0.0.0", 8),
+        net("192.168.0.0", 16),
+        net("127.0.0.0", 8),
+        net("fc00::", 7),
+        net("::1", 128),
+    ];
+    let h = harness(Settings {
+        disable_local_login: true,
+        admin_networks: reach,
+        ..Settings::default()
+    });
+    h.auth
+        .create_user("vic", "a viewer password", Role::Viewer, false, 1)
+        .unwrap();
+    h.auth
+        .create_user("opal", "an operator password", Role::Operator, false, 1)
+        .unwrap();
+
+    // Who is refused, and that the refusal carries no network.
+    let (id, secret) = (
+        crate::auth::crypto::random_id(),
+        crate::auth::crypto::random_secret(),
+    );
+    let root = h.auth.state().user_by_name("root").unwrap().unwrap();
+    h.auth
+        .state()
+        .create_token(
+            &id,
+            root.id,
+            "reader",
+            &crate::auth::crypto::secret_hash(&secret),
+            "read",
+            None,
+            1,
+        )
+        .unwrap();
+    let read_token = Request::get("/api/v1/users")
+        .header("authorization", format!("Bearer tt_{id}_{secret}"))
+        .body(Body::empty())
+        .unwrap();
+    for (who, (status, body)) in [
+        ("anonymous", users_as(&h.app, None).await),
+        (
+            "a viewer",
+            users_as(&h.app, Some(&cookie_for(&h, "vic"))).await,
+        ),
+        (
+            "an operator",
+            users_as(&h.app, Some(&cookie_for(&h, "opal"))).await,
+        ),
+        ("a read token of an admin", answer(&h.app, read_token).await),
+    ] {
+        let expected = if who == "anonymous" {
+            StatusCode::UNAUTHORIZED
+        } else {
+            StatusCode::FORBIDDEN
+        };
+        assert_eq!(status, expected, "{who}: {body}");
+        assert!(
+            !body.to_string().contains("10.0.0.0") && body.get("passwordLogin").is_none(),
+            "{who} must not be told the policy: {body}"
+        );
+    }
+
+    // An admin is told: the list as configured, in order, as `address/prefix`.
+    let admin = cookie_for(&h, "root");
+    let (s, v) = users_as(&h.app, Some(&admin)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["items"].as_array().map(Vec::len), Some(3), "{v}");
+    assert_eq!(
+        v["passwordLogin"],
+        serde_json::json!({
+            "restricted": true,
+            "networks": ["10.0.0.0/8", "192.168.0.0/16", "127.0.0.0/8", "fc00::/7", "::1/128"],
+            "reachesBeyondLoopback": true,
+            "trustedProxiesSet": false
+        })
+    );
+
+    // Loopback only, with a proxy listed.
+    let h = harness(Settings {
+        disable_local_login: true,
+        admin_networks: vec![net("127.0.0.0", 8), net("::1", 128)],
+        trusted_proxies: vec![net("127.0.0.1", 32)],
+        ..Settings::default()
+    });
+    let (s, v) = users_as(&h.app, Some(&cookie_for(&h, "root"))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["passwordLogin"],
+        serde_json::json!({
+            "restricted": true,
+            "networks": ["127.0.0.0/8", "::1/128"],
+            "reachesBeyondLoopback": false,
+            "trustedProxiesSet": true
+        })
+    );
+
+    // An empty list: restricted, and nobody may use a password.
+    let h = harness(Settings {
+        disable_local_login: true,
+        admin_networks: Vec::new(),
+        ..Settings::default()
+    });
+    let (_, v) = users_as(&h.app, Some(&cookie_for(&h, "root"))).await;
+    assert_eq!(
+        v["passwordLogin"],
+        serde_json::json!({
+            "restricted": true,
+            "networks": [],
+            "reachesBeyondLoopback": false,
+            "trustedProxiesSet": false
+        })
+    );
+
+    // The flag off: not restricted, and the list in the settings (unused) is not reported.
+    let h = harness(Settings {
+        disable_local_login: false,
+        admin_networks: vec![net("10.0.0.0", 8)],
+        ..Settings::default()
+    });
+    let (_, v) = users_as(&h.app, Some(&cookie_for(&h, "root"))).await;
+    assert_eq!(
+        v["passwordLogin"],
+        serde_json::json!({
+            "restricted": false,
+            "networks": [],
+            "reachesBeyondLoopback": false,
+            "trustedProxiesSet": false
+        })
+    );
+}
+
 /// An access token from the fake provider, signed with its key.
 fn access_token(claims: &serde_json::Value) -> String {
     use base64::Engine as _;

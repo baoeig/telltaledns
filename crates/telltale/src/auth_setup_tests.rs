@@ -320,3 +320,72 @@ fn api_004_start_up_says_where_password_sign_in_is_still_open() {
         assert_eq!(!warning, only_this_machine, "{list}: {line}");
     }
 }
+
+// REQ: API-004 (issue #63, ADR-175) — what start-up says and what an admin is shown in Settings
+// (`GET /users`, `passwordLogin`) are one fact: the same networks in the same order, the same
+// answer to "does the list reach beyond this machine", and the same proxy hint. Both read it from
+// `telltale_api::auth`, and this test is what keeps them from drifting apart.
+#[test]
+fn api_004_the_start_up_line_and_the_policy_agree() {
+    let lists: Vec<(&str, Vec<Cidr>)> = vec![
+        (
+            "the default list",
+            Config::default().auth.oidc.allowed_admin_networks,
+        ),
+        ("loopback", cidrs(&["127.0.0.0/8", "::1/128"])),
+        ("one loopback host", cidrs(&["127.0.0.1/32"])),
+        (
+            "loopback and one LAN host",
+            cidrs(&["127.0.0.0/8", "192.168.1.5/32"]),
+        ),
+        ("every address", cidrs(&["0.0.0.0/0"])),
+        ("a /7 around 127.0.0.0", cidrs(&["127.0.0.0/7"])),
+        ("::1/64", cidrs(&["::1/64"])),
+        ("an IPv4-mapped loopback", cidrs(&["::ffff:127.0.0.1/128"])),
+        ("an empty list", Vec::new()),
+    ];
+    for (what, networks) in lists {
+        for proxies in [Vec::new(), cidrs(&["127.0.0.1/32"])] {
+            let mut c = break_glass(Path::new("/nonexistent/tt-agree"), networks.clone(), None);
+            c.api.trusted_proxies = proxies.clone();
+            let policy = settings(&c).password_login();
+            let (warning, line) = break_glass_notice(&networks, &proxies);
+            let ctx = format!("{what}, {} proxies: {line}", proxies.len());
+
+            assert!(policy.restricted, "{ctx}");
+            let listed: Vec<String> = networks.iter().map(ToString::to_string).collect();
+            assert_eq!(policy.networks, listed, "the same networks: {ctx}");
+            assert_eq!(
+                policy.trusted_proxies_set,
+                !proxies.is_empty(),
+                "the proxy list: {ctx}"
+            );
+            let loopback = line.contains("restricted to loopback");
+            assert_eq!(
+                loopback,
+                !networks.is_empty() && !policy.reaches_beyond_loopback,
+                "'restricted to loopback' is what the policy says: {ctx}"
+            );
+            assert_eq!(
+                warning,
+                networks.is_empty() || policy.reaches_beyond_loopback,
+                "a warning when it reaches past this machine, or reaches nobody: {ctx}"
+            );
+            assert_eq!(
+                line.contains("trusted_proxies"),
+                loopback && !policy.trusted_proxies_set,
+                "the proxy hint shows when the policy says no proxy is listed: {ctx}"
+            );
+        }
+    }
+
+    // The flag off: nothing is restricted, and the list that is set is not reported.
+    let mut off = break_glass(
+        Path::new("/nonexistent/tt-agree"),
+        Config::default().auth.oidc.allowed_admin_networks,
+        None,
+    );
+    off.auth.oidc.disable_local_login = false;
+    let policy = settings(&off).password_login();
+    assert!(!policy.restricted && policy.networks.is_empty() && !policy.reaches_beyond_loopback);
+}

@@ -1143,7 +1143,8 @@ async fn fallback(
         auth::routes::LoginResponse, auth::routes::PasswordChange, auth::routes::TotpSetup,
         auth::routes::TotpCode, auth::routes::PasswordConfirm, auth::routes::RecoveryCodes,
         auth::routes::TokenInfo, auth::routes::TokenKind, auth::routes::CreateToken, auth::routes::NewToken, auth::routes::DisplayInfo, auth::routes::CreateDisplay, auth::routes::NewDisplay, auth::routes::OpenDisplay, auth::routes::DisplayOpened,
-        auth::routes::UserInfo, auth::routes::CreateUser, auth::routes::UpdateUser,
+        auth::routes::UserInfo, auth::routes::UserList, auth::PasswordLogin,
+        auth::routes::CreateUser, auth::routes::UpdateUser,
         auth::routes::AuditInfo, auth::routes::AuditPage, auth::routes::AuditVerify,
         auth::routes::OidcButton, auth::routes::LogoutResult
     )),
