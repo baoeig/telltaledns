@@ -3,7 +3,7 @@
 //!
 //! The `Backend` trait is synchronous, so a federated read starts its RPCs on the runtime and
 //! waits for the answers on a thread of its own: a blocking-pool thread, where the API runs its
-//! backend calls. Two rules:
+//! backend calls. Three rules:
 //!
 //! 1. The wait never needs the runtime to end it. It is a `recv_timeout` on a `std` channel,
 //!    for the RPC's own timeout plus a short grace. A runtime that can't run the tasks (every
@@ -14,6 +14,11 @@
 //! 2. Few waits at once. Each holds a thread (of the blocking pool's 512) for up to its deadline,
 //!    so a slow or dead primary can't pile them up. Past [`MAX_WAITS`] a read is told "didn't
 //!    answer" without being sent.
+//! 3. Few calls in a read. A read is one task per call and holds one place under rule 2 for all
+//!    of them, so the places bound reads, not tasks: a read of more than [`MAX_CALLS`] calls is
+//!    not sent either (every call: "wasn't asked"). A read for the nodes' time buckets is one
+//!    call per node and window of time (`telltale_api::federation::timeseries_chunks`, which
+//!    bounds that on its own, first).
 //!
 //! No `block_in_place`: it panics outside a worker (the release profile aborts on a panic) and
 //! ties the runtime's own liveness to the blocking pool.
@@ -29,6 +34,14 @@ pub(super) const GRACE: Duration = Duration::from_millis(250);
 /// Federated waits in flight at once on this node (each is a read: all of its peers together).
 /// A healthy cluster's reads end in milliseconds; this only bounds a slow or dead peer's cost.
 const MAX_WAITS: usize = 32;
+
+/// The most calls one read may have. A read is one call to each peer, or, for a range of time,
+/// one to each peer for each window of it (the longest range any step documents is 87 windows,
+/// and `telltale_api::federation::TIMESERIES_MAX_WINDOWS` caps one at 256): this lets a cluster
+/// of 11 peers ask for all of history by the day, and 23 for 7 days of minutes, and no more.
+/// Over it the whole read is not sent: each of its calls is a task, and the places of
+/// [`MAX_WAITS`] count reads.
+pub(super) const MAX_CALLS: usize = 1024;
 
 /// The cap every federated read of this process shares.
 pub(super) static WAITS: LazyLock<Limiter> = LazyLock::new(|| Limiter::new(MAX_WAITS));
@@ -98,8 +111,9 @@ impl Drop for Pending {
 }
 
 /// Starts each of `calls` (a peer, and its RPC) as a task on `rt` and returns at once. `timeout`
-/// is the RPCs' own; the wait ends [`GRACE`] after it at the latest. Over the cap nothing is
-/// started, and every call's result is "wasn't asked".
+/// is the RPCs' own; the wait ends [`GRACE`] after it at the latest. Over the cap of reads, or
+/// with more than [`MAX_CALLS`] calls, nothing is started, and every call's result is "wasn't
+/// asked".
 pub(super) fn start<Fut>(
     limiter: &Limiter,
     rt: &tokio::runtime::Handle,
@@ -119,6 +133,17 @@ where
         gave_up: Arc::new(AtomicBool::new(false)),
     };
     if futures.is_empty() {
+        return pending(peers, results, None);
+    }
+    // REQ: CLU-004, CLU-002 (final review, F1) — the places below count reads, not the tasks
+    // each makes: a read of this many calls is not sent, and takes no place.
+    if futures.len() > MAX_CALLS {
+        drop(futures);
+        for (r, peer) in results.iter_mut().zip(&peers) {
+            *r = Some(Err(format!(
+                "{peer} wasn't asked: the read has too many calls at once"
+            )));
+        }
         return pending(peers, results, None);
     }
     let Some(permit) = limiter.acquire() else {
@@ -410,6 +435,75 @@ mod tests {
         .wait();
         assert_eq!(third[0].1, Ok(b"T".to_vec()));
         assert_eq!(sent.load(Ordering::SeqCst), 0);
+    }
+
+    /// A call that counts the times it is run.
+    fn counting(sent: &Arc<AtomicUsize>) -> Call {
+        let sent = Arc::clone(sent);
+        Box::pin(async move {
+            sent.fetch_add(1, Ordering::SeqCst);
+            Ok(b"ok".to_vec())
+        })
+    }
+
+    // REQ: CLU-004, CLU-002 (ADR-174, final review F1) — a read of more than 1024 calls is not
+    // sent at all: none of its calls is run, none takes a place under the cap, and every call is
+    // told "wasn't asked". Before: one task per call, however many (a viewer's request for a long
+    // range of seconds made millions), under one place.
+    #[test]
+    fn clu_004_a_read_over_the_call_cap_is_not_sent() {
+        let rt = runtime(2);
+        let limiter = Limiter::new(8);
+        let sent = Arc::new(AtomicUsize::new(0));
+        assert_eq!(MAX_CALLS, 1024, "the number the ADR and the docs give");
+        let calls: Vec<(String, Call)> = (0..=MAX_CALLS)
+            .map(|i| (format!("p{i}"), counting(&sent)))
+            .collect();
+        let started = Instant::now();
+        let got = start(&limiter, rt.handle(), calls, Duration::from_secs(30)).wait();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            got.len(),
+            MAX_CALLS + 1,
+            "one answer for each call, in order"
+        );
+        assert!(
+            got.iter().enumerate().all(|(i, (peer, r))| {
+                *peer == format!("p{i}") && r.as_ref().is_err_and(|e| e.contains("wasn't asked"))
+            }),
+            "{:?}",
+            got.first()
+        );
+        assert_eq!(limiter.in_flight(), 0, "a refused read takes no place");
+        assert_eq!(sent.load(Ordering::SeqCst), 0, "no call was run");
+    }
+
+    // REQ: CLU-004, CLU-002 (final review, F1) — the cap is on what a read may ask, not a cut
+    // in what is sent: a read of exactly 1024 calls (a 12-node cluster's whole history by the
+    // day) is sent in full and answered in order.
+    #[test]
+    fn clu_004_a_read_at_the_call_cap_is_sent_in_full() {
+        let rt = runtime(2);
+        let limiter = Limiter::new(8);
+        let sent = Arc::new(AtomicUsize::new(0));
+        let calls: Vec<(String, Call)> = (0..MAX_CALLS)
+            .map(|i| (format!("p{i}"), counting(&sent)))
+            .collect();
+        let got = start(&limiter, rt.handle(), calls, Duration::from_secs(30)).wait();
+        assert_eq!(got.len(), MAX_CALLS);
+        assert!(
+            got.iter()
+                .enumerate()
+                .all(|(i, (peer, r))| { *peer == format!("p{i}") && *r == Ok(b"ok".to_vec()) }),
+            "{:?}",
+            got.iter().find(|(_, r)| r.is_err())
+        );
+        assert_eq!(sent.load(Ordering::SeqCst), MAX_CALLS);
+        wait_until("every place is given back", || limiter.in_flight() == 0);
     }
 
     // REQ: CLU-004 (ADR-174) — any calling context: from a current-thread runtime's own thread
