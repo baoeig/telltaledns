@@ -60,6 +60,12 @@ const REPROBE_MIN: Duration = Duration::from_millis(100);
 const REPROBE_MAX: Duration = Duration::from_millis(400);
 /// A look at the primary that takes longer than this counts as no answer.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// How often [`mesh`] runs: the sweep for stray peers on every node, and, in automatic failover,
+/// the streams to the other voters. Tests look sooner.
+#[cfg(not(test))]
+const MESH_EVERY: Duration = Duration::from_secs(3);
+#[cfg(test)]
+const MESH_EVERY: Duration = Duration::from_millis(100);
 
 fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
@@ -2903,7 +2909,7 @@ pub async fn mesh(cluster: Arc<Cluster>, mut stop: watch::Receiver<bool>) {
     loop {
         tokio::select! {
             _ = stop.changed() => return,
-            () = tokio::time::sleep(Duration::from_secs(3)) => {}
+            () = tokio::time::sleep(MESH_EVERY) => {}
         }
         let id = cluster.identity.reload();
         // REQ: CLU-001 (ADR-173) — the peers this node keeps no link to leave its member list
