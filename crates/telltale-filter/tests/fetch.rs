@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use telltale_filter::fetch::{
-    Client, FetchSettings, Fetcher, ListSource, ListSpec, Outcome, Resolve, Store,
+    Client, FetchSettings, Fetcher, ListMeta, ListSource, ListSpec, Outcome, Resolve, Store,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -531,6 +531,245 @@ async fn flt_004_file_and_inline_sources() {
         f.store().read_source("manual").unwrap(),
         b"||ads.example.com^\n@@||ok.example.com^\n"
     );
+}
+
+// ---------------------------------------------------------------- inline lists that are refused
+
+fn inline(name: &str, rules: &[&str]) -> ListSpec {
+    ListSpec {
+        source: ListSource::Inline(rules.iter().map(|r| (*r).to_owned()).collect()),
+        ..spec(name, String::new())
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn meta_of(f: &Fetcher, name: &str) -> ListMeta {
+    f.status().into_iter().find(|(n, _)| n == name).unwrap().1
+}
+
+/// What `Fetcher::run` does between two sleeps: ask `due`, refresh what it names, and ask again
+/// at once (`run` `continue`s after a round, without waiting). Returns the refreshes made before
+/// `due` came back empty, the point where `run` would sleep; `max_rounds` stands for "never".
+async fn refresh_until_idle(f: &Fetcher, specs: &[ListSpec], max_rounds: usize) -> usize {
+    let mut refreshes = 0;
+    for _ in 0..max_rounds {
+        let (due, _) = f.due(specs, unix_now());
+        if due.is_empty() {
+            break;
+        }
+        for spec in &due {
+            f.refresh_one(spec).await;
+            refreshes += 1;
+        }
+    }
+    refreshes
+}
+
+/// The next "stored content changed" signal from `run`.
+async fn changed(rx: &mut watch::Receiver<u64>) {
+    let signalled = tokio::time::timeout(Duration::from_secs(5), rx.changed()).await;
+    assert!(
+        matches!(signalled, Ok(Ok(()))),
+        "no change signal within 5 s: {signalled:?}"
+    );
+}
+
+/// Polls for up to five seconds: a bound on a wait for an event, not a pause the test relies on.
+async fn wait_until(what: &str, mut ok: impl FnMut() -> bool) {
+    for _ in 0..500 {
+        if ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(ok(), "timed out waiting for {what}");
+}
+
+/// REQ: FLT-004 — an inline list whose rules are refused (blank rules fail the sanity check,
+/// mostly-invalid ones the usable-list check) has no copy to keep and a config that doesn't change
+/// by itself, so retrying it can't help: `run` re-asks `due` straight after a round, and a list
+/// that is "due" every time turns that into a loop (a synced meta-file write and a WARN per
+/// pass). It's tried once, counted as failing, and waits for a change to its rules.
+#[tokio::test]
+async fn flt_004_a_failing_inline_list_waits_for_a_config_change() {
+    let cases: [(&str, &[&str]); 2] = [
+        ("blank rules", &[" ", "\t"]),
+        (
+            "mostly invalid rules",
+            &["{\"error\": 1}", "{\"retry\": 2}"],
+        ),
+    ];
+    for (what, rules) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = fetcher(tmp.path(), settings(), &[]);
+        let bad = inline("l", rules);
+
+        let refreshes = refresh_until_idle(&f, std::slice::from_ref(&bad), 1000).await;
+        let m = meta_of(&f, "l");
+        assert_eq!(
+            refreshes, 1,
+            "{what}: {refreshes} refreshes in 1000 rounds (failures {}); `run` would spin",
+            m.consecutive_failures
+        );
+        // Still reported: the count and the error feed `telltale_list_fetch_consecutive_failures`
+        // and the in-app `list_failing` rule.
+        assert_eq!(m.consecutive_failures, 1, "{what}");
+        assert!(m.last_error.is_some(), "{what}");
+        assert!(!m.has_content(), "{what}");
+        assert_eq!(
+            refresh_until_idle(&f, std::slice::from_ref(&bad), 1000).await,
+            0,
+            "{what}: idle stays idle"
+        );
+
+        // A change to the rules is a new list: tried at once, and counted again when refused.
+        let mut more = rules.to_vec();
+        more.push(rules[0]);
+        let edited = inline("l", &more);
+        assert_eq!(
+            refresh_until_idle(&f, std::slice::from_ref(&edited), 1000).await,
+            1,
+            "{what}: an edit is tried at once, then waits again"
+        );
+        assert_eq!(meta_of(&f, "l").consecutive_failures, 2, "{what}");
+
+        // Rules that work load, reset the count, and are never refreshed again.
+        let good = inline("l", &["||ads.example.com^"]);
+        assert_eq!(
+            refresh_until_idle(&f, std::slice::from_ref(&good), 1000).await,
+            1
+        );
+        let m = meta_of(&f, "l");
+        assert!(m.has_content() && m.consecutive_failures == 0, "{what}");
+        assert_eq!(
+            refresh_until_idle(&f, std::slice::from_ref(&good), 1000).await,
+            0,
+            "{what}: a loaded inline list is left alone"
+        );
+    }
+}
+
+/// REQ: FLT-004 — what is allowed to bring a refused inline list back without an edit to its
+/// rules: turning it off and on again, and a restart (changes to `[filter]`, such as
+/// `max_invalid_percent`, are read at start, and they decide what "usable" means).
+#[tokio::test]
+async fn flt_004_a_refused_inline_list_is_retried_when_re_enabled_and_after_a_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = fetcher(tmp.path(), settings(), &[]);
+    let junk = inline(
+        "l",
+        &["a.com", "b.com", "{\"x\": 1}", "{\"y\": 2}", "{\"z\": 3}"],
+    );
+    assert_eq!(
+        refresh_until_idle(&f, std::slice::from_ref(&junk), 100).await,
+        1,
+        "refused once"
+    );
+
+    // Off: never due. On again: a new try.
+    let off = ListSpec {
+        enabled: false,
+        ..junk.clone()
+    };
+    assert_eq!(refresh_until_idle(&f, &[off], 100).await, 0);
+    assert_eq!(
+        refresh_until_idle(&f, std::slice::from_ref(&junk), 100).await,
+        1,
+        "re-enabling is a retry"
+    );
+    assert_eq!(meta_of(&f, "l").consecutive_failures, 2);
+    assert_eq!(
+        refresh_until_idle(&f, std::slice::from_ref(&junk), 100).await,
+        0
+    );
+
+    // A restart with a more lenient `max_invalid_percent` loads it: 3 of 5 lines invalid is
+    // refused at 50 and accepted at 100.
+    let restarted = fetcher(
+        tmp.path(),
+        FetchSettings {
+            max_invalid_percent: 100,
+            ..settings()
+        },
+        &[],
+    );
+    assert_eq!(
+        refresh_until_idle(&restarted, std::slice::from_ref(&junk), 100).await,
+        1,
+        "a restart tries again"
+    );
+    let m = meta_of(&restarted, "l");
+    assert!(m.has_content() && m.consecutive_failures == 0, "{m:?}");
+    assert_eq!(
+        refresh_until_idle(&restarted, std::slice::from_ref(&junk), 100).await,
+        0
+    );
+}
+
+/// REQ: FLT-004 — the same through the real `run` loop: a refused inline list is tried when it is
+/// added, when someone asks for a refresh, when its rules change, and when it is switched off and
+/// on again, and at no other time. A second inline list whose rules change in the same step is the
+/// marker that `run` has handled the step (its arrival is signalled on `changed`).
+#[tokio::test]
+async fn flt_004_run_loop_retries_a_refused_inline_list_only_on_a_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = fetcher(tmp.path(), settings(), &[]);
+    let bad = inline("bad", &[" "]);
+    let (specs_tx, specs_rx) = watch::channel(Arc::new(vec![
+        bad.clone(),
+        inline("marker", &["||one.example^"]),
+    ]));
+    let (changed_tx, mut changed_rx) = watch::channel(0u64);
+    let task = tokio::spawn(Arc::clone(&f).run(specs_rx, changed_tx));
+    let failures = |f: &Arc<Fetcher>| meta_of(f, "bad").consecutive_failures;
+
+    // Added: tried once, in the round that loaded the marker.
+    changed(&mut changed_rx).await;
+    assert_eq!(failures(&f), 1, "tried when added");
+
+    // "Refresh now" refreshes every enabled list, a refused one too.
+    f.request_refresh();
+    wait_until("the manual refresh", || failures(&f) >= 2).await;
+    assert_eq!(failures(&f), 2, "tried when asked");
+
+    // An edit to its rules is tried at once.
+    let edited = inline("bad", &[" ", "\t"]);
+    specs_tx
+        .send(Arc::new(vec![
+            edited.clone(),
+            inline("marker", &["||one.example^"]),
+        ]))
+        .unwrap();
+    wait_until("the edit", || failures(&f) >= 3).await;
+    assert_eq!(failures(&f), 3, "tried when edited");
+
+    // Switched off (with the marker's rules changing in the same step, so its arrival says `run`
+    // has seen the disabled list) and on again.
+    let off = ListSpec {
+        enabled: false,
+        ..edited.clone()
+    };
+    specs_tx
+        .send(Arc::new(vec![off, inline("marker", &["||two.example^"])]))
+        .unwrap();
+    changed(&mut changed_rx).await;
+    assert_eq!(failures(&f), 3, "off: not tried");
+    specs_tx
+        .send(Arc::new(vec![
+            edited,
+            inline("marker", &["||two.example^"]),
+        ]))
+        .unwrap();
+    wait_until("the re-enable", || failures(&f) >= 4).await;
+    assert_eq!(failures(&f), 4, "tried when switched on again");
+
+    task.abort();
 }
 
 // REQ: FLT-004 — a slow or unreachable source doesn't hold back the lists that arrived: the

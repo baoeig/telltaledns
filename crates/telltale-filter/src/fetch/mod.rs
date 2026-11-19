@@ -142,8 +142,9 @@ pub enum Outcome {
     Held(String),
 }
 
-/// Retry a failing list after 5 min, doubling up to 1 h (but never later than its normal
-/// refresh), instead of waiting a whole refresh interval.
+/// Retry a failing URL or file list after 5 min, doubling up to 1 h (but never later than its
+/// normal refresh), instead of waiting a whole refresh interval. (Inline rules are different:
+/// see [`Fetcher::is_refused`].)
 const FAIL_RETRY_BASE: u64 = 300;
 const FAIL_RETRY_MAX: u64 = 3600;
 
@@ -165,6 +166,10 @@ pub struct Fetcher {
     client: Client,
     settings: FetchSettings,
     metas: Mutex<HashMap<String, ListMeta>>,
+    /// REQ: FLT-004 — the inline lists whose rules this process tried and refused, by list name,
+    /// each with the source key of the refused rules. Memory only: a restart tries again, because
+    /// `[filter]` settings (what counts as usable) and the parser can have changed since.
+    refused: Mutex<HashMap<String, String>>,
     refresh_now: Notify,
 }
 
@@ -175,6 +180,7 @@ impl Fetcher {
             client,
             settings,
             metas: Mutex::new(HashMap::new()),
+            refused: Mutex::new(HashMap::new()),
             refresh_now: Notify::new(),
         }
     }
@@ -212,6 +218,40 @@ impl Fetcher {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(name.to_owned(), meta);
+    }
+
+    /// REQ: FLT-004 — remembers that an inline list's rules (identified by `key`) were refused,
+    /// or forgets it once they load.
+    fn note_inline_outcome(&self, spec: &ListSpec, key: &str, outcome: &Outcome) {
+        if !matches!(spec.source, ListSource::Inline(_)) {
+            return;
+        }
+        let mut refused = self.refused.lock().unwrap_or_else(PoisonError::into_inner);
+        if matches!(outcome, Outcome::Failed(_)) {
+            refused.insert(spec.name.clone(), key.to_owned());
+        } else {
+            refused.remove(&spec.name);
+        }
+    }
+
+    /// REQ: FLT-004 — true while `spec` is an inline list whose current rules this process has
+    /// already refused. Inline rules change only with the config (which changes their key), so
+    /// trying them again can't give another answer; offering them as due again would also make
+    /// `run`, which asks `due` straight after a round, refresh them in a loop (a synced metadata
+    /// write and a warning per pass, dozens a second). The URL ladder doesn't apply: there is no
+    /// server to wait for.
+    fn is_refused(&self, spec: &ListSpec, meta: &ListMeta) -> bool {
+        if !matches!(spec.source, ListSource::Inline(_)) {
+            return false;
+        }
+        let key = spec.source.key();
+        meta.source == key
+            && self
+                .refused
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&spec.name)
+                .is_some_and(|k| *k == key)
     }
 
     fn spawn_refreshes(self: &Arc<Self>, specs: &[ListSpec]) -> JoinSet<(String, Outcome)> {
@@ -389,6 +429,7 @@ impl Fetcher {
             }
         }
         self.put_meta(&spec.name, meta);
+        self.note_inline_outcome(spec, &key, &outcome);
         outcome
     }
 
@@ -450,10 +491,20 @@ impl Fetcher {
         let mut next: Option<u64> = None;
         for spec in specs {
             if !spec.enabled {
+                // Switching a list off forgets that its rules were refused, so switching it
+                // on again is a retry.
+                self.refused
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&spec.name);
                 continue;
             }
             let meta = self.meta(&spec.name);
-            let at = next_attempt(spec, &meta);
+            let at = if self.is_refused(spec, &meta) {
+                u64::MAX
+            } else {
+                next_attempt(spec, &meta)
+            };
             if at <= now {
                 due.push(spec.clone());
             } else {
@@ -504,6 +555,11 @@ impl Fetcher {
         let removed = self.store.prune(&keep);
         let mut metas = self.metas.lock().unwrap_or_else(PoisonError::into_inner);
         metas.retain(|name, _| keep.contains(&name.as_str()));
+        drop(metas);
+        self.refused
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|name, _| keep.contains(&name.as_str()));
         for name in &removed {
             info!(list = %name, "removed stored list (no longer configured)");
         }
@@ -581,7 +637,9 @@ fn next_attempt(spec: &ListSpec, meta: &ListMeta) -> u64 {
         return 0;
     }
     if let ListSource::Inline(_) = spec.source {
-        // Inline rules only change with the config, which changes the key.
+        // Inline rules only change with the config, which changes the key. With no stored copy
+        // this is the first try (or the first since a restart); rules that were refused are
+        // held back by `Fetcher::is_refused`, which `due` asks first.
         return if meta.has_content() { u64::MAX } else { 0 };
     }
     let refresh = spec.refresh.as_secs();
