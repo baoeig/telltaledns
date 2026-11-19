@@ -281,6 +281,37 @@ grafanaDashboard:
     grafana_dashboard: "1"
   annotations: {}
 
+# REQ: OPS-014 (ADR-177) — upgrade the cluster's native nodes (installed with install.sh, outside
+# Kubernetes) before this chart rolls its own pods. A pre-upgrade hook Job (Argo CD: PreSync)
+# runs `telltale ctl upgrade --to-self` from the new image: it asks each native node in turn,
+# replicas first, to install the image's version, and waits until it is back, ready, and in
+# sync. A node that fails stops the upgrade, and the pods keep their version. Each node needs
+# its update service on (install.sh --cluster-updates, or systemctl enable --now
+# telltale-update.path). An edge image's build can be installed on the nodes only while it is
+# the newest on the edge channel. Nodes on an older version without this feature are upgraded
+# by hand once (telltale self-update --restart).
+upgradeHook:
+  enabled: false
+  # A Secret with an agent token (Settings → API tokens → for an AI agent, made by an admin)
+  # that has the scopes analytics:read and cluster:upgrade.
+  tokenSecret:
+    name: ""
+    key: token
+  # The API to ask. Default: this release's API Service (plain HTTP inside the cluster).
+  url: ""
+  # How long each node may take to install the version and come back in sync.
+  timeout: 10m
+  # Leave nodes that are down out instead of failing the upgrade.
+  skipDown: false
+  # The whole hook's limit, for every node together.
+  activeDeadlineSeconds: 1800
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
+
 networkPolicy:
   enabled: false
   # CIDRs allowed to query DNS / reach the UI+API / scrape metrics. Empty: anyone.

@@ -406,6 +406,44 @@
           "clusterDns"
         ]
       }
+    },
+    "upgradeHook": {
+      "type": "object",
+      "description": "REQ: OPS-014 \u2014 the pre-upgrade hook that upgrades native nodes first.",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "tokenSecret": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "key": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "url": {
+          "type": "string"
+        },
+        "timeout": {
+          "type": "string",
+          "pattern": "^[0-9]+[smhd]?$"
+        },
+        "skipDown": {
+          "type": "boolean"
+        },
+        "activeDeadlineSeconds": {
+          "type": "integer",
+          "minimum": 60
+        },
+        "resources": {
+          "type": "object"
+        }
+      }
     }
   }
 }

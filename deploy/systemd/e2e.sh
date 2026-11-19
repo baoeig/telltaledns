@@ -117,6 +117,23 @@ sh "$HERE/install.sh" --disable-resolved-stub >/dev/null
 grep -q "# local edit" /etc/telltale/telltale.toml || { fail "config overwritten"; }
 systemctl is-active --quiet telltale
 
+# REQ: OPS-014 (ADR-177) — the update service: installed and off; once on, it picks up a request
+# the telltale user writes, removes it, refuses this build (a local build never installs from a
+# request), records the outcome where the node can read it, and leaves the node running.
+echo "== the update service picks a request up"
+[ -f /etc/systemd/system/telltale-update.path ] || { fail "telltale-update.path not installed"; }
+if systemctl is-enabled --quiet telltale-update.path; then fail "telltale-update.path is on by default"; fi
+systemctl enable --now telltale-update.path
+now=$(( $(date +%s) * 1000 ))
+sudo -u telltale sh -c "printf '%s' '{\"id\":\"1a-2b\",\"to\":\"9.9.9\",\"by\":\"e2e\",\"requestedMs\":$now}' > /var/lib/telltale/update-request.json"
+for _ in $(seq 1 30); do [ -f /var/lib/telltale-update/result.json ] && break; sleep 0.5; done
+result="$(sudo -u telltale cat /var/lib/telltale-update/result.json 2>&1)" || { journalctl -u telltale-update --no-pager | tail -20; fail "the node can't read the outcome: $result"; }
+grep -q '"state": "refused"' <<<"$result" || { journalctl -u telltale-update --no-pager | tail -20; fail "no refusal recorded: $result"; }
+grep -q '"id": "1a-2b"' <<<"$result" || { fail "the outcome isn't the request's: $result"; }
+[ ! -e /var/lib/telltale/update-request.json ] || { fail "the request was left behind"; }
+systemctl is-active --quiet telltale || { fail "the update service stopped the node"; }
+systemctl disable --now telltale-update.path
+
 # REQ: OPS-001 (T7.6) — the guided setup on a fresh machine: answers on stdin, the first admin
 # made from the answers (its drop-in removed once the service is up), the answers in the config.
 echo "== guided install, admin made now"

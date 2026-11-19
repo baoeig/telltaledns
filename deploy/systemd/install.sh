@@ -24,6 +24,10 @@
 #                            The install then waits (up to 15 s) for port 53 to be free before
 #                            it starts the service, and says what holds it if it isn't.
 #   --no-start               install but don't enable or start the service
+#   --cluster-updates        let the cluster install newer versions on this node: enables
+#                            telltale-update.path (REQ: OPS-014). Off by default; re-runs keep
+#                            whatever it is. `telltale ctl upgrade` and the Helm chart's
+#                            upgradeHook use it.
 #   --uninstall              stop and remove the service, its unit, and the binary; offers to
 #                            restore systemd-resolved if the install changed it, and keeps
 #                            /etc/telltale and /var/lib/telltale unless you say otherwise
@@ -49,6 +53,7 @@ UNINSTALL=no
 PURGE=ask
 RESTORE_RESOLVER=ask
 WAIT_PORT53=no
+CLUSTER_UPDATES=no
 
 say() { printf '\033[1m==>\033[0m %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -58,6 +63,7 @@ while [ $# -gt 0 ]; do
     --edge) CHANNEL=edge ;;
     --disable-resolved-stub) DISABLE_STUB=yes ;;
     --no-start) START=no ;;
+    --cluster-updates) CLUSTER_UPDATES=yes ;;
     --yes|-y) INTERACTIVE=no ;;
     --interactive) INTERACTIVE=yes ;;
     --config-only) shift; [ $# -gt 0 ] || die "--config-only needs a file"; CONFIG_ONLY=$1 ;;
@@ -172,8 +178,10 @@ uninstall() {
     say "Stopping and removing the telltale service"
     systemctl disable --now telltale >/dev/null 2>&1 || true
   fi
-  rm -f /etc/systemd/system/telltale.service
-  rm -rf /etc/systemd/system/telltale.service.d
+  systemctl disable --now telltale-update.path >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/telltale.service /etc/systemd/system/telltale-update.path \
+    /etc/systemd/system/telltale-update.service
+  rm -rf /etc/systemd/system/telltale.service.d /var/lib/telltale-update
   systemctl daemon-reload
   systemctl reset-failed telltale >/dev/null 2>&1 || true
   rm -f "$PREFIX/bin/telltale" "$PREFIX/bin/telltale.old" "$PREFIX/bin/telltale.new"
@@ -525,6 +533,12 @@ UNIT=/etc/systemd/system/telltale.service
 if [ -f "$HERE/telltale.service" ]; then cp "$HERE/telltale.service" "$TMP/telltale.service"
 else fetch "$REPO_RAW/deploy/systemd/telltale.service" "$TMP/telltale.service"; fi
 sed "s#/usr/local/bin/telltale#$PREFIX/bin/telltale#" "$TMP/telltale.service" > "$UNIT"
+# REQ: OPS-014 — the root update service for versions the cluster asks for (off until enabled).
+for u in telltale-update.path telltale-update.service; do
+  if [ -f "$HERE/$u" ]; then cp "$HERE/$u" "$TMP/$u"
+  else fetch "$REPO_RAW/deploy/systemd/$u" "$TMP/$u"; fi
+  sed "s#/usr/local/bin#$PREFIX/bin#g" "$TMP/$u" > "/etc/systemd/system/$u"
+done
 # The first admin, when chosen in the guided setup: its Argon2id hash goes to the service for
 # its first start only (a root-only drop-in, removed once the service is up).
 DROPIN=/etc/systemd/system/telltale.service.d/10-first-admin.conf
@@ -664,6 +678,10 @@ if [ "$START" = yes ]; then
   # five starts per ten seconds, and the first instance killed before it handled SIGTERM.)
   systemctl enable telltale >/dev/null 2>&1 || true
   systemctl restart telltale
+  if [ "$CLUSTER_UPDATES" = yes ]; then
+    systemctl enable --now telltale-update.path >/dev/null
+    say "Updates from the cluster are on (telltale-update.path)"
+  fi
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     "$PREFIX/bin/telltale" health >/dev/null 2>&1 && break
     sleep 1
@@ -685,6 +703,7 @@ if [ "$START" = yes ]; then
   First admin: $first
   Test:        dig @${ip:-127.0.0.1} example.com
   Updates:     sudo telltale self-update --restart   (--channel edge for builds from main)
+               or from the cluster: sudo systemctl enable --now telltale-update.path
   Then point your router's DHCP DNS setting at ${ip:-this machine}.
 EOF
 fi
