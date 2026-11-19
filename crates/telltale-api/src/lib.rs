@@ -1548,7 +1548,9 @@ async fn stats_slo(
 ///
 /// Buckets by status, query type, and response code, plus upstream exchanges. `step=second`
 /// covers the last 15 minutes, `step=minute` 7 days (48 hours live), `step=hour` 400 days,
-/// `step=day` everything. Buckets without queries are omitted. Example:
+/// `step=day` everything. On a cluster the longest ranges can come back partial: the nodes
+/// whose answers were left out are in `missingNodes`. Buckets without queries are omitted.
+/// Example:
 /// `GET /api/v1/stats/timeseries?from=-30d&step=hour`.
 #[utoipa::path(get, path = "/api/v1/stats/timeseries", tag = "stats", params(TimeseriesParams),
     responses((status = 200, body = Items<TimeBucket>, description = "The result."), (status = 400, body = Problem, description = "Invalid request: problem+json says which parameter and how to fix it.")))]

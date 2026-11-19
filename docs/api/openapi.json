@@ -7134,7 +7134,7 @@
           "stats"
         ],
         "summary": "Query counts over time.",
-        "description": "Buckets by status, query type, and response code, plus upstream exchanges. `step=second`\ncovers the last 15 minutes, `step=minute` 7 days (48 hours live), `step=hour` 400 days,\n`step=day` everything. Buckets without queries are omitted. Example:\n`GET /api/v1/stats/timeseries?from=-30d&step=hour`.",
+        "description": "Buckets by status, query type, and response code, plus upstream exchanges. `step=second`\ncovers the last 15 minutes, `step=minute` 7 days (48 hours live), `step=hour` 400 days,\n`step=day` everything. On a cluster the longest ranges can come back partial: the nodes\nwhose answers were left out are in `missingNodes`. Buckets without queries are omitted.\nExample:\n`GET /api/v1/stats/timeseries?from=-30d&step=hour`.",
         "operationId": "stats_timeseries",
         "parameters": [
           {

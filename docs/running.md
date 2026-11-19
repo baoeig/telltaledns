@@ -1806,18 +1806,26 @@ groups, query log, and live query stream cover every node:
   the API documents (15 minutes of seconds, 7 days of minutes, 400 days of hours, and every
   day) is well under it. Reads that ask many nodes about many windows are limited by count as
   well: one read makes at most 4,096 calls (a node and a window of time is one call, so all of
-  history by the day is 87 calls a node, and a cluster of 47 nodes can ask for it whole; the
-  range gains a window every 240 days, and the number of nodes is 4,096 divided by the windows,
-  plus this node, so it falls by one every one or two windows), and all the reads together have
-  at most 32,768 calls running or holding an answer their read hasn't taken yet. They are limited
-  in bytes too: the answers one read holds can be at most 20 MiB, and the answers all reads hold
-  40 MiB. An answer that would pass that is dropped as it arrives, and its node is listed in
-  `missingNodes` as one that didn't answer; the rest of the read is kept. On a cluster of 3 or
-  more nodes that happens to the API's longest ranges (7 days of minutes or 400 days of hours,
-  about 15 MiB of answers from each other node), not to the dashboard's (48 hours of minutes is
-  about 4 MiB a node, 17 MiB from 4). Reading a range takes the node that merges it about 7
-  times the answers' bytes in memory, which is why the limit is there: one read at 20 MiB takes
-  a node to about 185 MiB, under the 256 MiB the Pi's service may use. A read over the 4,096 is
+  history by the day is 87 calls a node, and a cluster of 48 nodes, this one and 47 others, can
+  ask for it whole; the range gains a window every 240 days, and the number of nodes is 4,096
+  divided by the windows, rounded down, plus this node, so it falls by one every one or two
+  windows), and all the reads together have at most 32,768 calls running or holding an answer
+  their read hasn't taken yet. They are limited in bytes too: the answers the other nodes send to
+  one read can be at most 20 MiB, and the answers all reads hold 40 MiB. An answer that would
+  pass that is dropped as it arrives, and its node is listed in `missingNodes` as one that didn't
+  answer; the rest of the read is kept. On a cluster of 3 or more nodes that happens to the API's
+  longest ranges (7 days of minutes or 400 days of hours, about 15 MiB of answers from each other
+  node). The dashboard at 48 hours makes two minute reads on each refresh (the summary and the
+  chart), each up to 2,881 buckets from every other node; a refresh stays whole while those
+  buckets average under about 3.6 KB each as JSON on 3 nodes, 2.4 KB on 4 or 1.8 KB on 5 (a
+  4-node home cluster measured 0.5 to 0.9 KB, about 1.8 MiB a read), and comes back partial
+  above that. Two viewers refreshing at the same moment share the 40 MiB, so one of them can see
+  a partial refresh, which the next poll heals. The limit is there because reading a range takes
+  the node that merges it about 7 times the answers' bytes in resident memory (4 to 6 times in
+  heap): on a node with no data of its own, one read at 20 MiB took it to about 185 MiB. It
+  bounds the other nodes' answers only, not this node's own part of the read and not reads that
+  merge at the same moment, so two such reads, or one on a node with a week of its own minutes in
+  big buckets, can still pass the 256 MiB the Pi's service may use. A read over the 4,096 is
   answered from this node alone, with the other nodes in `missingNodes`, every time, and so is
   the part of a read over 20 MiB: narrow the `scope`, or ask for a coarser `step` or a shorter
   range. A read that finds too many reads waiting, the call limit spent, or the 40 MiB held is
