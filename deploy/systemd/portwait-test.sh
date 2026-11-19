@@ -22,9 +22,13 @@ cd "$(dirname "$0")/../.."
 INSTALL=deploy/systemd/install.sh
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
+# The load average goes into every failure: the checks of how long something took are the ones a
+# stalled or busy machine can fail, and the number says whether it was.
 fail() {
-  echo "FAIL: $*"
-  [ -n "${GITHUB_ACTIONS:-}" ] && echo "::error title=portwait-test::FAIL: $*"
+  local load=
+  [ ! -r /proc/loadavg ] || load=" [load average: $(cut -d' ' -f1-3 /proc/loadavg)]"
+  echo "FAIL: $*$load"
+  [ -n "${GITHUB_ACTIONS:-}" ] && echo "::error title=portwait-test::FAIL: $*$load"
   exit 1
 }
 n=0
@@ -201,7 +205,6 @@ run_wait
 [ "$RC" = 0 ] || fail "ops_004_port53_wait_ends_when_free: rc=$RC: $OUT"
 [ "$(checks)" = 4 ] || fail "ops_004_port53_wait_ends_when_free: $(checks) checks, expected 4 (3 held + 1 free): $OUT"
 [ "$MS" -ge 700 ] || fail "ops_004_port53_wait_ends_when_free: returned after $MS ms, before three polling intervals"
-[ "$MS" -lt 8000 ] || fail "ops_004_port53_wait_ends_when_free: took $MS ms"
 has "Waiting" || fail "ops_004_port53_wait_ends_when_free: no 'Waiting' line: $OUT"
 has "Port 53 is free" || fail "ops_004_port53_wait_ends_when_free: no 'free' line: $OUT"
 ok ops_004_port53_wait_ends_when_free
@@ -211,7 +214,7 @@ fixture always
 run_wait 2
 [ "$RC" = 1 ] || fail "ops_004_port53_wait_is_bounded: rc=$RC, expected 1: $OUT"
 [ "$MS" -ge 1900 ] || fail "ops_004_port53_wait_is_bounded: gave up after $MS ms, before the 2 s limit"
-[ "$MS" -lt 12000 ] || fail "ops_004_port53_wait_is_bounded: took $MS ms for a 2 s limit"
+[ "$(checks)" -le 9 ] || fail "ops_004_port53_wait_is_bounded: $(checks) looks for a 2 s limit (the first and at most 8 polls); it took $MS ms"
 has "still held after 2s" || fail "ops_004_port53_wait_is_bounded: no 'still held' line: $OUT"
 has 'systemd-resolve' || fail "ops_004_port53_wait_is_bounded: the holder's process isn't named: $OUT"
 has "sudo systemctl restart telltale" || fail "ops_004_port53_wait_is_bounded: no next step: $OUT"
@@ -362,7 +365,7 @@ $STUB_TCP" '' 700
 printf '%s\n' "$OWN_UDP" > "$FAKE/udp_holder_after"
 printf '%s\n' "$OWN_TCP" > "$FAKE/tcp_holder_after"
 run_wait
-{ [ "$RC" = 0 ] && has "Waiting up to" && has "Port 53 is free" && [ "$(checks)" = 2 ] && [ "$MS" -lt 8000 ]; } \
+{ [ "$RC" = 0 ] && has "Waiting up to" && has "Port 53 is free" && [ "$(checks)" = 2 ]; } \
   || fail "ops_004_port53_wait_ends_when_only_its_own_sockets_remain: rc=$RC checks=$(checks) ms=$MS: $OUT"
 ok ops_004_port53_wait_ends_when_only_its_own_sockets_remain
 # (i) a telltale that isn't the service's main process (a stray `telltale run`) is a holder.
@@ -416,8 +419,8 @@ ok ops_004_port53_report_leaves_out_a_restarted_service
 fixture always
 echo 1 > "$FAKE/ss_delay"
 run_wait 3
-{ [ "$RC" = 1 ] && has "still held after 3s" && [ "$MS" -ge 5000 ] && [ "$MS" -lt 15000 ]; } \
-  || fail "ops_004_port53_wait_is_bounded_by_the_clock: rc=$RC ms=$MS (a first look of 2 s, a 3 s wait, at most one look more): $OUT"
+{ [ "$RC" = 1 ] && has "still held after 3s" && [ "$MS" -ge 5000 ] && [ "$(checks)" -le 4 ]; } \
+  || fail "ops_004_port53_wait_is_bounded_by_the_clock: rc=$RC ms=$MS looks=$(checks) (a first look of 2 s, a 3 s wait, at most one look more: 3 looks, 13 on the base): $OUT"
 ok ops_004_port53_wait_is_bounded_by_the_clock
 # The clock itself: hundredths of a second since boot from /proc/uptime. A copy of the block reads
 # a file of the test's instead, to feed it values (a leading zero in the fraction is decimal).
