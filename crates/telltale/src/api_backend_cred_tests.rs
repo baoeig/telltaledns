@@ -910,3 +910,81 @@ async fn obs_010_a_git_commits_destination_counts_as_the_nodes_own() {
     assert_eq!(v["ok"], true, "{v}");
     assert!(server.got.lock().unwrap()[0].contains("/git"));
 }
+
+/// REQ: OBS-010, API-002 (ADR-179) — an operator can't override a config-file destination that
+/// names a credential file (whatever the new body says), but may hide it; an admin may override
+/// it with a file in a folder.
+#[tokio::test]
+async fn obs_010_an_operator_cannot_override_a_file_destination_with_a_credential_file() {
+    let n = node();
+    let mut file = (*n.src.file_config.load_full()).clone();
+    file.alerts.destination.push(ntfy_dest(
+        "phone",
+        "https://ntfy.sh/home-dns",
+        "/run/secrets/ntfy-token",
+    ));
+    n.src.file_config.store(Arc::new(file));
+    apply(&n.src);
+    let mut moved = ntfy("/run/secrets/ntfy-token");
+    moved["url"] = "https://ntfy.example.net/elsewhere".into();
+    let mut bare = moved.clone();
+    bare.as_object_mut().unwrap().remove("token_file");
+    for body in [moved.clone(), bare] {
+        for bearer in [&n.operator, &n.agent] {
+            let (s, v) = n.put("phone", bearer, true, body.clone()).await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{body}: {v}");
+        }
+    }
+    let (s, v) = n.put("phone", &n.admin, true, moved).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = n
+        .send(
+            "DELETE",
+            "/api/v1/alerts/destinations/phone?dryRun=true",
+            &n.operator,
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "hiding it takes something away: {v}");
+}
+
+/// REQ: OBS-010, API-002 (ADR-179) — a write forwarded from another node is planned on this
+/// node (the primary) with the same rule: without the entry node's word that an administrator
+/// made it, a destination with a credential file is refused and nothing is stored; with it, the
+/// write is planned like a local administrator's.
+#[tokio::test]
+async fn obs_010_a_forwarded_write_from_a_non_admin_is_refused() {
+    let n = node();
+    let local: telltale_api::Shared = Arc::new(ApiBackend {
+        src: Arc::clone(&n.src),
+    });
+    let write = |by_admin: bool, dry_run: bool| crate::forward::Write::Managed {
+        kind: ManagedKind::AlertDestination,
+        name: "phone".into(),
+        body: Some(ntfy("/run/secrets/ntfy-token")),
+        dry_run,
+        expect: None,
+        by: "olga".into(),
+        simulate: None,
+        by_admin,
+    };
+    for dry_run in [false, true] {
+        let a =
+            crate::forward::apply(&n.src, &local, "node-b", "site-b", write(false, dry_run)).await;
+        let a = serde_json::to_value(a).unwrap();
+        assert_eq!(a["err"]["code"], "forbidden", "dry_run={dry_run}: {a}");
+    }
+    assert!(
+        crate::managed::entries(n.auth.state())
+            .alert_destinations
+            .is_empty(),
+        "nothing was stored"
+    );
+    assert!(
+        !n.audit_text().contains("alert_destination.put"),
+        "a refused write isn't audited as a change"
+    );
+    let a = crate::forward::apply(&n.src, &local, "node-b", "site-b", write(true, true)).await;
+    let a = serde_json::to_value(a).unwrap();
+    assert_eq!(a["ok"]["applied"], false, "planned as a dry run: {a}");
+}

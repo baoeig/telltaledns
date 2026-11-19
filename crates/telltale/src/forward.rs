@@ -91,7 +91,7 @@ impl From<ClientWrite> for Write {
 
 /// A [`Problem`] across the channel (its code, so the entry node answers with the same status).
 #[derive(Debug, Serialize, Deserialize)]
-struct WireProblem {
+pub(crate) struct WireProblem {
     code: Code,
     detail: String,
     hint: Option<String>,
@@ -123,7 +123,7 @@ impl From<WireProblem> for Problem {
 /// The primary's answer: the change, or why it was refused.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Answer {
+pub(crate) enum Answer {
     Ok(serde_json::Value),
     Err(WireProblem),
 }
@@ -138,7 +138,14 @@ pub(crate) async fn handle(
 ) -> Result<Vec<u8>, String> {
     let write: Write = serde_json::from_slice(&body).map_err(|e| format!("bad write: {e}"))?;
     let answer = if cluster.is_primary() {
-        apply(&src, &local, &cluster, &peer, write).await
+        let via = cluster
+            .members()
+            .into_iter()
+            .find(|m| m.node_id == peer)
+            .map(|m| m.site)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| peer.clone());
+        apply(&src, &local, &peer, &via, write).await
     } else {
         Answer::Err(
             Problem::new(Code::Conflict, "this node isn't the primary any more")
@@ -149,14 +156,16 @@ pub(crate) async fn handle(
     serde_json::to_vec(&answer).map_err(|e| e.to_string())
 }
 
-async fn apply(src: &Sources, local: &Shared, cluster: &Cluster, peer: &str, w: Write) -> Answer {
-    let via = cluster
-        .members()
-        .into_iter()
-        .find(|m| m.node_id == peer)
-        .map(|m| m.site)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| peer.to_owned());
+/// Applies a forwarded write from `peer` (named `via`: its site, or its ID) on this node, the
+/// primary, through the same planning as a local write (REQ: OBS-010, API-002 — so the
+/// credential-file rule of ADR-179 is the primary's to apply, with the entry node's `by_admin`).
+pub(crate) async fn apply(
+    src: &Sources,
+    local: &Shared,
+    peer: &str,
+    via: &str,
+    w: Write,
+) -> Answer {
     let (action, target, result) = match w {
         Write::Managed {
             kind,
@@ -224,7 +233,7 @@ async fn apply(src: &Sources, local: &Shared, cluster: &Cluster, peer: &str, w: 
                 .map(|c| serde_json::to_value(c).unwrap_or_default());
             (verb("client", deleting), (name, by), r)
         }
-        Write::AnomalyAck(w) => return apply_ack(src, local, peer, &via, w).await,
+        Write::AnomalyAck(w) => return apply_ack(src, local, peer, via, w).await,
     };
     match result {
         Ok(c) => {
