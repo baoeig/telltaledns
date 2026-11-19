@@ -682,3 +682,231 @@ async fn obs_010_refusals_and_the_audit_log_hold_no_file_content() {
     assert!(audit.contains("alert.test"), "{audit}");
     assert!(!audit.contains(&marker), "{audit}");
 }
+
+// ---- Review round 1: where a destination comes from, as a node that follows another sees it.
+
+/// An ntfy destination whose token is `token_file`, sent to `url`.
+fn ntfy_dest(name: &str, url: &str, token_file: &str) -> telltale_config::AlertDestination {
+    serde_json::from_value(serde_json::json!({
+        "name": name, "type": "ntfy", "url": url, "token_file": token_file,
+    }))
+    .unwrap()
+}
+
+/// The configuration a node runs when its shared sections come from another node (a replica,
+/// or a primary promoted from one or pinned to a version): its own files plus `primary`'s
+/// shared part, as replication merges them.
+fn following(n: &Node, primary: &telltale_config::Config) {
+    let file = n.src.file_config.load_full();
+    let shared = telltale_config::shared::shared_part(primary);
+    let c = telltale_config::shared::with_shared(&file, &shared).unwrap();
+    n.src.config.store(Arc::new(c));
+}
+
+impl Node {
+    async fn test_send(&self, name: &str) -> serde_json::Value {
+        let (s, v) = self
+            .send(
+                "POST",
+                &format!("/api/v1/alerts/destinations/{name}/test"),
+                &self.admin,
+                None,
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK, "{name}: {v}");
+        v
+    }
+}
+
+/// REQ: OBS-010 (ADR-179) — a node whose shared sections come from another node holds every
+/// destination with a credential file to the folder rule unless its own config files define it
+/// the same way: one an older primary stored through the API is neither read nor sent to from
+/// here, and neither is a primary's file destination that this node's files don't have (the
+/// cost). One its own files define the same way (one `ConfigMap` for every pod) still sends,
+/// whatever its path.
+#[tokio::test]
+async fn obs_010_a_replica_does_not_send_an_unchecked_destination() {
+    let n = node();
+    let d = n.data();
+    let server = catcher();
+    let marker = format!("marker-{}", auth::crypto::random_id());
+    std::fs::create_dir_all(format!("{d}/outside")).unwrap();
+    std::fs::write(format!("{d}/outside/token"), &marker).unwrap();
+    let token = format!("{d}/outside/token");
+    let at = |topic: &str| format!("{}/{topic}", server.url);
+    let mut file = (*n.src.file_config.load_full()).clone();
+    file.alerts
+        .destination
+        .push(ntfy_dest("same", &at("same"), &token));
+    n.src.file_config.store(Arc::new(file.clone()));
+    let mut primary = file;
+    primary.alerts.destination = vec![
+        ntfy_dest("same", &at("same"), &token),
+        ntfy_dest("legacy", &at("legacy"), &token),
+        ntfy_dest("theirs", &at("theirs"), &token),
+    ];
+    following(&n, &primary);
+    for name in ["legacy", "theirs"] {
+        let v = n.test_send(name).await;
+        assert_eq!(v["ok"], false, "{name}: {v}");
+        assert!(
+            v["error"].as_str().unwrap_or("").contains("token_file"),
+            "{name}: {v}"
+        );
+    }
+    let v = n.test_send("same").await;
+    assert_eq!(v["ok"], true, "{v}");
+    let got = server.got.lock().unwrap().clone();
+    assert_eq!(
+        got.len(),
+        1,
+        "only the node's own destination was sent to: {got:?}"
+    );
+    assert!(
+        got[0].contains("/same") && got[0].contains(&format!("Bearer {marker}")),
+        "{got:?}"
+    );
+}
+
+/// REQ: OBS-010 (ADR-179) — the alert task of a primary whose configuration came from another
+/// node (promoted after a failover, or pinned to a version) doesn't send to a destination with
+/// a credential file outside the folders that its own files don't define; the Alerts page says
+/// why, and a destination without one goes out as usual. Driven through `alerts::run`.
+#[tokio::test]
+async fn obs_010_a_promoted_primary_does_not_send_an_unchecked_destination() {
+    let n = node();
+    let d = n.data();
+    let server = catcher();
+    std::fs::create_dir_all(format!("{d}/outside")).unwrap();
+    std::fs::write(format!("{d}/outside/token"), "tk").unwrap();
+    let mut primary = (*n.src.file_config.load_full()).clone();
+    primary.alerts.destination = vec![
+        ntfy_dest(
+            "legacy",
+            &format!("{}/legacy", server.url),
+            &format!("{d}/outside/token"),
+        ),
+        serde_json::from_value(serde_json::json!({
+            "name": "plain", "type": "webhook", "url": format!("{}/plain", server.url),
+        }))
+        .unwrap(),
+    ];
+    primary.alerts.rule = vec![
+        serde_json::from_value(serde_json::json!({
+            "name": "Update", "when": "update_available", "for_secs": 0, "to": ["legacy", "plain"],
+        }))
+        .unwrap(),
+    ];
+    following(&n, &primary);
+    {
+        let mut u = n.src.update.lock().unwrap();
+        u.state = "available".into();
+        u.latest = Some("99.0.0".into());
+    }
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(crate::alerts::run(Arc::clone(&n.src), stopped));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deliveries = loop {
+        let got = n.src.alerts.lock().unwrap().deliveries.clone();
+        if ["legacy", "plain"]
+            .iter()
+            .all(|w| got.iter().any(|x| x.destination == *w))
+        {
+            break got;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no deliveries: {got:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let _ = stop.send(true);
+    let _ = task.await;
+    let of = |w: &str| deliveries.iter().find(|x| x.destination == w).unwrap();
+    assert!(!of("legacy").ok, "{deliveries:?}");
+    assert!(
+        of("legacy")
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("token_file"),
+        "{deliveries:?}"
+    );
+    assert!(of("plain").ok, "{deliveries:?}");
+    let got = server.got.lock().unwrap().clone();
+    assert!(got.iter().all(|r| !r.contains("/legacy")), "{got:?}");
+    assert!(got.iter().any(|r| r.contains("/plain")), "{got:?}");
+}
+
+/// REQ: OBS-010 (ADR-179) — a destination made through the API that overrides a config-file
+/// destination of the same name isn't the files': it is held to the folder rule.
+#[tokio::test]
+async fn obs_010_an_api_override_of_a_file_destination_is_held() {
+    let n = node();
+    let d = n.data();
+    let server = catcher();
+    std::fs::create_dir_all(format!("{d}/outside")).unwrap();
+    std::fs::write(format!("{d}/outside/token"), "tk").unwrap();
+    let token = format!("{d}/outside/token");
+    let mut file = (*n.src.file_config.load_full()).clone();
+    file.alerts.destination.push(ntfy_dest(
+        "phone",
+        &format!("{}/file-topic", server.url),
+        &token,
+    ));
+    n.src.file_config.store(Arc::new(file));
+    let over = ntfy_dest("phone", &format!("{}/api-topic", server.url), &token);
+    n.auth
+        .state()
+        .put_managed(
+            crate::managed::ALERT_DESTINATION,
+            "phone",
+            &serde_json::to_string(&over).unwrap(),
+            None,
+            None,
+            now(),
+            "an older version",
+        )
+        .unwrap();
+    apply(&n.src);
+    let v = n.test_send("phone").await;
+    assert_eq!(v["ok"], false, "{v}");
+    assert!(server.got.lock().unwrap().is_empty(), "nothing was sent");
+}
+
+/// REQ: OBS-010 (ADR-179) — on a node that takes the cluster's configuration from Git, the commit
+/// in use is the node's own too: a destination it defines sends, whatever its path.
+#[tokio::test]
+async fn obs_010_a_git_commits_destination_counts_as_the_nodes_own() {
+    let n = node();
+    let d = n.data();
+    let server = catcher();
+    std::fs::create_dir_all(format!("{d}/outside")).unwrap();
+    std::fs::write(format!("{d}/outside/token"), "tk").unwrap();
+    let mut file = (*n.src.file_config.load_full()).clone();
+    file.cluster.git = Some(
+        serde_json::from_value(serde_json::json!({
+            "repo": "https://git.example.test/homelab", "path": "telltale/shared.toml",
+        }))
+        .unwrap(),
+    );
+    n.src.file_config.store(Arc::new(file));
+    let dir = telltale_cluster::node::dir_of(n.dir.path());
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("git-shared.toml"),
+        format!(
+            "[[alerts.destination]]\nname = \"phone\"\ntype = \"ntfy\"\nurl = \"{}/git\"\ntoken_file = \"{d}/outside/token\"\n",
+            server.url
+        ),
+    )
+    .unwrap();
+    let file = n.src.file_config.load_full();
+    let shared = crate::gitsource::shared(&file).unwrap();
+    n.src.config.store(Arc::new(
+        telltale_config::shared::with_shared(&file, &shared).unwrap(),
+    ));
+    let v = n.test_send("phone").await;
+    assert_eq!(v["ok"], true, "{v}");
+    assert!(server.got.lock().unwrap()[0].contains("/git"));
+}

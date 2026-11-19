@@ -2488,7 +2488,7 @@ impl Backend for ApiBackend {
             // REQ: OBS-010 (ADR-179) — a destination made through the API whose credential file
             // isn't in a folder meant for secrets isn't read or sent to; the answer says why.
             let refused = tokio::task::spawn_blocking(move || {
-                crate::alerts::refused(&cfg, &crate::alerts::api_destinations(&src, &cfg))
+                crate::alerts::refused(&cfg, &crate::alerts::own_destinations(&src))
             })
             .await
             .map_err(|e| Problem::internal(format!("request worker failed: {e}")))?;

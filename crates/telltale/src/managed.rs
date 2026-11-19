@@ -199,18 +199,6 @@ fn decode_ovr<T: for<'de> Deserialize<'de>>(state: &State, kind: &str) -> Vec<(S
         .collect()
 }
 
-/// REQ: OBS-010 (ADR-179) — the alert destinations made through the API that `state.db` holds
-/// (hidden names left out), as they are merged over the files'.
-pub(crate) fn api_alert_destinations(state: &State) -> Vec<telltale_config::AlertDestination> {
-    decode_ovr(state, ALERT_DESTINATION)
-        .into_iter()
-        .filter_map(|(_, o)| match o {
-            Ovr::Set(d) => Some(d),
-            Ovr::Hidden => None,
-        })
-        .collect()
-}
-
 /// Applies `over` to `items` by name: an override replaces the files' entry, a new name is
 /// added, a hidden name is removed.
 pub(crate) fn apply_ovr<T: Named + Clone>(items: &mut Vec<T>, over: &[(String, Ovr<T>)]) {

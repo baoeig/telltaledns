@@ -88,8 +88,9 @@ fn inside(p: &Path, roots: &[PathBuf]) -> bool {
         })
 }
 
-/// `p` with its links followed as far as it exists, the rest as written; `None` for a loop or a
-/// link that can't be read.
+/// `p` with its links followed as far as it exists, the rest as written; `None` (refused) for a
+/// loop, a link that can't be read, or a part that can't be looked at (only a part that isn't
+/// there lets the rest be taken as written).
 fn resolve(p: &Path, links: u8) -> Option<PathBuf> {
     if links > MAX_LINKS {
         return None;
@@ -98,23 +99,32 @@ fn resolve(p: &Path, links: u8) -> Option<PathBuf> {
     for i in (1..=parts.len()).rev() {
         let head: PathBuf = parts[..i].iter().collect();
         let tail: PathBuf = parts[i..].iter().collect();
-        if let Ok(real) = std::fs::canonicalize(&head) {
-            return Some(if tail.as_os_str().is_empty() {
-                real
-            } else {
-                real.join(tail)
-            });
-        }
-        // A link whose target isn't there (yet): follow it as written.
-        if std::fs::symlink_metadata(&head).is_ok_and(|m| m.file_type().is_symlink()) {
-            let target = std::fs::read_link(&head).ok()?;
-            let parent = head.parent()?;
-            let next = if target.is_absolute() {
-                target
-            } else {
-                parent.join(target)
-            };
-            return resolve(&next.join(tail), links + 1);
+        let missing = match std::fs::canonicalize(&head) {
+            Ok(real) => {
+                return Some(if tail.as_os_str().is_empty() {
+                    real
+                } else {
+                    real.join(tail)
+                });
+            }
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        };
+        match std::fs::symlink_metadata(&head) {
+            // A link whose target isn't there (yet), or a loop: follow it as written.
+            Ok(m) if m.file_type().is_symlink() => {
+                let target = std::fs::read_link(&head).ok()?;
+                let parent = head.parent()?;
+                let next = if target.is_absolute() {
+                    target
+                } else {
+                    parent.join(target)
+                };
+                return resolve(&next.join(tail), links + 1);
+            }
+            // Not there: look one level up.
+            Err(_) if missing => {}
+            // There but not resolvable, or not to be looked at: refused.
+            _ => return None,
         }
     }
     Some(p.to_path_buf())
@@ -235,5 +245,26 @@ mod tests {
             &format!("{}/secrets/token", link.to_str().unwrap()),
             link.to_str().unwrap()
         ));
+    }
+
+    /// REQ: OBS-010 (ADR-179) — fails closed: a path whose links can't be looked at (a folder on
+    /// the way this process may not search) is refused, not taken as written.
+    #[cfg(unix)]
+    #[test]
+    fn obs_010_a_path_that_cannot_be_looked_at_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = Dir::new("locked");
+        let data = d.s();
+        let locked = d.0.join("secrets/locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("token"), "t").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root searches any folder: there is nothing it can't look at.
+        let can_look = std::fs::read_dir(&locked).is_ok();
+        let answer = allowed(&format!("{data}/secrets/locked/token"), &data);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if !can_look {
+            assert!(!answer, "a path that can't be looked at is refused");
+        }
     }
 }
