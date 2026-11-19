@@ -15,15 +15,21 @@
 //!    so a slow or dead primary can't pile them up. Past [`MAX_WAITS`] a read is told "didn't
 //!    answer" without being sent.
 //! 3. Few calls at once. A read is one task per call and holds one place under rule 2 for all
-//!    of them, so the places bound reads, not tasks; tasks are what hold memory. Two limits
-//!    bound them. The calls of all reads together are a budget of [`CALL_BUDGET`] (32,768: the
-//!    most that 32 reads of 1,024 calls, the first cap, could have had): a read takes a share
-//!    for each of its calls, all of them or none, and a call's share comes back when its task
-//!    ends or is dropped, so tasks queued on a stuck runtime keep theirs. And one read may have
-//!    at most [`MAX_READ_CALLS`] calls, which is what a range of time on a large cluster needs
-//!    (a read for the nodes' time buckets is one call per node and window of time,
+//!    of them, so the places bound reads, not tasks. Two limits bound the calls. The calls of all
+//!    reads together are a budget of [`CALL_BUDGET`] (32,768: the most that 32 reads of 1,024
+//!    calls, the first cap, could have had): a read takes a share for each of its calls, all of
+//!    them or none. A call's share travels with its answer and comes back when the read is done
+//!    with the answer (`Pending::wait` returns, or the read is dropped), or when the call's task
+//!    is dropped; so a call that has answered still counts while its answer waits for the read,
+//!    and tasks queued on a stuck runtime keep theirs. And one read may have at most
+//!    [`MAX_READ_CALLS`] calls, which is what a range of time on a large cluster needs (a read
+//!    for the nodes' time buckets is one call per node and window of time,
 //!    `telltale_api::federation::timeseries_chunks`, which bounds the windows on its own,
 //!    first). A read over either is not sent (every call: "wasn't asked"), and takes nothing.
+//!    This is a count of calls and of the answers they hold, not of bytes: an answer can be as
+//!    big as the cluster channel's 1 MiB frame, and what the caller does with the answers after
+//!    `wait` returns (merging them, parsing them) is not covered. A bound in bytes is a later
+//!    design.
 //!
 //! A read that is refused is counted and said in the log, as a warning at most once a minute
 //! ([`Limiter::refused`]).
@@ -52,18 +58,21 @@ const MAX_WAITS: usize = 32;
 
 /// The most calls one read may have. A read is one call to each peer, or, for a range of time,
 /// one to each peer for each window of it. The longest range any step documents is 87 windows
-/// (`step=day` over all of history; 7 days of minutes is 43, 400 days of hours 41, 15 minutes of
-/// seconds 4), and `telltale_api::federation::TIMESERIES_MAX_WINDOWS` caps one read at 256 a
-/// peer, so 4,096 lets a cluster of 47 peers ask for all of history by the day, 95 for 7 days of
-/// minutes and 99 for 400 days of hours, whole. A read over it is not sent. It bounds what one
-/// request can ask; [`CALL_BUDGET`] bounds what all of them hold.
+/// (`step=day` over all of history, one window more every 240 days, so 88 from March 2027; 7
+/// days of minutes is 43, 400 days of hours 41, 15 minutes of seconds 4), and
+/// `telltale_api::federation::TIMESERIES_MAX_WINDOWS` caps one read at 256 a peer. So 4,096 lets
+/// floor(4,096 / windows) peers ask for a range whole: 47 for all of history by the day today (46
+/// from March 2027), 95 for 7 days of minutes, 99 for 400 days of hours. A read over it is not
+/// sent. It bounds what one request can ask; [`CALL_BUDGET`] bounds what all of them hold.
 pub(super) const MAX_READ_CALLS: usize = 4096;
 
-/// The calls that may be tasks on the runtime at once, all reads together: what holds memory is
-/// a task, so this is the bound that matters. 32,768 is 32 reads ([`MAX_WAITS`]) of 1,024
-/// calls, the most the first, flat cap (1,024 calls a read) could ever have had, so raising
-/// [`MAX_READ_CALLS`] did not raise the worst case: it lets one big read use what many small ones
-/// could. At most 8 reads of [`MAX_READ_CALLS`] fit at once.
+/// The calls that may be counted at once, all reads together: a call counts from its start
+/// until its read is done with its answer, so it covers the tasks that are running and the
+/// answers that wait for their read. It is a count, not bytes. 32,768 is 32 reads
+/// ([`MAX_WAITS`]) of 1,024 calls, the most the first, flat cap (1,024 calls a read) could ever
+/// have had, so raising [`MAX_READ_CALLS`] did not raise the number of calls or answers that
+/// can be held: it lets one big read use what many small ones could. At most 8 reads of
+/// [`MAX_READ_CALLS`] fit at once.
 pub(super) const CALL_BUDGET: usize = 32 * 1024;
 
 // The budget lives in the low half of a `u64` beside the reads in the high half (see `Limiter`),
@@ -189,9 +198,13 @@ impl Drop for Place {
     }
 }
 
-/// One call's share of the budget. It is given back when the call's task ends or is dropped,
-/// run or not (the runtime shutting down drops the tasks it never ran); a task still queued on a
-/// stuck runtime keeps its share, as it keeps the read's place.
+/// One call's share of the budget: the right to have the call running, and then to have its
+/// answer held. The task owns it while it runs and sends it with the answer; the read keeps it
+/// until it is done with the answer. It is given back when `Pending::wait` returns, when the read
+/// is dropped (the answers still in the channel go with it), when a task that is over finds nobody
+/// waiting (the send fails), or when the task is dropped, run or not (the runtime shutting down
+/// drops the tasks it never ran). A task still queued on a stuck runtime keeps its share, as it
+/// keeps the read's place. Each share is dropped once, by whoever owns it last; nothing clones it.
 #[derive(Debug)]
 struct Share(Arc<AtomicU64>);
 
@@ -240,7 +253,8 @@ impl Limiter {
     pub(super) fn with_budget(max_reads: usize, budget: usize) -> Self {
         Self {
             state: Arc::new(AtomicU64::new(0)),
-            max_reads: u64::try_from(max_reads).unwrap_or(u64::MAX),
+            // The reads live in the high half: more than it holds could not be counted.
+            max_reads: u64::try_from(max_reads).unwrap_or(u64::MAX).min(CALL_MASK),
             budget: u64::try_from(budget).unwrap_or(CALL_MASK).min(CALL_MASK),
             log: RefusalLog::default(),
             since: Instant::now(),
@@ -304,7 +318,7 @@ impl Limiter {
         usize::try_from(self.state.load(Ordering::Acquire) >> 32).unwrap_or(usize::MAX)
     }
 
-    /// Calls that are tasks now (started, and not ended or dropped).
+    /// Calls counted now: a task that is running, or an answer that waits for its read.
     #[cfg(test)]
     fn calls_in_flight(&self) -> usize {
         usize::try_from(self.state.load(Ordering::Acquire) & CALL_MASK).unwrap_or(usize::MAX)
@@ -314,13 +328,19 @@ impl Limiter {
 /// One call's result: the peer's answer, or why there is none.
 type Answer = Result<Vec<u8>, String>;
 
+/// What a call's task sends when it is over: which call, its answer, and the call's share, which
+/// travels with the answer so the budget goes on counting it until the read is done with it.
+type Done = (usize, Answer, Share);
+
 /// Calls started on the runtime, to be waited for on the calling thread.
 #[derive(Debug)]
 pub(super) struct Pending {
     peers: Vec<String>,
     /// What is in so far, by call.
     results: Vec<Option<Answer>>,
-    rx: Option<mpsc::Receiver<(usize, Answer)>>,
+    /// The shares of the answers that are in, kept until `wait` returns.
+    shares: Vec<Share>,
+    rx: Option<mpsc::Receiver<Done>>,
     /// When the caller stops waiting.
     until: Instant,
     /// Set when the caller stops waiting: a call still queued then isn't sent.
@@ -351,6 +371,7 @@ where
     let pending = |peers, results, rx| Pending {
         peers,
         results,
+        shares: Vec::new(),
         rx,
         until: Instant::now() + timeout + GRACE,
         gave_up: Arc::new(AtomicBool::new(false)),
@@ -380,8 +401,9 @@ where
     let (tx, rx) = mpsc::channel();
     let started = pending(peers, results, Some(rx));
     for (i, call) in futures.into_iter().enumerate() {
-        // One share for each task, and every task keeps the read's place: the share goes when
-        // its task does, the place when the last of them does.
+        // One share for each task, and every task keeps the read's place until it ends. The
+        // share goes with the answer to the read, which gives it back when it is done with it;
+        // a task that is dropped, or that finds nobody waiting, drops it itself.
         let Some(share) = grant.shares.issue() else {
             break;
         };
@@ -391,11 +413,12 @@ where
             Arc::clone(&started.gave_up),
         );
         drop(rt.spawn(async move {
-            let (_place, _share) = (place, share);
+            let _place = place;
             if gave_up.load(Ordering::Acquire) {
                 return;
             }
-            let _ = tx.send((i, call.await));
+            let answer = call.await;
+            let _ = tx.send((i, answer, share));
         }));
     }
     started
@@ -405,6 +428,8 @@ impl Pending {
     /// Waits for every call, or until the deadline: one entry per call, in the order given, with
     /// the answer or why there is none (`didn't answer in time` for a call the runtime never
     /// finished). Blocks the calling thread only: it needs nothing from the runtime to wake.
+    /// The shares of the answers it returns go back to the budget as it returns: the read is done
+    /// with them. (A call that never answered keeps its own until its task ends.)
     pub(super) fn wait(mut self) -> Vec<(String, Answer)> {
         let mut missing = self.results.iter().filter(|r| r.is_none()).count();
         let mut why = "didn't answer in time";
@@ -412,7 +437,7 @@ impl Pending {
             while missing > 0 {
                 let left = self.until.saturating_duration_since(Instant::now());
                 match rx.recv_timeout(left) {
-                    Ok((i, r)) => self.put(i, r, &mut missing),
+                    Ok((i, r, share)) => self.put(i, r, share, &mut missing),
                     Err(mpsc::RecvTimeoutError::Timeout) => break,
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
                         why = "wasn't answered: its call was dropped";
@@ -421,10 +446,13 @@ impl Pending {
                 }
             }
             // What came in as the deadline passed.
-            while let Ok((i, r)) = rx.try_recv() {
-                self.put(i, r, &mut missing);
+            while let Ok((i, r, share)) = rx.try_recv() {
+                self.put(i, r, share, &mut missing);
             }
         }
+        // Done with the answers: their shares go back (an answer that comes in later finds the
+        // channel closed, and its task drops its share).
+        self.shares.clear();
         let peers = std::mem::take(&mut self.peers);
         let results = std::mem::take(&mut self.results);
         peers
@@ -437,7 +465,9 @@ impl Pending {
             .collect()
     }
 
-    fn put(&mut self, i: usize, r: Answer, missing: &mut usize) {
+    /// Takes in one call's answer, and keeps its share until `wait` returns.
+    fn put(&mut self, i: usize, r: Answer, share: Share, missing: &mut usize) {
+        self.shares.push(share);
         if let Some(slot) = self.results.get_mut(i)
             && slot.is_none()
         {
@@ -1030,29 +1060,230 @@ mod tests {
         assert_eq!(live.load(Ordering::SeqCst), 0);
     }
 
-    // REQ: CLU-004 (ADR-174) — a call's share goes back to the budget when its task ends, not
-    // only when the read's last one does: a read held up by one silent peer is not holding the
-    // shares of the peers that answered. The read's place stays until its last task ends.
+    /// Calls that answer at once, counting each one that has (so a test knows its answers are in).
+    fn quick(n: usize, tag: &str, done: &Arc<AtomicUsize>) -> Vec<(String, Call)> {
+        (0..n)
+            .map(|i| (format!("{tag}{i}"), counting(done)))
+            .collect()
+    }
+
+    // REQ: CLU-004, CLU-002 (ADR-174, final review round 2, F1) — a call's share is the right to
+    // hold its answer, so it comes back when the read is done with the answer (`wait` returns, or
+    // the read is dropped), not when the call's task ends: answers that wait for their read count
+    // against the budget. Before: the share went with the task, so a read with 7 answers in and one
+    // call out held one share, and the next read could take as many again. Budget of ten.
     #[test]
-    fn clu_004_a_call_gives_its_share_back_when_its_task_ends() {
+    fn clu_004_a_finished_call_keeps_its_share_until_the_read_is_done_with_its_answer() {
         let rt = runtime(2);
-        let limiter = Limiter::with_budget(8, 100);
-        let (live, ran, gate) = (count(), count(), Gate::shut());
-        let mut calls = gate.calls(2, "held", &live, &ran);
-        calls.push(("quick".into(), answer("Q")));
-        let read = start(&limiter, rt.handle(), calls, Duration::from_secs(60));
-        assert!(was_sent(&read));
-        wait_until("the quick call's share is back", || {
-            limiter.calls_in_flight() == 2
+        let limiter = Limiter::with_budget(8, 10);
+        let _ = limiter.log.note(Refused::Full, 0);
+        let (live, ran, done, gate) = (count(), count(), count(), Gate::shut());
+        let long = Duration::from_secs(60);
+        let mut calls = quick(7, "quick", &done);
+        calls.extend(gate.calls(1, "held", &live, &ran));
+        let first = start(&limiter, rt.handle(), calls, long);
+        assert!(was_sent(&first));
+        // Seven answers are in and their tasks are over; the eighth call is still out.
+        wait_until("the quick calls answered", || {
+            done.load(Ordering::SeqCst) == 7
         });
-        assert_eq!(limiter.in_flight(), 1, "the read still holds its place");
+        wait_until("only the held call's task is alive", || {
+            rt.metrics().num_alive_tasks() == 1
+        });
+        assert_eq!(
+            limiter.calls_in_flight(),
+            8,
+            "the answers that wait for their read still count"
+        );
+        assert_eq!(limiter.in_flight(), 1);
+        // So a second read of 3 does not fit (8 + 3 > 10), and takes nothing.
+        let second = start(&limiter, rt.handle(), gate.calls(3, "b", &live, &ran), long).wait();
+        assert!(
+            refused_for(&second, "calls are already in flight"),
+            "{second:?}"
+        );
+        assert_eq!(limiter.calls_in_flight(), 8);
+        assert_eq!(
+            limiter.log.pending(),
+            Tally {
+                full: 0,
+                spent: 1,
+                too_big: 0
+            }
+        );
+        // The held call answers, and the read is done: every share is back at once.
         gate.open();
-        let got = read.wait();
-        assert_eq!(got[2], ("quick".to_owned(), Ok(b"Q".to_vec())));
+        let got = first.wait();
+        assert_eq!(got.len(), 8);
         assert!(got.iter().all(|(_, r)| r.is_ok()), "{got:?}");
+        assert_eq!(
+            limiter.calls_in_flight(),
+            0,
+            "wait gave the answers' shares back"
+        );
+        wait_until("the place is back", || limiter.in_flight() == 0);
+        // And now the second read fits.
+        let third = start(&limiter, rt.handle(), gate.calls(3, "c", &live, &ran), long).wait();
+        assert!(third.iter().all(|(_, r)| r.is_ok()), "{third:?}");
         wait_until("everything is given back", || {
             limiter.calls_in_flight() == 0 && limiter.in_flight() == 0
         });
+    }
+
+    // REQ: CLU-004, CLU-002 (ADR-174, final review round 2, F1) — the answers a waiting read
+    // holds are bounded by the budget, not only the calls still out. Thirty-two reads of the
+    // ceiling are tried, each with 4,095 calls that answer at once and one that is held: the
+    // answers that wait for their reads (counted by the calls that ran, none is consumed yet) plus
+    // the held calls never pass 32,768. Before: 4,095 shares came back as the quick calls
+    // ended, so all 32 reads were sent and 131,040 answers waited, four times the old cap's.
+    #[test]
+    fn clu_004_answers_held_while_waiting_never_pass_the_budget() {
+        let rt = runtime(2);
+        let limiter = Limiter::new(MAX_WAITS);
+        let (live, ran, done, gate) = (count(), count(), count(), Gate::shut());
+        let long = Duration::from_secs(60);
+        let mut waiting = Vec::new();
+        let mut answered = 0;
+        for r in 0..MAX_WAITS {
+            let mut calls = quick(MAX_READ_CALLS - 1, &format!("q{r}-"), &done);
+            calls.extend(gate.calls(1, &format!("held{r}-"), &live, &ran));
+            let read = start(&limiter, rt.handle(), calls, long);
+            if was_sent(&read) {
+                waiting.push(read);
+                answered += MAX_READ_CALLS - 1;
+                // This read's quick answers are in, and their tasks are over.
+                wait_until("the quick calls answered", || {
+                    done.load(Ordering::SeqCst) == answered
+                });
+                wait_until("only the held calls' tasks are alive", || {
+                    rt.metrics().num_alive_tasks() == waiting.len()
+                });
+            }
+        }
+        let held = done.load(Ordering::SeqCst) + waiting.len();
+        assert!(
+            held <= CALL_BUDGET,
+            "{} reads waiting hold {held} answers and calls: more than the budget of {CALL_BUDGET}",
+            waiting.len()
+        );
+        assert_eq!(waiting.len(), CALL_BUDGET / MAX_READ_CALLS);
+        assert_eq!(limiter.calls_in_flight(), CALL_BUDGET);
+        // Each read, done with its answers, gives its shares back.
+        gate.open();
+        for read in waiting {
+            assert!(read.wait().iter().all(|(_, r)| r.is_ok()));
+        }
+        assert_eq!(limiter.calls_in_flight(), 0);
+        wait_until("every place is back", || limiter.in_flight() == 0);
+    }
+
+    // REQ: CLU-004 (ADR-174, final review round 2, F1) — a caller that drops its read with
+    // answers waiting gets every share of them back at once; the call still out keeps its share
+    // and the place until its task ends, and nothing is returned twice.
+    #[test]
+    fn clu_004_shares_come_back_when_the_caller_drops_a_read_with_answers_waiting() {
+        let rt = runtime(2);
+        let limiter = Limiter::with_budget(8, 100);
+        let (live, ran, done, gate) = (count(), count(), count(), Gate::shut());
+        let mut calls = quick(20, "quick", &done);
+        calls.extend(gate.calls(1, "held", &live, &ran));
+        let read = start(&limiter, rt.handle(), calls, Duration::from_secs(60));
+        wait_until("the quick calls answered", || {
+            done.load(Ordering::SeqCst) == 20
+        });
+        wait_until("only the held call's task is alive", || {
+            rt.metrics().num_alive_tasks() == 1
+        });
+        assert_eq!(limiter.calls_in_flight(), 21, "20 answers wait, 1 call out");
+        drop(read);
+        assert_eq!(
+            limiter.calls_in_flight(),
+            1,
+            "the dropped read's answers are gone, and their shares"
+        );
+        assert_eq!(
+            limiter.in_flight(),
+            1,
+            "the call that is out keeps the place"
+        );
+        gate.open();
+        wait_until("the last task ends", || {
+            limiter.calls_in_flight() == 0 && limiter.in_flight() == 0
+        });
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+    }
+
+    // REQ: CLU-004 (ADR-174, final review round 2, F1) — a read that gives up at its deadline with
+    // some answers in: the answers it returns give their shares back, the calls that never
+    // answered keep theirs until their tasks end, and then everything is back, once.
+    #[test]
+    fn clu_004_shares_come_back_when_a_read_times_out_with_some_answers_in() {
+        let rt = runtime(2);
+        let limiter = Limiter::with_budget(8, 100);
+        let (live, ran, done, gate) = (count(), count(), count(), Gate::shut());
+        let mut calls = quick(5, "quick", &done);
+        calls.extend(gate.calls(2, "held", &live, &ran));
+        let read = start(&limiter, rt.handle(), calls, Duration::from_millis(100));
+        // The five answers are in before the wait starts, so a slow machine can't make them late.
+        wait_until("the quick calls answered", || {
+            done.load(Ordering::SeqCst) == 5
+        });
+        let got = read.wait();
+        assert_eq!(got.iter().filter(|(_, r)| r.is_ok()).count(), 5);
+        assert!(
+            got[5..].iter().all(|(_, r)| r
+                .as_ref()
+                .is_err_and(|e| e.contains("didn't answer in time"))),
+            "{got:?}"
+        );
+        assert_eq!(
+            limiter.calls_in_flight(),
+            2,
+            "the five answers are consumed; the two calls still out hold theirs"
+        );
+        gate.open();
+        wait_until("the late tasks end", || {
+            limiter.calls_in_flight() == 0 && limiter.in_flight() == 0
+        });
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+    }
+
+    // REQ: CLU-004 (ADR-174, final review round 2, F1) — a runtime that is dropped with answers
+    // already waiting in their read: the call that was out is dropped with its share, the answers
+    // keep theirs until the read is done with them, and then everything is back, once.
+    #[test]
+    fn clu_004_answers_waiting_when_the_runtime_is_dropped_keep_their_shares_until_the_read_is_done()
+     {
+        let rt = runtime(2);
+        let limiter = Limiter::with_budget(8, 100);
+        let (live, ran, done, gate) = (count(), count(), count(), Gate::shut());
+        let mut calls = quick(10, "quick", &done);
+        calls.extend(gate.calls(1, "held", &live, &ran));
+        let read = start(&limiter, rt.handle(), calls, Duration::from_secs(60));
+        wait_until("the quick calls answered", || {
+            done.load(Ordering::SeqCst) == 10
+        });
+        wait_until("only the held call's task is alive", || {
+            rt.metrics().num_alive_tasks() == 1
+        });
+        drop(rt);
+        assert_eq!(
+            limiter.calls_in_flight(),
+            10,
+            "the call that was out is dropped with its share; the answers still wait"
+        );
+        assert_eq!(limiter.in_flight(), 0, "no task is left to hold the place");
+        let got = read.wait();
+        assert_eq!(got.iter().filter(|(_, r)| r.is_ok()).count(), 10);
+        assert!(
+            got[10]
+                .1
+                .as_ref()
+                .is_err_and(|e| e.contains("its call was dropped")),
+            "{got:?}"
+        );
+        assert_eq!(limiter.calls_in_flight(), 0);
+        assert_eq!(live.load(Ordering::SeqCst), 0);
     }
 
     // REQ: CLU-004 (ADR-174) — tasks queued on a stuck runtime keep their shares and the place,
