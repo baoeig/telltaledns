@@ -46,7 +46,7 @@ On a Raspberry Pi or any Linux machine with systemd (no Docker needed):
 curl -fsSLO https://raw.githubusercontent.com/paimonsoror/telltaledns/main/deploy/systemd/install.sh
 less install.sh                     # read it before running it as root
 sudo sh install.sh
-sudo -u telltale telltale auth setup-token -c /etc/telltale/telltale.toml     # then open http://<host>:8053/
+sudo -u telltale /usr/local/bin/telltale auth setup-token -c /etc/telltale/telltale.toml     # then open http://<host>:8053/
 ```
 Prefer Docker? On any Linux host with Docker:
 ```sh

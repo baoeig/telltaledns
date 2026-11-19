@@ -48,7 +48,7 @@
 <section id="install">
   <p class="eyebrow">Step 1</p>
   <h2>Pick where it runs</h2>
-  <p class="muted">Every path ends the same way: your router hands out TelltaleDNS as the DNS server, and every device uses it, with its own address visible. <span class="badge"><span class="dot"></span> Pre-1.0: installs use the latest tagged release by default; <code>edge</code> is the opt-in build from main.</span></p>
+  <p class="muted">Every path ends the same way: your router hands out TelltaleDNS as the DNS server, and every device uses it, with its own address visible. <span class="badge"><span class="dot"></span> Pre-1.0: installs use the latest tagged release by default (From source builds <code>main</code>); <code>edge</code> is the opt-in build from main.</span></p>
   <div class="tabs">
     <div role="tablist" aria-label="Where it runs">
       <button role="tab" type="button">Raspberry Pi &amp; Linux</button>
@@ -96,7 +96,7 @@
         </ul>
       </div>
       <ol class="guide">
-        <li><b>Prepare the machine.</b> Give it a fixed address (a DHCP reservation in your router). Then free port 53: if Pi-hole or another DNS server runs on it, stop it. Check: <code>sudo ss -ulpn 'sport = :53'</code> should print nothing. (systemd-resolved is the one exception; see the list below.)</li>
+        <li><b>Prepare the machine.</b> Give it a fixed address (a DHCP reservation in your router). Then free port 53: if Pi-hole or another DNS server runs on it, stop it. Check: <code>sudo ss -Hulpn 'sport = :53'</code> should print nothing. (systemd-resolved is the one exception; see the list below.)</li>
         <li><b>Install it.</b> The installer checks the release's signature and checksum before installing anything, so read it, then run it:
 <pre><code>curl -fsSLO https://raw.githubusercontent.com/paimonsoror/telltaledns/main/deploy/systemd/install.sh
 less install.sh
@@ -106,13 +106,13 @@ sudo sh install.sh                 # the latest release; --edge: builds from mai
 dig @192.168.1.2 doubleclick.net      # 0.0.0.0 or NXDOMAIN: the blocklist works</code></pre>
           On Windows: <code>nslookup example.com 192.168.1.2</code>.</li>
         <li><b>Create the admin account.</b> Print the one-time setup token and open the UI at <code>http://&lt;address&gt;:8053/</code> (skip the token if you chose a password in the walk-through):
-<pre><code>sudo -u telltale telltale auth setup-token -c /etc/telltale/telltale.toml</code></pre></li>
+<pre><code>sudo -u telltale /usr/local/bin/telltale auth setup-token -c /etc/telltale/telltale.toml</code></pre></li>
       </ol>
       <p><b>About the installer</b></p>
       <ul>
-        <li>It asks first: press Enter for the recommended settings, or <b>walk me through the options</b> to pick upstreams (encrypted presets or your own server), starting blocklists (or none), the listen address, the first admin (a setup token, or a password now), and the query log's retention and privacy. Every step shows its default; Enter keeps it. Piped or automated runs (and <code>--yes</code>) ask nothing.</li>
+        <li>It asks first: press Enter for the recommended settings, or <b>walk me through the options</b> to pick upstreams (encrypted presets or your own server), starting blocklists (or none), the listen address, the first admin (a setup token, or a password now), and the query log's retention and privacy. Every step shows its default; Enter keeps it. Piped or automated runs, <code>--yes</code>, and a re-run over an existing config skip these questions (the next point has the one about systemd-resolved).</li>
         <li>It creates a <code>telltale</code> user, writes the config to <code>/etc/telltale/telltale.toml</code> (never overwriting yours), and keeps data in <code>/var/lib/telltale</code>.</li>
-        <li>If systemd-resolved holds port 53 (Ubuntu, some Debian setups), it offers to turn the stub listener off (<code>--disable-resolved-stub</code> does it without asking), then waits up to 15 seconds for port 53 to be free before it starts the service. If something still holds the port, it prints what.</li>
+        <li>If systemd-resolved holds port 53 (Ubuntu, some Debian setups), it asks in a terminal whether to turn the stub listener off, even on a re-run or with <code>--yes</code> (<code>--disable-resolved-stub</code> answers it in advance; a run without a terminal leaves systemd-resolved as it is). After turning it off it waits up to 15 seconds for port 53 to be free before it starts the service. If something still holds the port, it prints what.</li>
         <li>Updates: <code>sudo telltale self-update --restart</code> (add <code>--channel edge</code> if you installed with <code>--edge</code>). The previous binary is kept as <code>telltale.old</code>.</li>
         <li>Logs: <code>journalctl -u telltale -f</code>. Reload after editing the config: <code>sudo systemctl reload telltale</code>.</li>
         <li>Uninstall: <code>sudo sh install.sh --uninstall</code>. It removes the service and binary, offers to give the machine its own resolver back (systemd-resolved, as it was before), and keeps your config and data unless you ask it to delete them (<code>--purge</code>).</li>
@@ -128,7 +128,7 @@ dig @192.168.1.2 doubleclick.net      # 0.0.0.0 or NXDOMAIN: the blocklist works
         <li><b>Install Docker</b> (skip this if you have it). On a Raspberry Pi, use Raspberry Pi OS (64-bit recommended) on a Pi 3, 4, 5, or Zero 2 W, and give it a fixed address (a DHCP reservation in your router):
 <pre><code>curl -fsSL https://get.docker.com | sh
 sudo usermod -aG docker $USER    # log out and back in</code></pre></li>
-        <li><b>Free port 53.</b> If Pi-hole or another DNS server runs on the machine, stop it (for systemd-resolved, see <a href="#trouble">troubleshooting</a>). Check: <code>sudo ss -ulpn 'sport = :53'</code> should print nothing.</li>
+        <li><b>Free port 53.</b> If Pi-hole or another DNS server runs on the machine, stop it (for systemd-resolved, see <a href="#trouble">troubleshooting</a>). Check: <code>sudo ss -Hulpn 'sport = :53'</code> should print nothing.</li>
         <li><b>Download the bundle and start it.</b>
 <pre><code>mkdir ~/telltale && cd ~/telltale
 curl -fsSLO https://raw.githubusercontent.com/paimonsoror/telltaledns/main/deploy/compose/compose.yaml
@@ -324,7 +324,7 @@ strategy = "fastest"</code></pre>
   <h2>Troubleshooting</h2>
   <dl class="faq">
     <dt>"address already in use" on port 53</dt>
-    <dd>Another DNS server runs there: Pi-hole, dnsmasq, or systemd-resolved's stub (<code>sudo ss -ulpn 'sport = :53'</code> names it). Stop it, or for systemd-resolved add <code>DNSStubListener=no</code> under <code>[Resolve]</code> in <code>/etc/systemd/resolved.conf.d/telltale.conf</code> and restart it.</dd>
+    <dd>Another DNS server runs there: Pi-hole, dnsmasq, or systemd-resolved's stub (<code>sudo ss -Hulpn 'sport = :53'</code> names it). Stop it, or for systemd-resolved add <code>DNSStubListener=no</code> under <code>[Resolve]</code> in <code>/etc/systemd/resolved.conf.d/telltale.conf</code> and restart it.</dd>
     <dt>A site is broken</dt>
     <dd>Find it in the <b>Query log</b> and press <b>Why?</b>: it names the list and line that blocked it. Then allow it with a quick rule, or add an allow line (<code>@@||name^</code>) to a list.</dd>
     <dt>Every query shows the same address</dt>

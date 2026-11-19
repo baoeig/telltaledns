@@ -185,8 +185,8 @@ took=$(( $(date +%s) - t1 - asked ))
 wait_metric "$EMERG_MET" telltale_cluster_primary 0 30 || fail "the emergency primary didn't step down"
 [ "$(metric "$OTHER_MET" telltale_cluster_primary)" = 0 ] || fail "$OTHER became primary instead of g (the hold-back failed)"
 [ "$(metric "$OTHER_MET" telltale_cluster_lease_held)" = 0 ] || fail "$OTHER holds a lease"
-epoch2=$(metric 29201 telltale_cluster_epoch)
-[ "$epoch2" -gt "$epoch" ] || fail "g's epoch $epoch2 isn't newer than $epoch"
+epoch2=$(epoch_of 29201)
+[ "${epoch2:-0}" -gt "$epoch" ] || fail "g's epoch '${epoch2:-unreadable}' isn't newer than $epoch"
 grep 'elected primary' "$E/g2.log" | grep -q 'role.*Primary' || fail "g wasn't made the primary: $(grep 'elected primary' "$E/g2.log" | tail -1)"
 wait "$LOAD"; LOAD=
 read -r ok sent < "$E/load.txt"

@@ -35,7 +35,7 @@
   <h2>Create the first admin</h2>
   <p>On first start the server creates a one-time <b>setup token</b> and saves it in <code>&lt;data_dir&gt;/setup-token</code>, readable by its owner only. The log says where the file is, never the token itself. Print it with:</p>
 <pre><code>telltale auth setup-token</code></pre>
-  <p class="muted">On a native install, run it as the service user: <code>sudo -u telltale telltale auth setup-token -c /etc/telltale/telltale.toml</code>.</p>
+  <p class="muted">On a native install, run it as the service user: <code>sudo -u telltale /usr/local/bin/telltale auth setup-token -c /etc/telltale/telltale.toml</code>.</p>
   <div class="tabs">
     <div role="tablist" aria-label="First admin">
       <button role="tab" type="button">Web UI</button>

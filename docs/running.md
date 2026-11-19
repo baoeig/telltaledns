@@ -65,7 +65,7 @@ Two ways, both with real client addresses (host networking) and port 53 without 
 curl -fsSLO https://raw.githubusercontent.com/paimonsoror/telltaledns/main/deploy/systemd/install.sh
 less install.sh                     # read before running as root
 sudo sh install.sh                  # the latest release; --edge: builds from main
-sudo -u telltale telltale auth setup-token -c /etc/telltale/telltale.toml
+sudo -u telltale /usr/local/bin/telltale auth setup-token -c /etc/telltale/telltale.toml
 ```
 **Guided setup.** Run in a terminal on a new machine, the installer asks one question first: press Enter for the recommended settings (the starter config: encrypted upstreams, one balanced blocklist, a 7-day query log), or choose **Walk me through the options**. Each step shows its default in `[brackets]`; Enter or `skip` keeps it:
 1. **Builds:** releases or edge.
@@ -77,7 +77,7 @@ sudo -u telltale telltale auth setup-token -c /etc/telltale/telltale.toml
 7. **The query log:** how many days to keep, and how much it records (privacy level 0 to 3).
 
 A summary comes before anything is installed. The answers become `/etc/telltale/telltale.toml`, checked with `telltale config check` before the service starts.
-- **No questions** when stdin isn't a terminal (`curl … | sh`, automation), with `--yes`, or when `/etc/telltale/telltale.toml` already exists (re-runs only upgrade). To see the questions again on a machine that already has TelltaleDNS, run `sh install.sh --config-only /tmp/test.toml` (it changes nothing), or uninstall first (below).
+- **No guided questions** when stdin isn't a terminal (`curl … | sh`, automation), with `--yes`, or when `/etc/telltale/telltale.toml` already exists (a re-run upgrades the binary and keeps your config). One question can still come, in a terminal, even on a re-run or with `--yes`: when systemd-resolved is running with its stub listener on (Ubuntu and some Debian setups), the installer asks `[Y/n]` whether to turn the stub off. `--disable-resolved-stub` answers it in advance; without a terminal the installer leaves systemd-resolved as it is. To see the guided questions again on a machine that already has TelltaleDNS, run `sh install.sh --config-only /tmp/test.toml` (it changes nothing), or uninstall first (below).
 - **Automation:** `--interactive` asks even without a terminal and reads the answers from stdin; `--config-only FILE` writes the config and stops (no root needed), to see what the answers produce.
 - **The first admin "now"** is created on the service's first start from an Argon2id hash in a root-only systemd drop-in, which the installer removes once the service is up. The password itself isn't stored.
 
