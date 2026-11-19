@@ -13,139 +13,222 @@
 //! 1. Which `Backend` methods can federate is derived, not listed: from `federated.rs` and
 //!    `federated_support.rs`, the methods that reach `bridge::start`, by calls through `self`.
 //! 2. Every method call `.name(` of one of them must be inside the arguments of a call to `blocking`
-//!    or `spawn_blocking`, or be matched by an entry of [`ALLOWED`], each with its reason. An entry
-//!    that matches no call is itself a failure, so the list can't go stale.
+//!    or `spawn_blocking`, or be one of the calls an entry of [`ALLOWED`] names. An entry names a
+//!    file, a function, a method (or `*`) and how many such calls there are, with its reason; the
+//!    scan fails when it finds more or fewer, so an entry can't hide a call added later, in the
+//!    same function or another, and can't go stale.
 //! 3. Test code is left out: a `#[cfg(test)]` module or item, and the files such an item declares.
 //!
-//! What it does not see: a call written as a path (`Backend::config_version(&*b)`), and a call
-//! made in a helper that is itself called inside `blocking(..)` (it is flagged, and goes on the
-//! list with the reason). It reads names, not types: a method of another type that shares a name
-//! with a federating one (`.top(` on a top-K list, `.latency(` on the aggregator) looks like a
-//! call, and is allowed by name, in the function that makes it.
+//! What it does not see: a call written as a path (`Backend::config_version(&*b)`); a call made
+//! in a helper that is itself called inside `blocking(..)` (it is flagged, and goes on the list
+//! with the reason); a `Federated` method that reaches the bridge only through a free function
+//! given `self` (`crate::health::slo_reasons(self, now)` is one: `health` is found because it also
+//! reaches the bridge through `self`), or a `Backend` default that `Federated` does not override
+//! (`heatmap_network` is one, and the test that checks the derivation names it). It reads names,
+//! not types: a method of another type that shares a name with a federating one (`.top(` on a
+//! top-K list, `.latency(` on the aggregator) looks like a call, and is allowed by name, in the
+//! function that makes it, with the count.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-/// A call the scan lets by without `blocking(..)` around it, and why.
+/// Calls the scan lets by without `blocking(..)` around them, and why.
 struct Allowed {
     /// The file, from `crates/`.
     file: &'static str,
-    /// The `fn` the call is in, or `*` for every one of them in the file.
+    /// The `fn` the calls are in, or `*` for every one of them in the file.
     in_fn: &'static str,
+    /// The method called, or `*` for every one that federates.
+    method: &'static str,
+    /// How many such calls there are: exactly, not at most.
+    count: usize,
     why: &'static str,
 }
 
-/// Every entry is justified here, and has to match a call the scan finds.
+impl Allowed {
+    /// Whether this entry names the call `site`.
+    fn covers(&self, site: &Site) -> bool {
+        self.file == site.file
+            && (self.in_fn == "*" || self.in_fn == site.in_fn)
+            && (self.method == "*" || self.method == site.method)
+    }
+}
+
+/// Every entry is justified here, and has to match exactly the number of calls it says. The first
+/// entry that names a call takes it, so a narrower entry goes before a broader one.
 const ALLOWED: &[Allowed] = &[
     Allowed {
         file: "telltale-api/src/lib.rs",
         in_fn: "heatmap_network",
+        method: "timeseries",
+        count: 1,
         why: "the `Backend` trait's default: it reads this backend's own `timeseries`. Whoever \
               calls `heatmap_network` is a call the scan checks (it federates)",
     },
     Allowed {
         file: "telltale/src/alerts.rs",
         in_fn: "observe",
-        why: "`alerts::run` calls it only inside its one `spawn_blocking` (the rules' reads); the \
-              other callers are the module's tests",
+        method: "*",
+        count: 7,
+        why: "`alerts::run` calls `observe` only inside its one `spawn_blocking` (the rules' \
+              reads); the other callers are the module's tests. A new read in it is in that \
+              closure too, and is counted here",
     },
     Allowed {
         file: "telltale/src/anomaly.rs",
         in_fn: "start",
+        method: "clients",
+        count: 1,
         why: "not a backend: `e.clients()` is the anomaly engine's count of tracked devices",
     },
     Allowed {
         file: "telltale/src/anomaly.rs",
         in_fn: "counters",
+        method: "clients",
+        count: 1,
         why: "not a backend: `e.clients()` is the anomaly engine's count of tracked devices",
     },
     Allowed {
         file: "telltale/src/api_backend.rs",
         in_fn: "*",
+        method: "*",
+        count: 11,
         why: "this is the node's own backend: its methods read this node's data and each other, \
-              and never ask a peer. The federating backend is `federated.rs`",
+              and never ask a peer. The federating backend is `federated.rs`. Any new call in the \
+              file changes the count, and has to be looked at",
+    },
+    Allowed {
+        file: "telltale/src/federated.rs",
+        in_fn: "answer",
+        method: "*",
+        count: 32,
+        why: "`answer` runs a peer's read on this node's own backend (`b` is the local \
+              `ApiBackend`): one call for each kind of read. A new kind of read adds a call, and \
+              has to be looked at",
     },
     Allowed {
         file: "telltale/src/federated.rs",
         in_fn: "*",
-        why: "the federating backend itself: `answer` runs a peer's read on this node's own \
-              backend, and the methods call `self.local` or each other. Their callers are what \
-              the scan checks",
+        method: "*",
+        count: 37,
+        why: "the federating backend's own methods: they call `self.local` (this node's backend) \
+              or each other, and their callers are what the scan checks. Any new call in the \
+              file changes the count, and has to be looked at",
     },
     Allowed {
         file: "telltale/src/health.rs",
         in_fn: "slo_reasons",
+        method: "timeseries",
+        count: 1,
         why: "called only from the `health` method of the two backends, which the scan checks at \
               its callers (`health` federates)",
     },
     Allowed {
         file: "telltale/src/http.rs",
         in_fn: "metrics",
+        method: "exemplars",
+        count: 1,
         why: "not a backend: `traces.exemplars()` is the trace ring's",
     },
     Allowed {
         file: "telltale/src/http.rs",
         in_fn: "render",
+        method: "queries",
+        count: 1,
         why: "not a backend: `w.queries(..)` is the Prometheus writer's",
     },
     Allowed {
         file: "telltale/src/http.rs",
         in_fn: "render_annotations",
+        method: "config_version",
+        count: 1,
         why: "not a backend: `config_version()` is the state store's own",
     },
     Allowed {
         file: "telltale/src/pihole.rs",
         in_fn: "convert",
+        method: "clients",
+        count: 1,
         why: "not a backend: `b.clients(..)` is the importer's own builder writing the converted \
               clients",
     },
     Allowed {
         file: "telltale/src/pipeline.rs",
         in_fn: "new",
+        method: "clients",
+        count: 1,
         why: "not a backend: `clients.clients()` is the client table's rows",
     },
     Allowed {
         file: "telltale/src/pipeline.rs",
         in_fn: "mask",
+        method: "clients",
+        count: 1,
         why: "not a backend: `self.clients.clients()` is the client table's rows",
     },
     Allowed {
         file: "telltale/src/replication.rs",
         in_fn: "serving_loop",
+        method: "latency",
+        count: 1,
         why: "not a backend: `agg.latency(..)` is the aggregator's",
     },
     Allowed {
         file: "telltale/src/rollups.rs",
         in_fn: "hour_extras",
+        method: "latency",
+        count: 4,
         why: "not a backend: `agg.latency(..)` is the aggregator's",
     },
     Allowed {
         file: "telltale/src/routers.rs",
         in_fn: "poll_unifi",
+        method: "clients",
+        count: 2,
         why: "not a backend: `s.clients(..)` is the UniFi source's own (async) request",
     },
     Allowed {
         file: "telltale/src/server.rs",
         in_fn: "config_marker",
+        method: "config_version",
+        count: 1,
         why: "not a backend: `config_version()` is the state store's own",
     },
     Allowed {
         file: "telltale/src/shadow.rs",
         in_fn: "lists_view",
+        method: "top",
+        count: 1,
         why: "not a backend: `.top(..)` is the top-K list's",
     },
     Allowed {
         file: "telltale/src/shadow.rs",
         in_fn: "record",
+        method: "clients",
+        count: 1,
         why: "not a backend: `f.clients.clients()` is the client table's rows",
     },
     Allowed {
         file: "telltale/src/support.rs",
         in_fn: "collect",
+        method: "*",
+        count: 8,
         why: "reads this node's own `ApiBackend` (`me`), not the federating one: a support part \
-              is this node's, each collector on a thread of its own with a deadline",
+              is this node's, each collector on a thread of its own with a deadline. A new \
+              collector adds a call, and is counted here",
     },
 ];
+
+/// One call of a federating method that is not inside `blocking(..)` or `spawn_blocking(..)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Site {
+    /// The file, from `crates/`.
+    file: String,
+    /// The `fn` it is in.
+    in_fn: String,
+    method: String,
+    line: usize,
+}
 
 // ---- reading Rust well enough to scan it -----------------------------------------------------
 
@@ -489,7 +572,7 @@ struct Report {
 /// Scans `sources` (a label from `crates/`, and the file's text; test files already left out).
 fn scan(sources: &[(String, String)], fan: &BTreeSet<String>, allowed: &[Allowed]) -> Report {
     let mut report = Report::default();
-    let mut used = vec![false; allowed.len()];
+    let mut sites = Vec::new();
     for (label, raw) in sources {
         let code = code_only(raw);
         let (tests, _) = test_items(raw, &code);
@@ -509,28 +592,42 @@ fn scan(sources: &[(String, String)], fan: &BTreeSet<String>, allowed: &[Allowed
                 report.behind += 1;
                 continue;
             }
-            let entry = allowed
-                .iter()
-                .position(|a| a.file == label && (a.in_fn == "*" || a.in_fn == in_fn));
-            if let Some(k) = entry {
-                used[k] = true;
-                continue;
-            }
-            let line = code[..dot].matches('\n').count() + 1;
-            report.problems.push(format!(
-                "{label}:{line}: `.{name}(` in `{in_fn}` is not inside `blocking(..)` or \
+            sites.push(Site {
+                file: label.clone(),
+                in_fn,
+                method: name.to_owned(),
+                line: code[..dot].matches('\n').count() + 1,
+            });
+        }
+    }
+    // Each call outside `blocking` belongs to the first entry that names it, and every entry has
+    // to have exactly the number of calls it says.
+    let mut found = vec![0_usize; allowed.len()];
+    for site in &sites {
+        let Site {
+            file,
+            in_fn,
+            method,
+            line,
+        } = site;
+        match allowed.iter().position(|a| a.covers(site)) {
+            Some(k) => found[k] += 1,
+            None => report.problems.push(format!(
+                "{file}:{line}: `.{method}(` in `{in_fn}` is not inside `blocking(..)` or \
                  `spawn_blocking(..)`: a federated read on a runtime worker costs its whole \
                  deadline and answers from this node alone (ADR-174). Run it in `blocking`; or, \
                  if it isn't a backend call (another type's method of the same name), add it to \
                  ALLOWED with the reason"
-            ));
+            )),
         }
     }
-    for (a, used) in allowed.iter().zip(used) {
-        if !used {
+    for (a, n) in allowed.iter().zip(found) {
+        if n != a.count {
             report.problems.push(format!(
-                "ALLOWED entry {} in `{}` matches no call: remove it ({})",
-                a.file, a.in_fn, a.why
+                "ALLOWED entry {} in `{}` for `.{}(` says {} call(s) and the scan found {n}: a call \
+                 was added or removed there. If it is a federating backend call, run it in \
+                 `blocking`; if not, change the count ({})",
+                a.file, a.in_fn, a.method, a.count, a.why
             ));
         }
     }
@@ -664,42 +761,129 @@ fn helper(b: Shared) { b.config_version(); }
     assert_eq!(found(&real, &["config_version"], &[]).problems.len(), 2);
 }
 
-// REQ: CLU-004 (ADR-174) — the allow-list: an entry silences the one function it names (or every
-// function of its file with `*`), and an entry that matches no call is a problem, so a fixed handler
-// can't leave a stale exemption behind.
+// REQ: CLU-004 (ADR-174) — the allow-list: an entry names the calls it lets by (a file, a function,
+// a method or `*`, and how many), and the count is exact. A call in another function, another
+// method, or another file is a problem; so is an entry whose count is wrong (a call added or
+// removed), which includes one that matches nothing, so a fixed handler can't leave a stale
+// exemption behind.
 #[test]
 fn clu_004_the_scan_allow_list_is_exact() {
     let src = "fn a(b: Shared) { b.config_version(); }\nfn c(b: Shared) { b.config_version(); }\n";
-    let entry = |in_fn| Allowed {
+    let entry = |in_fn, method, count| Allowed {
         file: "x.rs",
         in_fn,
+        method,
+        count,
         why: "a reason",
     };
-    let r = found(src, &["config_version"], &[entry("a")]);
+    let fan = ["config_version", "latency"];
+    let r = found(src, &fan, &[entry("a", "config_version", 1)]);
     assert_eq!(r.problems.len(), 1, "{:?}", r.problems);
     assert!(r.problems[0].contains("`c`"), "{}", r.problems[0]);
+    // `*` for the function and for the method each cover the calls they name, with the count.
     assert_eq!(
-        found(src, &["config_version"], &[entry("*")]).problems,
+        found(src, &fan, &[entry("*", "config_version", 2)]).problems,
         Vec::<String>::new()
     );
+    assert_eq!(
+        found(src, &fan, &[entry("a", "*", 1), entry("c", "*", 1)]).problems,
+        Vec::<String>::new()
+    );
+    // A method that is not the one named is not covered.
+    let wrong = found(src, &fan, &[entry("*", "latency", 2)]);
+    assert_eq!(wrong.problems.len(), 3, "{:?}", wrong.problems);
+    // An entry that matches nothing, or fewer or more than it says, is a problem.
     let stale = found(
         src,
-        &["config_version"],
-        &[entry("a"), entry("c"), entry("gone")],
+        &fan,
+        &[
+            entry("a", "config_version", 1),
+            entry("c", "config_version", 1),
+            entry("gone", "*", 1),
+        ],
     );
     assert_eq!(stale.problems.len(), 1, "{:?}", stale.problems);
     assert!(
-        stale.problems[0].contains("matches no call"),
+        stale.problems[0].contains("says 1 call(s) and the scan found 0"),
         "{}",
         stale.problems[0]
     );
-    // An entry for another file does not apply, and is itself stale.
+    let more = found(src, &fan, &[entry("*", "config_version", 1)]);
+    assert_eq!(more.problems.len(), 1, "{:?}", more.problems);
+    assert!(
+        more.problems[0].contains("says 1 call(s) and the scan found 2"),
+        "{}",
+        more.problems[0]
+    );
+    // An entry for another file does not apply, and is itself wrong.
     let other = Allowed {
         file: "y.rs",
         in_fn: "*",
+        method: "*",
+        count: 2,
         why: "elsewhere",
     };
-    assert_eq!(found(src, &["config_version"], &[other]).problems.len(), 3);
+    assert_eq!(found(src, &fan, &[other]).problems.len(), 3);
+}
+
+// REQ: CLU-004 (ADR-174, final review round 2, F3) — an entry hides only the calls it was written
+// for. `a` is allowed one `agg.latency(..)`, a call of another type. A real backend call added to
+// `a` later (another method), or a second call of the same method, is still a problem, where an
+// entry that was a whole function let both by.
+#[test]
+fn clu_004_an_allow_entry_hides_only_the_call_it_was_written_for() {
+    let entry = Allowed {
+        file: "x.rs",
+        in_fn: "a",
+        method: "latency",
+        count: 1,
+        why: "agg is the aggregator",
+    };
+    let fan = ["latency", "config_version"];
+    let as_written = "fn a(agg: Agg) {\n    agg.latency();\n}\n";
+    assert_eq!(
+        found(as_written, &fan, std::slice::from_ref(&entry)).problems,
+        Vec::<String>::new()
+    );
+    // A real backend call added to the same function.
+    let added = "fn a(agg: Agg, b: Shared) {\n    agg.latency();\n    b.config_version();\n}\n";
+    let r = found(added, &fan, std::slice::from_ref(&entry));
+    assert_eq!(r.problems.len(), 1, "{:?}", r.problems);
+    assert!(
+        r.problems[0].contains("config_version"),
+        "{}",
+        r.problems[0]
+    );
+    // A second call of the allowed method: the count is exact.
+    let twice = "fn a(agg: Agg, b: Shared) {\n    agg.latency();\n    b.latency();\n}\n";
+    let r = found(twice, &fan, std::slice::from_ref(&entry));
+    assert_eq!(r.problems.len(), 1, "{:?}", r.problems);
+    assert!(
+        r.problems[0].contains("says 1 call(s) and the scan found 2"),
+        "{}",
+        r.problems[0]
+    );
+    // A `*` entry (a whole file or function) is pinned the same way: one call more fails it.
+    let whole = Allowed {
+        file: "x.rs",
+        in_fn: "*",
+        method: "*",
+        count: 2,
+        why: "the node's own backend",
+    };
+    let two = "fn a(b: Own) {\n    b.latency();\n}\nfn c(b: Own) {\n    b.config_version();\n}\n";
+    assert_eq!(
+        found(two, &fan, std::slice::from_ref(&whole)).problems,
+        Vec::<String>::new()
+    );
+    let three = format!("{two}fn d(b: Shared) {{\n    b.config_version();\n}}\n");
+    let r = found(&three, &fan, std::slice::from_ref(&whole));
+    assert_eq!(r.problems.len(), 1, "{:?}", r.problems);
+    assert!(
+        r.problems[0].contains("says 2 call(s) and the scan found 3"),
+        "{}",
+        r.problems[0]
+    );
 }
 
 // REQ: CLU-004 (ADR-174) — the reader: nested block comments, raw strings with quotes and hashes
@@ -855,7 +1039,7 @@ fn clu_004_every_federating_backend_call_sits_behind_blocking() {
         .filter(|(p, _)| !test_files.contains(p))
         .map(|(p, text)| {
             let label = p.strip_prefix(&root).unwrap_or(p).to_string_lossy();
-            (label.into_owned(), text.clone())
+            (label.replace('\\', "/"), text.clone())
         })
         .collect();
     let report = scan(&sources, &fan, ALLOWED);
