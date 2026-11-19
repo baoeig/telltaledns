@@ -82,15 +82,18 @@ pub(super) const MAX_READ_CALLS: usize = 4096;
 /// [`MAX_READ_CALLS`] fit at once.
 pub(super) const CALL_BUDGET: usize = 32 * 1024;
 
-/// REQ: CLU-004 (ADR-174) — the bytes of answers one read may hold: 20 MiB. What a read costs
-/// is mostly after `wait`: parsing and merging its answers takes the node to 6.6 to 7.3 times
-/// their bytes above its own use (two real nodes, a peer padding its answers: 33 MB of answers,
-/// under a first cap of 32 MiB, took a replica from 42 MB resident to a 251 MiB high-water mark,
-/// at the Pi's limit; 20.7 MB, under this cap, to 185 MiB). So this cap is what keeps one read
-/// under the Pi's 256 MiB (`MemoryMax`), with about 70 MiB to spare. Measured (ADR-174) for a
-/// cluster of 5 nodes (4 peers asked) whose buckets look
+/// REQ: CLU-004 (ADR-174) — the bytes of the peers' answers one read may hold: 20 MiB. What a
+/// read costs is mostly after `wait`: parsing and merging its answers took a node to 6.6 to 7.3
+/// times their bytes above its own use (two real nodes, a peer padding its answers, a replica
+/// with no data of its own: 33 MB of answers, under a first cap of 32 MiB, took it from 42 MB
+/// resident to a 251 MiB high-water mark; 20.7 MB, under this cap, to 185 MiB). It bounds the
+/// peers' answers only: this node's own part of a read (which `Federated::timeseries` adds after
+/// the wait) and reads that merge at the same time are not counted, so two reads at this cap, or
+/// one on a node with its own week of minutes and big buckets, can pass a Pi's 256 MiB
+/// (`MemoryMax`). Measured (ADR-174) for a cluster of 5 nodes (4 peers asked) whose buckets look
 /// like a home network's: the longest range the dashboard asks for, 48 hours of minutes, is 16.9
-/// MiB of answers (1.2 times under this), the others 8.4 MiB or less, and a read of one call a
+/// MiB of answers a read (1.2 times under this; a refresh makes two such reads, the summary and
+/// the chart, 33.7 MiB of [`HELD_BYTES`]'s 40), the others 8.4 MiB or less, and a read of one call a
 /// peer (a top list, a page of the query log, a support part) 4 MiB at most. The longest ranges
 /// the API documents (7 days of minutes, 400 days of hours) are 59 to 62 MiB there, and come back
 /// partial. An answer that would take the read past it is "wasn't kept".
@@ -2159,9 +2162,10 @@ mod tests {
     // calls past the budget: a thread watches the counts all the while. Every read keeps a call
     // out until all of them have started, so they all hold their answers at once, and the answers
     // offered are many times the cap; what the reads kept is exactly what was counted as held, an
-    // answer is kept whole or not at all, and everything comes back.
+    // answer is kept whole or not at all, and everything comes back. (Long: one scenario, start to
+    // end.)
     #[test]
-    #[allow(clippy::too_many_lines)] // one scenario, start to end
+    #[allow(clippy::too_many_lines)]
     fn clu_004_reads_from_many_threads_never_pass_the_caps_on_bytes() {
         const HELD: usize = 64 * 1024;
         const READ: usize = 16 * 1024;
@@ -2271,11 +2275,13 @@ mod tests {
         assert_eq!(live.load(Ordering::SeqCst), 0);
     }
 
-    // REQ: CLU-004 (ADR-174) — the caps are what the docs and the metric's help give, two reads
-    // at a read's fit everyone's, the dashboard's longest range on a cluster of 5 nodes
-    // (measured: 17,683,487 bytes of answers on home-network buckets) fits a read's 1.2 times,
-    // and a read at the cap, at the 7.3 times its answers measured on two real nodes, plus a
-    // node's own 42 MiB, stays under three quarters of the Pi's 256 MiB.
+    // REQ: CLU-004 (ADR-174) — a pin of the constants, not a test of what the bridge does: the
+    // caps are the ones the docs and the metric's help give, two reads at a read's fit everyone's,
+    // the dashboard's longest range on a cluster of 5 nodes (measured: 17,683,487 bytes of answers
+    // a read on home-network buckets) fits a read's 1.18 times (the 11 below is ten times that,
+    // rounded down), and the ADR's arithmetic for a node with no data of its own (42 MiB, plus 7.3
+    // times the peers' answers, as measured on two real nodes) gives under three quarters of the
+    // Pi's 256 MiB. This node's own part and reads merging at once are not in it.
     #[test]
     fn clu_004_the_caps_on_bytes_are_the_documented_ones() {
         assert_eq!(READ_BYTES, 20 * 1024 * 1024);
