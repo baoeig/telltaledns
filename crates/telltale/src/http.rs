@@ -633,7 +633,7 @@ pub(crate) fn render(src: &Sources) -> String {
     render_upstream_quality(&mut w, &src.pipeline.quality, &state.router);
     render_exported(&mut w, src, &state);
     if let Some(l) = src.lists.load_full() {
-        render_lists(&mut w, &l.fetcher);
+        render_lists(&mut w, &l.fetcher, &src.config.load());
         render_filter(&mut w, &l);
     }
     render_shadow(&mut w, &src.shadow);
@@ -1285,9 +1285,19 @@ type ListGauge = (
     fn(&ListMeta) -> Option<u64>,
 );
 
-/// REQ: FLT-004, `spec/06` §6 alert "list fetch failing for > 48 h": per-list fetch state.
-fn render_lists(w: &mut PromWriter, fetcher: &Fetcher) {
-    render_list_status(w, &fetcher.status());
+/// REQ: FLT-004, OBS-005 (the chart's list alerts, `spec/06` §8): per-list fetch state, for the
+/// lists the configuration enables. The fetcher keeps a disabled list's state (re-enabling it
+/// needs no download), but a frozen failure count or last success would keep the list alerts
+/// firing for a list nobody is fetching, so it is left out here, at export time. A list the
+/// configuration doesn't hold (a blocked service's) has no `enabled = false` and stays.
+fn render_lists(w: &mut PromWriter, fetcher: &Fetcher, cfg: &telltale_config::Config) {
+    let mut status = fetcher.status();
+    status.retain(|(name, _)| {
+        !cfg.list
+            .iter()
+            .any(|l| !l.enabled && l.name.as_str() == name)
+    });
+    render_list_status(w, &status);
 }
 
 /// REQ: FLT-004 — inline rules are never fetched, so they have no last-success time: one would
