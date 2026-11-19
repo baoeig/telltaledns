@@ -10,6 +10,9 @@
 # The same way it also runs two blocks cut out of other scripts: the failure report of
 # deploy/systemd/e2e.sh (it must say who held port 53 and never hang), and the epoch reads of
 # deploy/cluster/gitops-failover-e2e.sh (REQ: CLU-005; they must not end that script silently).
+# Section 7e runs the rest of install.sh after the block (the call sites) with every system path
+# moved into a temp tree and a fake `systemctl`, to see that the wait comes after the resolver's stub
+# was turned off and before the one start, and nowhere else.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 INSTALL=deploy/systemd/install.sh
@@ -34,11 +37,15 @@ mkdir -p "$FAKE" "$FAKEBIN" "$FAKEROOT/bin"
 # the port held ("always": every check); later ones find it free, or show what the
 # `*_holder_after` files hold if there are any. The holder files carry the `users:(...)` column as
 # `ss -p` prints it; it is left off unless `p` was asked for. `ss -Hlunpt` is the report with
-# process names. $FAKE/ss_fails makes it refuse like an old `ss` that doesn't know -H.
+# process names. $FAKE/ss_fails makes it refuse like an old `ss` that doesn't know -H; $FAKE/ss_delay
+# is a number of seconds every look takes (`ss -p` walks every process's descriptors, which costs
+# time on a busy machine). Every call is added to $FAKE/calls.
 cat > "$FAKEBIN/ss" <<'EOF'
 #!/bin/sh
+echo "ss $*" >> "$FAKE/calls"
 case "$*" in *-Hlunpt*) cat "$FAKE/who"; exit 0 ;; esac
 if [ -f "$FAKE/ss_fails" ]; then echo "ss: invalid option -- 'H'" >&2; exit 1; fi
+[ ! -f "$FAKE/ss_delay" ] || sleep "$(cat "$FAKE/ss_delay")"
 case "$*" in
   *-Hlun*) c=$(cat "$FAKE/checks" 2>/dev/null || echo 0); c=$((c + 1)); echo "$c" > "$FAKE/checks"; held=udp_holder ;;
   *-Hltn*) c=$(cat "$FAKE/checks"); held=tcp_holder ;;
@@ -53,28 +60,43 @@ case "$*" in
 esac
 exit 0
 EOF
-# systemctl: only `show -p MainPID telltale`: the pid in $FAKE/mainpid (0: not running), or a failure.
+# systemctl: only `show -p MainPID telltale`: the pid in $FAKE/mainpid (0: not running), or the pid
+# in $FAKE/mainpid_after once the first look at the sockets has been made (the service restarted
+# during the wait), or a failure.
 cat > "$FAKEBIN/systemctl" <<'EOF'
 #!/bin/sh
 [ -f "$FAKE/systemctl_fails" ] && exit 1
 [ "$*" = "show -p MainPID telltale" ] || exit 2
-echo "MainPID=$(cat "$FAKE/mainpid")"
+c=$(cat "$FAKE/checks" 2>/dev/null || echo 0)
+if [ -f "$FAKE/mainpid_after" ] && [ "$c" -ge 1 ]; then echo "MainPID=$(cat "$FAKE/mainpid_after")"; else echo "MainPID=$(cat "$FAKE/mainpid")"; fi
 EOF
-# telltale: only `config check FILE --no-env --print`, which prints the canned effective config.
+# telltale: `config check FILE --no-env --print`, which prints the canned effective config, and
+# `health` (fails when $FAKE/health_fails exists).
 cat > "$FAKEROOT/bin/telltale" <<'EOF'
 #!/bin/sh
+if [ "$1" = health ]; then [ ! -f "$FAKE/health_fails" ]; exit; fi
 [ "$1 $2" = "config check" ] || exit 2
 [ "$4 $5" = "--no-env --print" ] || exit 2
 [ -f "$FAKE/config_fails" ] && exit 1
 cat "$FAKE/config.printed"
 EOF
-chmod +x "$FAKEBIN/ss" "$FAKEBIN/systemctl" "$FAKEROOT/bin/telltale"
+# awk: the real one, unless $FAKE/awk_fails (every call fails) or $FAKE/awk_binds_fails (only the
+# program that reads the config's listeners, which counts `blocks`, fails).
+REAL_AWK=$(command -v awk)
+cat > "$FAKEBIN/awk" <<'EOF'
+#!/bin/sh
+[ ! -f "$FAKE/awk_fails" ] || exit 2
+if [ -f "$FAKE/awk_binds_fails" ]; then case "$*" in *blocks*) exit 2 ;; esac; fi
+exec "$REAL_AWK" "$@"
+EOF
+chmod +x "$FAKEBIN/ss" "$FAKEBIN/systemctl" "$FAKEBIN/awk" "$FAKEROOT/bin/telltale"
 
 # A tool directory without `ss`, for the machine that doesn't have it.
 NOSS="$T/noss"
 mkdir -p "$NOSS"
 for tool in awk tr sleep cat sed date; do ln -s "$(command -v "$tool")" "$NOSS/$tool"; done
-TIMEOUT=$(command -v timeout)   # a hung install.sh function fails the test instead of the job
+# A hung install.sh function fails the test instead of the job: that needs coreutils' `timeout`.
+TIMEOUT=$(command -v timeout) || fail "ops_004_test_setup: \`timeout\` isn't installed (coreutils), and the test can't guard install.sh's functions against a hang without it"
 
 DEFAULT_CONFIG='config_version = 1
 
@@ -109,7 +131,8 @@ tcp LISTEN 0      4096    127.0.0.53%lo:53 0.0.0.0:* users:(("systemd-resolve",p
 # fixture BUSY [CONFIG [UDP_LINE TCP_LINE WHO [MAINPID]]]: resets the fakes for one case. MAINPID is
 # the pid systemd reports for the telltale service (default 0: the service isn't running).
 fixture() {
-  rm -f "$FAKE"/checks "$FAKE"/ss_fails "$FAKE"/config_fails "$FAKE"/systemctl_fails "$FAKE"/udp_holder_after "$FAKE"/tcp_holder_after
+  rm -f "$FAKE"/checks "$FAKE"/ss_fails "$FAKE"/config_fails "$FAKE"/systemctl_fails "$FAKE"/udp_holder_after "$FAKE"/tcp_holder_after \
+    "$FAKE"/ss_delay "$FAKE"/awk_fails "$FAKE"/awk_binds_fails "$FAKE"/mainpid_after "$FAKE"/health_fails "$FAKE"/resolved_inactive "$FAKE"/calls
   printf '%s\n' "$1" > "$FAKE/busy_checks"
   printf '%s\n' "${2-$DEFAULT_CONFIG}" > "$FAKE/config.printed"
   printf '%s\n' "${3-$STUB_UDP}" > "$FAKE/udp_holder"
@@ -123,7 +146,7 @@ checks() { cat "$FAKE/checks" 2>/dev/null || echo 0; }
 # middle of a case can't fail a timing bound; the wall clock where there is no /proc/uptime.
 now_ms() {
   local up
-  if read -r up _ < /proc/uptime 2>/dev/null; then
+  if read -r up _ 2>/dev/null < /proc/uptime; then
     echo $((10#${up%.*} * 1000 + 10#${up#*.} * 10))
   else
     echo $(($(date +%s%N) / 1000000))
@@ -138,7 +161,7 @@ run_wait() {
   local start end
   start=$(now_ms)
   set +e
-  OUT=$(PATH="${2:-$FAKEBIN:$PATH}" FAKE="$FAKE" PREFIX="$FAKEROOT" TELLTALE_PORT_WAIT="${1:-}" \
+  OUT=$(PATH="${2:-$FAKEBIN:$PATH}" FAKE="$FAKE" REAL_AWK="$REAL_AWK" PREFIX="$FAKEROOT" TELLTALE_PORT_WAIT="${1:-}" \
     "$TIMEOUT" 90 "$SH" -c 'set -eu; say() { printf "==> %s\n" "$*"; }; . "$1"; wait_for_port53 "$2"' sh "$T/lib.sh" "$T/telltale.toml" 2>&1)
   RC=$?
   set -e
@@ -349,6 +372,211 @@ run_wait 1
 { [ "$RC" = 1 ] && has "still held after 1s" && has 'pid=700'; } \
   || fail "ops_004_port53_wait_without_the_service_pid: rc=$RC: $OUT"
 ok ops_004_port53_wait_without_the_service_pid
+# (k) the service restarts while the wait runs (a start that failed at its bind is retried every two
+# seconds): its new process, pid 800, is its own too, not a holder. The stub holds the port at the
+# first look and is gone at the second; the service has it under its new pid.
+NEW_UDP='UNCONN 0      0       192.0.2.10:53 0.0.0.0:* users:(("telltale",pid=800,fd=7))'
+NEW_TCP='LISTEN 0      4096    192.0.2.10:53 0.0.0.0:* users:(("telltale",pid=800,fd=8))'
+fixture 1 "$DEFAULT_CONFIG" "$STUB_UDP" "$STUB_TCP" "$STUB_WHO" 700
+printf '%s\n' "$NEW_UDP" > "$FAKE/udp_holder_after"
+printf '%s\n' "$NEW_TCP" > "$FAKE/tcp_holder_after"
+printf '%s\n' 800 > "$FAKE/mainpid_after"
+run_wait 2
+{ [ "$RC" = 0 ] && has "Waiting up to" && has "Port 53 is free" && [ "$(checks)" = 2 ]; } \
+  || fail "ops_004_port53_wait_ignores_a_restarted_service: rc=$RC checks=$(checks) ms=$MS: $OUT"
+ok ops_004_port53_wait_ignores_a_restarted_service
+# (l) and the report, after the wait ran out, doesn't name it as the holder either.
+fixture always "$DEFAULT_CONFIG" "$STUB_UDP
+$NEW_UDP" "$STUB_TCP
+$NEW_TCP" "$STUB_WHO
+udp $NEW_UDP
+tcp $NEW_TCP" 700
+printf '%s\n' 800 > "$FAKE/mainpid_after"
+run_wait 1
+{ [ "$RC" = 1 ] && has "still held after 1s" && has 'systemd-resolve' && ! has 'pid=800'; } \
+  || fail "ops_004_port53_report_leaves_out_a_restarted_service: rc=$RC: $OUT"
+# (l2) the same with no wait at all, so no poll read the pid again: the report reads it itself.
+printf '%s\n' 800 > "$FAKE/mainpid_after"
+rm -f "$FAKE/checks"
+run_wait 0
+{ [ "$RC" = 1 ] && has "still held after 0s" && has 'systemd-resolve' && ! has 'pid=800'; } \
+  || fail "ops_004_port53_report_leaves_out_a_restarted_service: no wait: rc=$RC: $OUT"
+ok ops_004_port53_report_leaves_out_a_restarted_service
+
+# ---- 7c. the limit is seconds on the clock, whatever a look costs --------------------------------
+# `ss -p` walks every process's descriptors, so on a busy or slow machine each look takes real time
+# and a count of polls alone made "up to 3 s" take about 30: the limit also counts the clock. Each
+# look here takes 2 s (two `ss` calls of 1 s).
+fixture always
+echo 1 > "$FAKE/ss_delay"
+run_wait 3
+{ [ "$RC" = 1 ] && has "still held after 3s" && [ "$MS" -ge 5000 ] && [ "$MS" -lt 11000 ]; } \
+  || fail "ops_004_port53_wait_is_bounded_by_the_clock: rc=$RC ms=$MS (a first look of 2 s, a 3 s wait, at most one look more): $OUT"
+ok ops_004_port53_wait_is_bounded_by_the_clock
+# The clock itself: hundredths of a second since boot from /proc/uptime. A copy of the block reads
+# a file of the test's instead, to feed it values (a leading zero in the fraction is decimal).
+sed "s#/proc/uptime#$T/uptime#g" "$T/lib.sh" > "$T/lib-uptime.sh"
+grep -qF "$T/uptime" "$T/lib-uptime.sh" || fail "ops_004_port53_clock: the block doesn't read /proc/uptime"
+now() { "$SH" -c 'set -eu; . "$1"; port53_now' sh "$T/lib-uptime.sh"; }
+for pair in '12345.67:1234567' '0.45:45' '5.05:505' '100.00:10000' '3.5:350' '17:1700' '999999999.99:99999999999' '08.09 1:809'; do
+  printf '%s 99.99\n' "${pair%%:*}" > "$T/uptime"
+  [ "$(now)" = "${pair##*:}" ] || fail "ops_004_port53_clock_reads_uptime: '${pair%%:*}' gave '$(now)', expected ${pair##*:}"
+done
+ok ops_004_port53_clock_reads_uptime
+# No file, or something that isn't an uptime: the wall clock's seconds, times 100 (never a shell error).
+rm -f "$T/uptime"
+for junk in missing 'abc 1.0' '' '12.3x 5' '.5 1' '-5.00 2' '1e3.00 1'; do
+  if [ "$junk" = missing ]; then rm -f "$T/uptime"; else printf '%s\n' "$junk" > "$T/uptime"; fi
+  before=$(date +%s); got=$(now); after=$(date +%s)
+  { [ $((got % 100)) = 0 ] && [ $((got / 100)) -ge "$before" ] && [ $((got / 100)) -le "$after" ]; } \
+    || fail "ops_004_port53_clock_falls_back_to_date: '$junk' gave '$got' (date is $before to $after)"
+done
+ok ops_004_port53_clock_falls_back_to_date
+# The real thing steps in hundredths and doesn't go backwards.
+if [ -r /proc/uptime ]; then
+  a=$("$SH" -c 'set -eu; . "$1"; port53_now' sh "$T/lib.sh"); sleep 0.3
+  b=$("$SH" -c 'set -eu; . "$1"; port53_now' sh "$T/lib.sh")
+  { [ $((b - a)) -ge 25 ] && [ $((b - a)) -lt 300 ]; } || fail "ops_004_port53_clock_follows_the_boot_clock: 0.3 s moved it by $((b - a)) hundredths"
+  ok ops_004_port53_clock_follows_the_boot_clock
+fi
+
+# ---- 7d. awk failing is said, not mistaken for "nothing to wait for" -----------------------------
+# (n) awk can't read the printed config: assume every address (the default), as for a config that
+# can't be printed at all. A LAN-only config would not wait for the stub on 127.0.0.53; this one does.
+fixture 1 "$LAN_CONFIG"
+touch "$FAKE/awk_binds_fails"
+run_wait
+{ [ "$RC" = 0 ] && has "Waiting" && ! has "no listener on port 53" && [ "$(checks)" = 2 ]; } \
+  || fail "ops_004_port53_wait_awk_failing_on_the_config_assumes_every_address: rc=$RC checks=$(checks): $OUT"
+ok ops_004_port53_wait_awk_failing_on_the_config_assumes_every_address
+# (o) awk can't read the socket list either: one line, no wait, no failure (as without `ss`).
+fixture always "$DEFAULT_CONFIG"
+touch "$FAKE/awk_fails"
+run_wait
+{ [ "$RC" = 0 ] && has "awk can't read the socket list here: not checking that port 53 is free" && [ "$MS" -lt 2000 ] \
+  && [ "$(printf '%s\n' "$OUT" | wc -l)" = 1 ]; } \
+  || fail "ops_004_port53_wait_awk_failing_on_the_sockets_says_so: rc=$RC ms=$MS: $OUT"
+ok ops_004_port53_wait_awk_failing_on_the_sockets_says_so
+
+# ---- 7e. the call sites in install.sh ------------------------------------------------------------
+# REQ: OPS-004 — what the part of install.sh after the block does: the wait comes after the
+# resolver's stub was turned off and before the one start, and nowhere else. The text is cut out of
+# install.sh like the block, with every path to the system moved into a temp tree (the commands that
+# change files run against it, and `systemctl` is a fake that only logs). Nothing here runs the real
+# installer.
+TREE="$T/tree"
+sed -n '/^# END port53-wait/,$p' "$INSTALL" > "$T/tail.raw"
+[ -s "$T/tail.raw" ] || fail "ops_004_install_call_sites: $INSTALL has no port53-wait END marker"
+sed "s#/etc/#$TREE/etc/#g; s#/run/#$TREE/run/#g" "$T/tail.raw" > "$T/tail.sh"
+"$SH" -n "$T/tail.sh" || fail "ops_004_install_call_sites: the rest of $INSTALL isn't valid sh"
+if grep -nE '(^|[^A-Za-z0-9_./-])/(etc|run|var|usr|opt|home|root|sys|boot|lib|bin|sbin|srv|mnt|media)/' "$T/tail.sh" >&2; then
+  fail "ops_004_install_call_sites: the rest of $INSTALL names a system path the test doesn't move into its temp tree (see above)"
+fi
+TAILBIN="$T/tailbin"
+mkdir -p "$TAILBIN"
+cat > "$TAILBIN/systemctl" <<'EOF'
+#!/bin/sh
+echo "systemctl $*" >> "$FAKE/calls"
+case "$*" in
+  "show -p MainPID telltale")
+    c=$(cat "$FAKE/checks" 2>/dev/null || echo 0)
+    if [ -f "$FAKE/mainpid_after" ] && [ "$c" -ge 1 ]; then echo "MainPID=$(cat "$FAKE/mainpid_after")"; else echo "MainPID=$(cat "$FAKE/mainpid")"; fi ;;
+  "is-active --quiet systemd-resolved") [ ! -f "$FAKE/resolved_inactive" ]; exit ;;
+esac
+exit 0
+EOF
+printf '#!/bin/sh\nexit 0\n' > "$TAILBIN/sleep"      # the polls and the health loop don't wait here
+printf '#!/bin/sh\necho 192.0.2.10\n' > "$TAILBIN/hostname"
+chmod +x "$TAILBIN"/*
+# tail_tree: a fresh tree with a resolv.conf that is the stub's link, and no stub setting.
+tail_tree() {
+  rm -rf "$TREE"
+  mkdir -p "$TREE/etc/systemd/resolved.conf.d" "$TREE/etc/systemd/system/telltale.service.d" "$TREE/etc/telltale" "$TREE/run/systemd/resolve"
+  ln -s "$TREE/run/systemd/resolve/stub-resolv.conf" "$TREE/etc/resolv.conf"
+  : > "$TREE/etc/systemd/resolved.conf"
+  echo '# the installed config (the fake binary ignores it)' > "$TREE/etc/telltale/telltale.toml"
+  : > "$FAKE/calls"
+}
+# tail_run [VAR=value ...]: runs the text as install.sh does at that point; sets RC and OUT.
+# $FAKE/calls says in which order the fakes were called.
+tail_run() {
+  set +e
+  OUT=$(env PATH="$TAILBIN:$FAKEBIN:$PATH" FAKE="$FAKE" REAL_AWK="$REAL_AWK" PREFIX="$FAKEROOT" TREE="$TREE" "$@" \
+    "$TIMEOUT" 60 "$SH" -c 'set -eu
+      say() { printf "==> %s\n" "$*"; }
+      die() { printf "error: %s\n" "$*" >&2; exit 1; }
+      RESOLVED_DROPIN=$TREE/etc/systemd/resolved.conf.d/telltale.conf
+      RESOLV_BACKUP=$TREE/etc/resolv.conf.telltale-backup
+      DROPIN=$TREE/etc/systemd/system/telltale.service.d/10-first-admin.conf
+      ADMIN=token; ADMIN_USER=admin; WAIT_PORT53=no
+      : "${DISABLE_STUB:=ask}" "${START:=yes}"
+      . "$1"; . "$2"' sh "$T/lib.sh" "$T/tail.sh" < /dev/null 2>&1)
+  RC=$?
+  set -e
+}
+call_line() { { grep -n -m1 -x -F -- "$1" "$FAKE/calls" || true; } | cut -d: -f1; }   # the first line that is exactly $1
+call_count() { grep -c -x -F -- "$1" "$FAKE/calls" || true; }
+ss_looks() { grep -c '^ss -Hlunp ' "$FAKE/calls" || true; }               # looks at the UDP sockets: one per check
+ss_calls() { grep -c '^ss ' "$FAKE/calls" || true; }
+ss_first() { { grep -n -m1 '^ss ' "$FAKE/calls" || true; } | cut -d: -f1; }
+ss_last() { { grep -n '^ss ' "$FAKE/calls" || true; } | tail -n 1 | cut -d: -f1; }
+starts() { call_count 'systemctl restart telltale'; }
+# T1: the stub is turned off, the port stays held for two looks, then it is free: the wait comes
+# after the resolver restarted and before the one start, which is `enable` and then `restart`.
+fixture 2 "$DEFAULT_CONFIG"
+tail_tree
+tail_run DISABLE_STUB=yes START=yes TELLTALE_PORT_WAIT=5
+l_resolved=$(call_line 'systemctl restart systemd-resolved'); l_ss=$(ss_first); last_ss=$(ss_last)
+l_enable=$(call_line 'systemctl enable telltale'); l_start=$(call_line 'systemctl restart telltale')
+{ [ "$RC" = 0 ] && has "TelltaleDNS is running" && has "Waiting up to 5s" && has "Port 53 is free" \
+  && [ -n "$l_resolved" ] && [ -n "$l_ss" ] && [ -n "$l_start" ] && [ -n "$l_enable" ] \
+  && [ "$l_resolved" -lt "$l_ss" ] && [ "$last_ss" -lt "$l_enable" ] && [ "$l_enable" -lt "$l_start" ]; } \
+  || fail "ops_004_install_waits_for_port_53_before_its_one_start: rc=$RC resolved=$l_resolved ss=$l_ss..$last_ss enable=$l_enable start=$l_start: $OUT
+$(cat "$FAKE/calls")"
+{ [ "$(ss_looks)" = 3 ] && [ "$(starts)" = 1 ] && [ "$(call_count 'systemctl enable --now telltale')" = 0 ]; } \
+  || fail "ops_004_install_waits_for_port_53_before_its_one_start: $(ss_looks) looks (2 held, 1 free), $(starts) starts: $(cat "$FAKE/calls")"
+grep -q '^DNSStubListener=no' "$TREE/etc/systemd/resolved.conf.d/telltale.conf" \
+  || fail "ops_004_install_waits_for_port_53_before_its_one_start: the drop-in wasn't written in the test's tree"
+ok ops_004_install_waits_for_port_53_before_its_one_start
+# T2..T4, T6: no wait unless this run turned the stub off, and none without a start.
+no_wait() { # name
+  [ "$(ss_calls)" = 0 ] || fail "ops_004_install_waits_only_after_turning_the_stub_off: $1: ss was called: $(cat "$FAKE/calls")"
+  ! has "Waiting up to" || fail "ops_004_install_waits_only_after_turning_the_stub_off: $1: it waited: $OUT"
+}
+fixture 2 "$DEFAULT_CONFIG"; tail_tree; tail_run DISABLE_STUB=no START=yes
+{ [ "$RC" = 0 ] && has "Leaving systemd-resolved as is" && [ "$(starts)" = 1 ] && [ "$(call_count 'systemctl restart systemd-resolved')" = 0 ]; } \
+  || fail "ops_004_install_waits_only_after_turning_the_stub_off: declined: rc=$RC: $OUT $(cat "$FAKE/calls")"
+no_wait declined
+fixture 2 "$DEFAULT_CONFIG"; tail_tree; tail_run START=yes          # the answer is still "ask" and there is no terminal
+{ [ "$RC" = 0 ] && has "Leaving systemd-resolved as is" && [ "$(starts)" = 1 ] && [ "$(call_count 'systemctl restart systemd-resolved')" = 0 ]; } \
+  || fail "ops_004_install_waits_only_after_turning_the_stub_off: no terminal: rc=$RC: $OUT $(cat "$FAKE/calls")"
+no_wait "no terminal"
+fixture 2 "$DEFAULT_CONFIG"; tail_tree
+printf '[Resolve]\nDNSStubListener=no\n' > "$TREE/etc/systemd/resolved.conf.d/10-mine.conf"
+tail_run DISABLE_STUB=yes START=yes                                 # the stub is already off
+{ [ "$RC" = 0 ] && [ "$(starts)" = 1 ] && [ "$(call_count 'systemctl restart systemd-resolved')" = 0 ]; } \
+  || fail "ops_004_install_waits_only_after_turning_the_stub_off: already off: rc=$RC: $OUT $(cat "$FAKE/calls")"
+no_wait "already off"
+fixture 2 "$DEFAULT_CONFIG"; tail_tree; touch "$FAKE/resolved_inactive"
+tail_run DISABLE_STUB=yes START=yes                                 # no systemd-resolved at all
+{ [ "$RC" = 0 ] && [ "$(starts)" = 1 ] && [ "$(call_count 'systemctl restart systemd-resolved')" = 0 ]; } \
+  || fail "ops_004_install_waits_only_after_turning_the_stub_off: no resolved: rc=$RC: $OUT $(cat "$FAKE/calls")"
+no_wait "no resolved"
+fixture 2 "$DEFAULT_CONFIG"; tail_tree; tail_run DISABLE_STUB=yes START=no   # --no-start: turned off, never started
+{ [ "$RC" = 0 ] && [ "$(call_count 'systemctl restart systemd-resolved')" = 1 ] && [ "$(starts)" = 0 ] && [ "$(call_count 'systemctl enable telltale')" = 0 ]; } \
+  || fail "ops_004_install_waits_only_after_turning_the_stub_off: --no-start: rc=$RC: $OUT $(cat "$FAKE/calls")"
+no_wait "--no-start"
+ok ops_004_install_waits_only_after_turning_the_stub_off
+# T5: the port stays held: it says what holds it, and still starts the service once; the failure that
+# follows names the port as the likely reason.
+fixture always "$DEFAULT_CONFIG"; tail_tree; touch "$FAKE/health_fails"
+tail_run DISABLE_STUB=yes START=yes TELLTALE_PORT_WAIT=1
+{ [ "$RC" = 1 ] && has "still held after 1s" && has 'systemd-resolve' && has "Port 53 was still held when the service started" \
+  && has "the service didn't become ready" && [ "$(starts)" = 1 ]; } \
+  || fail "ops_004_install_starts_once_even_when_port_53_stays_held: rc=$RC starts=$(starts): $OUT"
+l_start=$(call_line 'systemctl restart telltale'); last_ss=$(ss_last)
+[ "$last_ss" -lt "$l_start" ] || fail "ops_004_install_starts_once_even_when_port_53_stays_held: it looked at the sockets after the start: $(cat "$FAKE/calls")"
+ok ops_004_install_starts_once_even_when_port_53_stays_held
 
 # ---- 8. the real binary prints the effective config the way install.sh reads it ----------------
 REAL=${1:-}
@@ -515,5 +743,12 @@ for want in 'read:[]' "couldn't read the epoch" 'advance:[?]' 'advance:[2]' 'rea
 done
 [ "$rc" = 0 ] || fail "clu_005_epoch_reads_report_instead_of_exiting: rc=$rc: $out"
 ok clu_005_epoch_reads_report_instead_of_exiting
+# The block is only safe where it is used: no step of the script may read an epoch with a bare
+# `x=$(metric ...)`, which ends the whole run silently when the node's metrics can't be reached
+# (the step 3 read did once). Every epoch read goes through `epoch_of`.
+bare=$(grep -nE '^[[:space:]]*[A-Za-z_][A-Za-z_0-9]*=\$\(metric ' "$G" | grep -vF '|| true' || true)
+[ -z "$bare" ] || fail "clu_005_no_epoch_read_ends_the_takeover_step_silently: a bare metric read in $G: $bare"
+[ "$(grep -cE '=\$\(epoch_of ' "$G")" -ge 3 ] || fail "clu_005_no_epoch_read_ends_the_takeover_step_silently: $G reads fewer than three epochs through epoch_of"
+ok clu_005_no_epoch_read_ends_the_takeover_step_silently
 
 echo "PASS ($n checks)"
