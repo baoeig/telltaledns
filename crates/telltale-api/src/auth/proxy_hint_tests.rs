@@ -93,6 +93,8 @@ fn ip(s: &str) -> IpAddr {
 }
 
 const SAYS: &str = "carry a forwarded-address header";
+/// What the line for a proxy that sends only `Forwarded` says instead.
+const ONLY_FORWARDED: &str = "reads client addresses only from `X-Forwarded-For`";
 
 #[test]
 fn api_004_an_unlisted_same_host_proxy_gets_one_hint_for_a_burst_and_another_after_ten_minutes() {
@@ -189,22 +191,101 @@ fn api_004_the_hint_needs_a_forwarded_address_header_and_counts_every_loopback_f
         assert_eq!(got, ip("127.0.0.1"));
         assert!(lines.is_empty(), "{pairs:?}: {lines:?}");
     }
-    // Either header, from any form of loopback, gets one line.
-    for (peer, pairs) in [
-        ("127.0.0.1", vec![("x-forwarded-for", "203.0.113.9")]),
-        (
-            "127.0.0.1",
-            vec![("forwarded", "for=203.0.113.9;proto=https")],
-        ),
-        ("127.0.0.5", vec![("x-forwarded-for", "203.0.113.9")]),
-        ("::1", vec![("x-forwarded-for", "203.0.113.9")]),
-        ("::ffff:127.0.0.1", vec![("x-forwarded-for", "203.0.113.9")]),
-    ] {
+    // `X-Forwarded-For`, from any form of loopback, gets one line (the one that says to list the
+    // proxy: listing it makes this node read the client from that header).
+    for peer in ["127.0.0.1", "127.0.0.5", "::1", "::ffff:127.0.0.1"] {
         let a = auth(&[]);
+        let pairs = [("x-forwarded-for", "203.0.113.9")];
         let (got, lines) = said(|| remote(&a, &from(peer), &headers(&pairs)));
         assert_eq!(got, ip(peer), "{peer}: still the peer");
         assert_eq!(lines.len(), 1, "{peer} {pairs:?}: {lines:?}");
+        assert!(lines[0].1.contains(SAYS), "{peer}: {lines:?}");
+        assert!(!lines[0].1.contains(ONLY_FORWARDED), "{peer}: {lines:?}");
     }
+    // The standard `Forwarded` header alone also gets one line, but not that advice: see below.
+    let a = auth(&[]);
+    let pairs = [("forwarded", "for=203.0.113.9;proto=https")];
+    let (got, lines) = said(|| remote(&a, &from("127.0.0.1"), &headers(&pairs)));
+    assert_eq!(got, ip("127.0.0.1"), "still the peer");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].1.contains(ONLY_FORWARDED), "{lines:?}");
+}
+
+/// F1 of the final review: this node reads a listed proxy's client only from `X-Forwarded-For`
+/// (`Forwarded` is never parsed). A proxy that sends only `Forwarded` must not be told to "list
+/// it": that would stop the hint and leave every client looking like the proxy, with the
+/// break-glass list as open as before. It is told to send `X-Forwarded-For` first.
+#[test]
+fn api_004_a_proxy_that_sends_only_forwarded_is_told_to_send_x_forwarded_for() {
+    let a = auth(&[]);
+    let h = headers(&[(
+        "forwarded",
+        "for=evil-marker-fwd;by=198.51.100.7;proto=https",
+    )]);
+    let (got, lines) = said(|| remote(&a, &from("127.0.0.1"), &h));
+    assert_eq!(
+        got,
+        ip("127.0.0.1"),
+        "remote() is unchanged: the proxy's address"
+    );
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let (level, text) = &lines[0];
+    assert_eq!(*level, tracing::Level::INFO);
+    for want in [
+        "127.0.0.1",
+        "`Forwarded`",
+        ONLY_FORWARDED,
+        "make the proxy send `X-Forwarded-For`",
+        "[api] trusted_proxies",
+    ] {
+        assert!(text.contains(want), "no `{want}` in: {text}");
+    }
+    assert!(
+        !text.contains(SAYS),
+        "not the line that says listing the proxy is enough: {text}"
+    );
+    for never in ["evil-marker", "198.51.100.7"] {
+        assert!(!text.contains(never), "`{never}` is in: {text}");
+    }
+
+    // Both headers: the proxy does send `X-Forwarded-For`, so it is the ordinary line.
+    let a = auth(&[]);
+    let h = headers(&[
+        ("x-forwarded-for", "203.0.113.9"),
+        ("forwarded", "for=203.0.113.9"),
+    ]);
+    let (got, lines) = said(|| remote(&a, &from("127.0.0.1"), &h));
+    assert_eq!(got, ip("127.0.0.1"));
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].1.contains(SAYS), "{lines:?}");
+    assert!(!lines[0].1.contains(ONLY_FORWARDED), "{lines:?}");
+
+    // Both lines share one limiter: whichever comes first in ten minutes is the only one.
+    let a = auth(&[]);
+    let only = headers(&[("forwarded", "for=203.0.113.9")]);
+    let xff = headers(&[("x-forwarded-for", "203.0.113.9")]);
+    let ((), lines) = said(|| {
+        remote(&a, &from("127.0.0.1"), &only);
+        remote(&a, &from("127.0.0.1"), &xff);
+    });
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].1.contains(ONLY_FORWARDED), "{lines:?}");
+    a.proxy_hint.advance(Duration::from_secs(601));
+    let (_, lines) = said(|| remote(&a, &from("127.0.0.1"), &xff));
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].1.contains(SAYS), "{lines:?}");
+
+    // Listing a proxy that sends only `Forwarded` silences the hint and reveals no client: the
+    // address is still the proxy's. That is why the line above says to send `X-Forwarded-For` first.
+    let a = auth(&[("127.0.0.1", 32)]);
+    let h = headers(&[("forwarded", "for=203.0.113.9")]);
+    let (got, lines) = said(|| remote(&a, &from("127.0.0.1"), &h));
+    assert_eq!(
+        got,
+        ip("127.0.0.1"),
+        "a listed proxy's `Forwarded` header is not read"
+    );
+    assert!(lines.is_empty(), "{lines:?}");
 }
 
 #[test]

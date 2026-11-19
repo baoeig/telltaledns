@@ -136,10 +136,24 @@ fn is_loopback(ip: IpAddr) -> bool {
     }
 }
 
-/// The request names a client in a header a proxy sets: `X-Forwarded-For` or `Forwarded`.
-/// (`X-Forwarded-Proto` alone doesn't: a TLS terminator on this machine sends it, rightly.)
-fn forwards_a_client(headers: &HeaderMap) -> bool {
-    headers.contains_key("x-forwarded-for") || headers.contains_key("forwarded")
+/// Which header a proxy on this machine named its client in, for the hint. (`X-Forwarded-Proto`
+/// alone says nothing about a client: a TLS terminator on this machine sends it, rightly.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardedBy {
+    /// `X-Forwarded-For`: the header this node reads a client's address from.
+    ForHeader,
+    /// Only the standard `Forwarded` header, which this node never reads.
+    ForwardedOnly,
+}
+
+fn forwarded_by(headers: &HeaderMap) -> Option<ForwardedBy> {
+    if headers.contains_key("x-forwarded-for") {
+        Some(ForwardedBy::ForHeader)
+    } else if headers.contains_key("forwarded") {
+        Some(ForwardedBy::ForwardedOnly)
+    } else {
+        None
+    }
 }
 
 /// The client's address. Behind a trusted proxy (`[api] trusted_proxies`: an ingress, a
@@ -165,15 +179,27 @@ pub(crate) fn remote(auth: &Auth, req_ext: &axum::http::Extensions, headers: &He
         // loopback peer that sends a forwarded-address header; every browser it serves then looks
         // like loopback to the break-glass list. Only loopback peers: a LAN host that sends the
         // header itself is not a proxy. The header is never logged (the sender wrote it).
+        // A proxy that sends only `Forwarded` gets another line: this node reads a client's address
+        // only from `X-Forwarded-For`, so listing that proxy would silence the hint and change
+        // nothing (every client would still be the proxy), which is the mistake it is for.
         if is_loopback(peer)
-            && forwards_a_client(headers)
+            && let Some(by) = forwarded_by(headers)
             && auth.proxy_hint.due(auth.proxy_hint.now_ms())
         {
-            tracing::info!(
-                "requests from {peer} carry a forwarded-address header but `[api] trusted_proxies` \
-                 doesn't list that proxy, so client addresses are taken as the proxy's; list it to \
-                 restrict by client (see the Users and sign-in guide in docs/running.md)"
-            );
+            match by {
+                ForwardedBy::ForHeader => tracing::info!(
+                    "requests from {peer} carry a forwarded-address header but `[api] trusted_proxies` \
+                     doesn't list that proxy, so client addresses are taken as the proxy's; list it to \
+                     restrict by client (see the Users and sign-in guide in docs/running.md)"
+                ),
+                ForwardedBy::ForwardedOnly => tracing::info!(
+                    "requests from {peer} carry a `Forwarded` header but no `X-Forwarded-For`; this node \
+                     reads client addresses only from `X-Forwarded-For`, so they are taken as the \
+                     proxy's whatever `[api] trusted_proxies` says: make the proxy send \
+                     `X-Forwarded-For`, then list it to restrict by client (see the Users and sign-in \
+                     guide in docs/running.md)"
+                ),
+            }
         }
         return peer;
     }
