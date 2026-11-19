@@ -757,7 +757,10 @@ async fn flt_004_an_inline_list_that_cannot_be_stored_is_retried_on_the_ladder()
     assert_eq!(f.refresh_one(&list).await, Outcome::Updated);
     let m = meta_of(&f, "l");
     assert!(m.has_content() && m.consecutive_failures == 0, "{m:?}");
-    assert!(f.due(specs, now + 30 * 86_400).0.is_empty());
+    assert!(
+        f.due(specs, now + 30 * 86_400).0.is_empty(),
+        "a loaded inline list is left alone"
+    );
 }
 
 /// REQ: FLT-004 — an inline list that loaded one set of rules and was then edited to rules that are
