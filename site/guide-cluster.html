@@ -126,7 +126,7 @@ telltale cluster set-failover auto</code></pre>
     <li><b>The Cluster page:</b> the summary on top, then <b>Nodes</b> (topology and every node's state), <b>Health</b> (checks with what to do when one fails), <b>Rollouts</b>, and <b>Events</b>. A tab with something wrong shows a count.</li>
     <li><b>The health icon</b> at the bottom of the menu turns amber when a node is unreachable or behind on configuration for a minute.</li>
     <li><b>Metrics</b> on every node: <code>telltale_cluster_peer_up</code>, <code>telltale_cluster_peer_config_lag</code>, <code>telltale_cluster_behind_seconds</code>, and <code>telltale_cluster_cert_expiry_timestamp_seconds</code>. A replica's <code>telltale_cluster_peer_up</code> lists the primary, the voters under automatic failover, and the peers it is connected to or heard from in the last 15 seconds; the primary lists every node, so scrape it to see a replica that is down. The Helm chart's alert rules cover a peer down, configuration behind, failing syncs, and expiring certificates.</li>
-    <li><b>Certificates renew themselves:</b> each node's lasts 90 days and is renewed with 30 left. To replace the cluster's certificate authority, run <code>telltale cluster rotate-ca</code> on the primary; DNS keeps answering while it runs. Trust only moves forward: an earlier step sent again can't bring the retired authority back.</li>
+    <li><b>Certificates renew themselves:</b> each node's lasts 90 days and is renewed with 30 left. To replace the cluster's certificate authority, run <code>telltale cluster rotate-ca</code> on the primary; DNS keeps answering while it runs. Trust only moves forward: a step of an older version sent again can't bring the retired authority back. One rare case is left: a primary that crashes right after publishing a step can publish that version number again with other content. <a href="https://github.com/paimonsoror/telltaledns/blob/main/docs/running.md">The docs</a> have the details.</li>
   </ul>
 </section>
 
@@ -140,6 +140,7 @@ telltale cluster set-failover auto</code></pre>
       <tr><td>The second node can't join</td><td>Make sure it can reach the first node's cluster port (8443 by default) at one of the <code>--advertise</code> URLs, and that the token hasn't expired (<code>telltale cluster token list</code>).</td></tr>
       <tr><td>Changes are refused with <b>503</b></td><td>There's no primary right now: promote one, or wait for automatic failover. DNS isn't affected.</td></tr>
       <tr><td>A node can't connect after a CA rotation</td><td>It was away for the whole rotation: join it again with a new token.</td></tr>
+      <tr><td>Configuration and a CA rotation stop reaching the other nodes after the primary lost <code>cluster/published.json</code> (a full disk and a restart) or its data came back from an older copy</td><td>Its version went backwards, so the others wait for it to pass theirs; DNS isn't affected. Promote another node (a new epoch beats any version). If none can be promoted, stop each other node, delete its <code>cluster/ca.version</code> and start it again; configuration still waits for the primary to catch up.</td></tr>
     </tbody>
   </table></div>
 </section>
