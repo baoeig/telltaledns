@@ -479,4 +479,29 @@ run_report "$T/rnotools"
   || fail "ops_004_e2e_failure_report_without_tools: rc=$RC: $OUT"
 ok ops_004_e2e_failure_report_without_tools
 
+# ---- 11. the GitOps takeover step reads epochs without ending silently --------------------------
+# REQ: CLU-005 — deploy/cluster/gitops-failover-e2e.sh runs under `set -euo pipefail` and `metric`
+# returns curl's status, so an epoch read while a node's metrics are unreachable used to end the
+# script with no FAIL line and no log dump. The reads now say so and go on. Here the real `metric`
+# and the epoch-report block run against a port nothing listens on.
+G=deploy/cluster/gitops-failover-e2e.sh
+sed -n '/^# BEGIN epoch-report/,/^# END epoch-report/p' "$G" > "$T/epoch.sh"
+[ -s "$T/epoch.sh" ] || fail "clu_005_epoch_reads: $G has no epoch-report block"
+grep -q '^# END epoch-report' "$T/epoch.sh" || fail "clu_005_epoch_reads: the epoch-report block in $G has no END marker"
+sed -n '/^metric() {/,/^}/p' "$G" > "$T/metric.sh"
+[ -s "$T/metric.sh" ] || fail "clu_005_epoch_reads: $G has no metric function"
+set +e
+out=$(bash -c 'set -euo pipefail; . "$1"; . "$2"
+  e=$(epoch_of 1); echo "read:[$e]"
+  echo "advance:[$(epoch_advance "$e" 3)]"; echo "advance:[$(epoch_advance 2 4)]"
+  metric() { echo 7; }; e=$(epoch_of 1); echo "read:[$e]"; echo "advance:[$(epoch_advance 2 "$e")]"
+  echo reached-the-end' bash "$T/metric.sh" "$T/epoch.sh" 2>&1)
+rc=$?
+set -e
+for want in 'read:[]' "couldn't read the epoch" 'advance:[?]' 'advance:[2]' 'read:[7]' 'advance:[5]' 'reached-the-end'; do
+  case "$out" in *"$want"*) ;; *) fail "clu_005_epoch_reads_report_instead_of_exiting: rc=$rc, no '$want': $out" ;; esac
+done
+[ "$rc" = 0 ] || fail "clu_005_epoch_reads_report_instead_of_exiting: rc=$rc: $out"
+ok clu_005_epoch_reads_report_instead_of_exiting
+
 echo "PASS ($n checks)"
