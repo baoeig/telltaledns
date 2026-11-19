@@ -396,7 +396,7 @@ tests:
         exp_alerts:
           - exp_labels: { severity: warning, job: telltale-metrics, instance: pi, list: typo }
             exp_annotations:
-              summary: Filter list typo has never refreshed successfully on pi and its latest refresh failed (check its URL or path; it blocks nothing until a refresh works).
+              summary: Filter list typo has never refreshed successfully on pi and its latest refresh failed (check its URL, path or rules).
 
   # REQ: FLT-004 — only a list with no last-success series is "never loaded". A list that
   # succeeded once, however long ago ("old": about 58 days; "recent": 100000 s), has the series,
@@ -433,7 +433,7 @@ tests:
         exp_alerts:
           - exp_labels: { severity: warning, job: telltale-metrics, instance: pi, list: typo }
             exp_annotations:
-              summary: Filter list typo has never refreshed successfully on pi and its latest refresh failed (check its URL or path; it blocks nothing until a refresh works).
+              summary: Filter list typo has never refreshed successfully on pi and its latest refresh failed (check its URL, path or rules).
       - eval_time: 65m
         alertname: TelltaleDNSListStale
         exp_alerts:
@@ -462,10 +462,10 @@ tests:
         exp_alerts:
           - exp_labels: { severity: warning, job: telltale-metrics, instance: pi, list: off-never }
             exp_annotations:
-              summary: Filter list off-never has never refreshed successfully on pi and its latest refresh failed (check its URL or path; it blocks nothing until a refresh works).
+              summary: Filter list off-never has never refreshed successfully on pi and its latest refresh failed (check its URL, path or rules).
           - exp_labels: { severity: warning, job: telltale-metrics, instance: pi, list: typo }
             exp_annotations:
-              summary: Filter list typo has never refreshed successfully on pi and its latest refresh failed (check its URL or path; it blocks nothing until a refresh works).
+              summary: Filter list typo has never refreshed successfully on pi and its latest refresh failed (check its URL, path or rules).
       - eval_time: 65m
         alertname: TelltaleDNSListStale
         exp_alerts:
@@ -477,7 +477,7 @@ tests:
         exp_alerts:
           - exp_labels: { severity: warning, job: telltale-metrics, instance: pi, list: typo }
             exp_annotations:
-              summary: Filter list typo has never refreshed successfully on pi and its latest refresh failed (check its URL or path; it blocks nothing until a refresh works).
+              summary: Filter list typo has never refreshed successfully on pi and its latest refresh failed (check its URL, path or rules).
       - eval_time: 80m
         alertname: TelltaleDNSListStale
         exp_alerts: []
@@ -507,7 +507,7 @@ tests:
         exp_alerts:
           - exp_labels: { severity: warning, job: telltale-metrics, instance: lab, list: typo }
             exp_annotations:
-              summary: Filter list typo has never refreshed successfully on lab and its latest refresh failed (check its URL or path; it blocks nothing until a refresh works).
+              summary: Filter list typo has never refreshed successfully on lab and its latest refresh failed (check its URL, path or rules).
           - exp_labels: { severity: warning, job: telltale-metrics, instance: pi, list: typo }
             exp_annotations:
-              summary: Filter list typo has never refreshed successfully on pi and its latest refresh failed (check its URL or path; it blocks nothing until a refresh works).
+              summary: Filter list typo has never refreshed successfully on pi and its latest refresh failed (check its URL, path or rules).
