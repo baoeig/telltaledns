@@ -95,6 +95,21 @@ wait_metric() { # port name value seconds
   for _ in $(seq $(( $4 * 4 ))); do [ "$(metric "$1" "$2")" = "$3" ] && return 0; sleep 0.25; done
   return 1
 }
+# BEGIN epoch-report — REQ: CLU-005. deploy/systemd/portwait-test.sh runs this block, with `metric`
+# above, against a port nothing listens on.
+# This script runs under `set -euo pipefail` and `metric` returns curl's status, so a bare
+# `epoch=$(metric ...)` ended the run with no FAIL line and no log dump when a node's metrics
+# couldn't be read at that moment. These say so and go on.
+epoch_of() { # metrics-port -> the node's cluster epoch; nothing (and a note) when it can't be read
+  local e
+  e=$(metric "$1" telltale_cluster_epoch || true)
+  [ -n "$e" ] || echo "note: couldn't read the epoch on :$1" >&2
+  printf '%s' "$e"
+}
+epoch_advance() { # before after -> how far the epoch moved; ? when either is unknown
+  if [ -n "$1" ] && [ -n "$2" ]; then echo $(( $2 - $1 )); else echo '?'; fi
+}
+# END epoch-report
 
 "$B" cluster init --name gf --advertise https://127.0.0.1:28641 --config-authority gitops -c "$E/g.toml" >/dev/null
 "$B" cluster set-failover auto -c "$E/g.toml" >/dev/null
@@ -122,7 +137,7 @@ done
 echo "ok (epoch $(metric 29201 telltale_cluster_epoch))"
 
 echo "== 2. kill g: a node that isn't Git-managed becomes the emergency primary"
-epoch_before=$(metric 29201 telltale_cluster_epoch)
+epoch_before=$(epoch_of 29201)
 t0=$(date +%s)
 kill -9 "$G_PID"; wait "$G_PID" 2>/dev/null || true; G_PID=
 EMERG=; OTHER=; EMERG_MET=; OTHER_MET=; EMERG_DNS=
@@ -137,19 +152,19 @@ for _ in $(seq 240); do
 done
 [ -n "$EMERG" ] || fail "nobody was elected within 60 s of g's death"
 took=$(( $(date +%s) - t0 ))
-epoch=$(metric "$EMERG_MET" telltale_cluster_epoch)
+epoch=$(epoch_of "$EMERG_MET")
 # REQ: CLU-005 — spec/12 §10: after the primary is killed, a new primary within 30 s. One election
-# round takes about one lease (15 s). When both candidates ask at once the vote splits and the next
-# round costs another lease, so two rounds (31 to 35 s seen) already pass the spec's 30 s. This
-# limit tolerates that one split and no more: a third round (about 50 s) fails the step on
-# purpose, with the number of rounds in the message, because it is a finding about the election
-# (spec/12 §5), not noise in the test. Widening the limit would hide it.
-rounds=$(( epoch - epoch_before ))
-[ "$took" -le 45 ] || fail "the election took $took s: $rounds election round(s) (epoch $epoch_before to $epoch, about 15 s each; a second round means the candidates split the vote, and spec/12 §10 allows 30 s in all)"
-[ "$epoch" -ge 2 ] || fail "the new primary's epoch is $epoch"
+# round takes about one lease (15 s) and moves the epoch by one. When both candidates ask at once
+# the vote splits and the next round costs another lease, so two rounds (31 to 35 s seen) already
+# pass the spec's 30 s. This limit tolerates that one split and no more: a third round (about 50 s)
+# fails the step on purpose, with how far the epoch moved in the message, because it is a finding
+# about the election (spec/12 §5), not noise in the test. Widening the limit would hide it.
+advanced=$(epoch_advance "$epoch_before" "$epoch")
+[ "$took" -le 45 ] || fail "the election took $took s: the epoch advanced $advanced time(s), from ${epoch_before:-?} to ${epoch:-?} (a round takes about 15 s and moves it by one; a second round means the candidates split the vote, and spec/12 §10 allows 30 s in all)"
+[ "${epoch:-0}" -ge 2 ] || fail "the new primary's epoch is '${epoch}' (its metrics couldn't be read, or it is below 2)"
 grep 'elected primary' "$E/$EMERG.log" | grep -q 'role.*Emergency' || fail "$EMERG wasn't made an emergency primary: $(grep 'elected primary' "$E/$EMERG.log" | tail -1)"
 [ "$(q "$EMERG_DNS" a.fo.test)" = 10.0.0.1 ] || fail "$EMERG doesn't answer DNS"
-echo "ok ($EMERG elected after ${took} s as an emergency primary, epoch $epoch: $rounds election round(s) from epoch $epoch_before)"
+echo "ok ($EMERG elected after ${took} s as an emergency primary, epoch $epoch: the epoch advanced $advanced time(s) from ${epoch_before:-?})"
 
 echo "== 3. g returns; it asks the emergency primary to hand over and is elected"
 "$B" run -c "$E/g.toml" > "$E/g2.log" 2>&1 & G_PID=$!

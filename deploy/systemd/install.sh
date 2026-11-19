@@ -560,13 +560,15 @@ port53_binds() { # config
     END { if (!blocks) print "*" }'
 }
 
-# The `ss` lines on stdin whose local address (the column numbered $2) overlaps one of the
-# addresses in $1: the same address, or either side is a wildcard.
-port53_filter() { # binds column
-  awk -v binds="$(printf '%s' "$1" | tr '\n' ' ')" -v col="$2" '
+# The `ss -p` lines on stdin whose local address (the column numbered $2) overlaps one of the
+# addresses in $1: the same address, or either side is a wildcard. Lines of the process numbered
+# $3 (the telltale service's own, see port53_own_pid; 0 for none) are left out.
+port53_filter() { # binds column own-pid
+  awk -v binds="$(printf '%s' "$1" | tr '\n' ' ')" -v col="$2" -v own="${3:-0}" '
     function wild(a) { return a == "*" || a == "0.0.0.0" || a == "::" }
     BEGIN { nb = split(binds, b, " ") }
     NF == 0 { next }
+    own != 0 && index($0, "pid=" own ",") { next }
     {
       a = $col; sub(/:[0-9]+$/, "", a); gsub(/[][]/, "", a); sub(/%.*$/, "", a)
       hit = wild(a)
@@ -575,36 +577,53 @@ port53_filter() { # binds column
     }'
 }
 
-# The UDP and TCP sockets that listen on port 53; fails when `ss` can't list them.
+# The UDP and TCP sockets that listen on port 53, with their processes (we run as root); fails when
+# `ss` can't list them.
 port53_sockets() {
-  ss -Hlun 'sport = :53' 2>/dev/null && ss -Hltn 'sport = :53' 2>/dev/null
+  ss -Hlunp 'sport = :53' 2>/dev/null && ss -Hltnp 'sport = :53' 2>/dev/null
 }
 
-# Waits until nothing holds UDP or TCP port 53 on an address TelltaleDNS binds (the config's
-# listeners; $1 is the config file), for up to $TELLTALE_PORT_WAIT seconds (default 15). Returns
-# 0 when the port is free, or can't be checked (no `ss`: it says so in one line, and carries on as
-# an install always did); 1 when it is still held after the wait, after printing what holds it
-# and the next step.
+# The process id of the telltale service (0: it isn't running, or systemd can't say). An upgrade
+# re-run finds the old instance on port 53; its sockets are what the `restart` below replaces, so
+# they are not what the wait is for. Only the service's own process: a stray `telltale run` is.
+port53_own_pid() {
+  _own="$(systemctl show -p MainPID telltale 2>/dev/null | sed -n 's/^MainPID=//p')"
+  case "$_own" in ''|*[!0-9]*) _own=0 ;; esac
+  echo "$_own"
+}
+
+# Waits until nothing else holds UDP or TCP port 53 on an address TelltaleDNS binds (the config's
+# listeners; $1 is the config file), for up to $TELLTALE_PORT_WAIT seconds (whole seconds, 0 to
+# 300; default 15). Returns 0 when the port is free, or can't be checked (no `ss`: it says so in
+# one line, and carries on as an install always did); 1 when it is still held after the wait,
+# after printing what holds it and the next step.
 wait_for_port53() { # config
   command -v ss >/dev/null 2>&1 || { say "ss isn't installed: not checking that port 53 is free"; return 0; }
   _binds="$(port53_binds "$1")"
   [ -n "$_binds" ] || { say "The config has no listener on port 53: not waiting for it"; return 0; }
+  _own="$(port53_own_pid)"
   _socks="$(port53_sockets)" || { say "ss can't list sockets here: not checking that port 53 is free"; return 0; }
-  [ -n "$(printf '%s\n' "$_socks" | port53_filter "$_binds" 4)" ] || return 0
+  [ -n "$(printf '%s\n' "$_socks" | port53_filter "$_binds" 4 "$_own")" ] || return 0
+  # Plain decimal seconds. A leading zero is decimal, not octal: `08` in `$((...))` ends the shell.
   _limit="${TELLTALE_PORT_WAIT:-15}"
-  case "$_limit" in ''|*[!0-9]*) _limit=15 ;; esac
-  say "Waiting up to ${_limit}s for port 53 to be free"
+  while [ "${#_limit}" -gt 1 ] && [ "${_limit#0}" != "$_limit" ]; do _limit="${_limit#0}"; done
+  case "$_limit" in ''|*[!0-9]*) _limit= ;; esac
+  if [ -z "$_limit" ] || [ "${#_limit}" -gt 3 ] || [ "$_limit" -gt 300 ]; then
+    say "TELLTALE_PORT_WAIT=${TELLTALE_PORT_WAIT:-} isn't a whole number of seconds from 0 to 300: waiting up to 15s"
+    _limit=15
+  fi
+  if [ "$_limit" -gt 0 ]; then say "Waiting up to ${_limit}s for port 53 to be free"; fi
   # A quarter-second step where `sleep` takes fractions, else a second: the limit holds either way.
   if sleep 0.1 2>/dev/null; then _step=0.25; _left=$((_limit * 4)); else _step=1; _left=$_limit; fi
   while [ "$_left" -gt 0 ]; do
     sleep "$_step"
     _socks="$(port53_sockets)" || return 0
-    if [ -z "$(printf '%s\n' "$_socks" | port53_filter "$_binds" 4)" ]; then say "Port 53 is free"; return 0; fi
+    if [ -z "$(printf '%s\n' "$_socks" | port53_filter "$_binds" 4 "$_own")" ]; then say "Port 53 is free"; return 0; fi
     _left=$((_left - 1))
   done
   say "Port 53 is still held after ${_limit}s, by:"
-  ss -Hlunpt 'sport = :53' 2>/dev/null | port53_filter "$_binds" 5 | sed 's/^/    /'
-  say "Starting TelltaleDNS anyway. If it can't bind, stop what holds port 53 (or set [[listen]] to this machine's LAN address in /etc/telltale/telltale.toml), then: sudo systemctl restart telltale"
+  ss -Hlunpt 'sport = :53' 2>/dev/null | port53_filter "$_binds" 5 "$_own" | sed 's/^/    /'
+  say "Starting TelltaleDNS anyway. If it can't bind, stop what holds port 53 (or set [[listen]] in /etc/telltale/telltale.toml to an address it doesn't hold), then: sudo systemctl restart telltale"
   return 1
 }
 # END port53-wait
