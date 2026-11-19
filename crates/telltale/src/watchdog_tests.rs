@@ -584,19 +584,28 @@ fn ops_012_the_cap_is_counted_once_per_stall_and_shown_in_the_metrics() {
     let mut wd = stuck_with_cap(dir.path(), 0, t0);
     logged(|| announced_rounds(&mut wd, &mut ev, t0, 1_000_000, 5, 8000));
     assert_eq!(wd.cap_episodes, 1, "two repeats are the same stall");
+    // `tick` publishes to the process-wide value, which parallel tests also write, so only a lower
+    // bound can be said of it here: a stall that reached the cap left it at one or more.
     assert!(
         shared().cap_reached.load(Ordering::Relaxed) >= 1,
-        "the watchdog's own thread publishes it, with no runtime to do it"
+        "tick published the count (a plain store: the test thread stands in for the watchdog's)"
     );
 
+    // What a scrape shows is checked on a `Shared` of this test's own: what `publish_cap_to`
+    // stores is what `render_from` says (final review F4).
     let local = Shared::new();
     local.enabled.store(true, Ordering::Relaxed);
     let scrape = |episodes: u64| {
-        local.cap_reached.store(episodes, Ordering::Relaxed);
+        publish_cap_to(&local, episodes);
         let mut w = PromWriter::default();
         render_from(&local, &mut w);
         w.finish()
     };
+    let text = scrape(wd.cap_episodes);
+    assert!(
+        text.contains("\ntelltale_watchdog_restart_cap_reached_total 1\n"),
+        "the count this watchdog reached is what the scrape shows: {text}"
+    );
     let text = scrape(2);
     assert!(
         text.contains("# TYPE telltale_watchdog_restart_cap_reached_total counter"),
@@ -610,6 +619,24 @@ fn ops_012_the_cap_is_counted_once_per_stall_and_shown_in_the_metrics() {
         scrape(0).contains("\ntelltale_watchdog_restart_cap_reached_total 0\n"),
         "it is there from the start, so a rate or an increase works"
     );
+}
+
+// REQ: OPS-012 — `TT_WEDGE_SECS` (wedge-test builds only) is read from the environment: a value too
+// big for an `Instant` must make a very long wedge, not panic the thread that starts it (final
+// review F5). Runs with `cargo test -p telltale --features wedge-test`.
+#[cfg(feature = "wedge-test")]
+#[test]
+fn ops_012_a_huge_wedge_time_is_a_long_wedge_not_a_panic() {
+    let now = Instant::now();
+    assert_eq!(wedge_deadline(now, 45), now + secs(45));
+    assert_eq!(wedge_deadline(now, 0), now);
+    let ten_years = now + secs(10 * 365 * 24 * 3600);
+    for hold in [u64::MAX, u64::MAX / 2, u64::MAX / 1_000_000_000] {
+        assert!(
+            wedge_deadline(now, hold) > ten_years,
+            "{hold} s is a very long wedge"
+        );
+    }
 }
 
 #[test]

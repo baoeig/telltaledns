@@ -432,7 +432,11 @@ fn publish_action(unix: u64) {
 /// REQ: OPS-012 (ADR-163, amended) — how many stalls of this run found the restart limit used up
 /// (the watchdog's own count, stored: one thread writes it).
 fn publish_cap(episodes: u64) {
-    shared().cap_reached.store(episodes, Ordering::Relaxed);
+    publish_cap_to(shared(), episodes);
+}
+
+fn publish_cap_to(s: &Shared, episodes: u64) {
+    s.cap_reached.store(episodes, Ordering::Relaxed);
 }
 
 /// REQ: OPS-012 — the watchdog's metrics.
@@ -1044,13 +1048,23 @@ pub(crate) fn wedge_for_test(handle: &tokio::runtime::Handle) {
     let handle = handle.clone();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(after));
-        let until = Instant::now() + Duration::from_secs(hold);
+        let until = wedge_deadline(Instant::now(), hold);
         // More tasks than any runtime has workers: each one holds a worker until `until`, and the
         // ones still queued then find it passed and end at once.
         for _ in 0..512 {
             handle.spawn(async move { wedge_here(until) });
         }
     });
+}
+
+/// When a wedge that begins at `now` and lasts `hold_secs` ends. `TT_WEDGE_SECS` comes from the
+/// environment, so a value too big for an `Instant` is a very long wedge (a hundred years), never
+/// a panic (final review F5).
+#[cfg(feature = "wedge-test")]
+fn wedge_deadline(now: Instant, hold_secs: u64) -> Instant {
+    now.checked_add(Duration::from_secs(hold_secs))
+        .or_else(|| now.checked_add(Duration::from_secs(100 * 365 * 24 * 3600)))
+        .unwrap_or(now)
 }
 
 /// Where the blocked workers sit, so a stack in a dump can be recognised.
