@@ -12,8 +12,8 @@
 //!    `join()` with no bound: with every worker parked in one, nothing could write an RPC, read
 //!    its answer or fire its timer, and the node stopped answering for good.
 //! 2. Few waits at once. Each holds a thread (of the blocking pool's 512) for up to its deadline,
-//!    so a slow or dead primary can't pile them up. Past [`MAX_WAITS`] a read is told "didn't
-//!    answer" without being sent.
+//!    so a slow or dead primary can't pile them up. Past [`MAX_WAITS`] a read is not sent: each
+//!    of its calls is told "wasn't asked".
 //! 3. Few calls at once. A read is one task per call and holds one place under rule 2 for all
 //!    of them, so the places bound reads, not tasks. Two limits bound the calls. The calls of all
 //!    reads together are a budget of [`CALL_BUDGET`] (32,768: the most that 32 reads of 1,024
@@ -91,8 +91,8 @@ const SAY_EVERY_MS: u64 = 60_000;
 pub(super) enum Refused {
     /// [`MAX_WAITS`] reads were already waiting.
     Full,
-    /// The calls other reads have in flight left no room for all of this read's: the
-    /// [`CALL_BUDGET`] was spent.
+    /// The calls other reads have running, or waiting to be read, left no room for all of this
+    /// read's: the [`CALL_BUDGET`] was spent.
     Spent,
     /// The read asked for too much at once: over [`MAX_READ_CALLS`] calls, or a range of time of
     /// too many windows.
@@ -104,7 +104,7 @@ impl Refused {
     fn why(self) -> &'static str {
         match self {
             Self::Full => "too many cluster reads are already waiting",
-            Self::Spent => "too many cluster calls are already in flight",
+            Self::Spent => "too many cluster calls are already running or waiting to be read",
             Self::TooBig => "the read has too many calls at once",
         }
     }
@@ -270,10 +270,10 @@ impl Limiter {
             tracing::warn!(
                 "federated reads are being refused and were not sent: {} because {} reads were \
                  already waiting (a slow or silent node), {} because the {} calls that reads may \
-                 have in flight at once were spent, {} because they asked for too much at once \
-                 (over {MAX_READ_CALLS} calls, or over {} windows of time a node); counted since \
-                 the last line of this kind, at most one a minute. The nodes they were for show \
-                 as not answering",
+                 have running or waiting to be read at once were spent, {} because they asked for \
+                 too much at once (over {MAX_READ_CALLS} calls, or over {} windows of time a \
+                 node); counted since the last line of this kind, at most one a minute. The nodes \
+                 they were for show as not answering",
                 n.full,
                 self.max_reads,
                 n.spent,
@@ -961,7 +961,7 @@ mod tests {
         let got = start(&limiter, rt.handle(), big, long).wait();
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(
-            refused_for(&got, "calls are already in flight"),
+            refused_for(&got, "calls are already running or waiting to be read"),
             "{:?}",
             got.first()
         );
@@ -1025,7 +1025,7 @@ mod tests {
         // 6 + 5 is over 10: refused, with nothing taken and nothing run.
         let second = start(&limiter, rt.handle(), gate.calls(5, "b", &live, &ran), long).wait();
         assert!(
-            refused_for(&second, "calls are already in flight"),
+            refused_for(&second, "calls are already running or waiting to be read"),
             "{second:?}"
         );
         assert_eq!((limiter.in_flight(), limiter.calls_in_flight()), (1, 6));
@@ -1043,7 +1043,10 @@ mod tests {
         assert!(was_sent(&third));
         assert_eq!((limiter.in_flight(), limiter.calls_in_flight()), (2, 10));
         let fourth = start(&limiter, rt.handle(), gate.calls(1, "d", &live, &ran), long).wait();
-        assert!(refused_for(&fourth, "calls are already in flight"));
+        assert!(refused_for(
+            &fourth,
+            "calls are already running or waiting to be read"
+        ));
         assert_eq!(limiter.calls_in_flight(), 10);
         assert_eq!(
             ran.load(Ordering::SeqCst),
@@ -1099,7 +1102,7 @@ mod tests {
         // So a second read of 3 does not fit (8 + 3 > 10), and takes nothing.
         let second = start(&limiter, rt.handle(), gate.calls(3, "b", &live, &ran), long).wait();
         assert!(
-            refused_for(&second, "calls are already in flight"),
+            refused_for(&second, "calls are already running or waiting to be read"),
             "{second:?}"
         );
         assert_eq!(limiter.calls_in_flight(), 8);
@@ -1224,9 +1227,13 @@ mod tests {
         let mut calls = quick(5, "quick", &done);
         calls.extend(gate.calls(2, "held", &live, &ran));
         let read = start(&limiter, rt.handle(), calls, Duration::from_millis(100));
-        // The five answers are in before the wait starts, so a slow machine can't make them late.
+        // The five answers are in (sent, not only run: their tasks are over) before the wait
+        // starts, so a slow machine can't make them late.
         wait_until("the quick calls answered", || {
             done.load(Ordering::SeqCst) == 5
+        });
+        wait_until("only the held calls' tasks are alive", || {
+            rt.metrics().num_alive_tasks() == 2
         });
         let got = read.wait();
         assert_eq!(got.iter().filter(|(_, r)| r.is_ok()).count(), 5);

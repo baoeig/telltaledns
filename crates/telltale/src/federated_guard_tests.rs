@@ -13,7 +13,7 @@
 //! 1. Which `Backend` methods can federate is derived, not listed: from `federated.rs` and
 //!    `federated_support.rs`, the methods that reach `bridge::start`, by calls through `self`.
 //! 2. Every method call `.name(` of one of them must be inside the arguments of a call to `blocking`
-//!    or `spawn_blocking`, or be one of the calls an entry of [`ALLOWED`] names. An entry names a
+//!    or `spawn_blocking`, or be one of the calls an entry of [`allowed`] names. An entry names a
 //!    file, a function, a method (or `*`) and how many such calls there are, with its reason; the
 //!    scan fails when it finds more or fewer, so an entry can't hide a call added later, in the
 //!    same function or another, and can't go stale.
@@ -27,12 +27,18 @@
 //! (`heatmap_network` is one, and the test that checks the derivation names it). It reads names,
 //! not types: a method of another type that shares a name with a federating one (`.top(` on a
 //! top-K list, `.latency(` on the aggregator) looks like a call, and is allowed by name, in the
-//! function that makes it, with the count.
+//! function that makes it, with the count. Two more, which need an odd edit to reach: under an
+//! entry whose method is `*`, one federating call swapped for another in the same function keeps
+//! the count, so the swap is not seen (the entries of `federated.rs` are by function for that
+//! reason); and "inside `blocking(..)`" is where the call is written, not where it runs, so
+//! `blocking(move || rt.spawn(async move { b.config_version() }))` passes though the call runs on
+//! a worker.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Calls the scan lets by without `blocking(..)` around them, and why.
+#[derive(Clone, Copy)]
 struct Allowed {
     /// The file, from `crates/`.
     file: &'static str,
@@ -52,6 +58,69 @@ impl Allowed {
             && (self.in_fn == "*" || self.in_fn == site.in_fn)
             && (self.method == "*" || self.method == site.method)
     }
+}
+
+/// REQ: CLU-004 (ADR-174; final review, N5) — `federated.rs` outside `answer`: each `Backend`
+/// method of `Federated` asks this node's own backend for its part (`self.local.<method>(..)`),
+/// and its callers are what the scan checks. By function, method and count (`clients` also reads
+/// this node's identities), not one entry for the file: a federating call moved into code that
+/// runs on the runtime (`rpc_handler`, `remote_tail`), or swapped for another in its function, is
+/// seen.
+const FEDERATED_OWN_PARTS: &[(&str, &str, usize)] = &[
+    ("annotations", "annotations", 1),
+    ("anomalies", "anomalies", 1),
+    ("blocking_pause", "blocking_pause", 1),
+    ("blocking_resume", "blocking_resume", 1),
+    ("blocking_state", "blocking_state", 1),
+    ("cache_entries", "cache_entries", 2),
+    ("cache_flush", "cache_flush", 2),
+    ("cache_lookup", "cache_lookup", 1),
+    ("cache_stats", "cache_stats", 1),
+    ("client_rhythm", "client_rhythm", 1),
+    ("clients", "clients", 1),
+    ("clients", "identities", 1),
+    ("config_entries", "config_entries", 1),
+    ("config_version", "config_version", 1),
+    ("exemplars", "exemplars", 1),
+    ("health", "health", 1),
+    ("heatmap_key", "heatmap_key", 1),
+    ("heatmap_network", "heatmap_network", 1),
+    ("identities", "identities", 1),
+    ("identity", "identity", 1),
+    ("kubernetes_workloads", "kubernetes_workloads", 1),
+    ("list_hits", "list_hits", 1),
+    ("new_devices", "new_devices", 1),
+    ("overblocking", "overblocking", 1),
+    ("probes", "probes", 1),
+    ("queries", "queries", 1),
+    ("shadow_lists", "shadow_lists", 1),
+    ("slo_parts", "slo_parts", 1),
+    ("support_package", "support_package", 1),
+    ("timeseries", "timeseries", 1),
+    ("top", "top", 1),
+    ("top_clients_rolling", "top_clients_rolling", 1),
+    ("top_in_group", "top_in_group", 1),
+    ("top_range", "top_range", 1),
+    ("upstream_checks", "upstream_checks", 1),
+];
+
+/// Every entry: [`ALLOWED`], then the entries of [`FEDERATED_OWN_PARTS`].
+fn allowed() -> Vec<Allowed> {
+    let mut all = ALLOWED.to_vec();
+    all.extend(
+        FEDERATED_OWN_PARTS
+            .iter()
+            .map(|&(in_fn, method, count)| Allowed {
+                file: "telltale/src/federated.rs",
+                in_fn,
+                method,
+                count,
+                why: "the federating backend's method asks this node's own backend \
+                      (`self.local`) for its part; its callers are what the scan checks. A new \
+                      call in it, or one moved elsewhere in the file, has to be looked at",
+            }),
+    );
+    all
 }
 
 /// Every entry is justified here, and has to match exactly the number of calls it says. The first
@@ -105,15 +174,6 @@ const ALLOWED: &[Allowed] = &[
         why: "`answer` runs a peer's read on this node's own backend (`b` is the local \
               `ApiBackend`): one call for each kind of read. A new kind of read adds a call, and \
               has to be looked at",
-    },
-    Allowed {
-        file: "telltale/src/federated.rs",
-        in_fn: "*",
-        method: "*",
-        count: 37,
-        why: "the federating backend's own methods: they call `self.local` (this node's backend) \
-              or each other, and their callers are what the scan checks. Any new call in the \
-              file changes the count, and has to be looked at",
     },
     Allowed {
         file: "telltale/src/health.rs",
@@ -1042,7 +1102,7 @@ fn clu_004_every_federating_backend_call_sits_behind_blocking() {
             (label.replace('\\', "/"), text.clone())
         })
         .collect();
-    let report = scan(&sources, &fan, ALLOWED);
+    let report = scan(&sources, &fan, &allowed());
     assert!(
         report.problems.is_empty(),
         "{} problem(s):\n{}",

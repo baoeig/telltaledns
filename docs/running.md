@@ -1800,9 +1800,10 @@ groups, query log, and live query stream cover every node:
   the API documents (15 minutes of seconds, 7 days of minutes, 400 days of hours, and every
   day) is well under it. Reads that ask many nodes about many windows are limited by count as
   well: one read makes at most 4,096 calls (a node and a window of time is one call, so all of
-  history by the day is 87 calls a node, and a cluster of 47 nodes can ask for it whole; that
-  gains a window every 240 days, so the number falls by one about that often), and all the reads
-  together have at most 32,768 calls running or holding an answer their read hasn't taken yet.
+  history by the day is 87 calls a node, and a cluster of 47 nodes can ask for it whole; the
+  range gains a window every 240 days, and the number of nodes is 4,096 divided by the windows,
+  plus this node, so it falls by one every one or two windows), and all the reads together have
+  at most 32,768 calls running or holding an answer their read hasn't taken yet.
   That limits how many calls and answers are held at once, not how many bytes: an answer can be
   up to 1 MiB, and merging the answers into the page isn't limited by it. A read over the 4,096
   is answered from this node alone, with the other nodes in `missingNodes`, every time: narrow
