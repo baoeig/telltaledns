@@ -203,9 +203,11 @@ pub(crate) enum Outcome {
         dump: Option<PathBuf>,
     },
     /// REQ: OPS-012 (ADR-163, amended) — the stall that reached the limit ended by itself: both
-    /// checks pass again, `after` the stall was first reported.
+    /// checks pass again, `after` the stall was first reported, when the node had already been
+    /// silent for `silent` (so it went about `silent + after` without answering).
     Recovered {
         after: Duration,
+        silent: Duration,
     },
 }
 
@@ -250,6 +252,8 @@ pub(crate) struct Watchdog<P> {
 struct Capped {
     /// When it was first reported.
     since: Instant,
+    /// How long the node had already been silent then (at least `stall_secs`).
+    silent: Duration,
     /// When the log last said it was still there.
     said: Instant,
     cap: Cap,
@@ -287,6 +291,7 @@ impl<P: Probes> Watchdog<P> {
             return match self.capped.take() {
                 Some(c) => Outcome::Recovered {
                     after: now.saturating_duration_since(c.since),
+                    silent: c.silent,
                 },
                 None => Outcome::Quiet,
             };
@@ -337,6 +342,7 @@ impl<P: Probes> Watchdog<P> {
             // and the counter say why. The decision is still made once per stall.
             self.capped = Some(Capped {
                 since: now,
+                silent: stall.silent,
                 said: now,
                 cap,
                 dump: path.clone(),
@@ -426,7 +432,11 @@ fn publish_action(unix: u64) {
 /// REQ: OPS-012 (ADR-163, amended) — how many stalls of this run found the restart limit used up
 /// (the watchdog's own count, stored: one thread writes it).
 fn publish_cap(episodes: u64) {
-    shared().cap_reached.store(episodes, Ordering::Relaxed);
+    publish_cap_to(shared(), episodes);
+}
+
+fn publish_cap_to(s: &Shared, episodes: u64) {
+    s.cap_reached.store(episodes, Ordering::Relaxed);
 }
 
 /// REQ: OPS-012 — the watchdog's metrics.
@@ -1005,10 +1015,15 @@ pub(crate) fn announce(outcome: &Outcome) {
             silent.as_secs(),
             cap.numbers()
         ),
-        Outcome::Recovered { after } => info!(
+        // The watchdog reports a stall only once it has lasted `stall_secs`, so the time since the
+        // report understates the outage by that much: both are said.
+        Outcome::Recovered { after, silent } => info!(
             "the node answers again: the stall the watchdog reported at its restart limit ended by \
-             itself after {} s",
-            after.as_secs()
+             itself {} s after it was reported (it had not answered for {} s then, so about {} s \
+             without answering)",
+            after.as_secs(),
+            silent.as_secs(),
+            after.saturating_add(*silent).as_secs()
         ),
     }
 }
@@ -1033,13 +1048,23 @@ pub(crate) fn wedge_for_test(handle: &tokio::runtime::Handle) {
     let handle = handle.clone();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(after));
-        let until = Instant::now() + Duration::from_secs(hold);
+        let until = wedge_deadline(Instant::now(), hold);
         // More tasks than any runtime has workers: each one holds a worker until `until`, and the
         // ones still queued then find it passed and end at once.
         for _ in 0..512 {
             handle.spawn(async move { wedge_here(until) });
         }
     });
+}
+
+/// When a wedge that begins at `now` and lasts `hold_secs` ends. `TT_WEDGE_SECS` comes from the
+/// environment, so a value too big for an `Instant` is a very long wedge (a hundred years), never
+/// a panic (final review F5).
+#[cfg(feature = "wedge-test")]
+fn wedge_deadline(now: Instant, hold_secs: u64) -> Instant {
+    now.checked_add(Duration::from_secs(hold_secs))
+        .or_else(|| now.checked_add(Duration::from_hours(100 * 365 * 24)))
+        .unwrap_or(now)
 }
 
 /// Where the blocked workers sit, so a stack in a dump can be recognised.
