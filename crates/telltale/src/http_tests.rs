@@ -509,6 +509,57 @@ fn flt_004_disabled_lists_are_left_out_of_the_list_metrics() {
     assert_eq!(list_lines(&src, "broken"), before);
 }
 
+// REQ: FLT-004 — what a list that has never loaded exports: a failure count and no last-success
+// time (the chart's `TelltaleDNSListNeverLoaded` reads exactly that pair). A list that succeeded
+// once, however long ago, has both.
+#[test]
+fn flt_004_a_list_that_never_loaded_reports_failures_but_no_last_success() {
+    let url = "https://example.com/l.txt".to_owned();
+    let status = vec![
+        (
+            "typo".to_owned(),
+            ListMeta {
+                source: url.clone(),
+                last_attempt: Some(5_000),
+                last_error: Some("HTTP 404".into()),
+                consecutive_failures: 7,
+                ..ListMeta::default()
+            },
+        ),
+        (
+            "old".to_owned(),
+            ListMeta {
+                source: url,
+                content_hash: Some("h".into()),
+                last_attempt: Some(5_000),
+                last_success: Some(10),
+                last_error: Some("HTTP 404".into()),
+                consecutive_failures: 7,
+                ..ListMeta::default()
+            },
+        ),
+    ];
+    let mut w = PromWriter::new();
+    render_list_status(&mut w, &status);
+    let text = w.finish();
+    assert!(
+        text.contains("telltale_list_fetch_consecutive_failures{list=\"typo\"} 7"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("telltale_list_last_success_timestamp_seconds{list=\"typo\"}"),
+        "{text}"
+    );
+    assert!(
+        text.contains("telltale_list_fetch_consecutive_failures{list=\"old\"} 7"),
+        "{text}"
+    );
+    assert!(
+        text.contains("telltale_list_last_success_timestamp_seconds{list=\"old\"} 10"),
+        "{text}"
+    );
+}
+
 // REQ: CLU-002 (ADR-125) — a node without the router (a resolver pod) names a device by
 // what the other nodes' routers know; this node's own sources still come first.
 #[test]
