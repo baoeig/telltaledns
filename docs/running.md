@@ -1338,7 +1338,7 @@ Phones, speakers, printers, and NAS boxes announce themselves on the local netwo
 mdns = true
 ```
 - Listen only: TelltaleDNS never sends mDNS. It shares port 5353 with avahi or the system's responder.
-- It has to hear the LAN: a native install, the Pi bundle, or a pod with host networking. In a bridge or pod network nothing arrives.
+- It has to hear the LAN: a native install, the Docker Compose bundle, or a pod with host networking. In a bridge or pod network nothing arrives.
 - Names you give devices win, then the routers' DHCP leases, then mDNS. Names are lowercase, as mDNS compares them. At most 4096 devices are remembered (until a restart).
 - `GET /api/v1/dhcp/leases` lists them with `source = mdns` (no MAC), and **Clients → Discovered** shows every device found by a router or mDNS. Naming one from there (or from any address in the UI) suggests the name it gave.
 - Changing it needs a restart.
