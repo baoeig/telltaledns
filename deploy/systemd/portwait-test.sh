@@ -80,16 +80,18 @@ if [ "$1" = health ]; then [ ! -f "$FAKE/health_fails" ]; exit; fi
 [ -f "$FAKE/config_fails" ] && exit 1
 cat "$FAKE/config.printed"
 EOF
+chmod +x "$FAKEBIN/ss" "$FAKEBIN/systemctl" "$FAKEROOT/bin/telltale"
 # awk: the real one, unless $FAKE/awk_fails (every call fails) or $FAKE/awk_binds_fails (only the
-# program that reads the config's listeners, which counts `blocks`, fails).
-REAL_AWK=$(command -v awk)
-cat > "$FAKEBIN/awk" <<'EOF'
-#!/bin/sh
-[ ! -f "$FAKE/awk_fails" ] || exit 2
-if [ -f "$FAKE/awk_binds_fails" ]; then case "$*" in *blocks*) exit 2 ;; esac; fi
-exec "$REAL_AWK" "$@"
+# program that reads the config's listeners, which counts `blocks`, fails). A shell function, sourced
+# before the block, rather than a program on PATH: a function comes first in any POSIX shell, and a
+# busybox shell runs its own `awk` applet without looking at PATH.
+cat > "$T/awkwrap.sh" <<'EOF'
+awk() {
+  [ ! -f "$FAKE/awk_fails" ] || return 2
+  if [ -f "$FAKE/awk_binds_fails" ]; then case "$*" in *blocks*) return 2 ;; esac; fi
+  command awk "$@"
+}
 EOF
-chmod +x "$FAKEBIN/ss" "$FAKEBIN/systemctl" "$FAKEBIN/awk" "$FAKEROOT/bin/telltale"
 
 # A tool directory without `ss`, for the machine that doesn't have it.
 NOSS="$T/noss"
@@ -161,8 +163,8 @@ run_wait() {
   local start end
   start=$(now_ms)
   set +e
-  OUT=$(PATH="${2:-$FAKEBIN:$PATH}" FAKE="$FAKE" REAL_AWK="$REAL_AWK" PREFIX="$FAKEROOT" TELLTALE_PORT_WAIT="${1:-}" \
-    "$TIMEOUT" 90 "$SH" -c 'set -eu; say() { printf "==> %s\n" "$*"; }; . "$1"; wait_for_port53 "$2"' sh "$T/lib.sh" "$T/telltale.toml" 2>&1)
+  OUT=$(PATH="${2:-$FAKEBIN:$PATH}" FAKE="$FAKE" PREFIX="$FAKEROOT" TELLTALE_PORT_WAIT="${1:-}" \
+    "$TIMEOUT" 90 "$SH" -c 'set -eu; say() { printf "==> %s\n" "$*"; }; . "$3"; . "$1"; wait_for_port53 "$2"' sh "$T/lib.sh" "$T/telltale.toml" "$T/awkwrap.sh" 2>&1)
   RC=$?
   set -e
   end=$(now_ms)
@@ -501,7 +503,7 @@ tail_tree() {
 # $FAKE/calls says in which order the fakes were called.
 tail_run() {
   set +e
-  OUT=$(env PATH="$TAILBIN:$FAKEBIN:$PATH" FAKE="$FAKE" REAL_AWK="$REAL_AWK" PREFIX="$FAKEROOT" TREE="$TREE" "$@" \
+  OUT=$(env PATH="$TAILBIN:$FAKEBIN:$PATH" FAKE="$FAKE" PREFIX="$FAKEROOT" TREE="$TREE" "$@" \
     "$TIMEOUT" 60 "$SH" -c 'set -eu
       say() { printf "==> %s\n" "$*"; }
       die() { printf "error: %s\n" "$*" >&2; exit 1; }
