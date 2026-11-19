@@ -81,7 +81,7 @@ sudo telltale self-update --restart               # upgrade and restart
 sudo telltale self-update --channel edge --restart  # builds from main</code></pre>
       <ul>
         <li>It verifies the signature with the release key built into the binary and checks the binary's SHA-256, test-runs the download, swaps it in atomically, and keeps the previous binary as <code>telltale.old</code>.</li>
-        <li><b>Or re-run the installer:</b> <code>sudo sh install.sh</code> upgrades the binary in place. When <code>/etc/telltale/telltale.toml</code> already exists it asks no questions and only upgrades; your config is kept.</li>
+        <li><b>Or re-run the installer:</b> <code>sudo sh install.sh</code> upgrades the binary in place. When <code>/etc/telltale/telltale.toml</code> already exists it asks no guided questions and upgrades; your config is kept. One question can still come, in a terminal: if systemd-resolved is running with its stub listener on, it asks whether to turn the stub off (<code>--disable-resolved-stub</code> answers it in advance; without a terminal systemd-resolved is left as it is).</li>
       </ul>
     </div>
 

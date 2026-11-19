@@ -16,7 +16,9 @@
 #
 # Options:
 #   --edge                   follow builds from main instead of tagged releases
-#   --yes                    ask nothing: the recommended settings
+#   --yes                    skip the guided questions: the recommended settings. (In a terminal,
+#                            the one about systemd-resolved's stub listener is still asked,
+#                            unless --disable-resolved-stub answers it.)
 #   --interactive            ask even without a terminal, reading answers from stdin
 #   --config-only FILE       ask, write the config to FILE, and stop (no root needed)
 #   --disable-resolved-stub  turn off systemd-resolved's stub listener on 127.0.0.53:53
@@ -88,7 +90,8 @@ fi
 # REQ: OPS-001, DOC-001 (T7.6) — the guided setup. In a terminal, a new install asks first:
 # the recommended settings (Enter) or a walk through the options, each with its default shown
 # (Enter or `skip` keeps it). Piped or automated installs (no terminal), --yes, and re-runs
-# over an existing config ask nothing and behave as before. --interactive asks even without a
+# over an existing config skip these questions and behave as before (in a terminal, the one about
+# systemd-resolved's stub listener is still asked below). --interactive asks even without a
 # terminal, reading the answers from stdin (for automation and tests).
 
 # One answer: REPLY is the reply, or the default for Enter, `skip`, or the end of input.
