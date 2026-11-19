@@ -2,7 +2,7 @@
 # REQ: OPS-001 (T7.6 AC) — install.sh's questions, without installing anything: answers fed on
 # stdin with --interactive --config-only, and every resulting config passes `telltale config
 # check`. Also: Enter at the first question gives the usual starter config, and without a
-# terminal nothing is asked.
+# terminal nothing is asked. Ends with portwait-test.sh (the wait for port 53, OPS-004).
 # Usage: deploy/systemd/guided-e2e.sh [path/to/telltale]   (default: target/debug/telltale)
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -65,4 +65,9 @@ grep -q 'Which' "$E/piped.out" && fail "asked a question without a terminal"
 cmp -s "$E/piped.toml" deploy/compose/telltale.toml || fail "the piped install's config isn't the starter"
 printf '2\n' | sh deploy/systemd/install.sh --yes --config-only "$E/yes.toml" > "$E/yes.out" 2>&1
 grep -q 'Which' "$E/yes.out" && fail "--yes asked a question"
+
+# REQ: OPS-004 — the installer's wait for port 53 (after it turns the resolver's stub off, before it
+# starts the service) and its single start, against a fake `ss`; nothing on this machine changes.
+bash deploy/systemd/portwait-test.sh "$B" > "$E/portwait.out" 2>&1 || { cat "$E/portwait.out"; fail "portwait-test.sh"; }
+cat "$E/portwait.out"
 echo "PASS ($(find "$E" -name '*.check' | wc -l) configs checked)"
