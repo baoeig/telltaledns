@@ -57,9 +57,12 @@ fn save(id: &Identity, r: &Rotation) -> Result<(), String> {
     write(&path(id), &b, false)
 }
 
-/// REQ: CLU-001 (ADR-066) — the cluster directory's one way to write a file: atomically, through
-/// a temporary file of its own (`ca.key` and `ca.crt` used to share `ca.tmp`), and a secret is
-/// owner-only from its first byte.
+/// REQ: CLU-001 (ADR-066) — the cluster directory's one way to write a file: atomically, through a
+/// temporary file named for this write alone (removed if the write fails), and a secret is
+/// owner-only from its first byte. The gain is the CLI's `ca-next.key` (a CA private key), which
+/// was created with the default mode and made owner-only only before its rename. The old fixed
+/// name (`<stem>.tmp`) was shared only by two writes of the same file, never by two files a
+/// rotation writes.
 fn write(p: &Path, data: &[u8], secret: bool) -> Result<(), String> {
     crate::node::write(p, data, secret).map_err(|e| e.to_string())
 }
@@ -364,9 +367,10 @@ mod tests {
         assert!(id.reload().signs_now());
     }
 
-    // REQ: CLU-001 (ADR-066) — each file a rotation writes has a temporary file of its own:
-    // `ca.key` and `ca.crt` written at the same moment never trade contents, and neither write
-    // fails because the other renamed its temporary file away.
+    // REQ: CLU-001 (ADR-066) — each write has a temporary file of its own. The property, shown on
+    // two files of one stem written at the same moment (a rotation never writes this pair: the
+    // old fixed name was shared only by two writes of one file): they never trade contents, and
+    // neither write fails because the other renamed its temporary file away.
     #[test]
     fn clu_001_rotation_writes_never_share_a_temporary_file() {
         use std::sync::{Arc, Barrier};
