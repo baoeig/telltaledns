@@ -571,18 +571,22 @@ async fn refresh_until_idle(f: &Fetcher, specs: &[ListSpec], max_rounds: usize) 
     refreshes
 }
 
+/// How long a test waits for an event before it gives up. Each step is a few fsynced writes, which
+/// can take seconds on a busy or shared disk; the bound never delays a test that passes.
+const EVENT_BOUND: Duration = Duration::from_secs(30);
+
 /// The next "stored content changed" signal from `run`.
-async fn changed(rx: &mut watch::Receiver<u64>) {
-    let signalled = tokio::time::timeout(Duration::from_secs(5), rx.changed()).await;
+async fn changed(what: &str, rx: &mut watch::Receiver<u64>) {
+    let signalled = tokio::time::timeout(EVENT_BOUND, rx.changed()).await;
     assert!(
         matches!(signalled, Ok(Ok(()))),
-        "no change signal within 5 s: {signalled:?}"
+        "no change signal for {what} within {EVENT_BOUND:?}: {signalled:?}"
     );
 }
 
-/// Polls for up to five seconds: a bound on a wait for an event, not a pause the test relies on.
+/// Polls for up to `EVENT_BOUND`: a bound on a wait for an event, not a pause the test relies on.
 async fn wait_until(what: &str, mut ok: impl FnMut() -> bool) {
-    for _ in 0..500 {
+    for _ in 0..3000 {
         if ok() {
             return;
         }
@@ -839,7 +843,7 @@ async fn flt_004_run_loop_retries_a_refused_inline_list_only_on_a_change() {
     let failures = |f: &Arc<Fetcher>| meta_of(f, "bad").consecutive_failures;
 
     // Added: tried once, in the round that loaded the marker.
-    changed(&mut changed_rx).await;
+    changed("the round that added both lists", &mut changed_rx).await;
     assert_eq!(failures(&f), 1, "tried when added");
 
     // A manual refresh (SIGUSR1) refreshes every enabled list, a refused one too.
@@ -867,7 +871,11 @@ async fn flt_004_run_loop_retries_a_refused_inline_list_only_on_a_change() {
     specs_tx
         .send(Arc::new(vec![off, inline("marker", &["||two.example^"])]))
         .unwrap();
-    changed(&mut changed_rx).await;
+    changed(
+        "the marker in the step that switched the list off",
+        &mut changed_rx,
+    )
+    .await;
     assert_eq!(failures(&f), 3, "off: not tried");
     specs_tx
         .send(Arc::new(vec![
