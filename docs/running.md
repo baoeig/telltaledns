@@ -1992,6 +1992,14 @@ and whom it waits for. Ephemeral members (resolver pods) don't hold it up. A nod
 for the whole rotation can't connect afterwards and must join again with a token. Join tokens
 made before a rotation pin the old CA, so make new ones afterwards.
 
+Trust moves forward only. Each step comes with a new configuration version, and a node takes
+the CAs of a version only if it isn't older than the one it last took them from (a new epoch,
+after a failover, counts as newer whatever its number); it keeps that version in
+`cluster/ca.version`. So an earlier step sent again, by a node that was the primary or by any
+member, can't bring a retired CA back. A primary whose data directory was put back from an older
+copy can't move trust (or configuration) until its version passes the others': promote another
+node instead.
+
 Rotation helps when the cluster key may have leaked but hasn't been used. Whoever holds the
 current key can sign configuration and rotate trust to a CA of their own, exactly as the
 primary does. If that may already have happened (configuration or a rotation you didn't make),

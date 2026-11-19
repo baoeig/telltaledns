@@ -248,10 +248,17 @@ mod tests {
     // is held, then used once a verified bundle trusts it.
     #[test]
     fn clu_001_trust_moves_step_by_step() {
+        use crate::node::{TrustStep, TrustVersion};
+        // The version of the rotation's manifest number `seq` (ADR-177).
+        let at = |id: &Identity, seq: u64| TrustVersion {
+            cluster_id: id.meta.cluster_id.clone(),
+            epoch: 1,
+            seq,
+        };
         let (_d, id) = primary();
         let stranger = pki::new_ca("evil").unwrap();
         assert!(
-            id.adopt_trust(&stranger.cert_pem).is_err(),
+            id.adopt_trust(&stranger.cert_pem, &at(&id, 1)).is_err(),
             "an unrelated CA can't replace trust"
         );
         let next = pki::new_ca_labeled("home", "next").unwrap();
@@ -261,7 +268,8 @@ mod tests {
         assert!(!replica.store_ca_key(&next.key_pem).unwrap());
         assert!(replica.dir.join("ca-pending.key").exists());
         let bundle = format!("{}{}", replica.ca_pem, next.cert_pem);
-        assert!(replica.adopt_trust(&bundle).unwrap());
+        let take = |b: &str, seq| replica.adopt_trust(b, &at(&replica, seq)).unwrap();
+        assert_eq!(take(&bundle, 1), TrustStep::Changed);
         assert!(
             replica.dir.join("ca-next.key").exists(),
             "held key promoted"
@@ -269,11 +277,11 @@ mod tests {
         assert!(!replica.dir.join("ca-pending.key").exists());
         // The switch: the new CA first; its key becomes ca.key.
         let flipped = format!("{}{}", next.cert_pem, replica.ca_pem);
-        assert!(replica.adopt_trust(&flipped).unwrap());
+        assert_eq!(take(&flipped, 2), TrustStep::Changed);
         assert!(replica.reload().signs_now());
         assert!(replica.dir.join("ca-old.key").exists());
         // The end: only the new CA; the old key goes.
-        assert!(replica.adopt_trust(&next.cert_pem).unwrap());
+        assert_eq!(take(&next.cert_pem, 3), TrustStep::Changed);
         assert!(!replica.dir.join("ca-old.key").exists());
         assert_eq!(pki::certs_of(&replica.reload().ca_pem).len(), 1);
     }
