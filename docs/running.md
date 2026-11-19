@@ -2014,8 +2014,9 @@ telltale cluster set-failover auto
   the eligible nodes wait for the lease to run out, and one is elected by a majority vote in a
   new epoch, typically within 15–25 s. When two nodes are free to stand at the same moment, the
   one whose node ID sorts first goes first and the other gives way. With three voters that
-  means they never split the vote; with more voters (two witnesses, say) a split is rarer than
-  it used to be but still possible, and costs one more lease.
+  means they don't split the vote, short of a lost or badly delayed message, a restart, or a
+  disagreement over the epoch; with more voters (two witnesses, say) a split is rarer than it
+  used to be but still possible. A split costs one more lease.
 - **Never two primaries writing:** a voter votes once per epoch and won't vote for anyone else
   while the lease it granted runs. A primary that loses its majority (for example, cut off by a
   network split) stops taking changes before anyone else can be elected. Proven by a simulator

@@ -19,8 +19,9 @@
 //!   doesn't depose a healthy primary when the partition heals.
 //! - **Giving way (ADR-178):** a node that grants a pre-vote to a node whose ID sorts before
 //!   its own lets that node have the round ([`Elector::on_ask`]), so two nodes freed by the same
-//!   lease end don't both ask for votes: with three voters they can't split them, and with more
-//!   a split gets rarer. It changes only when a node stands.
+//!   lease end don't both ask for votes: with three voters they don't split them, short of a
+//!   lost or badly delayed message, a restart, or a disagreement over the epoch, and with more
+//!   voters a split gets rarer. It changes only when a node stands.
 //! - **Maintenance (OPS-010, ADR-118):** a node in maintenance doesn't stand ([`Elector::standing`]
 //!   is false) but still votes, so a planned event never weakens the quorum. A primary that
 //!   hands over ([`Elector::stepping_down`]) stops renewing: its lease runs out and another node
@@ -374,9 +375,11 @@ impl Elector {
     /// Two nodes freed by the same lease end otherwise both send pre-votes on their next tick,
     /// grant each other's (a pre-vote binds nothing), vote for themselves, and split the vote;
     /// each one's own vote is then a lease the other has to wait out. With three voters, where
-    /// neither can win without the other, this rules the split out; with more voters it only
-    /// makes it rarer (ADR-178). A candidate (it has voted for itself) and a primary don't give
-    /// way. Only when this node stands changes: no ballot, epoch, lease or reply does.
+    /// neither can win without the other, they don't split the vote, short of a lost or badly
+    /// delayed message, a restart, or a disagreement over the epoch (there is no giving way to an
+    /// older epoch than this node's own); with more voters a split only gets rarer (ADR-178). A
+    /// candidate (it has voted for itself) and a primary don't give way. Only when this node
+    /// stands changes: no ballot, epoch, lease or reply does.
     fn give_way(&mut self, ask: &Ask, now_ms: u64) {
         if ask.candidate >= self.id {
             return;
