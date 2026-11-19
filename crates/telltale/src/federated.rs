@@ -33,6 +33,10 @@ const DEADLINE: Duration = Duration::from_secs(2);
 mod bridge;
 #[path = "federated_support.rs"]
 mod support_cluster;
+// REQ: CLU-004 (ADR-174) — the scan that keeps every federating backend call behind `blocking`.
+#[cfg(test)]
+#[path = "federated_guard_tests.rs"]
+mod guard_tests;
 
 /// How long a replica waits for the primary's configuration version before using its own.
 const VERSION_DEADLINE: Duration = Duration::from_secs(1);
