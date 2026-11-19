@@ -2,6 +2,8 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
@@ -64,6 +66,82 @@ pub(crate) fn body<T>(b: Result<Json<T>, JsonRejection>) -> Result<T, Problem> {
         .map_err(|e| Problem::invalid(format!("request body: {}", e.body_text())))
 }
 
+/// REQ: API-004 (issue #63, ADR-175) — how often the hint about a proxy on this machine may be
+/// logged: at most once in this long, however many requests carry the header.
+const PROXY_HINT_EVERY_MS: u64 = 10 * 60 * 1000;
+
+/// REQ: API-004 (issue #63, ADR-175) — remembers when the hint about a same-host reverse proxy was
+/// last logged, so a busy proxy doesn't fill the log (the same shape as the federated reads' refusal
+/// line: one `AtomicU64`, no lock, no new dependency).
+#[derive(Debug)]
+pub(crate) struct ProxyHint {
+    /// The clock (milliseconds since `since`) of the last line, plus one: zero is "never".
+    last: AtomicU64,
+    /// The clock's origin: monotonic, from when this was made.
+    #[cfg_attr(test, allow(dead_code))]
+    since: Instant,
+    /// In tests the clock is this, moved on by hand ([`ProxyHint::advance`]): no test waits for
+    /// ten minutes or races the real clock.
+    #[cfg(test)]
+    skew_ms: AtomicU64,
+}
+
+impl ProxyHint {
+    pub(crate) fn new() -> Self {
+        Self {
+            last: AtomicU64::new(0),
+            since: Instant::now(),
+            #[cfg(test)]
+            skew_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// The clock the hint's interval is measured on.
+    #[cfg(not(test))]
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.since.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    #[cfg(test)]
+    fn now_ms(&self) -> u64 {
+        self.skew_ms.load(Ordering::Relaxed)
+    }
+
+    /// Whether the line is due at `now_ms`: the first time, then once the interval has passed.
+    /// Of any number of threads that find it due together, exactly one is told so.
+    fn due(&self, now_ms: u64) -> bool {
+        let stamp = now_ms.saturating_add(1);
+        let last = self.last.load(Ordering::Acquire);
+        if last != 0 && stamp.saturating_sub(last) < PROXY_HINT_EVERY_MS {
+            return false;
+        }
+        self.last
+            .compare_exchange(last, stamp, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Moves the clock on (tests).
+    #[cfg(test)]
+    pub(crate) fn advance(&self, by: std::time::Duration) {
+        let ms = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
+        self.skew_ms.fetch_add(ms, Ordering::Relaxed);
+    }
+}
+
+/// `ip` is this machine: `127.0.0.0/8`, `::1`, or either as an IPv4-mapped address.
+fn is_loopback(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(a) => a.is_loopback(),
+        IpAddr::V6(a) => a.is_loopback() || a.to_ipv4_mapped().is_some_and(|m| m.is_loopback()),
+    }
+}
+
+/// The request names a client in a header a proxy sets: `X-Forwarded-For` or `Forwarded`.
+/// (`X-Forwarded-Proto` alone doesn't: a TLS terminator on this machine sends it, rightly.)
+fn forwards_a_client(headers: &HeaderMap) -> bool {
+    headers.contains_key("x-forwarded-for") || headers.contains_key("forwarded")
+}
+
 /// The client's address. Behind a trusted proxy (`[api] trusted_proxies`: an ingress, a
 /// reverse proxy) it's the rightmost `X-Forwarded-For` entry that isn't itself a trusted
 /// proxy; entries further left are client-supplied and can be forged. Used for lockouts,
@@ -82,6 +160,21 @@ pub(crate) fn remote(auth: &Auth, req_ext: &axum::http::Extensions, headers: &He
             .any(|(n, l)| super::in_network(ip, *n, *l))
     };
     if !trusted(peer) {
+        // REQ: API-004 (issue #63, ADR-175) — a hint, and nothing else changes: the peer is still
+        // the client. A proxy on this machine that isn't in `trusted_proxies` shows up as a
+        // loopback peer that sends a forwarded-address header; every browser it serves then looks
+        // like loopback to the break-glass list. Only loopback peers: a LAN host that sends the
+        // header itself is not a proxy. The header is never logged (the sender wrote it).
+        if is_loopback(peer)
+            && forwards_a_client(headers)
+            && auth.proxy_hint.due(auth.proxy_hint.now_ms())
+        {
+            tracing::info!(
+                "requests from {peer} carry a forwarded-address header but `[api] trusted_proxies` \
+                 doesn't list that proxy, so client addresses are taken as the proxy's; list it to \
+                 restrict by client (see the Users and sign-in guide in docs/running.md)"
+            );
+        }
         return peer;
     }
     headers
@@ -2122,6 +2215,10 @@ pub(crate) async fn delete_user(
     })
     .await
 }
+
+#[cfg(test)]
+#[path = "proxy_hint_tests.rs"]
+mod proxy_hint_tests;
 
 #[cfg(test)]
 mod group_tests {
