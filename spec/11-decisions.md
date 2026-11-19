@@ -1394,6 +1394,112 @@ The engine can already express device-scoped rules (`$client` in the manual-rule
 - Mixed versions: an older build ignores the file and doesn't move it, so after a downgrade and an upgrade the mark is behind the node's trust (never ahead, unless the cluster's versions went backwards meanwhile): it holds nothing newer back, and moves on with the next manifest.
 **Verification:** in `crates/telltale-cluster/src/net_trust_tests.rs`, `clu_001_trust_is_not_taken_from_an_older_manifest`, `clu_001_follow_ignores_the_cas_of_an_older_manifest` (and doesn't apply it), `clu_001_follow_trust_ignores_the_cas_of_an_older_manifest`, `clu_001_the_same_version_again_is_taken_and_mends_a_crash`, `clu_001_a_trust_mark_from_another_cluster_is_ignored`, `clu_005_a_new_epoch_moves_trust_though_its_seq_is_lower` and `clu_001_a_node_without_a_trust_mark_starts_one_with_its_next_manifest`; `clu_001_a_new_identity_starts_without_a_trust_mark` in `node.rs`. `deploy/cluster/rotate-e2e.sh` shows the rotation still completes (the happy path only).
 
+## ADR-178 — A node that grants a pre-vote to a node that sorts before it gives that node the round, so two candidates rarely split the vote, and with three voters don't, short of a lost or badly delayed message, a restart, or a disagreement over the epoch (Proposed)
+**Context:** `deploy/cluster/gitops-failover-e2e.sh` kills the primary of three eligible nodes (three voters), so two replicas can lead. Of the 79 CI jobs that reached that step, 65 had a new primary at the next epoch after 15 to 16 s, 12 needed a second round (30 to 35 s), and 2 needed a third (49 to 50 s), which failed the script's 45 s limit. The VM study had 2 of 48 runs at two rounds. `spec/12` §10 promises a new primary within 30 s. There was jitter (the caller draws `jitter` in 0 to 7.5 s on every step and passes it to `tick`), but:
+- **It never applied to the first attempt.** While the primary lives, a replica's retry time is long past, so the replica sends its pre-vote on the first tick of its election loop (every 250 ms) after it is free to stand. Both replicas are freed at the same moment. The lease ends when the same renewal is 15 s old on both, and under the GitOps authority the hold-back ends when the dead primary's last heartbeats, on two streams opened 10 to 20 ms apart, are 15 s old.
+- **The scripts start the replicas back to back, so their loops tick almost in step.** In the 48 kept runs of the VM study, the two replicas' tick phases were 0 to 34 ms apart, median 8 ms (read from the times both logged `automatic failover on`, which the loop logs on a tick). Independent phases would spread over 0 to 125 ms. The only two runs there that needed a second round had the two smallest gaps, 0.4 and 0.8 ms. In one of CI's three-round failures, both replicas logged that line in the same microsecond.
+- **Pre-votes less than about one message delay apart cross.** Each node grants the other's (a pre-vote binds nothing), both ask for real votes, each votes for itself, and neither has a majority. Each one's own vote is a 15 s lease on its ballot, so the other's next request is refused until that lease ends (the fencing rule): a split costs a full lease.
+- **The retries run on the same tick grids.** The jitter is rounded up to the next tick, so two retries in one tick can split again.
+
+**Measured:** `crates/telltale-cluster/tests/rounds.rs` runs the real `Elector` on every node, driven as `failover::run` drives it. Each node's loop steps on its own 250 ms grid and on every reply, with the hold-back from heartbeats, the jitter drawn on every step, an fsync (0.5 to 5 ms) before a changed ballot leaves, and an explicit one-way delay (50 µs plus an exponential). The primary is killed 0.1 to 0.6 s after the replicas get the cluster key, as in the scripts. The replicas' phases are within 30 ms of each other (as measured); the mean delay is the model's one free parameter.
+- Before this decision, at a mean of 6 ms, 18.3 % of 200,000 GitOps failovers (three voters) needed a second round (CI: 17.7 %), at 0.5 to 1 ms 3 to 6 % (the VM: 4 %).
+- Every first pre-vote went out on the step that found its node free to stand.
+- A split happened only when the two candidates' first pre-votes were less than 30 ms apart (three voters): 34 % of the runs under 1 ms apart split, 15 % of those 10 to 30 ms apart, and none of the 1,316 runs further apart.
+- The model's third round (0.15 % at the calibrated point, up to 0.8 % with fully aligned ticks) is below CI's 2 of 79 (2.5 %, a 95 % interval of 0.3 % to 8.8 %), so the CI count is either an unlucky draw from the aligned case or the sign of something the model leaves out (epochs in heartbeats, the server's own processing time, runner-wide stalls).
+
+**Decision:**
+- A node that **grants a pre-vote** to a candidate whose node ID **sorts before its own**, for the epoch it would stand for itself or a newer one, gives that candidate the round:
+  - a pre-candidate stands down (it becomes a follower) and may stand again `ROUND_MS` (2 s) later. It does not wait for the retry time it set when its attempt started (`LEASE_MS / 3` plus the jitter, 5 to 12.5 s after that start);
+  - a follower doesn't stand for `ROUND_MS` from then on, or until a later retry time it already had (`next_try_ms` is pushed, never pulled forward).
+- So giving a node the round costs the giver that round and no more.
+- A node that grants a pre-vote to a node that sorts after it, that refuses one, or that grants a real vote isn't affected. Neither is a candidate (it has voted for itself) or a primary.
+- Nothing else changes: the reply is the ballot's as before, and a pre-vote still changes no ballot. One vote per epoch, the refusal of candidates behind, the lease and its margin, majority, pre-vote, epochs, the wire, and the registry are unchanged. The first attempt is still made at once, and the jitter and the back-offs after a round that times out are as before.
+- REQ: CLU-005, in `Elector::on_ask` / `give_way`.
+
+**Why it is safe (any number of voters):** safety never depended on when a node stands.
+- Two primaries in one epoch are prevented by `Ballot::decide`, the leases and `MARGIN_MS`, which this doesn't touch.
+- The change moves only when a node next stands, and drops a pre-vote that hasn't become a vote.
+- The giver's retry can now come earlier than its own retry time (in the unit test, 3.01 s instead of 13.499 s). It is still at least `ROUND_MS` after its attempt began, which the code before this decision already allowed after a round that timed out with no jitter.
+
+**What it guarantees: no split when neither candidate can win without the other**, short of a lost or badly delayed message, a restart, or a disagreement over the epoch (listed below). That covers three voters (the two candidates and the dead primary, as in the e2e), and four voters with one dead (each candidate needs every other live node). A split needs both candidates to vote for themselves, so here each must have the other's pre-vote grant before the other's real request arrives. Take the one that sorts after (B):
+- If B grants A's pre-vote as a pre-candidate, it stands down.
+- If B grants it as a follower, it doesn't start for 2 s.
+- In both cases, by the time B stands again, A's pre-vote round is over: A has voted for itself (and refuses B), or has given up.
+- If B is already a candidate, it refuses A, and A can't vote for itself without B's grant.
+
+So with three voters, or four with one dead, a second round needs one of:
+- a message delayed past a round (2 s), or lost;
+- a restart;
+- or the two candidates asking for different epochs (a node doesn't give way to a request for an older epoch than the one it would stand for).
+
+**What it only reduces: more voters.** When a candidate can reach a majority without the other, a split stays possible. With three eligible nodes and two witnesses (five voters, majority three), and the primary gone:
+1. The higher candidate collects the witnesses' pre-votes and votes for itself before the lower one's request reaches it.
+2. It then refuses that request, so it never gives way.
+3. The lower one collects the same witnesses' pre-votes (they bind nothing) and votes for itself too.
+4. The witnesses' real votes go one each way, two votes each, and a lease passes before the next round.
+
+What decides it is how the majority is made up, not how many candidates there are: four voters with one dead and three candidates don't split (with the same exceptions as three voters), while five voters with two candidates can. The same holds for five eligible nodes with some in maintenance or holding back under GitOps.
+
+**Measured after it**, on the same seeds (200,000 each; mean / p99 / worst seconds to a primary after the kill):
+
+| Scenario (voters) | Before: 2 rounds / 3+ | Before: mean / p99 / worst | After: 2 rounds / 3+ | After: mean / p99 / worst |
+|---|---|---|---|---|
+| GitOps, the scripts' timing (3) | 18.3 % / 0.148 % | 16.2 / 34.5 / 103.0 | 0 / 0 | 13.0 / 15.2 / 15.3 |
+| Three eligible, the scripts' timing (3) | 18.5 % / 0.153 % | 15.3 / 33.8 / 69.2 | 0 / 0 | 12.1 / 15.2 / 15.3 |
+| GitOps, independent phases (3) | 3.05 % / 0.026 % | 13.5 / 31.5 / 66.3 | 0 / 0 | 13.0 / 15.2 / 15.3 |
+| Three eligible + two witnesses, the scripts' timing (5) | 12.4 % / 0.071 % | 15.0 / 33.7 / 67.1 | 2.3 % / 0.001 % | 13.2 / 30.5 / 45.5 |
+| Three eligible + two witnesses, independent phases (5) | 1.91 % / 0.014 % | 13.1 / 30.2 / 53.2 | 0.38 % / 0 | 12.9 / 15.2 / 37.9 |
+| Five eligible, the scripts' timing (5) | 24.2 % / 2.06 % | 17.2 / 45.2 / 117.2 | 4.0 % / 0.069 % | 13.5 / 30.1 / 56.4 |
+| Five eligible, independent phases (5) | 3.8 % / 0.10 % | 13.4 / 29.9 / 116.4 | 0.74 % / 0.003 % | 12.9 / 15.2 / 45.7 |
+
+Notes on the table:
+- With three voters, 0 of 200,000 runs needed a second round (a 95 % upper bound of 1.5 × 10⁻⁵).
+- A single candidate (two eligible nodes and a witness, three voters, `failover-e2e.sh`) always took one round, before and after.
+- The partition simulator (`tests/sim.rs`, 3 to 5 voters) still passes. It prints how many schedules took 10 s or more to recover after healing, but doesn't assert it.
+  - At CI's 10,000 schedules that count went from 3 (a pre-candidate keeping its own retry time) to 8 (the round-only wait). That isn't significant: one generator drives each schedule's delays, drops, jitter and chaos, so any change re-randomises every schedule (two-sided p ≈ 0.23).
+  - At 100,000 schedules on the same seeds (`f2el_r4`): main had 249 (worst 32.6 s), the earlier form 47 (worst 16.45 s), and the round-only wait 52 (worst 16.45 s). Giving way cut that tail about five-fold, and the two forms of it don't differ.
+- There is one real mechanism left, at any voter count: a pre-vote grant delayed by more than `ROUND_MS` plus the giver's tick lag can still let two candidates cross and split. The simulator exercises it (it delays 5 % of its messages by up to 3 s); `rounds.rs` can't (its delays average 6 ms). Each occurrence costs one lease. In production it needs an RPC stall of about 2 s (TCP retransmits, an overloaded Pi). It is not a safety issue.
+
+**What it costs: a lower node that can't win.** A node that keeps granting pre-votes to lower nodes that can't win is held back after each one: for a round (2 s, plus the next tick of its loop) as a follower or as a pre-candidate that stands down. `rounds.rs` builds the case, with only one node, H, able to win once the primary is gone (200,000 seeds each; mean / p99 / worst seconds after the kill, before → after):
+
+| Scenario | the scripts' timing | independent phases |
+|---|---|---|
+| `Cut4`: four voters, L and X sort before H, the L-X link cut | 12.5 / 15.3 / 24.5 → 14.5 / 19.3 / 27.1 | 12.5 / 15.3 / 24.6 → 14.0 / 17.5 / 26.1 |
+| `Star5`: five voters, three lower leaves that reach only H | 12.9 / 15.2 / 24.4 → 14.9 / 20.1 / 34.6 | 12.9 / 15.2 / 24.4 → 14.6 / 19.3 / 34.6 |
+
+- H is elected in every run, so the election is delayed, never stopped. The lower nodes' asks follow their own jitter, redrawn on every step, so each further delay is a fresh draw.
+- With the scripts' near-lockstep ticks, all of them are freed together, so H's first attempts are often spoiled; each spoil costs H a round.
+- The test's bound is `LEASE_MS` plus twenty spoiled attempts of a round and a tick each (60 s).
+- `Star5`'s worst case, 34.6 s, is above `spec/12` §10's 30 s (see "Spec and tests").
+- **In an earlier form of this decision**, a pre-candidate that gave way kept its own retry time (5 to 12.5 s after its attempt started). That took 17.4 / 32.6 / 62.0 and 14.6 / 26.6 / 57.0 (`Cut4`), and 17.4 / 33.8 / 64.3 and 15.0 / 26.8 / 50.3 (`Star5`) on the same seeds. Every split rate in the table above is the same either way.
+
+**Spec and tests:** with three voters the worst case in the model is one round, 15.3 s after the kill (mean 13.03 s), so `spec/12` §10's 30 s holds and stays as written. In the partial-partition cases above (`Star5`: lower nodes that can't win), the model's worst case is 34.6 s against 24.4 s on main, which exceeds that 30 s; the promise was written for a plain kill, and the spec isn't changed. `gitops-failover-e2e.sh` (three voters) keeps its 45 s limit, and its comment now says why: one round that splits for a reason the model doesn't have still passes.
+
+**Consequences:**
+- In a tie, the node with the lower node ID becomes primary (`docs/running.md`, the Cluster guide). The ID is the first 16 hex digits of the SHA-256 of the node's key, so the tie always goes to the same node, and that can't be configured.
+- If that lowest-ID node is systematically slow (for example a Pi whose SD-card fsync takes more than 2 s), it takes every tie and can time out its own real round, which then costs a lease. The hazard existed before; now it falls on the same node every time.
+- A node that keeps granting pre-votes to lower nodes that can't win (they reach it but not a majority) is held back after each one, as measured above. Its attempts are delayed, never stopped (any number of voters). An eligible node could ask over and over on purpose to hold higher nodes back, but it holds the cluster key and could already stand and win (ADR-154's trust note), so this widens nothing.
+- With more than three voters a split is still possible, now and then (see the table): left to the owner. A wait that grows after a split round would make the third round rarer still.
+
+**Alternatives rejected:**
+- A random wait before the first attempt (Raft's randomized timeout). With loops that tick in step, two waits land in the same 250 ms tick with a chance of about 250 ms over the range, so a range short enough not to slow every failover (adding about a third of it on average) doesn't separate them.
+- A finer tick, or a wake-up at the retry time: more wake-ups, and still a slower first attempt.
+- Fixed delays by rank: a node waits whenever a lower one is dead, and the `Elector` doesn't know which voters are eligible.
+- Widening the e2e limit, which would only hide the split.
+
+**Verification:**
+- `clu_005_crossed_pre_votes_elect_the_lower_node_in_one_round`, `clu_005_a_follower_gives_a_lower_node_whose_pre_vote_it_grants_a_round` and `clu_005_giving_way_costs_the_giver_one_round` (unit tests).
+  - The first one's lease check fails when the follower's lease check is taken out of `tick`.
+  - The third one fails when a pre-candidate keeps its own retry time.
+- `clu_005_a_failover_with_two_candidates_takes_one_round` (three voters), `clu_005_four_candidates_split_the_vote_far_less_often` (five voters) and `clu_005_two_candidates_with_two_witnesses_split_less_often` (five voters): they fail before this decision and pass after.
+- `clu_005_a_failover_with_one_candidate_takes_one_round`.
+- `clu_005_a_lower_node_that_cannot_win_only_delays_the_election` (`Cut4`, `Star5`).
+- `clu_005_failover_timing_never_elects_two_primaries`: adversarial delays up to 3 s, up to 5 % lost, all seven topologies.
+- `tests/sim.rs`.
+- `gitops-failover-e2e.sh` on real processes, against the base binary: on the build VM, 2 CPUs per cluster, two clusters at once with the binaries alternating, 21 runs each. The new binary needed one round in 21 of 21 (14 to 16 s). The base binary needed one round in 20 and two in 1 (36 s). All 42 passed.
+- `failover-e2e.sh` and `deploy/cluster/e2e.sh` pass on the new binary.
+- Twenty runs can't show a rate of 10⁻⁴; the simulation is the proof.
+
 ## ADR-172 — A cluster support package: each node redacts its own part under one key, with labels every node agrees on (Accepted)
 **Context:** GitHub issue #55 (the later phase of #50, ADR-156): in a cluster the problem is often on another node, and a package of the node that answered covers only that one. ADR-156 settled the direction (each node redacts before its data leaves it, the asking node's key travels over the mutually authenticated stream) and left three points: how the key reaches the others, what an older peer does, and the size cap across nodes. One more came up in building it: ADR-156 numbers a name by when it is first met (`device-3`), so two nodes would give one device two labels, and the issue asks that a device have one name on every node.
 **Decision:**
