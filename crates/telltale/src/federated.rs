@@ -901,13 +901,7 @@ impl Federated {
     /// nodes didn't answer: those not connected, and those the runtime didn't get an answer from
     /// in time.
     fn gather(&self, reads: Vec<(String, Read)>) -> Vec<(String, Vec<u8>)> {
-        let mut missing: Vec<String> = self
-            .cluster
-            .members()
-            .into_iter()
-            .filter(|m| !m.connected && self.in_scope(&m.node_id))
-            .map(|m| if m.site.is_empty() { m.node_id } else { m.site })
-            .collect();
+        let mut missing = self.unconnected();
         let calls: Vec<(String, Vec<u8>)> = reads
             .into_iter()
             .filter_map(|(peer, r)| serde_json::to_vec(&r).ok().map(|b| (peer, b)))
@@ -929,20 +923,25 @@ impl Federated {
                 }
             }
         }
-        missing.sort();
-        missing.dedup();
-        *self.missing.lock().unwrap_or_else(PoisonError::into_inner) = missing;
+        self.record_missing(missing);
         ok
     }
 
-    /// REQ: CLU-004 (ADR-174) — lists `peers` among the nodes that didn't answer, for a read that
-    /// was not sent to them (it asked for too much), as one that failed would be.
-    fn not_asked(&self, peers: &[String]) {
-        let labels: Vec<String> = peers.iter().map(|p| self.label_of(p)).collect();
-        let mut missing = self.missing.lock().unwrap_or_else(PoisonError::into_inner);
-        missing.extend(labels);
+    /// The in-scope members that aren't connected, by site (or ID).
+    fn unconnected(&self) -> Vec<String> {
+        self.cluster
+            .members()
+            .into_iter()
+            .filter(|m| !m.connected && self.in_scope(&m.node_id))
+            .map(|m| if m.site.is_empty() { m.node_id } else { m.site })
+            .collect()
+    }
+
+    /// Sets the list of nodes that didn't answer, all at once: a reader never sees half of it.
+    fn record_missing(&self, mut missing: Vec<String>) {
         missing.sort();
         missing.dedup();
+        *self.missing.lock().unwrap_or_else(PoisonError::into_inner) = missing;
     }
 
     /// Asks every reachable peer the same read; decoded answers with each peer's label.
@@ -1081,9 +1080,12 @@ impl Federated {
             w
         } else {
             bridge::WAITS.refused(bridge::Refused::TooBig);
-            // Records who isn't connected, as a read does, and adds the peers that weren't asked.
-            let _ = self.gather(Vec::new());
-            self.not_asked(&peers);
+            // REQ: CLU-004 (ADR-174) — lists who isn't connected, as a read does, and the peers
+            // that weren't asked as ones that failed would be, in one step: two writes let
+            // another request's reader see the list without the peers.
+            let mut missing = self.unconnected();
+            missing.extend(peers.iter().map(|p| self.label_of(p)));
+            self.record_missing(missing);
             return (Vec::new(), Vec::new());
         };
         let reads = peers
@@ -3231,13 +3233,13 @@ mod bridge_tests {
     }
 
     // REQ: CLU-004 (ADR-174, final review F1) — the bridge's own bound covers any other caller: a
-    // gathered read of over 1024 calls asks nobody and lists the peer as not answering.
+    // gathered read of over 4,096 calls asks nobody and lists the peer as not answering.
     #[test]
-    fn clu_004_a_gathered_read_over_the_call_cap_asks_no_peer() {
+    fn clu_004_a_gathered_read_over_the_ceiling_asks_no_peer() {
         let (handler, asked) = recording_peer();
         let n = two_nodes_answering(handler);
         let _in = n.rt.enter();
-        let reads: Vec<(String, Read)> = (0..=bridge::MAX_CALLS)
+        let reads: Vec<(String, Read)> = (0..=bridge::MAX_READ_CALLS)
             .map(|_| (n.primary.clone(), Read::ConfigVersion))
             .collect();
         let answers = n.fed.gather(reads);
@@ -3250,5 +3252,70 @@ mod bridge_tests {
             "no peer was asked"
         );
         assert_eq!(n.fed.missing_nodes(), [n.fed.label_of(&n.primary)]);
+    }
+
+    // REQ: CLU-004 (ADR-174) — a range that is refused lists the peers it did not ask in one step:
+    // a thread that reads `missingNodes` while another refuses ranges never sees the list
+    // half made (the nodes that are not connected, and not yet the peers that weren't asked).
+    // Before: the list was written, then added to under a second lock, so a watcher sometimes
+    // saw the list without the peer. The watcher can only pass by never seeing a half list; it
+    // proves nothing by one pass on its own, so it also has to have seen the whole one.
+    #[test]
+    fn clu_004_a_refused_range_lists_the_peers_in_one_step() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        // Tells the watcher to stop when this test ends, a failed assertion included.
+        struct StopOnDrop(Arc<AtomicBool>);
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let n = two_nodes();
+        let _in = n.rt.enter();
+        let label = n.fed.label_of(&n.primary);
+        let peers = n.fed.peers();
+        assert_eq!(peers.len(), 1, "the shape of the test");
+        // A range of 300 windows at one second a bucket: over the cap, so it is refused.
+        let (from, to) = (1_791_000_000, 1_791_000_000 + 300 * 240);
+        let refuse = |fed: &Federated| {
+            let (parts, answered) = fed.peer_timeseries(peers.clone(), Step::Second, from, to);
+            assert!(parts.is_empty() && answered.is_empty(), "nobody was asked");
+        };
+        refuse(&n.fed);
+        assert_eq!(n.fed.missing_nodes(), std::slice::from_ref(&label));
+        let watching = Arc::new(AtomicBool::new(true));
+        let _stop = StopOnDrop(Arc::clone(&watching));
+        let seen = Arc::new(AtomicU64::new(0));
+        let watcher = {
+            let (fed, watching, seen) =
+                (Arc::clone(&n.fed), Arc::clone(&watching), Arc::clone(&seen));
+            let label = label.clone();
+            std::thread::spawn(move || {
+                let mut torn = 0_u64;
+                while watching.load(Ordering::SeqCst) {
+                    if fed.missing_nodes() == [label.clone()] {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        torn += 1;
+                    }
+                }
+                torn
+            })
+        };
+        // The watcher is reading before the refusals start, and keeps reading while they run.
+        let until = Instant::now() + Duration::from_secs(10);
+        while seen.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < until, "the watcher never saw the list");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for _ in 0..20_000 {
+            refuse(&n.fed);
+        }
+        watching.store(false, Ordering::SeqCst);
+        let torn = watcher.join().unwrap();
+        assert_eq!(
+            torn, 0,
+            "{torn} reads saw a list that was not the whole one"
+        );
     }
 }
