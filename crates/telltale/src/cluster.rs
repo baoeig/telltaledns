@@ -1469,9 +1469,10 @@ pub(crate) fn witness(cfg: &telltale_config::Config) -> ExitCode {
         tokio::spawn(net::dial(Arc::clone(&cluster), stop.clone()));
         tokio::spawn(net::mesh(Arc::clone(&cluster), stop.clone()));
         tokio::spawn(telltale_cluster::failover::run(Arc::clone(&cluster), stop.clone()));
-        // T5.4c: the CAs to trust (a rotation) and the witness's own certificate renewal.
+        // T5.4c: the CAs to trust (a rotation) and the witness's own certificate renewal. REQ:
+        // CLU-001 — renewal starts once: two loops renewed twice (and bumped the certificate
+        // generation twice) at every rotation; two commits had each added it.
         tokio::spawn(net::follow_trust(Arc::clone(&cluster), stop.clone()));
-        tokio::spawn(telltale_cluster::renew::run(Arc::clone(&cluster), stop.clone()));
         tokio::spawn(telltale_cluster::renew::run(Arc::clone(&cluster), stop.clone()));
         // The registry and failover mode come with the primary's signed manifests.
         let mut incoming = cluster.incoming();
