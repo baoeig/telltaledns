@@ -1803,14 +1803,21 @@ groups, query log, and live query stream cover every node:
   history by the day is 87 calls a node, and a cluster of 47 nodes can ask for it whole; the
   range gains a window every 240 days, and the number of nodes is 4,096 divided by the windows,
   plus this node, so it falls by one every one or two windows), and all the reads together have
-  at most 32,768 calls running or holding an answer their read hasn't taken yet.
-  That limits how many calls and answers are held at once, not how many bytes: an answer can be
-  up to 1 MiB, and merging the answers into the page isn't limited by it. A read over the 4,096
-  is answered from this node alone, with the other nodes in `missingNodes`, every time: narrow
-  the `scope`, or ask for a coarser `step` or a shorter range. A read that finds too many reads
-  waiting or the call limit spent is answered the same way, and works again a moment later. In
-  Kubernetes, the controller counts each resolver pod as a node. A node that refuses cluster
-  reads, for any of these reasons, says so in its log as a warning, once a minute at most.
+  at most 32,768 calls running or holding an answer their read hasn't taken yet. They are limited
+  in bytes too: the answers one read holds can be at most 20 MiB, and the answers all reads hold
+  40 MiB. An answer that would pass that is dropped as it arrives, and its node is listed in
+  `missingNodes` as one that didn't answer; the rest of the read is kept. On a cluster of 3 or
+  more nodes that happens to the API's longest ranges (7 days of minutes or 400 days of hours,
+  about 15 MiB of answers from each other node), not to the dashboard's (48 hours of minutes is
+  about 4 MiB a node, 17 MiB from 4). Reading a range takes the node that merges it about 7
+  times the answers' bytes in memory, which is why the limit is there: one read at 20 MiB takes
+  a node to about 185 MiB, under the 256 MiB the Pi's service may use. A read over the 4,096 is
+  answered from this node alone, with the other nodes in `missingNodes`, every time, and so is
+  the part of a read over 20 MiB: narrow the `scope`, or ask for a coarser `step` or a shorter
+  range. A read that finds too many reads waiting, the call limit spent, or the 40 MiB held is
+  answered the same way, and works again a moment later. In Kubernetes, the controller counts
+  each resolver pod as a node. A node that refuses cluster reads, for any of these reasons,
+  says so in its log as a warning, once a minute at most.
 - `scope` on a stats or query-log request narrows it: `cluster` (the default, every node),
   `site:<name>` (the nodes of one site, e.g. `site:k8s`), `node:<name or ID>` (one node, by
   site, pod, or node ID), or `node:local` (the node you're asking). For example

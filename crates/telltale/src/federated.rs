@@ -724,6 +724,9 @@ pub(crate) struct Federated {
     /// REQ: AGT-011, CLU-002 (T7.3) — a read's `scope` narrowed to some nodes; `None` is the
     /// whole cluster.
     only: Option<Only>,
+    /// REQ: CLU-004 (ADR-174) — the bounds its reads share: the process's ([`bridge::WAITS`]);
+    /// a test's own in tests.
+    limiter: &'static bridge::Limiter,
 }
 
 /// The nodes a scoped read covers.
@@ -748,6 +751,7 @@ impl Federated {
             cluster,
             missing: Mutex::new(Vec::new()),
             only: None,
+            limiter: &bridge::WAITS,
         }
     }
 
@@ -767,6 +771,7 @@ impl Federated {
             cluster: Arc::clone(&self.cluster),
             missing: Mutex::new(Vec::new()),
             only: Some(Only { me, peers }),
+            limiter: self.limiter,
         }
     }
 
@@ -866,7 +871,7 @@ impl Federated {
                 )
             })
             .collect();
-        bridge::start(&bridge::WAITS, rt, calls, timeout)
+        bridge::start(self.limiter, rt, calls, timeout)
     }
 
     /// One RPC to one peer from synchronous code; `None` without a runtime. REQ: CLU-004
@@ -1087,7 +1092,7 @@ impl Federated {
         } else if let Some(w) = federation::timeseries_chunks(step, from_s, to_s) {
             w
         } else {
-            bridge::WAITS.refused(bridge::Refused::TooBig);
+            self.limiter.refused(bridge::Refused::TooBig);
             // REQ: CLU-004 (ADR-174) — lists who isn't connected, as a read does, and the peers
             // that weren't asked as ones that failed would be, in one step: two writes let
             // another request's reader see the list without the peers.
@@ -1153,6 +1158,7 @@ impl Backend for Federated {
             cluster: Arc::clone(&self.cluster),
             missing: Mutex::new(Vec::new()),
             only: Some(only),
+            limiter: self.limiter,
         }))
     }
     fn local(&self) -> Option<Shared> {
@@ -3324,6 +3330,69 @@ mod bridge_tests {
         assert_eq!(
             torn, 0,
             "{torn} reads saw a list that was not the whole one"
+        );
+    }
+
+    /// A primary that answers each time-bucket window with one bucket at the window's start, and
+    /// the window that starts at `big_from` with a bucket of `groups` groups: a big answer.
+    fn peer_with_one_big_window(big_from: u64, groups: usize) -> RpcHandler {
+        Arc::new(move |_peer, _kind, body| {
+            Box::pin(async move {
+                let Ok(Read::Timeseries { from_s, .. }) = serde_json::from_slice::<Read>(&body)
+                else {
+                    return Err("a read these tests don't ask".to_owned());
+                };
+                let mut b = TimeBucket {
+                    start_unix_seconds: from_s,
+                    total: 1,
+                    ..TimeBucket::default()
+                };
+                if from_s == big_from {
+                    b.by_group = (0..groups).map(|g| (format!("group-{g:04}"), 1)).collect();
+                }
+                serde_json::to_vec(&vec![b]).map_err(|e| e.to_string())
+            })
+        })
+    }
+
+    /// A replica's federated backend over `n`'s cluster, with bounds of its own.
+    fn with_limiter(n: &Nodes, limiter: &'static bridge::Limiter) -> Federated {
+        Federated {
+            limiter,
+            ..Federated::new(Arc::new(Local), Arc::clone(&n.fed.cluster))
+        }
+    }
+
+    // REQ: CLU-004, CLU-002 (ADR-174) — over the real cluster channel: a peer whose answer for one
+    // window would take the read past its cap on bytes is listed in `missingNodes`, the same as a
+    // peer that didn't answer, and the read keeps the peer's other windows. This test's read may
+    // hold 4,096 bytes; the big window's answer is about 6 KB, the others under 200 bytes each.
+    // Before: every answer was kept, however big, and nobody was listed.
+    #[test]
+    fn clu_004_a_peer_whose_answer_is_over_the_cap_on_bytes_is_listed_as_missing() {
+        let from = 1_791_000_000;
+        let n = two_nodes_answering(peer_with_one_big_window(from + 240, 400));
+        let _in = n.rt.enter();
+        let limiter: &'static bridge::Limiter = Box::leak(Box::new(bridge::Limiter::with_caps(
+            8,
+            1_000,
+            64 * 1024,
+            4 * 1024,
+        )));
+        let fed = with_limiter(&n, limiter);
+        let label = fed.label_of(&n.primary);
+        // Four windows of 240 seconds; the second is the big one.
+        let items = fed.timeseries(Step::Second, from, from + 4 * 240);
+        let starts: Vec<u64> = items.iter().map(|b| b.start_unix_seconds).collect();
+        assert_eq!(
+            starts,
+            [from, from + 480, from + 720],
+            "the peer's other windows are kept"
+        );
+        assert_eq!(
+            fed.missing_nodes(),
+            [label],
+            "the peer is listed as one that didn't answer"
         );
     }
 }

@@ -3,7 +3,7 @@
 //!
 //! The `Backend` trait is synchronous, so a federated read starts its RPCs on the runtime and
 //! waits for the answers on a thread of its own: a blocking-pool thread, where the API runs its
-//! backend calls. Three rules:
+//! backend calls. Four rules:
 //!
 //! 1. The wait never needs the runtime to end it. It is a `recv_timeout` on a `std` channel,
 //!    for the RPC's own timeout plus a short grace. A runtime that can't run the tasks (every
@@ -26,13 +26,19 @@
 //!    for the nodes' time buckets is one call per node and window of time,
 //!    `telltale_api::federation::timeseries_chunks`, which bounds the windows on its own,
 //!    first). A read over either is not sent (every call: "wasn't asked"), and takes nothing.
-//!    This is a count of calls and of the answers they hold, not of bytes: an answer can be as
-//!    big as the cluster channel's 1 MiB frame, and what the caller does with the answers after
-//!    `wait` returns (merging them, parsing them) is not covered. A bound in bytes is a later
-//!    design.
+//!    This counts calls and the answers they hold; rule 4 is what the answers weigh.
+//! 4. Few bytes at once. An answer is as big as its peer makes it, up to the cluster channel's
+//!    1 MiB frame, so each is weighed as it comes in, on the task that got it and before it is
+//!    kept: its length is added to what its read holds and to what all reads hold together. If
+//!    either would pass its cap ([`READ_BYTES`] a read, [`HELD_BYTES`] in all), the answer is
+//!    dropped there and its call is "wasn't kept", which the caller treats as it treats a peer
+//!    that didn't answer (`missingNodes`): an answer is never cut short, and the rest of the read
+//!    is kept. The bytes are part of the call's share, so they go back when the share does. What
+//!    the caller does with the answers once `wait` has returned them (parsing them, merging them,
+//!    writing the response) is not covered (ADR-174 says why and what bounds it).
 //!
-//! A read that is refused is counted and said in the log, as a warning at most once a minute
-//! ([`Limiter::refused`]).
+//! A read that is refused, or that loses an answer to rule 4, is counted and said in the log, as
+//! a warning at most once a minute ([`Limiter::refused`]).
 //!
 //! What this does not do: a read made on a worker thread of a multi-thread runtime costs its
 //! deadline even when the runtime is healthy. Tokio puts a task a worker spawns in that worker's
@@ -68,17 +74,41 @@ pub(super) const MAX_READ_CALLS: usize = 4096;
 
 /// The calls that may be counted at once, all reads together: a call counts from its start
 /// until its read is done with its answer, so it covers the tasks that are running and the
-/// answers that wait for their read. It is a count, not bytes. 32,768 is 32 reads
-/// ([`MAX_WAITS`]) of 1,024 calls, the most the first, flat cap (1,024 calls a read) could ever
-/// have had, so raising [`MAX_READ_CALLS`] did not raise the number of calls or answers that
+/// answers that wait for their read. It is a count; [`HELD_BYTES`] is their bytes. 32,768 is 32
+/// reads ([`MAX_WAITS`]) of 1,024 calls, the most the first, flat cap (1,024 calls a read) could
+/// ever have had, so raising [`MAX_READ_CALLS`] did not raise the number of calls or answers that
 /// can be held: it lets one big read use what many small ones could. At most 8 reads of
 /// [`MAX_READ_CALLS`] fit at once.
 pub(super) const CALL_BUDGET: usize = 32 * 1024;
+
+/// REQ: CLU-004 (ADR-174) — the bytes of answers one read may hold: 20 MiB. What a read costs
+/// is mostly after `wait`: parsing and merging its answers takes the node to 6.6 to 7.3 times
+/// their bytes above its own use (two real nodes, a peer padding its answers: 33 MB of answers,
+/// under a first cap of 32 MiB, took a replica from 42 MB resident to a 251 MiB high-water mark,
+/// at the Pi's limit; 20.7 MB, under this cap, to 185 MiB). So this cap is what keeps one read
+/// under the Pi's 256 MiB (`MemoryMax`), with about 70 MiB to spare. Measured (ADR-174) for a
+/// cluster of 5 nodes (4 peers asked) whose buckets look
+/// like a home network's: the longest range the dashboard asks for, 48 hours of minutes, is 16.9
+/// MiB of answers (1.2 times under this), the others 8.4 MiB or less, and a read of one call a
+/// peer (a top list, a page of the query log, a support part) 4 MiB at most. The longest ranges
+/// the API documents (7 days of minutes, 400 days of hours) are 59 to 62 MiB there, and come back
+/// partial. An answer that would take the read past it is "wasn't kept".
+pub(super) const READ_BYTES: usize = 20 << 20;
+
+/// REQ: CLU-004 (ADR-174) — the bytes of answers all reads may hold at once: 40 MiB, two reads
+/// at [`READ_BYTES`]. Before, held answers were bounded only by count: [`CALL_BUDGET`] of them,
+/// each up to the cluster channel's 1 MiB frame, 32 GiB. What callers do once `wait` has
+/// returned (the parse and the merge) is not in it (ADR-174).
+pub(super) const HELD_BYTES: usize = 40 << 20;
 
 // The budget lives in the low half of a `u64` beside the reads in the high half (see `Limiter`),
 // and a read that is allowed at all must be able to fit.
 const _: () = assert!(MAX_READ_CALLS <= CALL_BUDGET);
 const _: () = assert!(CALL_BUDGET as u64 <= CALL_MASK);
+// One read may hold up to its own cap without passing everyone's, and no one answer (at most a
+// frame) is over a read's cap on its own.
+const _: () = assert!(READ_BYTES <= HELD_BYTES);
+const _: () = assert!(telltale_cluster::wire::MAX_FRAME < READ_BYTES);
 
 /// The cap every federated read of this process shares.
 pub(super) static WAITS: LazyLock<Limiter> = LazyLock::new(|| Limiter::new(MAX_WAITS));
@@ -86,7 +116,7 @@ pub(super) static WAITS: LazyLock<Limiter> = LazyLock::new(|| Limiter::new(MAX_W
 /// How often, at most, refused reads are said in the log.
 const SAY_EVERY_MS: u64 = 60_000;
 
-/// Why a read was not sent.
+/// Why a read was not sent, or (`Bytes`) not kept whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Refused {
     /// [`MAX_WAITS`] reads were already waiting.
@@ -97,15 +127,29 @@ pub(super) enum Refused {
     /// The read asked for too much at once: over [`MAX_READ_CALLS`] calls, or a range of time of
     /// too many windows.
     TooBig,
+    /// An answer came in that would have taken the bytes held past [`READ_BYTES`] for its read or
+    /// [`HELD_BYTES`] for all of them, and was dropped (rule 4). The read was sent, and keeps its
+    /// other answers.
+    Bytes,
 }
 
 impl Refused {
-    /// What each call of the read is told, after "wasn't asked".
+    /// What each call of the read is told: after "wasn't asked", or (`Bytes`) "wasn't kept".
     fn why(self) -> &'static str {
         match self {
             Self::Full => "too many cluster reads are already waiting",
             Self::Spent => "too many cluster calls are already running or waiting to be read",
             Self::TooBig => "the read has too many calls at once",
+            Self::Bytes => "the answers held would pass the bytes cluster reads may hold",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Full => 0,
+            Self::Spent => 1,
+            Self::TooBig => 2,
+            Self::Bytes => 3,
         }
     }
 }
@@ -116,6 +160,7 @@ struct Tally {
     full: u64,
     spent: u64,
     too_big: u64,
+    bytes: u64,
 }
 
 /// What was refused since the last line said so, and when that was.
@@ -123,9 +168,8 @@ struct Tally {
 struct RefusalLog {
     /// The clock (milliseconds, any origin) of the last line, plus one: zero is "never".
     last: AtomicU64,
-    full: AtomicU64,
-    spent: AtomicU64,
-    too_big: AtomicU64,
+    /// Since the last line, by [`Refused::index`].
+    unsaid: [AtomicU64; 4],
 }
 
 impl RefusalLog {
@@ -133,11 +177,7 @@ impl RefusalLog {
     /// a minute at most, with what was counted since the last line (which this resets). Of any
     /// number of threads that find a line due, one gets it, and a refusal is in exactly one line.
     fn note(&self, why: Refused, now_ms: u64) -> Option<Tally> {
-        match why {
-            Refused::Full => self.full.fetch_add(1, Ordering::AcqRel),
-            Refused::Spent => self.spent.fetch_add(1, Ordering::AcqRel),
-            Refused::TooBig => self.too_big.fetch_add(1, Ordering::AcqRel),
-        };
+        self.unsaid[why.index()].fetch_add(1, Ordering::AcqRel);
         let stamp = now_ms.saturating_add(1);
         let last = self.last.load(Ordering::Acquire);
         if last != 0 && stamp.saturating_sub(last) < SAY_EVERY_MS {
@@ -146,20 +186,24 @@ impl RefusalLog {
         self.last
             .compare_exchange(last, stamp, Ordering::AcqRel, Ordering::Acquire)
             .ok()?;
+        let take = |why: Refused| self.unsaid[why.index()].swap(0, Ordering::AcqRel);
         Some(Tally {
-            full: self.full.swap(0, Ordering::AcqRel),
-            spent: self.spent.swap(0, Ordering::AcqRel),
-            too_big: self.too_big.swap(0, Ordering::AcqRel),
+            full: take(Refused::Full),
+            spent: take(Refused::Spent),
+            too_big: take(Refused::TooBig),
+            bytes: take(Refused::Bytes),
         })
     }
 
     /// What is counted and not yet said.
     #[cfg(test)]
     fn pending(&self) -> Tally {
+        let n = |why: Refused| self.unsaid[why.index()].load(Ordering::Acquire);
         Tally {
-            full: self.full.load(Ordering::Acquire),
-            spent: self.spent.load(Ordering::Acquire),
-            too_big: self.too_big.load(Ordering::Acquire),
+            full: n(Refused::Full),
+            spent: n(Refused::Spent),
+            too_big: n(Refused::TooBig),
+            bytes: n(Refused::Bytes),
         }
     }
 }
@@ -170,21 +214,131 @@ const ONE_READ: u64 = 1 << 32;
 const CALL_MASK: u64 = ONE_READ - 1;
 
 /// What the federated reads of a process may hold at once: places among the reads waiting
-/// ([`MAX_WAITS`]) and shares of the budget of calls in flight ([`CALL_BUDGET`]).
+/// ([`MAX_WAITS`]), shares of the budget of calls ([`CALL_BUDGET`]), and bytes of answers
+/// ([`HELD_BYTES`], [`READ_BYTES`] a read).
 ///
-/// Both are one number, so one compare-and-swap takes a read's place and all of its calls' shares
-/// together, or takes nothing: a refused read never holds a share for a moment, which two counts
-/// taken one after the other could not promise (a read refused for lack of a place would, for an
-/// instant, have held shares that made a read that fits look too big).
+/// The places and the shares are one number, so one compare-and-swap takes a read's place and all
+/// of its calls' shares together, or takes nothing: a refused read never holds a share for a
+/// moment, which two counts taken one after the other could not promise (a read refused for lack
+/// of a place would, for an instant, have held shares that made a read that fits look too big).
+/// The bytes are taken later, one answer at a time, as the answers come in ([`Scale`]).
 #[derive(Debug)]
 pub(super) struct Limiter {
-    /// Reads waiting (high half) and calls in flight (low half).
+    /// Reads waiting (high half) and calls counted (low half).
     state: Arc<AtomicU64>,
     max_reads: u64,
     budget: u64,
+    /// The bytes held and the refusals, shared with the reads this lets go.
+    ledger: Arc<Ledger>,
+}
+
+/// What a limiter shares with each read it lets go: the bytes all reads hold, the caps on them,
+/// and the refusals (the log), so an answer can be weighed, and a read that loses
+/// one counted, without the limiter.
+#[derive(Debug)]
+struct Ledger {
+    /// The bytes of answers held, all reads together.
+    bytes: AtomicU64,
+    /// What `bytes` may be at most.
+    held_cap: u64,
+    /// What one read's answers may hold at most.
+    read_cap: u64,
     log: RefusalLog,
     /// The refusal log's clock: monotonic, from when this was made.
     since: Instant,
+    /// For the log line: the limiter's caps on reads and calls.
+    max_reads: u64,
+    budget: u64,
+}
+
+impl Ledger {
+    /// REQ: CLU-004 (final review, F2) — counts a read that was not sent or (`Bytes`) not kept
+    /// whole, and says so in the log as a warning: the first time, then at most once a minute,
+    /// with how many were refused since the last line. A silent refusal showed as healthy peers
+    /// in `missingNodes`.
+    fn refused(&self, why: Refused) {
+        let now = u64::try_from(self.since.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let Some(n) = self.log.note(why, now) {
+            tracing::warn!(
+                "federated reads are being refused and were not sent: {} because {} reads were \
+                 already waiting (a slow or silent node), {} because the {} calls that reads may \
+                 have running or waiting to be read at once were spent, {} because they asked for \
+                 too much at once (over {MAX_READ_CALLS} calls, or over {} windows of time a \
+                 node); and {} were sent but lost answers, which would have passed the {} bytes \
+                 of answers one read may hold or the {} all of them may; counted since the last \
+                 line of this kind, at most one a minute. The nodes they were for show as not \
+                 answering",
+                n.full,
+                self.max_reads,
+                n.spent,
+                self.budget,
+                n.too_big,
+                telltale_api::federation::TIMESERIES_MAX_WINDOWS,
+                n.bytes,
+                self.read_cap,
+                self.held_cap,
+            );
+        }
+    }
+}
+
+/// What one read's answers weigh, beside what all reads' do ([`Ledger::bytes`]).
+#[derive(Debug)]
+struct Scale {
+    ledger: Arc<Ledger>,
+    /// The bytes of this read's answers that are held.
+    read: AtomicU64,
+}
+
+impl Scale {
+    /// REQ: CLU-004 (ADR-174) — adds `n` bytes to what this read holds and to what all reads
+    /// hold, or adds nothing and says no when either would pass its cap. The read's own total is
+    /// taken first and given back if everyone's has no room, so for an instant it can make another
+    /// answer of the same read look too big (that answer is dropped: the safe side), never one of
+    /// another read.
+    fn take(&self, n: u64) -> bool {
+        let fits = |cap: u64| move |held: u64| held.checked_add(n).filter(|t| *t <= cap);
+        if self
+            .read
+            .try_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                fits(self.ledger.read_cap),
+            )
+            .is_err()
+        {
+            return false;
+        }
+        let all = &self.ledger.bytes;
+        if all
+            .try_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                fits(self.ledger.held_cap),
+            )
+            .is_err()
+        {
+            self.read.fetch_sub(n, Ordering::AcqRel);
+            return false;
+        }
+        true
+    }
+
+    /// Gives back `n` bytes that [`Scale::take`] took.
+    fn give(&self, n: u64) {
+        self.read.fetch_sub(n, Ordering::AcqRel);
+        self.ledger.bytes.fetch_sub(n, Ordering::AcqRel);
+    }
+}
+
+/// What an answer weighs: the bytes it holds (a peer's error is a peer's text, and is weighed
+/// too).
+fn weight(answer: &Answer) -> u64 {
+    let n = match answer {
+        Ok(body) => body.len(),
+        Err(text) => text.len(),
+    };
+    u64::try_from(n).unwrap_or(u64::MAX)
 }
 
 /// One read's place among the reads waiting. It is given back when the read's last task ends
@@ -199,18 +353,44 @@ impl Drop for Place {
 }
 
 /// One call's share of the budget: the right to have the call running, and then to have its
-/// answer held. The task owns it while it runs and sends it with the answer; the read keeps it
-/// until it is done with the answer. It is given back when `Pending::wait` returns, when the read
-/// is dropped (the answers still in the channel go with it), when a task that is over finds nobody
-/// waiting (the send fails), or when the task is dropped, run or not (the runtime shutting down
-/// drops the tasks it never ran). A task still queued on a stuck runtime keeps its share, as it
-/// keeps the read's place. Each share is dropped once, by whoever owns it last; nothing clones it.
+/// answer held, with the answer's bytes once it is in ([`Share::weigh`]). The task owns it while
+/// it runs and sends it with the answer; the read keeps it until it is done with the answer. It is
+/// given back, call and bytes together, when `Pending::wait` returns, when the read is dropped
+/// (the answers still in the channel go with it), when a task that is over finds nobody waiting
+/// (it gave up, or the send fails), or when the task is dropped, run or not (the runtime shutting
+/// down drops the tasks it never ran). A task still queued on a stuck runtime keeps its share, as
+/// it keeps the read's place. Each share is dropped once, by whoever owns it last; nothing clones
+/// it.
 #[derive(Debug)]
-struct Share(Arc<AtomicU64>);
+struct Share {
+    state: Arc<AtomicU64>,
+    /// The bytes of the answer it holds, and the scale they count on: `None` until an answer of
+    /// some bytes is in and kept.
+    weight: Option<(Arc<Scale>, u64)>,
+}
+
+impl Share {
+    /// REQ: CLU-004 (ADR-174) — weighs the answer of `n` bytes this share's call got: `true` if
+    /// it may be kept, its bytes counted until the share is given back; `false` if they would
+    /// pass a cap, and nothing was counted.
+    fn weigh(&mut self, scale: &Arc<Scale>, n: u64) -> bool {
+        if n == 0 {
+            return true;
+        }
+        let kept = scale.take(n);
+        if kept {
+            self.weight = Some((Arc::clone(scale), n));
+        }
+        kept
+    }
+}
 
 impl Drop for Share {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        if let Some((scale, n)) = self.weight.take() {
+            scale.give(n);
+        }
+        self.state.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -225,7 +405,10 @@ struct Unissued {
 impl Unissued {
     fn issue(&mut self) -> Option<Share> {
         self.left = self.left.checked_sub(1)?;
-        Some(Share(Arc::clone(&self.state)))
+        Some(Share {
+            state: Arc::clone(&self.state),
+            weight: None,
+        })
     }
 }
 
@@ -245,43 +428,46 @@ struct Grant {
 }
 
 impl Limiter {
-    /// Up to `max_reads` reads waiting, and [`CALL_BUDGET`] calls in flight.
+    /// Up to `max_reads` reads waiting, [`CALL_BUDGET`] calls counted, and the production caps
+    /// on bytes.
     pub(super) fn new(max_reads: usize) -> Self {
         Self::with_budget(max_reads, CALL_BUDGET)
     }
 
     pub(super) fn with_budget(max_reads: usize, budget: usize) -> Self {
+        Self::with_caps(max_reads, budget, HELD_BYTES, READ_BYTES)
+    }
+
+    /// Any caps: `held_bytes` for all reads' answers, `read_bytes` for one read's.
+    pub(super) fn with_caps(
+        max_reads: usize,
+        budget: usize,
+        held_bytes: usize,
+        read_bytes: usize,
+    ) -> Self {
+        // The reads live in the high half: more than it holds could not be counted.
+        let max_reads = u64::try_from(max_reads).unwrap_or(u64::MAX).min(CALL_MASK);
+        let budget = u64::try_from(budget).unwrap_or(CALL_MASK).min(CALL_MASK);
         Self {
             state: Arc::new(AtomicU64::new(0)),
-            // The reads live in the high half: more than it holds could not be counted.
-            max_reads: u64::try_from(max_reads).unwrap_or(u64::MAX).min(CALL_MASK),
-            budget: u64::try_from(budget).unwrap_or(CALL_MASK).min(CALL_MASK),
-            log: RefusalLog::default(),
-            since: Instant::now(),
+            max_reads,
+            budget,
+            ledger: Arc::new(Ledger {
+                bytes: AtomicU64::new(0),
+                held_cap: u64::try_from(held_bytes).unwrap_or(u64::MAX),
+                read_cap: u64::try_from(read_bytes).unwrap_or(u64::MAX),
+                log: RefusalLog::default(),
+                since: Instant::now(),
+                max_reads,
+                budget,
+            }),
         }
     }
 
     /// REQ: CLU-004 (final review, F2) — counts a read that was not sent, and says so in the log
-    /// as a warning: the first time, then at most once a minute, with how many were refused
-    /// since the last line. A silent refusal showed as healthy peers in `missingNodes`.
+    /// ([`Ledger::refused`]).
     pub(super) fn refused(&self, why: Refused) {
-        let now = u64::try_from(self.since.elapsed().as_millis()).unwrap_or(u64::MAX);
-        if let Some(n) = self.log.note(why, now) {
-            tracing::warn!(
-                "federated reads are being refused and were not sent: {} because {} reads were \
-                 already waiting (a slow or silent node), {} because the {} calls that reads may \
-                 have running or waiting to be read at once were spent, {} because they asked for \
-                 too much at once (over {MAX_READ_CALLS} calls, or over {} windows of time a \
-                 node); counted since the last line of this kind, at most one a minute. The nodes \
-                 they were for show as not answering",
-                n.full,
-                self.max_reads,
-                n.spent,
-                self.budget,
-                n.too_big,
-                telltale_api::federation::TIMESERIES_MAX_WINDOWS,
-            );
-        }
+        self.ledger.refused(why);
     }
 
     /// REQ: CLU-004, CLU-002 (ADR-174) — a place among the reads and a share for each of `n`
@@ -314,7 +500,7 @@ impl Limiter {
 
     /// Reads waiting now.
     #[cfg(test)]
-    fn in_flight(&self) -> usize {
+    pub(super) fn in_flight(&self) -> usize {
         usize::try_from(self.state.load(Ordering::Acquire) >> 32).unwrap_or(usize::MAX)
     }
 
@@ -323,14 +509,27 @@ impl Limiter {
     fn calls_in_flight(&self) -> usize {
         usize::try_from(self.state.load(Ordering::Acquire) & CALL_MASK).unwrap_or(usize::MAX)
     }
+
+    /// Bytes of answers held now, all reads together.
+    #[cfg(test)]
+    fn bytes_held(&self) -> u64 {
+        self.ledger.bytes.load(Ordering::Acquire)
+    }
+
+    /// The refusal log (tests feed it and read it).
+    #[cfg(test)]
+    fn log(&self) -> &RefusalLog {
+        &self.ledger.log
+    }
 }
 
 /// One call's result: the peer's answer, or why there is none.
 type Answer = Result<Vec<u8>, String>;
 
-/// What a call's task sends when it is over: which call, its answer, and the call's share, which
-/// travels with the answer so the budget goes on counting it until the read is done with it.
-type Done = (usize, Answer, Share);
+/// What a call's task sends when it is over: which call, its answer (`None`: it came in and was
+/// dropped, its bytes over a cap), and the call's share, which travels with the answer so the
+/// budget goes on counting it, and its bytes, until the read is done with it.
+type Done = (usize, Option<Answer>, Share);
 
 /// Calls started on the runtime, to be waited for on the calling thread.
 #[derive(Debug)]
@@ -341,9 +540,14 @@ pub(super) struct Pending {
     /// The shares of the answers that are in, kept until `wait` returns.
     shares: Vec<Share>,
     rx: Option<mpsc::Receiver<Done>>,
+    /// What this read's answers weigh (`None` for a read that wasn't sent).
+    scale: Option<Arc<Scale>>,
+    /// Whether an answer of this read was dropped for its bytes: the read is counted once.
+    lost: bool,
     /// When the caller stops waiting.
     until: Instant,
-    /// Set when the caller stops waiting: a call still queued then isn't sent.
+    /// Set when the caller stops waiting: a call still queued then isn't sent, and an answer
+    /// that comes in after isn't weighed or kept.
     gave_up: Arc<AtomicBool>,
 }
 
@@ -356,7 +560,8 @@ impl Drop for Pending {
 /// Starts each of `calls` (a peer, and its RPC) as a task on `rt` and returns at once. `timeout`
 /// is the RPCs' own; the wait ends [`GRACE`] after it at the latest. Over the cap of reads, with
 /// more than [`MAX_READ_CALLS`] calls, or without room for all of them in the [`CALL_BUDGET`],
-/// nothing is started and nothing is taken, and every call's result is "wasn't asked".
+/// nothing is started and nothing is taken, and every call's result is "wasn't asked". An
+/// answer whose bytes would pass a cap ([`READ_BYTES`], [`HELD_BYTES`]) is "wasn't kept".
 pub(super) fn start<Fut>(
     limiter: &Limiter,
     rt: &tokio::runtime::Handle,
@@ -368,16 +573,18 @@ where
 {
     let (peers, futures): (Vec<String>, Vec<Fut>) = calls.into_iter().unzip();
     let mut results: Vec<Option<Answer>> = vec![None; peers.len()];
-    let pending = |peers, results, rx| Pending {
+    let pending = |peers, results, rx, scale| Pending {
         peers,
         results,
         shares: Vec::new(),
         rx,
+        scale,
+        lost: false,
         until: Instant::now() + timeout + GRACE,
         gave_up: Arc::new(AtomicBool::new(false)),
     };
     if futures.is_empty() {
-        return pending(peers, results, None);
+        return pending(peers, results, None, None);
     }
     // REQ: CLU-004, CLU-002 (ADR-174; final review, F1) — the places count reads, not the tasks
     // each makes, so the tasks are bounded here: a read of too many calls, or one the budget of
@@ -395,22 +602,27 @@ where
             for (r, peer) in results.iter_mut().zip(&peers) {
                 *r = Some(Err(format!("{peer} wasn't asked: {}", why.why())));
             }
-            return pending(peers, results, None);
+            return pending(peers, results, None, None);
         }
     };
     let (tx, rx) = mpsc::channel();
-    let started = pending(peers, results, Some(rx));
+    let scale = Arc::new(Scale {
+        ledger: Arc::clone(&limiter.ledger),
+        read: AtomicU64::new(0),
+    });
+    let started = pending(peers, results, Some(rx), Some(Arc::clone(&scale)));
     for (i, call) in futures.into_iter().enumerate() {
         // One share for each task, and every task keeps the read's place until it ends. The
         // share goes with the answer to the read, which gives it back when it is done with it;
         // a task that is dropped, or that finds nobody waiting, drops it itself.
-        let Some(share) = grant.shares.issue() else {
+        let Some(mut share) = grant.shares.issue() else {
             break;
         };
-        let (tx, place, gave_up) = (
+        let (tx, place, gave_up, scale) = (
             tx.clone(),
             Arc::clone(&grant.place),
             Arc::clone(&started.gave_up),
+            Arc::clone(&scale),
         );
         drop(rt.spawn(async move {
             let _place = place;
@@ -418,7 +630,13 @@ where
                 return;
             }
             let answer = call.await;
-            let _ = tx.send((i, answer, share));
+            // REQ: CLU-004 (ADR-174) — nobody waits for it: it isn't weighed, and goes now.
+            if gave_up.load(Ordering::Acquire) {
+                return;
+            }
+            // Weighed before it is kept: over a cap it goes here, and its call is "wasn't kept".
+            let kept = share.weigh(&scale, weight(&answer)).then_some(answer);
+            let _ = tx.send((i, kept, share));
         }));
     }
     started
@@ -427,9 +645,10 @@ where
 impl Pending {
     /// Waits for every call, or until the deadline: one entry per call, in the order given, with
     /// the answer or why there is none (`didn't answer in time` for a call the runtime never
-    /// finished). Blocks the calling thread only: it needs nothing from the runtime to wake.
-    /// The shares of the answers it returns go back to the budget as it returns: the read is done
-    /// with them. (A call that never answered keeps its own until its task ends.)
+    /// finished, `wasn't kept` for one whose answer was over a cap on bytes). Blocks the calling
+    /// thread only: it needs nothing from the runtime to wake. The shares of the answers it
+    /// returns, with their bytes, go back as it returns: the read is done with them. (A call that
+    /// never answered keeps its own until its task ends.)
     pub(super) fn wait(mut self) -> Vec<(String, Answer)> {
         let mut missing = self.results.iter().filter(|r| r.is_none()).count();
         let mut why = "didn't answer in time";
@@ -450,9 +669,16 @@ impl Pending {
                 self.put(i, r, share, &mut missing);
             }
         }
-        // Done with the answers: their shares go back (an answer that comes in later finds the
-        // channel closed, and its task drops its share).
+        // Done with the answers: their shares and bytes go back (an answer that comes in later
+        // finds nobody waiting, and its task drops its share).
         self.shares.clear();
+        // REQ: CLU-004 (ADR-174) — a read that lost an answer to a cap on bytes is counted once,
+        // here on the caller's thread.
+        if self.lost
+            && let Some(scale) = &self.scale
+        {
+            scale.ledger.refused(Refused::Bytes);
+        }
         let peers = std::mem::take(&mut self.peers);
         let results = std::mem::take(&mut self.results);
         peers
@@ -465,13 +691,19 @@ impl Pending {
             .collect()
     }
 
-    /// Takes in one call's answer, and keeps its share until `wait` returns.
-    fn put(&mut self, i: usize, r: Answer, share: Share, missing: &mut usize) {
+    /// Takes in one call's answer, and keeps its share until `wait` returns. An answer that was
+    /// dropped for its bytes is "wasn't kept", which a caller reads as it reads a peer that didn't
+    /// answer.
+    fn put(&mut self, i: usize, r: Option<Answer>, share: Share, missing: &mut usize) {
         self.shares.push(share);
         if let Some(slot) = self.results.get_mut(i)
             && slot.is_none()
         {
-            *slot = Some(r);
+            *slot = Some(r.unwrap_or_else(|| {
+                self.lost = true;
+                let peer = self.peers.get(i).map_or("a node", String::as_str);
+                Err(format!("{peer} wasn't kept: {}", Refused::Bytes.why()))
+            }));
             *missing -= 1;
         }
     }
@@ -938,7 +1170,7 @@ mod tests {
     fn clu_004_a_big_read_is_sent_when_the_budget_is_free_and_refused_when_it_is_not() {
         let rt = runtime(2);
         let limiter = Limiter::new(MAX_WAITS);
-        let _ = limiter.log.note(Refused::Full, 0); // so the next refusals are only counted
+        let _ = limiter.log().note(Refused::Full, 0); // so the next refusals are only counted
         let (live, ran) = (count(), count());
         let (hold, free) = (Gate::shut(), Gate::shut());
         let long = Duration::from_secs(60);
@@ -975,11 +1207,12 @@ mod tests {
         );
         assert_eq!(ran.load(Ordering::SeqCst), 0);
         assert_eq!(
-            limiter.log.pending(),
+            limiter.log().pending(),
             Tally {
                 full: 0,
                 spent: 1,
-                too_big: 0
+                too_big: 0,
+                bytes: 0
             }
         );
         // One read of the ceiling ends: there is room for 4,000 again.
@@ -1016,7 +1249,7 @@ mod tests {
     fn clu_004_two_reads_over_the_budget_the_second_is_refused_and_takes_nothing() {
         let rt = runtime(2);
         let limiter = Limiter::with_budget(8, 10);
-        let _ = limiter.log.note(Refused::Full, 0);
+        let _ = limiter.log().note(Refused::Full, 0);
         let (live, ran, gate) = (count(), count(), Gate::shut());
         let long = Duration::from_secs(60);
         let first = start(&limiter, rt.handle(), gate.calls(6, "a", &live, &ran), long);
@@ -1031,11 +1264,12 @@ mod tests {
         assert_eq!((limiter.in_flight(), limiter.calls_in_flight()), (1, 6));
         assert_eq!(live.load(Ordering::SeqCst), 6, "the refused calls are gone");
         assert_eq!(
-            limiter.log.pending(),
+            limiter.log().pending(),
             Tally {
                 full: 0,
                 spent: 1,
-                too_big: 0
+                too_big: 0,
+                bytes: 0
             }
         );
         // 6 + 4 is exactly 10: it fits. One call more does not.
@@ -1079,7 +1313,7 @@ mod tests {
     fn clu_004_a_finished_call_keeps_its_share_until_the_read_is_done_with_its_answer() {
         let rt = runtime(2);
         let limiter = Limiter::with_budget(8, 10);
-        let _ = limiter.log.note(Refused::Full, 0);
+        let _ = limiter.log().note(Refused::Full, 0);
         let (live, ran, done, gate) = (count(), count(), count(), Gate::shut());
         let long = Duration::from_secs(60);
         let mut calls = quick(7, "quick", &done);
@@ -1099,6 +1333,11 @@ mod tests {
             "the answers that wait for their read still count"
         );
         assert_eq!(limiter.in_flight(), 1);
+        assert_eq!(
+            limiter.bytes_held(),
+            14,
+            "the seven answers' bytes are held with them"
+        );
         // So a second read of 3 does not fit (8 + 3 > 10), and takes nothing.
         let second = start(&limiter, rt.handle(), gate.calls(3, "b", &live, &ran), long).wait();
         assert!(
@@ -1107,11 +1346,12 @@ mod tests {
         );
         assert_eq!(limiter.calls_in_flight(), 8);
         assert_eq!(
-            limiter.log.pending(),
+            limiter.log().pending(),
             Tally {
                 full: 0,
                 spent: 1,
-                too_big: 0
+                too_big: 0,
+                bytes: 0
             }
         );
         // The held call answers, and the read is done: every share is back at once.
@@ -1123,6 +1363,11 @@ mod tests {
             limiter.calls_in_flight(),
             0,
             "wait gave the answers' shares back"
+        );
+        assert_eq!(
+            limiter.bytes_held(),
+            0,
+            "and their bytes, at the same moment"
         );
         wait_until("the place is back", || limiter.in_flight() == 0);
         // And now the second read fits.
@@ -1198,12 +1443,14 @@ mod tests {
             rt.metrics().num_alive_tasks() == 1
         });
         assert_eq!(limiter.calls_in_flight(), 21, "20 answers wait, 1 call out");
+        assert_eq!(limiter.bytes_held(), 40, "and the 20 answers' bytes");
         drop(read);
         assert_eq!(
             limiter.calls_in_flight(),
             1,
             "the dropped read's answers are gone, and their shares"
         );
+        assert_eq!(limiter.bytes_held(), 0, "and their bytes");
         assert_eq!(
             limiter.in_flight(),
             1,
@@ -1214,6 +1461,11 @@ mod tests {
             limiter.calls_in_flight() == 0 && limiter.in_flight() == 0
         });
         assert_eq!(live.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            limiter.bytes_held(),
+            0,
+            "the answer that came after the read was dropped is not held"
+        );
     }
 
     // REQ: CLU-004 (ADR-174, final review round 2, F1) — a read that gives up at its deadline with
@@ -1235,6 +1487,7 @@ mod tests {
         wait_until("only the held calls' tasks are alive", || {
             rt.metrics().num_alive_tasks() == 2
         });
+        assert_eq!(limiter.bytes_held(), 10, "the five answers' bytes");
         let got = read.wait();
         assert_eq!(got.iter().filter(|(_, r)| r.is_ok()).count(), 5);
         assert!(
@@ -1248,11 +1501,21 @@ mod tests {
             2,
             "the five answers are consumed; the two calls still out hold theirs"
         );
+        assert_eq!(
+            limiter.bytes_held(),
+            0,
+            "the consumed answers' bytes are back"
+        );
         gate.open();
         wait_until("the late tasks end", || {
             limiter.calls_in_flight() == 0 && limiter.in_flight() == 0
         });
         assert_eq!(live.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            limiter.bytes_held(),
+            0,
+            "the late answers found nobody waiting and are not held"
+        );
     }
 
     // REQ: CLU-004 (ADR-174, final review round 2, F1) — a runtime that is dropped with answers
@@ -1273,12 +1536,14 @@ mod tests {
         wait_until("only the held call's task is alive", || {
             rt.metrics().num_alive_tasks() == 1
         });
+        assert_eq!(limiter.bytes_held(), 20, "the ten answers' bytes");
         drop(rt);
         assert_eq!(
             limiter.calls_in_flight(),
             10,
             "the call that was out is dropped with its share; the answers still wait"
         );
+        assert_eq!(limiter.bytes_held(), 20, "with their bytes");
         assert_eq!(limiter.in_flight(), 0, "no task is left to hold the place");
         let got = read.wait();
         assert_eq!(got.iter().filter(|(_, r)| r.is_ok()).count(), 10);
@@ -1290,6 +1555,7 @@ mod tests {
             "{got:?}"
         );
         assert_eq!(limiter.calls_in_flight(), 0);
+        assert_eq!(limiter.bytes_held(), 0);
         assert_eq!(live.load(Ordering::SeqCst), 0);
     }
 
@@ -1322,6 +1588,7 @@ mod tests {
         });
         assert_eq!(ran.load(Ordering::SeqCst), 0, "no call was sent late");
         assert_eq!(live.load(Ordering::SeqCst), 0);
+        assert_eq!(limiter.bytes_held(), 0, "nothing answered, nothing is held");
     }
 
     // REQ: CLU-004 (ADR-174) — a runtime that is shutting down drops its tasks without running
@@ -1528,6 +1795,7 @@ mod tests {
                 full,
                 spent,
                 too_big,
+                bytes: 0,
             })
         };
         // The first one is said at once.
@@ -1591,7 +1859,7 @@ mod tests {
         // One place, and room for two calls.
         let limiter = Limiter::with_budget(1, 2);
         // The first refusal is the one that is said at once; take it, so the next are only counted.
-        let _ = limiter.log.note(Refused::Full, 0);
+        let _ = limiter.log().note(Refused::Full, 0);
         let (open, shut) = tokio::sync::oneshot::channel::<()>();
         let held: Vec<(String, Call)> = vec![(
             "held".into(),
@@ -1611,11 +1879,12 @@ mod tests {
         )
         .wait();
         assert_eq!(
-            limiter.log.pending(),
+            limiter.log().pending(),
             Tally {
                 full: 1,
                 spent: 0,
-                too_big: 0
+                too_big: 0,
+                bytes: 0
             }
         );
         open.send(()).unwrap();
@@ -1626,11 +1895,12 @@ mod tests {
             (0..3).map(|i| (format!("q{i}"), counting(&sent))).collect();
         let _ = start(&limiter, rt.handle(), three, Duration::from_secs(30)).wait();
         assert_eq!(
-            limiter.log.pending(),
+            limiter.log().pending(),
             Tally {
                 full: 1,
                 spent: 1,
-                too_big: 0
+                too_big: 0,
+                bytes: 0
             }
         );
         // Over the ceiling on the calls of a read.
@@ -1639,11 +1909,12 @@ mod tests {
             .collect();
         let _ = start(&limiter, rt.handle(), calls, Duration::from_secs(30)).wait();
         assert_eq!(
-            limiter.log.pending(),
+            limiter.log().pending(),
             Tally {
                 full: 1,
                 spent: 1,
-                too_big: 1
+                too_big: 1,
+                bytes: 0
             }
         );
         assert_eq!(sent.load(Ordering::SeqCst), 0);
@@ -1676,6 +1947,319 @@ mod tests {
                 .unwrap_err()
                 .contains("didn't answer in time"),
             "{got:?}"
+        );
+    }
+
+    // ---- bytes (rule 4) ----------------------------------------------------------------------
+
+    /// Calls that answer at once with `sizes[i]` bytes each, counting each one that has.
+    fn sized(sizes: &[usize], tag: &str, done: &Arc<AtomicUsize>) -> Vec<(String, Call)> {
+        sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| {
+                let done = Arc::clone(done);
+                let call: Call = Box::pin(async move {
+                    done.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![b'x'; n])
+                });
+                (format!("{tag}{i}"), call)
+            })
+            .collect()
+    }
+
+    /// A call that waits at `gate`, then answers `n` bytes.
+    fn gated(gate: &Gate, n: usize) -> Call {
+        let mut door = gate.0.subscribe();
+        Box::pin(async move {
+            let _ = door.wait_for(|open| *open).await;
+            Ok(vec![b'y'; n])
+        })
+    }
+
+    /// Whether a result is the "wasn't kept" of an answer a cap on bytes dropped.
+    fn not_kept(r: &Answer) -> bool {
+        r.as_ref().is_err_and(|e| e.contains("wasn't kept"))
+    }
+
+    // REQ: CLU-004 (ADR-174) — an answer that would take its read past the read's cap on bytes is
+    // dropped as it comes in and its call is "wasn't kept" (which `gather` lists as a node that
+    // didn't answer); the read's other answers are kept, whole and in order; the bytes held are
+    // only what was kept, until the read is done; and the read is counted once. Before: every
+    // answer was kept, however big. Caps: 100 bytes a read, 1,000 in all.
+    #[test]
+    fn clu_004_an_answer_over_the_read_cap_is_dropped_and_the_rest_are_kept() {
+        let rt = runtime(2);
+        let limiter = Limiter::with_caps(8, 100, 1_000, 100);
+        let _ = limiter.log().note(Refused::Full, 0); // so the next refusals are only counted
+        let (live, ran, done, gate) = (count(), count(), count(), Gate::shut());
+        // 40 and 40 fit; 150 is over the read's cap on its own, whichever comes first.
+        let mut calls = sized(&[40, 150, 40], "p", &done);
+        calls.extend(gate.calls(1, "held", &live, &ran));
+        let read = start(&limiter, rt.handle(), calls, Duration::from_secs(60));
+        wait_until("the three answers are in", || {
+            done.load(Ordering::SeqCst) == 3
+        });
+        wait_until("only the held call's task is alive", || {
+            rt.metrics().num_alive_tasks() == 1
+        });
+        assert_eq!(limiter.bytes_held(), 80, "only what was kept is held");
+        assert_eq!(
+            limiter.calls_in_flight(),
+            4,
+            "the dropped answer's call counts until the read is done, as a timed-out one would"
+        );
+        gate.open();
+        let got = read.wait();
+        assert_eq!(got.len(), 4);
+        assert_eq!(got[0], ("p0".to_owned(), Ok(vec![b'x'; 40])));
+        assert!(not_kept(&got[1].1), "{:?}", got[1]);
+        assert!(
+            got[1]
+                .1
+                .as_ref()
+                .is_err_and(|e| e.starts_with("p1 wasn't kept")),
+            "names its node: {:?}",
+            got[1]
+        );
+        assert_eq!(got[2], ("p2".to_owned(), Ok(vec![b'x'; 40])));
+        assert_eq!(got[3], ("held0".to_owned(), Ok(b"ok".to_vec())));
+        assert_eq!(
+            limiter.bytes_held(),
+            0,
+            "the read is done: its bytes are back"
+        );
+        assert_eq!(limiter.calls_in_flight(), 0);
+        assert_eq!(
+            limiter.log().pending(),
+            Tally {
+                bytes: 1,
+                ..Tally::default()
+            },
+            "the read is counted once"
+        );
+        wait_until("the place is back", || limiter.in_flight() == 0);
+    }
+
+    // REQ: CLU-004 (ADR-174) — two reads that together would hold more bytes than all reads may:
+    // the first keeps every answer, the second keeps what fits in the room that is left and loses
+    // only the rest. Caps: 100 bytes in all, 100 a read.
+    #[test]
+    fn clu_004_two_reads_over_the_held_cap_the_second_loses_only_the_excess() {
+        let rt = runtime(2);
+        let limiter = Limiter::with_caps(8, 100, 100, 100);
+        let _ = limiter.log().note(Refused::Full, 0); // so the next refusals are only counted
+        let (live, ran, done, gate) = (count(), count(), count(), Gate::shut());
+        let long = Duration::from_secs(60);
+        // The first: 90 bytes of answers in, and a call still out, so it holds them.
+        let mut calls = sized(&[30, 30, 30], "a", &done);
+        calls.extend(gate.calls(1, "a-held", &live, &ran));
+        let first = start(&limiter, rt.handle(), calls, long);
+        wait_until("the first's answers are in", || {
+            done.load(Ordering::SeqCst) == 3
+        });
+        wait_until("only the first's held call is alive", || {
+            rt.metrics().num_alive_tasks() == 1
+        });
+        assert_eq!(limiter.bytes_held(), 90);
+        // The second: 5 and 5 fit in the 10 bytes left, 20 doesn't, in whatever order they come.
+        let second = start(&limiter, rt.handle(), sized(&[5, 20, 5], "b", &done), long).wait();
+        assert_eq!(second[0], ("b0".to_owned(), Ok(vec![b'x'; 5])));
+        assert!(not_kept(&second[1].1), "{second:?}");
+        assert_eq!(second[2], ("b2".to_owned(), Ok(vec![b'x'; 5])));
+        assert_eq!(
+            limiter.bytes_held(),
+            90,
+            "the second is done and gave its 10 back; the first still holds its 90"
+        );
+        // The first lost nothing: its last answer comes into the room the second left.
+        gate.open();
+        let got = first.wait();
+        assert!(got.iter().all(|(_, r)| r.is_ok()), "{got:?}");
+        assert_eq!(limiter.bytes_held(), 0);
+        assert_eq!(limiter.log().pending().bytes, 1, "the second, once");
+        wait_until("every place is back", || limiter.in_flight() == 0);
+    }
+
+    // REQ: CLU-004 (ADR-174) — an answer that everyone's cap turns away takes nothing from its own
+    // read either: the read's total it had added is given back at once, so a later answer of the
+    // same read still has the read's whole room. Caps: 100 bytes in all, 40 a read.
+    #[test]
+    fn clu_004_an_answer_turned_away_by_the_held_cap_takes_nothing_from_its_read() {
+        let rt = runtime(2);
+        let limiter = Limiter::with_caps(8, 100, 100, 40);
+        let (live, ran, done) = (count(), count(), count());
+        let (hold_a, hold_b) = (Gate::shut(), Gate::shut());
+        let long = Duration::from_secs(60);
+        // Two reads hold 35 bytes each of everyone's 100, so 30 are left.
+        let mut held = Vec::new();
+        for r in 0..2 {
+            let mut calls = sized(&[35], &format!("a{r}-"), &done);
+            calls.extend(hold_a.calls(1, &format!("a{r}-held"), &live, &ran));
+            held.push(start(&limiter, rt.handle(), calls, long));
+        }
+        wait_until("their answers are in", || {
+            done.load(Ordering::SeqCst) == 2 && rt.metrics().num_alive_tasks() == 2
+        });
+        assert_eq!(limiter.bytes_held(), 70);
+        // The second read: 35 now (over the 30 left in all, within its own 40), 30 later.
+        let calls: Vec<(String, Call)> = sized(&[35], "b", &done)
+            .into_iter()
+            .chain([("b-late".to_owned(), gated(&hold_b, 30))])
+            .collect();
+        let second = start(&limiter, rt.handle(), calls, long);
+        wait_until("its first answer came and went", || {
+            done.load(Ordering::SeqCst) == 3 && rt.metrics().num_alive_tasks() == 3
+        });
+        assert_eq!(limiter.bytes_held(), 70, "turned away: nothing was taken");
+        // The first reads finish, and the second's late answer comes: 30 fits its own 40 only if
+        // the 35 that was turned away took nothing from it.
+        hold_a.open();
+        for read in held {
+            assert!(read.wait().iter().all(|(_, r)| r.is_ok()));
+        }
+        hold_b.open();
+        let got = second.wait();
+        assert!(not_kept(&got[0].1), "{got:?}");
+        assert_eq!(got[1], ("b-late".to_owned(), Ok(vec![b'y'; 30])));
+        assert_eq!(limiter.bytes_held(), 0);
+    }
+
+    // REQ: CLU-004 (ADR-174) — from many threads at once, reads whose answers are of every size
+    // never get the bytes held past the cap for all reads, nor one read's past its own, nor the
+    // calls past the budget: a thread watches the counts all the while. Every read keeps a call
+    // out until all of them have started, so they all hold their answers at once, and the answers
+    // offered are many times the cap; what the reads kept is exactly what was counted as held, an
+    // answer is kept whole or not at all, and everything comes back.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one scenario, start to end
+    fn clu_004_reads_from_many_threads_never_pass_the_caps_on_bytes() {
+        const HELD: usize = 64 * 1024;
+        const READ: usize = 16 * 1024;
+        const LARGEST: usize = 3_000;
+        let rt = runtime(2);
+        let limiter = Arc::new(Limiter::with_caps(MAX_WAITS, CALL_BUDGET, HELD, READ));
+        let (live, ran, done, gate) = (count(), count(), count(), Arc::new(Gate::shut()));
+        let watching = Arc::new(AtomicBool::new(true));
+        // A failed assertion below must not leave the watcher spinning.
+        let _stop = StopOnDrop(Arc::clone(&watching));
+        let watcher = {
+            let (limiter, watching) = (Arc::clone(&limiter), Arc::clone(&watching));
+            std::thread::spawn(move || {
+                let mut worst = (0, 0);
+                while watching.load(Ordering::SeqCst) {
+                    let (bytes, calls) = (limiter.bytes_held(), limiter.calls_in_flight());
+                    worst = (worst.0.max(bytes), worst.1.max(calls));
+                    std::thread::yield_now();
+                }
+                worst
+            })
+        };
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let (limiter, gate, live, ran, done) = (
+                    Arc::clone(&limiter),
+                    Arc::clone(&gate),
+                    Arc::clone(&live),
+                    Arc::clone(&ran),
+                    Arc::clone(&done),
+                );
+                let handle = rt.handle().clone();
+                std::thread::spawn(move || {
+                    let mut reads = Vec::new();
+                    // 8 threads of 4 reads: the 32 places, every read sent.
+                    for i in 0..4 {
+                        let sizes: Vec<usize> = (0..20)
+                            .map(|k| 1 + (t * 7_919 + i * 104_729 + k * 1_299_709) % LARGEST)
+                            .collect();
+                        let tag = format!("t{t}-{i}-");
+                        let mut calls = sized(&sizes, &tag, &done);
+                        calls.extend(gate.calls(1, &format!("{tag}held"), &live, &ran));
+                        let read = start(&limiter, &handle, calls, Duration::from_secs(60));
+                        assert!(was_sent(&read), "read {tag}");
+                        reads.push((read, sizes));
+                    }
+                    reads
+                })
+            })
+            .collect();
+        let reads: Vec<_> = threads
+            .into_iter()
+            .flat_map(|t| t.join().unwrap())
+            .collect();
+        let offered: usize = reads.iter().flat_map(|(_, s)| s).sum();
+        let quick: usize = reads.iter().map(|(_, s)| s.len()).sum();
+        wait_until("every quick answer is in", || {
+            done.load(Ordering::SeqCst) == quick
+        });
+        wait_until("only the held calls' tasks are alive", || {
+            rt.metrics().num_alive_tasks() == reads.len()
+        });
+        let held = usize::try_from(limiter.bytes_held()).unwrap();
+        assert!(
+            offered > 8 * HELD,
+            "the answers offered ({offered}) dwarf the cap"
+        );
+        assert!(held <= HELD, "{held} bytes held");
+        assert!(
+            held > HELD - LARGEST,
+            "everyone's cap was what turned answers away: {held} bytes held"
+        );
+        gate.open();
+        let mut kept_all = 0;
+        for (read, sizes) in reads {
+            let got = read.wait();
+            let mut kept = 0;
+            for ((peer, r), n) in got.iter().zip(&sizes) {
+                match r {
+                    Ok(body) => {
+                        assert_eq!(body.len(), *n, "{peer}: an answer is kept whole");
+                        kept += n;
+                    }
+                    Err(e) => assert!(e.contains("wasn't kept"), "{peer}: {e}"),
+                }
+            }
+            assert!(
+                kept <= READ,
+                "a read kept {kept} bytes, more than its {READ}"
+            );
+            kept_all += kept;
+        }
+        assert_eq!(
+            kept_all, held,
+            "what the reads kept is what was counted as held"
+        );
+        wait_until("everything is given back", || {
+            limiter.calls_in_flight() == 0 && limiter.in_flight() == 0 && limiter.bytes_held() == 0
+        });
+        watching.store(false, Ordering::SeqCst);
+        let (bytes, calls) = watcher.join().unwrap();
+        assert!(
+            bytes <= u64::try_from(HELD).unwrap(),
+            "{bytes} bytes held at once"
+        );
+        assert!(calls <= CALL_BUDGET, "{calls} calls counted at once");
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+    }
+
+    // REQ: CLU-004 (ADR-174) — the caps are what the docs and the metric's help give, two reads
+    // at a read's fit everyone's, the dashboard's longest range on a cluster of 5 nodes
+    // (measured: 17,683,487 bytes of answers on home-network buckets) fits a read's 1.2 times,
+    // and a read at the cap, at the 7.3 times its answers measured on two real nodes, plus a
+    // node's own 42 MiB, stays under three quarters of the Pi's 256 MiB.
+    #[test]
+    fn clu_004_the_caps_on_bytes_are_the_documented_ones() {
+        assert_eq!(READ_BYTES, 20 * 1024 * 1024);
+        assert_eq!(HELD_BYTES, 40 * 1024 * 1024);
+        assert_eq!(HELD_BYTES / READ_BYTES, 2, "two reads at their cap");
+        let dashboard_48h_of_minutes_5_nodes: usize = 17_683_487;
+        assert_eq!(READ_BYTES * 10 / dashboard_48h_of_minutes_5_nodes, 11);
+        let (mib, pi) = (1024 * 1024, 256 * 1024 * 1024);
+        let at_the_cap = 42 * mib + READ_BYTES * 73 / 10;
+        assert_eq!(
+            at_the_cap * 4 / pi,
+            2,
+            "under three quarters of the Pi's unit, over half"
         );
     }
 }
