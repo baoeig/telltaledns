@@ -203,9 +203,11 @@ pub(crate) enum Outcome {
         dump: Option<PathBuf>,
     },
     /// REQ: OPS-012 (ADR-163, amended) — the stall that reached the limit ended by itself: both
-    /// checks pass again, `after` the stall was first reported.
+    /// checks pass again, `after` the stall was first reported, when the node had already been
+    /// silent for `silent` (so it went about `silent + after` without answering).
     Recovered {
         after: Duration,
+        silent: Duration,
     },
 }
 
@@ -250,6 +252,8 @@ pub(crate) struct Watchdog<P> {
 struct Capped {
     /// When it was first reported.
     since: Instant,
+    /// How long the node had already been silent then (at least `stall_secs`).
+    silent: Duration,
     /// When the log last said it was still there.
     said: Instant,
     cap: Cap,
@@ -287,6 +291,7 @@ impl<P: Probes> Watchdog<P> {
             return match self.capped.take() {
                 Some(c) => Outcome::Recovered {
                     after: now.saturating_duration_since(c.since),
+                    silent: c.silent,
                 },
                 None => Outcome::Quiet,
             };
@@ -337,6 +342,7 @@ impl<P: Probes> Watchdog<P> {
             // and the counter say why. The decision is still made once per stall.
             self.capped = Some(Capped {
                 since: now,
+                silent: stall.silent,
                 said: now,
                 cap,
                 dump: path.clone(),
@@ -1005,10 +1011,15 @@ pub(crate) fn announce(outcome: &Outcome) {
             silent.as_secs(),
             cap.numbers()
         ),
-        Outcome::Recovered { after } => info!(
+        // The watchdog reports a stall only once it has lasted `stall_secs`, so the time since the
+        // report understates the outage by that much: both are said.
+        Outcome::Recovered { after, silent } => info!(
             "the node answers again: the stall the watchdog reported at its restart limit ended by \
-             itself after {} s",
-            after.as_secs()
+             itself {} s after it was reported (it had not answered for {} s then, so about {} s \
+             without answering)",
+            after.as_secs(),
+            silent.as_secs(),
+            after.saturating_add(*silent).as_secs()
         ),
     }
 }

@@ -525,10 +525,16 @@ fn ops_012_a_stall_that_ends_by_itself_after_the_cap_says_so_once_and_the_next_o
     let said: Vec<&str> = lines.iter().map(|(_, l)| l.as_str()).collect();
     assert_eq!(said.len(), 3, "{said:?}");
     assert!(said[0].contains(CAP_LINE), "{said:?}");
-    assert!(
-        said[1].contains("the node answers again") && said[1].contains("after 45 s"),
-        "{said:?}"
-    );
+    // It was reported after 60 s of silence and answered again 45 s later: the line says both and
+    // that the outage was about 105 s (a report comes `stall_secs` into the outage; final review F2).
+    for want in [
+        "the node answers again",
+        "45 s after it was reported",
+        "had not answered for 60 s",
+        "about 105 s without answering",
+    ] {
+        assert!(said[1].contains(want), "no `{want}` in {said:?}");
+    }
     assert_eq!(lines[1].0, tracing::Level::INFO, "it is good news");
     assert!(said[2].contains(CAP_LINE), "{said:?}");
     assert_eq!(wd.cap_episodes, 2, "two stalls reached the limit");
