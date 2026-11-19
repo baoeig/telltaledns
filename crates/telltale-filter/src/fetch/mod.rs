@@ -439,42 +439,7 @@ impl Fetcher {
             Err(e) => Outcome::Failed(e),
         };
 
-        match &outcome {
-            Outcome::Updated | Outcome::Unchanged => {
-                meta.last_success = Some(now);
-                meta.last_error = None;
-                meta.consecutive_failures = 0;
-                meta.held_hash = None;
-                if outcome == Outcome::Updated {
-                    info!(list = %spec.name, bytes = meta.bytes, lines = meta.lines, "list updated");
-                } else {
-                    debug!(list = %spec.name, "list unchanged");
-                }
-            }
-            Outcome::Failed(e) => {
-                if !same_source {
-                    // Schedule retries for the new source with backoff (a stale `source`
-                    // would make it due again immediately). Its validators don't apply to
-                    // the previous content, which keeps serving until a download succeeds.
-                    meta.source.clone_from(&key);
-                    meta.etag = None;
-                    meta.last_modified = None;
-                }
-                meta.last_error = Some(e.clone());
-                meta.consecutive_failures = meta.consecutive_failures.saturating_add(1);
-                let kept = if meta.has_content() {
-                    "keeping the previous copy"
-                } else {
-                    "no copy available yet"
-                };
-                warn!(list = %spec.name, "list refresh failed ({kept}): {e}");
-            }
-            // Not a failure: no early retry, and the list's status says why it waits.
-            Outcome::Held(why) => {
-                meta.last_error = Some(why.clone());
-                warn!(list = %spec.name, "list update held: {why}");
-            }
-        }
+        record_outcome(spec, &key, same_source, now, &outcome, &mut meta);
         // REQ: FLT-004 — an inline list that failed waits: for a change if its rules were
         // refused, on the retry ladder if only storing it failed.
         let hold = match &outcome {
@@ -618,6 +583,54 @@ impl Fetcher {
             info!(list = %name, "removed stored list (no longer configured)");
         }
         !removed.is_empty()
+    }
+}
+
+/// Updates `meta` for the result of refreshing `spec` (whose source key is `key`; `same_source`:
+/// a stored copy of that source existed) and logs it.
+fn record_outcome(
+    spec: &ListSpec,
+    key: &str,
+    same_source: bool,
+    now: u64,
+    outcome: &Outcome,
+    meta: &mut ListMeta,
+) {
+    match outcome {
+        Outcome::Updated | Outcome::Unchanged => {
+            meta.last_success = Some(now);
+            meta.last_error = None;
+            meta.consecutive_failures = 0;
+            meta.held_hash = None;
+            if *outcome == Outcome::Updated {
+                info!(list = %spec.name, bytes = meta.bytes, lines = meta.lines, "list updated");
+            } else {
+                debug!(list = %spec.name, "list unchanged");
+            }
+        }
+        Outcome::Failed(e) => {
+            if !same_source {
+                // Schedule retries for the new source with backoff (a stale `source`
+                // would make it due again immediately). Its validators don't apply to
+                // the previous content, which keeps serving until a download succeeds.
+                key.clone_into(&mut meta.source);
+                meta.etag = None;
+                meta.last_modified = None;
+            }
+            meta.last_error = Some(e.clone());
+            meta.consecutive_failures = meta.consecutive_failures.saturating_add(1);
+            let kept = if meta.has_content() {
+                "keeping the previous copy"
+            } else {
+                "no copy available yet"
+            };
+            warn!(list = %spec.name, "list refresh failed ({kept}): {e}");
+        }
+        // Not a failure: no early retry, and the list's status says why it waits.
+        Outcome::Held(why) => {
+            meta.last_error = Some(why.clone());
+            warn!(list = %spec.name, "list update held: {why}");
+        }
     }
 }
 
