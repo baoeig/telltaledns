@@ -119,19 +119,31 @@ fixture() {
   echo "# the installed config (the fake binary ignores it)" > "$T/telltale.toml"
 }
 checks() { cat "$FAKE/checks" 2>/dev/null || echo 0; }
+# Milliseconds on a clock that never steps (/proc/uptime, centiseconds), so a time sync in the
+# middle of a case can't fail a timing bound; the wall clock where there is no /proc/uptime.
+now_ms() {
+  local up
+  if read -r up _ < /proc/uptime 2>/dev/null; then
+    echo $((10#${up%.*} * 1000 + 10#${up#*.} * 10))
+  else
+    echo $(($(date +%s%N) / 1000000))
+  fi
+}
+t0=$(now_ms); sleep 0.3; t1=$(now_ms)
+{ [ $((t1 - t0)) -ge 250 ] && [ $((t1 - t0)) -lt 3000 ]; } || fail "ops_004_test_clock: now_ms measured $((t1 - t0)) ms for a 0.3 s sleep"
 
 # run_wait [WAIT_SECONDS] [PATH]: runs wait_for_port53 the way install.sh does (POSIX sh, set -eu);
 # sets RC, OUT and MS (milliseconds it took).
 run_wait() {
   local start end
-  start=$(date +%s%N)
+  start=$(now_ms)
   set +e
   OUT=$(PATH="${2:-$FAKEBIN:$PATH}" FAKE="$FAKE" PREFIX="$FAKEROOT" TELLTALE_PORT_WAIT="${1:-}" \
     "$TIMEOUT" 90 "$SH" -c 'set -eu; say() { printf "==> %s\n" "$*"; }; . "$1"; wait_for_port53 "$2"' sh "$T/lib.sh" "$T/telltale.toml" 2>&1)
   RC=$?
   set -e
-  end=$(date +%s%N)
-  MS=$(((end - start) / 1000000))
+  end=$(now_ms)
+  MS=$((end - start))
 }
 has() { printf '%s\n' "$OUT" | grep -qF -- "$1"; }
 
@@ -424,14 +436,14 @@ EOF
 # run_report [PATH]: the failure path as e2e.sh takes it; sets RC, OUT, MS.
 run_report() {
   local start end
-  start=$(date +%s%N)
+  start=$(now_ms)
   set +e
   OUT=$(PATH="${1:-$RBIN:$PATH}" RFAKE="$RFAKE" WORK="$T/work" REPORT_TIMEOUT="${REPORT_TIMEOUT_TEST:-8}" \
     "$TIMEOUT" 120 bash "$T/harness.sh" "$T/report.sh" 2>&1)
   RC=$?
   set -e
-  end=$(date +%s%N)
-  MS=$(((end - start) / 1000000))
+  end=$(now_ms)
+  MS=$((end - start))
 }
 rm -f "$RFAKE/hang" "$RFAKE/nobody" "$T/work/guided.out"
 printf 'install line one\nTelltaleDNS is running\n' > "$T/work/guided.out"
