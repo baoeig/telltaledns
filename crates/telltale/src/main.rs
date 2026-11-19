@@ -50,6 +50,7 @@ mod replication;
 mod rollout;
 mod rollups;
 mod routers;
+mod secret_path;
 mod selfupdate;
 mod server;
 mod shadow;

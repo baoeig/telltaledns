@@ -44,7 +44,10 @@ export interface paths {
          *     Secrets stay in files on the node (`token_file`, `password_file`): only the path is sent.
          *     A destination that names either file, before or after the change, is added or changed only
          *     by an administrator (an admin's sign-in or API token; agent tokens can't); without one, or to
-         *     delete one, the operator role is enough.
+         *     delete one, the operator role is enough. The file is an absolute path under `/run/secrets/`,
+         *     `/etc/telltale-secrets/` or the data directory's `secrets/` folder (not
+         *     `/run/secrets/kubernetes.io/`), written without `.` or `..`; links are followed. It needn't
+         *     exist yet.
          *     A destination the config files define is overridden until this one is deleted.
          */
         put: operations["put_alert_destination"];

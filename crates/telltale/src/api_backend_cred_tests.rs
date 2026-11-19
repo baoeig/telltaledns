@@ -1,8 +1,10 @@
 // REQ: OBS-010, API-002 (ADR-179) — credential files (`token_file`, `password_file`) on alert
 // destinations made through the API, driven through the real routes, sign-in and backend: only an
-// administrator sets or changes a destination that names one.
+// administrator sets or changes a destination that names one, the file must be in a place meant
+// for secrets, and a destination stored otherwise isn't used.
 
-use std::sync::Arc;
+use std::io::{Read as _, Write as _};
+use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -19,6 +21,7 @@ fn now() -> u64 {
 
 /// One node with a state database, an admin, an operator, and agent tokens.
 struct Node {
+    src: Arc<Sources>,
     app: axum::Router,
     auth: Arc<Auth>,
     /// Bearer tokens.
@@ -27,8 +30,7 @@ struct Node {
     /// Agent tokens with `config:write:alerts`: an operator's, and an admin's.
     agent: String,
     admin_agent: String,
-    /// The data directory lives as long as the node.
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
 }
 
 fn token(auth: &Auth, user: i64, scope: &str, agent_scopes: Option<&str>) -> String {
@@ -89,13 +91,14 @@ fn node() -> Node {
         Arc::clone(&auth),
     );
     Node {
+        src,
         app,
         auth,
         admin,
         operator,
         agent,
         admin_agent,
-        _dir: dir,
+        dir,
     }
 }
 
@@ -110,6 +113,10 @@ fn apply(src: &Sources) {
 }
 
 impl Node {
+    fn data(&self) -> String {
+        self.dir.path().to_str().unwrap().to_owned()
+    }
+
     async fn send(
         &self,
         method: &str,
@@ -155,6 +162,17 @@ impl Node {
             if dry { "?dryRun=true" } else { "" }
         );
         self.send("PUT", &uri, bearer, Some(body)).await
+    }
+
+    fn audit_text(&self) -> String {
+        self.auth
+            .state()
+            .audit_page(None, 1000, None, None)
+            .unwrap()
+            .iter()
+            .map(|e| [e.action.as_str(), e.target.as_str(), e.detail.as_str()].join(" "))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -332,4 +350,335 @@ async fn obs_010_only_an_admin_changes_a_destination_with_a_credential_file() {
     assert_eq!(s, StatusCode::OK, "{v}");
     let (s, v) = n.put("phone", &n.admin, false, moved).await;
     assert_eq!(s, StatusCode::OK, "{v}");
+}
+
+/// REQ: OBS-010, API-002 (ADR-179) — an API-set credential file is an absolute path under
+/// `/run/secrets/`, `/etc/telltale-secrets/` or `<data_dir>/secrets/`, compared by path
+/// components after normalisation, and not the Kubernetes service-account mount. Anything else is
+/// a 422 that names the field and the places; a file that doesn't exist yet is fine.
+#[tokio::test]
+async fn obs_010_credential_files_must_be_in_a_place_for_secrets() {
+    let n = node();
+    let d = n.data();
+    std::fs::write(format!("{d}/outside"), "not a secret").unwrap();
+    let refused = [
+        "/etc/shadow".to_owned(),
+        "/proc/self/environ".to_owned(),
+        format!("{d}/state.db"),
+        format!("{d}/outside"),
+        format!("{d}/secrets/../state.db"),
+        format!("{d}/secrets/./x/../../state.db"),
+        format!("{d}/secrets"),
+        format!("{d}/secretsx/token"),
+        "/run/secrets/../etc/passwd".to_owned(),
+        "/run/secrets-evil/x".to_owned(),
+        "/run/secretsx".to_owned(),
+        "/run/secrets".to_owned(),
+        "/run/secrets/".to_owned(),
+        "/run/secrets/kubernetes.io/serviceaccount/token".to_owned(),
+        "/var/run/secrets/kubernetes.io/serviceaccount/token".to_owned(),
+        "/etc/telltale-secrets".to_owned(),
+        "relative/token".to_owned(),
+        "secrets/token".to_owned(),
+        String::new(),
+        "/run/secrets/a\u{0}b".to_owned(),
+    ];
+    for p in &refused {
+        for (field, body) in [("token_file", ntfy(p)), ("password_file", email(p))] {
+            let (s, v) = n.put("phone", &n.admin, true, body).await;
+            assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{field} = {p:?}: {v}");
+            // A control character is refused by the schema already, before this rule.
+            if !p.contains('\u{0}') {
+                let detail = v["detail"].as_str().unwrap_or("");
+                assert!(detail.contains(field), "{p:?}: {v}");
+                assert!(
+                    detail.contains("/run/secrets/") && detail.contains("/etc/telltale-secrets/"),
+                    "{p:?}: the places are named: {v}"
+                );
+            }
+        }
+    }
+    for p in [
+        "/run/secrets/ntfy-token".to_owned(),
+        "/run/secrets/telltale/ntfy".to_owned(),
+        "/etc/telltale-secrets/ntfy/token".to_owned(),
+        format!("{d}/secrets/ntfy-token"),
+    ] {
+        for body in [ntfy(&p), email(&p)] {
+            let (s, v) = n.put("phone", &n.admin, true, body).await;
+            assert_eq!(s, StatusCode::OK, "{p}: {v}");
+        }
+    }
+    // Saved for real, and refused for real: nothing is stored.
+    let (s, _) = n.put("phone", &n.admin, false, ntfy("/etc/shadow")).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        crate::managed::entries(n.auth.state())
+            .alert_destinations
+            .is_empty(),
+        "a refused write stores nothing"
+    );
+    let (s, v) = n
+        .put(
+            "phone",
+            &n.admin,
+            false,
+            ntfy(&format!("{d}/secrets/ntfy-token")),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+}
+
+/// REQ: OBS-010 (ADR-179) — the place is checked on the file itself: a link inside a secrets
+/// folder that leads out of it (to a file, or through a linked folder, even to a file that isn't
+/// there yet) is refused; the links a Kubernetes Secret mount is made of, which stay inside, are
+/// not.
+#[cfg(unix)]
+#[tokio::test]
+async fn obs_010_a_link_that_leaves_a_secrets_folder_is_refused() {
+    use std::os::unix::fs::symlink;
+    let n = node();
+    let d = n.data();
+    let secrets = format!("{d}/secrets");
+    // A Secret mount: `<key> -> ..data/<key>`, `..data -> ..<timestamp>`.
+    std::fs::create_dir_all(format!("{secrets}/..2026_11_19_00_00_00.1")).unwrap();
+    std::fs::write(
+        format!("{secrets}/..2026_11_19_00_00_00.1/ntfy-token"),
+        "tk",
+    )
+    .unwrap();
+    symlink("..2026_11_19_00_00_00.1", format!("{secrets}/..data")).unwrap();
+    symlink("..data/ntfy-token", format!("{secrets}/ntfy-token")).unwrap();
+    std::fs::create_dir_all(format!("{d}/elsewhere")).unwrap();
+    std::fs::write(format!("{d}/elsewhere/file"), "x").unwrap();
+    symlink(format!("{d}/state.db"), format!("{secrets}/state")).unwrap();
+    symlink(format!("{d}/elsewhere"), format!("{secrets}/folder")).unwrap();
+    symlink(format!("{d}/nothing-here"), format!("{secrets}/dangling")).unwrap();
+    for ok in [
+        format!("{secrets}/ntfy-token"),
+        format!("{secrets}/..data/ntfy-token"),
+    ] {
+        let (s, v) = n.put("phone", &n.admin, true, ntfy(&ok)).await;
+        assert_eq!(s, StatusCode::OK, "{ok}: {v}");
+    }
+    for bad in [
+        format!("{secrets}/state"),
+        format!("{secrets}/folder/file"),
+        format!("{secrets}/folder/not-yet"),
+        format!("{secrets}/dangling"),
+    ] {
+        let (s, v) = n.put("phone", &n.admin, true, ntfy(&bad)).await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{bad}: {v}");
+    }
+}
+
+/// A plain HTTP server that answers 200 and keeps every request it got (head and body).
+struct Catcher {
+    url: String,
+    got: Arc<Mutex<Vec<String>>>,
+}
+
+fn catcher() -> Catcher {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let got = Arc::new(Mutex::new(Vec::new()));
+    let keep = Arc::clone(&got);
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut c) = conn else { continue };
+            let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            // The head, then as much body as `content-length` says.
+            while let Ok(k) = c.read(&mut chunk) {
+                if k == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..k]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let len = text[..end]
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            keep.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&buf).to_string());
+            let _ =
+                c.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+        }
+    });
+    Catcher { url, got }
+}
+
+/// REQ: OBS-010 (ADR-179) — at use time: a destination made through the API whose credential
+/// file isn't in a place for secrets (stored by an older version, replicated, or restored) isn't
+/// used. Its test send reads nothing, sends nothing, and says why. A destination from the config
+/// files with the same file still sends.
+#[tokio::test]
+async fn obs_010_a_stored_destination_outside_the_secrets_folders_is_not_used() {
+    let n = node();
+    let d = n.data();
+    let server = catcher();
+    let marker = format!("marker-{}", auth::crypto::random_id());
+    std::fs::create_dir_all(format!("{d}/outside/folder")).unwrap();
+    std::fs::write(format!("{d}/outside/token"), &marker).unwrap();
+    // The files' destination.
+    let mut file = (*n.src.file_config.load_full()).clone();
+    file.alerts.destination.push(
+        serde_json::from_value(serde_json::json!({
+            "name": "from-file", "type": "ntfy", "url": format!("{}/file-topic", server.url),
+            "token_file": format!("{d}/outside/token"),
+        }))
+        .unwrap(),
+    );
+    n.src.file_config.store(Arc::new(file));
+    // Destinations stored as an older version would have stored them.
+    for (name, token_file) in [
+        ("from-api", format!("{d}/outside/token")),
+        ("from-api-folder", format!("{d}/outside/folder")),
+    ] {
+        let body = serde_json::json!({
+            "name": name, "type": "ntfy", "url": format!("{}/api-topic", server.url),
+            "token_file": token_file,
+        });
+        n.auth
+            .state()
+            .put_managed(
+                crate::managed::ALERT_DESTINATION,
+                name,
+                &body.to_string(),
+                None,
+                None,
+                now(),
+                "an older version",
+            )
+            .unwrap();
+    }
+    apply(&n.src);
+    let names: Vec<String> = n
+        .src
+        .config
+        .load()
+        .alerts
+        .destination
+        .iter()
+        .map(|d| d.name.to_string())
+        .collect();
+    assert_eq!(names.len(), 3, "{names:?}");
+    for name in ["from-api", "from-api-folder"] {
+        let (s, v) = n
+            .send(
+                "POST",
+                &format!("/api/v1/alerts/destinations/{name}/test"),
+                &n.admin,
+                None,
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["ok"], false, "{name}: {v}");
+        let why = v["error"].as_str().unwrap_or("");
+        assert!(
+            why.contains("token_file") && why.contains("/run/secrets/"),
+            "{name}: says why, not what reading the file did: {v}"
+        );
+        assert!(!why.contains(&marker), "{v}");
+    }
+    assert!(
+        server
+            .got
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|r| !r.contains("/api-topic")),
+        "nothing went to the API destinations' address"
+    );
+    let (s, v) = n
+        .send(
+            "POST",
+            "/api/v1/alerts/destinations/from-file/test",
+            &n.admin,
+            None,
+        )
+        .await;
+    assert_eq!((s, v["ok"].as_bool()), (StatusCode::OK, Some(true)), "{v}");
+    let got = server.got.lock().unwrap().clone();
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(got[0].contains("/file-topic"), "{got:?}");
+    assert!(
+        got[0].contains(&format!("Bearer {marker}")),
+        "the files' destination reads its file: {got:?}"
+    );
+}
+
+/// REQ: OBS-010 (ADR-179) — refusals say what the rule is and never what is in the file: the 403,
+/// the 422 (the same for a file that is there and one that isn't), and the audit log after saves
+/// and test sends hold no byte of it.
+#[tokio::test]
+async fn obs_010_refusals_and_the_audit_log_hold_no_file_content() {
+    let n = node();
+    let d = n.data();
+    let server = catcher();
+    let marker = format!("marker-{}", auth::crypto::random_id());
+    std::fs::create_dir_all(format!("{d}/secrets")).unwrap();
+    std::fs::write(format!("{d}/outside-token"), &marker).unwrap();
+    std::fs::write(format!("{d}/secrets/ntfy-token"), &marker).unwrap();
+    let (s, v) = n
+        .put(
+            "phone",
+            &n.operator,
+            false,
+            ntfy(&format!("{d}/outside-token")),
+        )
+        .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+    assert!(!v.to_string().contains(&marker), "{v}");
+    let there = format!("{d}/outside-token");
+    let missing = format!("{d}/outside-missing");
+    let (s1, v1) = n.put("phone", &n.admin, false, ntfy(&there)).await;
+    let (s2, v2) = n.put("phone", &n.admin, true, ntfy(&missing)).await;
+    assert_eq!(
+        (s1, s2),
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::UNPROCESSABLE_ENTITY
+        )
+    );
+    assert!(!v1.to_string().contains(&marker), "{v1}");
+    assert_eq!(
+        v1.to_string().replace(&there, "P"),
+        v2.to_string().replace(&missing, "P"),
+        "a file that is there and one that isn't are refused alike"
+    );
+    // Saved where it belongs, then sent: the audit log has the path, never the content.
+    let mut body = ntfy(&format!("{d}/secrets/ntfy-token"));
+    body["url"] = format!("{}/topic", server.url).into();
+    let (s, v) = n.put("phone", &n.admin, false, body).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = n
+        .send(
+            "POST",
+            "/api/v1/alerts/destinations/phone/test",
+            &n.admin,
+            None,
+        )
+        .await;
+    assert_eq!((s, v["ok"].as_bool()), (StatusCode::OK, Some(true)), "{v}");
+    assert!(
+        server.got.lock().unwrap()[0].contains(&format!("Bearer {marker}")),
+        "it was sent"
+    );
+    let audit = n.audit_text();
+    assert!(audit.contains("alert_destination.put"), "{audit}");
+    assert!(audit.contains("alert.test"), "{audit}");
+    assert!(!audit.contains(&marker), "{audit}");
 }

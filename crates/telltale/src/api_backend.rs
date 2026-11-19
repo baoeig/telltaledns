@@ -2481,10 +2481,21 @@ impl Backend for ApiBackend {
             .cloned();
         let node = crate::http::node_name(&cfg);
         let name = name.to_owned();
+        let src = Arc::clone(&self.src);
         Box::pin(async move {
             let d =
                 d.ok_or_else(|| Problem::not_found(format!("no alert destination `{name}`")))?;
-            let r = crate::alerts::send_test(&d, &node).await;
+            // REQ: OBS-010 (ADR-179) — a destination made through the API whose credential file
+            // isn't in a folder meant for secrets isn't read or sent to; the answer says why.
+            let refused = tokio::task::spawn_blocking(move || {
+                crate::alerts::refused(&cfg, &crate::alerts::api_destinations(&src, &cfg))
+            })
+            .await
+            .map_err(|e| Problem::internal(format!("request worker failed: {e}")))?;
+            let r = match refused.get(d.name.as_str()) {
+                Some(why) => Err(why.clone()),
+                None => crate::alerts::send_test(&d, &node).await,
+            };
             Ok(telltale_api::model::AlertTest {
                 ok: r.is_ok(),
                 error: r.err(),
@@ -4655,6 +4666,28 @@ fn credential_guard(w: &ManagedWrite, current: Option<&serde_json::Value>) -> Re
     .hint("Setting or changing a credential file needs an administrator. A destination without one, or deleting this one, needs only the operator role."))
 }
 
+/// REQ: OBS-010, API-002 (ADR-179) — a credential file an alert destination made through the API
+/// names is in a folder meant for secrets ([`crate::secret_path`]): otherwise a 422 that names the
+/// field and the folders. The message is the same whatever is, or isn't, at that path. Blocking
+/// (the check may look at the filesystem; writes are planned on a blocking thread).
+fn credential_place(d: &telltale_config::AlertDestination, data_dir: &str) -> Result<(), Problem> {
+    for (field, path) in [
+        ("token_file", &d.token_file),
+        ("password_file", &d.password_file),
+    ] {
+        if let Some(p) = path
+            && !crate::secret_path::allowed(p.as_str(), data_dir)
+        {
+            return Err(Problem::new(
+                Code::InvalidConfig,
+                format!("`{field}`: use {}", crate::secret_path::places()),
+            )
+            .hint("Keep the file in a Docker or Compose secret (/run/secrets/), a Kubernetes Secret (the Helm chart's secretMounts, /etc/telltale-secrets/), or the data directory's secrets/ folder, and name that path."));
+        }
+    }
+    Ok(())
+}
+
 /// REQ: API-002 (T7.5, ADR-069) — a change to an upstream, upstream group, list, or group: it
 /// may override or hide the files' entry of the same name. `PUT` stores a definition; `DELETE`
 /// removes what the API stored (so the files' entry, if any, is back), or else hides the
@@ -4763,6 +4796,14 @@ fn plan_override(
             &mut entries.groups,
         )?,
     };
+    // REQ: OBS-010, API-002 (ADR-179) — a credential file named here is in a folder meant for
+    // secrets, whoever writes it.
+    if w.kind == ManagedKind::AlertDestination
+        && let Some((_, crate::managed::Ovr::Set(d))) =
+            entries.alert_destinations.iter().find(|(n, _)| *n == name)
+    {
+        credential_place(d, file.node.data_dir.as_str())?;
+    }
     let merged = crate::managed::merge(&file, &entries)
         .map_err(|errs| Problem::new(Code::InvalidConfig, errs.join("; ")))?;
     let after = match w.kind {
