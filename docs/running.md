@@ -58,19 +58,9 @@ docker run -d --name telltale --restart unless-stopped \
 Build it yourself with `docker buildx build -t telltale:dev .` (add `--platform linux/amd64,linux/arm64,linux/arm/v7` for all three). The build cross-compiles, so it doesn't need QEMU.
 
 ## Raspberry Pi and Linux
-Two ways, both with real client addresses (host networking) and port 53 without running as a full root process. Pi 3, 4, 5, and Zero 2 W are supported (64-bit or 32-bit OS); ARMv6 boards (Pi 1, Zero W) aren't.
+Two ways, both with real client addresses (host networking) and port 53 without running as a full root process. Native is the simplest on a Pi or any Linux machine, because it needs no Docker; use the Docker Compose bundle (after the native steps) if you already run Docker. Pi 3, 4, 5, and Zero 2 W are supported (64-bit or 32-bit OS); ARMv6 boards (Pi 1, Zero W) aren't.
 
-**Docker Compose (recommended):** `deploy/compose/` has `compose.yaml` and a starter `telltale.toml` (encrypted upstreams, one balanced blocklist, a 7-day query log).
-```sh
-mkdir telltale && cd telltale
-curl -fsSLO https://raw.githubusercontent.com/paimonsoror/telltaledns/main/deploy/compose/compose.yaml
-curl -fsSLO https://raw.githubusercontent.com/paimonsoror/telltaledns/main/deploy/compose/telltale.toml
-docker compose up -d
-docker compose exec telltale telltale auth setup-token     # then open http://<pi>:8053/
-```
-The container uses the host network, a read-only root filesystem, and only `NET_BIND_SERVICE`, as root inside the container by default. To run it as the image's unprivileged user, set `net.ipv4.ip_unprivileged_port_start=53` on the host (`echo net.ipv4.ip_unprivileged_port_start=53 | sudo tee /etc/sysctl.d/50-telltale.conf && sudo sysctl --system`) and switch `user:` in `compose.yaml`. Updates: `docker compose pull && docker compose up -d`. Reload the config without a restart: `docker compose kill -s HUP`.
-
-**Native (systemd):** `deploy/systemd/install.sh` downloads the static binary for your CPU, checks the release signature (minisign) and its SHA-256, creates a `telltale` system user, installs a sandboxed systemd unit (`ProtectSystem=strict`, only `CAP_NET_BIND_SERVICE`, `MemoryMax=256M`) and the starter config (an existing `/etc/telltale/telltale.toml` is kept), then starts the service and waits until it's ready.
+**Native (systemd), recommended:** `deploy/systemd/install.sh` downloads the static binary for your CPU, checks the release signature (minisign) and its SHA-256, creates a `telltale` system user, installs a sandboxed systemd unit (`ProtectSystem=strict`, only `CAP_NET_BIND_SERVICE`, `MemoryMax=256M`) and the starter config (an existing `/etc/telltale/telltale.toml` is kept), then starts the service and waits until it's ready.
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/paimonsoror/telltaledns/main/deploy/systemd/install.sh
 less install.sh                     # read before running as root
@@ -97,6 +87,16 @@ Re-running it upgrades the binary in place. `sudo telltale self-update --restart
 - **The system resolver:** if the install turned off systemd-resolved's stub listener, it asks to restore it (the default). `/etc/resolv.conf` is put back as the install found it (the install records the link it replaced, or keeps a copy of the file), and systemd-resolved is restarted, so the machine resolves names again without TelltaleDNS. Without a terminal or with `--yes` it restores without asking; `--keep-resolver` leaves it as the install set it. Installs from before this was recorded get the usual stub link (`/run/systemd/resolve/stub-resolv.conf`).
 - **Config and data** (`/etc/telltale`, `/var/lib/telltale`: users, query log, lists) are kept, so a later install picks them up. It asks whether to delete them; `--purge` deletes them and the `telltale` user without asking.
 - Point your router's DNS setting back at your previous server if it handed out this machine.
+
+**Docker Compose:** `deploy/compose/` has `compose.yaml` and a starter `telltale.toml` (encrypted upstreams, one balanced blocklist, a 7-day query log).
+```sh
+mkdir telltale && cd telltale
+curl -fsSLO https://raw.githubusercontent.com/paimonsoror/telltaledns/main/deploy/compose/compose.yaml
+curl -fsSLO https://raw.githubusercontent.com/paimonsoror/telltaledns/main/deploy/compose/telltale.toml
+docker compose up -d
+docker compose exec telltale telltale auth setup-token     # then open http://<host>:8053/
+```
+The container uses the host network, a read-only root filesystem, and only `NET_BIND_SERVICE`, as root inside the container by default. To run it as the image's unprivileged user, set `net.ipv4.ip_unprivileged_port_start=53` on the host (`echo net.ipv4.ip_unprivileged_port_start=53 | sudo tee /etc/sysctl.d/50-telltale.conf && sudo sysctl --system`) and switch `user:` in `compose.yaml`. Updates: `docker compose pull && docker compose up -d`. Reload the config without a restart: `docker compose kill -s HUP`.
 
 **Port 53 already in use:** on Ubuntu and some Debian setups, systemd-resolved's stub listener holds `127.0.0.53:53`. `install.sh` offers to turn it off (`--disable-resolved-stub` does it without asking: the machine then resolves through TelltaleDNS); for Compose, add `DNSStubListener=no` under `[Resolve]` in `/etc/systemd/resolved.conf.d/telltale.conf` and `sudo systemctl restart systemd-resolved`. Alternatively listen on the LAN address only with `[[listen]]`. Pi-hole or another resolver on the same machine must be stopped first.
 
@@ -1338,7 +1338,7 @@ Phones, speakers, printers, and NAS boxes announce themselves on the local netwo
 mdns = true
 ```
 - Listen only: TelltaleDNS never sends mDNS. It shares port 5353 with avahi or the system's responder.
-- It has to hear the LAN: a native install, the Pi bundle, or a pod with host networking. In a bridge or pod network nothing arrives.
+- It has to hear the LAN: a native install, the Docker Compose bundle, or a pod with host networking. In a bridge or pod network nothing arrives.
 - Names you give devices win, then the routers' DHCP leases, then mDNS. Names are lowercase, as mDNS compares them. At most 4096 devices are remembered (until a restart).
 - `GET /api/v1/dhcp/leases` lists them with `source = mdns` (no MAC), and **Clients → Discovered** shows every device found by a router or mDNS. Naming one from there (or from any address in the UI) suggests the name it gave.
 - Changing it needs a restart.
