@@ -99,14 +99,23 @@ ask() { # prompt default
   case "$REPLY" in ''|skip|s|S) REPLY="$2" ;; esac
 }
 
+# REPLY, when it is a whole number, without its leading zeros (`08` is 8, `007` is 7, `00` is 0).
+# `[ -le ]` reads them as decimal, but the answers go on as text: `08` would match no `case` (no
+# upstream, so the config couldn't be written) and `retention_days = 007` isn't valid TOML.
+plain_number() {
+  case "$REPLY" in ''|*[!0123456789]*) return 0 ;; esac
+  while [ "${#REPLY}" -gt 1 ] && [ "${REPLY#0}" != "$REPLY" ]; do REPLY="${REPLY#0}"; done
+}
+
 # A number from 1 to max (or 0 when zero is allowed); asks again on anything else, then gives up
 # on the default after three tries (so piped answers can't loop).
 choose() { # prompt default max [allow-zero]
   _tries=0
   while :; do
     ask "$1" "$2"
+    plain_number
     case "$REPLY" in
-      *[!0-9]*|'') ;;
+      *[!0123456789]*|'') ;;
       *) if [ "$REPLY" -le "$3" ] && { [ "$REPLY" -ge 1 ] || [ "${4:-}" = zero ]; }; then return; fi ;;
     esac
     _tries=$((_tries + 1))
@@ -344,7 +353,8 @@ guided() {
   _tries=0
   while :; do
     ask "   Keep it for how many days" "$RETENTION"
-    case "$REPLY" in *[!0-9]*|'') ;; *) [ "$REPLY" -ge 1 ] && [ "$REPLY" -le 400 ] && break ;; esac
+    plain_number
+    case "$REPLY" in *[!0123456789]*|'') ;; *) [ "$REPLY" -ge 1 ] && [ "$REPLY" -le 400 ] && break ;; esac
     _tries=$((_tries + 1))
     if [ "$_tries" -ge 3 ]; then REPLY=$RETENTION; break; fi
     echo "  Please type a number of days from 1 to 400."
