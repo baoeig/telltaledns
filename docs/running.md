@@ -2015,6 +2015,23 @@ and whom it waits for. Ephemeral members (resolver pods) don't hold it up. A nod
 for the whole rotation can't connect afterwards and must join again with a token. Join tokens
 made before a rotation pin the old CA, so make new ones afterwards.
 
+Trust moves forward only. Each step comes with a new configuration version, and a node takes
+the CAs of a version only if it isn't older than the one it last took them from (a new epoch,
+after a failover, counts as newer whatever its number). It keeps that version in
+`cluster/ca.version`; a file it can't read counts as none. So a step of an older version sent
+again, by a node that was the primary or by any member, can't bring a retired CA back. One rare
+case is left. A primary can crash, or fail to save `cluster/published.json`, right after it
+publishes a step, and then publish the same version number again with other content. Someone who
+kept both can then switch the nodes between the two until the next version.
+
+If the primary's version goes backwards (its data directory put back from an older copy, or
+`cluster/published.json` lost or unreadable, for example after its disk filled up and it
+restarted), the other nodes take neither trust nor configuration from it until its version
+passes theirs, and a rotation waits; DNS keeps answering. Promote another node: a new epoch
+beats any version. If no other node can be promoted, stop each of the other nodes, delete its
+`cluster/ca.version` and start it again. That is safe (with no mark, the next version is taken),
+but configuration still waits until the primary's version passes what each node applied.
+
 Rotation helps when the cluster key may have leaked but hasn't been used. Whoever holds the
 current key can sign configuration and rotate trust to a CA of their own, exactly as the
 primary does. If that may already have happened (configuration or a rotation you didn't make),
