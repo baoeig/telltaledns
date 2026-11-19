@@ -988,3 +988,29 @@ async fn obs_010_a_forwarded_write_from_a_non_admin_is_refused() {
     let a = serde_json::to_value(a).unwrap();
     assert_eq!(a["ok"]["applied"], false, "planned as a dry run: {a}");
 }
+
+/// REQ: OBS-010 — a webhook or Slack destination never uses a token, so it doesn't read
+/// `token_file`: one whose file isn't there still sends.
+#[tokio::test]
+async fn obs_010_a_webhook_does_not_read_a_token_file() {
+    let n = node();
+    let d = n.data();
+    let server = catcher();
+    let mut file = (*n.src.file_config.load_full()).clone();
+    for (name, kind) in [("hook", "webhook"), ("chat", "slack")] {
+        file.alerts.destination.push(
+            serde_json::from_value(serde_json::json!({
+                "name": name, "type": kind, "url": format!("{}/{name}", server.url),
+                "token_file": format!("{d}/not-there"),
+            }))
+            .unwrap(),
+        );
+    }
+    n.src.file_config.store(Arc::new(file));
+    apply(&n.src);
+    for name in ["hook", "chat"] {
+        let v = n.test_send(name).await;
+        assert_eq!(v["ok"], true, "{name}: {v}");
+    }
+    assert_eq!(server.got.lock().unwrap().len(), 2);
+}

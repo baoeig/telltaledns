@@ -941,14 +941,15 @@ async fn deliver(
     if d.kind == AlertKind::Email {
         return deliver_email(d, rule, n, node).await;
     }
-    let token = match &d.token_file {
-        Some(f) => Some(
+    // REQ: OBS-010 — only ntfy and Gotify send a token: other kinds never read `token_file`.
+    let token = match (&d.token_file, d.kind) {
+        (Some(f), AlertKind::Ntfy | AlertKind::Gotify) => Some(
             std::fs::read_to_string(f.as_str())
                 .map_err(|e| format!("{}: {e}", f.as_str()))?
                 .trim()
                 .to_owned(),
         ),
-        None => None,
+        _ => None,
     };
     let (body, ct, headers) = render(d, token.as_deref(), rule, n, node);
     let mut url = d.url.to_string();
