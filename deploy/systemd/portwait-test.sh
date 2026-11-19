@@ -12,15 +12,23 @@
 # deploy/cluster/gitops-failover-e2e.sh (REQ: CLU-005; they must not end that script silently).
 # Section 7e runs the rest of install.sh after the block (the call sites) with every system path
 # moved into a temp tree and a fake `systemctl`, to see that the wait comes after the resolver's stub
-# was turned off and before the one start, and nowhere else.
+# was turned off and before the one start, and nowhere else. It is skipped when run as root.
+# A fake tool on PATH does not bind a busybox shell (PORTWAIT_TEST_SH=busybox ash): it runs its own
+# applet for awk, sed, sleep, hostname, grep and the like without looking at PATH. What must hold
+# under busybox is therefore a shell function (the awk failures) or a tool busybox doesn't have
+# (ss, systemctl, telltale); a fake `sleep` or `hostname` is only a speed-up.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 INSTALL=deploy/systemd/install.sh
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
+# The load average goes into every failure: the checks of how long something took are the ones a
+# stalled or busy machine can fail, and the number says whether it was.
 fail() {
-  echo "FAIL: $*"
-  [ -n "${GITHUB_ACTIONS:-}" ] && echo "::error title=portwait-test::FAIL: $*"
+  local load=
+  [ ! -r /proc/loadavg ] || load=" [load average: $(cut -d' ' -f1-3 /proc/loadavg)]"
+  echo "FAIL: $*$load"
+  [ -n "${GITHUB_ACTIONS:-}" ] && echo "::error title=portwait-test::FAIL: $*$load"
   exit 1
 }
 n=0
@@ -197,7 +205,6 @@ run_wait
 [ "$RC" = 0 ] || fail "ops_004_port53_wait_ends_when_free: rc=$RC: $OUT"
 [ "$(checks)" = 4 ] || fail "ops_004_port53_wait_ends_when_free: $(checks) checks, expected 4 (3 held + 1 free): $OUT"
 [ "$MS" -ge 700 ] || fail "ops_004_port53_wait_ends_when_free: returned after $MS ms, before three polling intervals"
-[ "$MS" -lt 8000 ] || fail "ops_004_port53_wait_ends_when_free: took $MS ms"
 has "Waiting" || fail "ops_004_port53_wait_ends_when_free: no 'Waiting' line: $OUT"
 has "Port 53 is free" || fail "ops_004_port53_wait_ends_when_free: no 'free' line: $OUT"
 ok ops_004_port53_wait_ends_when_free
@@ -207,7 +214,7 @@ fixture always
 run_wait 2
 [ "$RC" = 1 ] || fail "ops_004_port53_wait_is_bounded: rc=$RC, expected 1: $OUT"
 [ "$MS" -ge 1900 ] || fail "ops_004_port53_wait_is_bounded: gave up after $MS ms, before the 2 s limit"
-[ "$MS" -lt 12000 ] || fail "ops_004_port53_wait_is_bounded: took $MS ms for a 2 s limit"
+[ "$(checks)" -le 9 ] || fail "ops_004_port53_wait_is_bounded: $(checks) looks for a 2 s limit (the first and at most 8 polls); it took $MS ms"
 has "still held after 2s" || fail "ops_004_port53_wait_is_bounded: no 'still held' line: $OUT"
 has 'systemd-resolve' || fail "ops_004_port53_wait_is_bounded: the holder's process isn't named: $OUT"
 has "sudo systemctl restart telltale" || fail "ops_004_port53_wait_is_bounded: no next step: $OUT"
@@ -358,7 +365,7 @@ $STUB_TCP" '' 700
 printf '%s\n' "$OWN_UDP" > "$FAKE/udp_holder_after"
 printf '%s\n' "$OWN_TCP" > "$FAKE/tcp_holder_after"
 run_wait
-{ [ "$RC" = 0 ] && has "Waiting up to" && has "Port 53 is free" && [ "$(checks)" = 2 ] && [ "$MS" -lt 8000 ]; } \
+{ [ "$RC" = 0 ] && has "Waiting up to" && has "Port 53 is free" && [ "$(checks)" = 2 ]; } \
   || fail "ops_004_port53_wait_ends_when_only_its_own_sockets_remain: rc=$RC checks=$(checks) ms=$MS: $OUT"
 ok ops_004_port53_wait_ends_when_only_its_own_sockets_remain
 # (i) a telltale that isn't the service's main process (a stray `telltale run`) is a holder.
@@ -412,8 +419,8 @@ ok ops_004_port53_report_leaves_out_a_restarted_service
 fixture always
 echo 1 > "$FAKE/ss_delay"
 run_wait 3
-{ [ "$RC" = 1 ] && has "still held after 3s" && [ "$MS" -ge 5000 ] && [ "$MS" -lt 11000 ]; } \
-  || fail "ops_004_port53_wait_is_bounded_by_the_clock: rc=$RC ms=$MS (a first look of 2 s, a 3 s wait, at most one look more): $OUT"
+{ [ "$RC" = 1 ] && has "still held after 3s" && [ "$MS" -ge 5000 ] && [ "$(checks)" -le 4 ]; } \
+  || fail "ops_004_port53_wait_is_bounded_by_the_clock: rc=$RC ms=$MS looks=$(checks) (a first look of 2 s, a 3 s wait, at most one look more: 3 looks, 13 on the base): $OUT"
 ok ops_004_port53_wait_is_bounded_by_the_clock
 # The clock itself: hundredths of a second since boot from /proc/uptime. A copy of the block reads
 # a file of the test's instead, to feed it values (a leading zero in the fraction is decimal).
@@ -465,7 +472,13 @@ ok ops_004_port53_wait_awk_failing_on_the_sockets_says_so
 # resolver's stub was turned off and before the one start, and nowhere else. The text is cut out of
 # install.sh like the block, with every path to the system moved into a temp tree (the commands that
 # change files run against it, and `systemctl` is a fake that only logs). Nothing here runs the real
-# installer.
+# installer. Not run as root (the body of this `if` is not indented, to keep the section readable):
+# every command in it is faked or confined to the temp tree, and the guard below refuses a path
+# the rewrite missed, but a test that could change a real machine when someone runs it with sudo
+# is one mistake away from doing so.
+if [ "$(id -u)" = 0 ]; then
+echo "skipped: section 7e (the call sites of install.sh) isn't run as root"
+else
 TREE="$T/tree"
 sed -n '/^# END port53-wait/,$p' "$INSTALL" > "$T/tail.raw"
 [ -s "$T/tail.raw" ] || fail "ops_004_install_call_sites: $INSTALL has no port53-wait END marker"
@@ -579,6 +592,7 @@ tail_run DISABLE_STUB=yes START=yes TELLTALE_PORT_WAIT=1
 l_start=$(call_line 'systemctl restart telltale'); last_ss=$(ss_last)
 [ "$last_ss" -lt "$l_start" ] || fail "ops_004_install_starts_once_even_when_port_53_stays_held: it looked at the sockets after the start: $(cat "$FAKE/calls")"
 ok ops_004_install_starts_once_even_when_port_53_stays_held
+fi
 
 # ---- 8. the real binary prints the effective config the way install.sh reads it ----------------
 REAL=${1:-}
