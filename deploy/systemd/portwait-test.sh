@@ -12,7 +12,11 @@
 # deploy/cluster/gitops-failover-e2e.sh (REQ: CLU-005; they must not end that script silently).
 # Section 7e runs the rest of install.sh after the block (the call sites) with every system path
 # moved into a temp tree and a fake `systemctl`, to see that the wait comes after the resolver's stub
-# was turned off and before the one start, and nowhere else.
+# was turned off and before the one start, and nowhere else. It is skipped when run as root.
+# A fake tool on PATH does not bind a busybox shell (PORTWAIT_TEST_SH=busybox ash): it runs its own
+# applet for awk, sed, sleep, hostname, grep and the like without looking at PATH. What must hold
+# under busybox is therefore a shell function (the awk failures) or a tool busybox doesn't have
+# (ss, systemctl, telltale); a fake `sleep` or `hostname` is only a speed-up.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 INSTALL=deploy/systemd/install.sh
@@ -412,7 +416,7 @@ ok ops_004_port53_report_leaves_out_a_restarted_service
 fixture always
 echo 1 > "$FAKE/ss_delay"
 run_wait 3
-{ [ "$RC" = 1 ] && has "still held after 3s" && [ "$MS" -ge 5000 ] && [ "$MS" -lt 11000 ]; } \
+{ [ "$RC" = 1 ] && has "still held after 3s" && [ "$MS" -ge 5000 ] && [ "$MS" -lt 15000 ]; } \
   || fail "ops_004_port53_wait_is_bounded_by_the_clock: rc=$RC ms=$MS (a first look of 2 s, a 3 s wait, at most one look more): $OUT"
 ok ops_004_port53_wait_is_bounded_by_the_clock
 # The clock itself: hundredths of a second since boot from /proc/uptime. A copy of the block reads
@@ -465,7 +469,13 @@ ok ops_004_port53_wait_awk_failing_on_the_sockets_says_so
 # resolver's stub was turned off and before the one start, and nowhere else. The text is cut out of
 # install.sh like the block, with every path to the system moved into a temp tree (the commands that
 # change files run against it, and `systemctl` is a fake that only logs). Nothing here runs the real
-# installer.
+# installer. Not run as root (the body of this `if` is not indented, to keep the section readable):
+# every command in it is faked or confined to the temp tree, and the guard below refuses a path
+# the rewrite missed, but a test that could change a real machine when someone runs it with sudo
+# is one mistake away from doing so.
+if [ "$(id -u)" = 0 ]; then
+echo "skipped: section 7e (the call sites of install.sh) isn't run as root"
+else
 TREE="$T/tree"
 sed -n '/^# END port53-wait/,$p' "$INSTALL" > "$T/tail.raw"
 [ -s "$T/tail.raw" ] || fail "ops_004_install_call_sites: $INSTALL has no port53-wait END marker"
@@ -579,6 +589,7 @@ tail_run DISABLE_STUB=yes START=yes TELLTALE_PORT_WAIT=1
 l_start=$(call_line 'systemctl restart telltale'); last_ss=$(ss_last)
 [ "$last_ss" -lt "$l_start" ] || fail "ops_004_install_starts_once_even_when_port_53_stays_held: it looked at the sockets after the start: $(cat "$FAKE/calls")"
 ok ops_004_install_starts_once_even_when_port_53_stays_held
+fi
 
 # ---- 8. the real binary prints the effective config the way install.sh reads it ----------------
 REAL=${1:-}
