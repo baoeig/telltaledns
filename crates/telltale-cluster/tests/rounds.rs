@@ -151,13 +151,49 @@ enum Topology {
     Witness,
     /// Five eligible nodes: four candidates once the primary is gone.
     Five,
+    /// Three eligible nodes and two witnesses (nodes 3 and 4): five voters, majority three, so
+    /// once the primary is gone each of the two candidates can win with the witnesses alone.
+    TwoWitnesses,
+    /// Four eligible nodes {P, L, X, H}: H (node 3) sorts after L and X, and the L-X link is
+    /// cut, so once P is gone only H can reach a majority, while L and X keep asking H.
+    Cut4,
+    /// Five eligible nodes: H (node 4) in the middle of a star of three lower leaves that reach
+    /// only H (and P), so once P is gone only H can win.
+    Star5,
 }
 
 impl Topology {
     fn nodes(self) -> usize {
         match self {
             Self::GitOps | Self::Three | Self::Witness => 3,
-            Self::Five => 5,
+            Self::Cut4 => 4,
+            Self::Five | Self::TwoWitnesses | Self::Star5 => 5,
+        }
+    }
+
+    /// Whether node `i` may stand once it holds the cluster key (a witness only votes).
+    fn can_lead(self, i: usize) -> bool {
+        match self {
+            Self::Witness => i != 2,
+            Self::TwoWitnesses => i < 3,
+            _ => true,
+        }
+    }
+
+    /// Whether the link between `a` and `b` is cut (both ways).
+    fn cut(self, a: usize, b: usize) -> bool {
+        match self {
+            Self::Cut4 => (a == 1 && b == 2) || (a == 2 && b == 1),
+            Self::Star5 => a != b && (1..=3).contains(&a) && (1..=3).contains(&b),
+            _ => false,
+        }
+    }
+
+    /// The node that alone can win once the primary is gone, where there is one.
+    fn only_winner(self) -> Option<usize> {
+        match self {
+            Self::Cut4 | Self::Star5 => Some(self.nodes() - 1),
+            _ => None,
         }
     }
 }
@@ -220,12 +256,16 @@ struct Outcome {
     /// For each node that stood: whether its first pre-vote went out on the step that found
     /// it free to stand (no wait of its own).
     first_try_at_once: Vec<bool>,
+    /// The node that became primary.
+    winner: usize,
 }
 
 struct Sim {
     t: u64,
     topo: Topology,
     net: Net,
+    /// `cut[a][b]`: nothing gets from `a` to `b`.
+    cut: Vec<Vec<bool>>,
     nodes: Vec<Node>,
     ids: Vec<String>,
     queue: BinaryHeap<Reverse<(u64, u64)>>,
@@ -234,7 +274,8 @@ struct Sim {
     winners: HashMap<u64, String>,
     killed_us: Option<u64>,
     dead_epoch: u64,
-    elected: Option<(u64, u64)>,
+    /// The first primary holding a lease after the kill: (epoch, when, which node).
+    elected: Option<(u64, u64, usize)>,
 }
 
 /// `net::bounded_deference`, with `since` kept by the caller.
@@ -254,16 +295,23 @@ impl Sim {
         let mut scen = Rng::new(seed, 1);
         let n = topo.nodes();
         // Node IDs are random, so the primary's place among the sorted voters is too.
-        let ids: Vec<String> = (0..n).map(|_| format!("{:016x}", scen.next())).collect();
+        let mut ids: Vec<String> = (0..n).map(|_| format!("{:016x}", scen.next())).collect();
+        if topo.only_winner().is_some() {
+            // H, the last node, sorts after every other replica.
+            ids[1..].sort();
+        }
         let mut voters = ids.clone();
         voters.sort();
+        let cut = (0..n)
+            .map(|a| (0..n).map(|b| topo.cut(a, b)).collect())
+            .collect();
         let nodes = (0..n)
             .map(|i| Node {
                 // Only the first node holds the key at the start; the others are joining.
                 el: Elector::new(&ids[i], voters.clone(), i == 0, Ballot::default()),
                 up: true,
                 git: topo == Topology::GitOps && i == 0,
-                can_lead: !(topo == Topology::Witness && i == 2),
+                can_lead: topo.can_lead(i),
                 last_seen_ms: vec![None; n],
                 defer_since_ms: 0,
                 jitter: Rng::new(seed, 100 + i as u64),
@@ -275,6 +323,7 @@ impl Sim {
             t: 0,
             topo,
             net: model.net,
+            cut,
             nodes,
             ids,
             queue: BinaryHeap::new(),
@@ -338,6 +387,9 @@ impl Sim {
     }
 
     fn send(&mut self, leave: u64, from: usize, to: usize, msg: Msg) {
+        if self.cut[from][to] {
+            return;
+        }
         if self.net.loss > 0.0 && self.rng.chance(self.net.loss) {
             return;
         }
@@ -485,21 +537,24 @@ impl Sim {
     /// primary after the kill (what the scripts wait for: `telltale_cluster_lease_held`).
     fn check_writers(&mut self) {
         let now = self.t / 1000;
-        let mut writers = self.nodes.iter().filter(|n| n.up && n.el.writable(now));
-        let first = writers.next().and_then(|n| n.el.leading());
+        let mut writers =
+            (0..self.nodes.len()).filter(|&i| self.nodes[i].up && self.nodes[i].el.writable(now));
+        let first = writers
+            .next()
+            .and_then(|i| self.nodes[i].el.leading().map(|e| (e, i)));
         assert!(writers.next().is_none(), "two writers at {now} ms");
-        if let Some(epoch) = first
+        if let Some((epoch, i)) = first
             && self.killed_us.is_some()
             && self.elected.is_none()
         {
-            self.elected = Some((epoch, self.t));
+            self.elected = Some((epoch, self.t, i));
         }
     }
 
     /// Runs until a primary holds a lease after the kill and then `tail_us` more.
     fn run(mut self, tail_us: u64) -> Option<Outcome> {
         while let Some(Reverse((t, seq))) = self.queue.pop() {
-            if let Some((_, e)) = self.elected
+            if let Some((_, e, _)) = self.elected
                 && t > e + tail_us
             {
                 break;
@@ -515,7 +570,7 @@ impl Sim {
             self.process(ev);
             self.check_writers();
         }
-        let (epoch, at) = self.elected?;
+        let (epoch, at, winner) = self.elected?;
         let kill = self.killed_us?;
         let mut tries: Vec<(u64, bool)> = self
             .nodes
@@ -531,6 +586,7 @@ impl Sim {
             took_ms: (at - kill) / 1000,
             first_tries_us: tries.iter().take(2).map(|t| t.0).collect(),
             first_try_at_once: tries.iter().map(|t| t.1).collect(),
+            winner,
         })
     }
 }
@@ -808,6 +864,9 @@ fn clu_005_failover_timing_never_elects_two_primaries() {
         Topology::Three,
         Topology::Witness,
         Topology::Five,
+        Topology::TwoWitnesses,
+        Topology::Cut4,
+        Topology::Star5,
     ] {
         let mut s = Stats::default();
         for seed in seeds() {
@@ -829,5 +888,90 @@ fn clu_005_failover_timing_never_elects_two_primaries() {
             }
         }
         s.report(&format!("{topo:?} (adversarial delays and loss)"));
+    }
+}
+
+/// How long after the kill the one node that can win may take when lower nodes that can't win
+/// keep asking it for pre-votes (`clu_005_a_lower_node_that_cannot_win_only_delays_the_election`).
+/// The lease ends at most `LEASE_MS` after the kill. Every pre-vote H grants a lower node then
+/// keeps H from standing for `ROUND_MS`; if one lands inside H's own pre-vote round, H stands
+/// down and waits for the retry time it set when that round started, at most `LEASE_MS / 3`
+/// plus the largest jitter (`LEASE_MS / 2`), 12.5 s, the longest single wait giving way adds
+/// (each grant as a follower adds at most `ROUND_MS`). The bound is the lease plus eight of the
+/// longest waits: 15 + 100 = 115 s. It is not a worst case in theory: the jitter is redrawn on
+/// every step, so each further wait is a fresh draw and the tail falls off geometrically. With
+/// the scripts' near-lockstep ticks the first attempt after the lease is usually spoiled (all of
+/// them are freed together), later ones rarely; the measured worst is about half the bound
+/// (ADR-178).
+const HELD_BACK_BOUND_MS: u64 = LEASE_MS + 8 * (LEASE_MS / 3 + LEASE_MS / 2);
+
+// REQ: CLU-005 (ADR-178) — a lower node that can't win only delays the election; it never stops
+// it. `Cut4`: four voters {P, L, X, H}, L and X sort before H, the L-X link is cut, so once P dies
+// only H can reach a majority (3 of 4), while L and X keep sending H pre-votes that it grants and
+// gives way to. `Star5`: five voters, H in the middle of three lower leaves that reach only H.
+// Every seed elects H, within `HELD_BACK_BOUND_MS` of the kill.
+#[test]
+fn clu_005_a_lower_node_that_cannot_win_only_delays_the_election() {
+    for (topo, model, name) in [
+        (
+            Topology::Cut4,
+            Model::scripts(),
+            "Cut4 (the scripts' timing)",
+        ),
+        (Topology::Cut4, Model::spread(), "Cut4 (independent phases)"),
+        (
+            Topology::Star5,
+            Model::scripts(),
+            "Star5 (the scripts' timing)",
+        ),
+        (
+            Topology::Star5,
+            Model::spread(),
+            "Star5 (independent phases)",
+        ),
+    ] {
+        let mut s = Stats::default();
+        for seed in seeds() {
+            let o = Sim::new(seed, topo, model).run(2_000_000);
+            assert!(o.is_some(), "{name} seed {seed}: no primary");
+            if let Some(o) = o {
+                assert_eq!(
+                    Some(o.winner),
+                    topo.only_winner(),
+                    "{name} seed {seed}: a node that can't reach a majority won"
+                );
+                s.add(seed, &o);
+            }
+        }
+        s.report(name);
+        assert!(
+            s.worst.0 < HELD_BACK_BOUND_MS,
+            "{name}: seed {} took {} ms",
+            s.worst.1,
+            s.worst.0
+        );
+    }
+}
+
+// REQ: CLU-005 (ADR-178) — three eligible nodes and two witnesses (five voters, majority three).
+// Once the primary dies, each of the two candidates can win with the two witnesses' votes alone,
+// so giving way can't rule a split out: the higher candidate may finish its pre-vote round (and
+// then refuse the lower one) before the lower one's request reaches it, while the lower one
+// collects the witnesses' pre-votes as well. It makes a split rarer, not impossible: before
+// ADR-178 12.4 % of the failovers took more than one round with the scripts' timing and 1.9 % with
+// independent phases; after it 2.3 % and 0.38 % (200,000 seeds each). The bounds sit between.
+#[test]
+fn clu_005_two_candidates_with_two_witnesses_split_less_often() {
+    for (model, name, two) in [
+        (Model::scripts(), "TwoWitnesses (the scripts' timing)", 0.05),
+        (Model::spread(), "TwoWitnesses (independent phases)", 0.012),
+    ] {
+        let mut s = scenario(Topology::TwoWitnesses, model);
+        s.report(name);
+        assert!(
+            s.share(2) + s.share(3) < two,
+            "{name}: {:.2} % of the failovers took more than one round",
+            (s.share(2) + s.share(3)) * 100.0
+        );
     }
 }

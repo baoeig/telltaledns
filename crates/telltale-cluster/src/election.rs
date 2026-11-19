@@ -19,7 +19,8 @@
 //!   doesn't depose a healthy primary when the partition heals.
 //! - **Giving way (ADR-178):** a node that grants a pre-vote to a node whose ID sorts before
 //!   its own lets that node have the round ([`Elector::on_ask`]), so two nodes freed by the same
-//!   lease end don't both ask for votes and split them. It changes only when a node stands.
+//!   lease end don't both ask for votes: with three voters they can't split them, and with more
+//!   a split gets rarer. It changes only when a node stands.
 //! - **Maintenance (OPS-010, ADR-118):** a node in maintenance doesn't stand ([`Elector::standing`]
 //!   is false) but still votes, so a planned event never weakens the quorum. A primary that
 //!   hands over ([`Elector::stepping_down`]) stops renewing: its lease runs out and another node
@@ -366,12 +367,15 @@ impl Elector {
 
     /// REQ: CLU-005 (ADR-178) — this node has just granted `ask`, a pre-vote. When the candidate
     /// sorts before this node and asks for the epoch this node would stand for (or a newer one),
-    /// this node gives it the round: a pre-candidate stands down, and a follower doesn't stand
-    /// for [`ROUND_MS`]. Two nodes freed by the same lease end otherwise both send pre-votes on
-    /// their next tick, grant each other's (a pre-vote binds nothing), vote for themselves, and
-    /// split the vote; each one's own vote is then a lease the other has to wait out. A candidate
-    /// (it has voted for itself) and a primary don't give way. Only when this node stands
-    /// changes: no ballot, epoch, lease or reply does.
+    /// this node gives it the round. A follower doesn't stand for [`ROUND_MS`]. A pre-candidate
+    /// stands down and keeps the retry time it set when its attempt started, `LEASE_MS / 3` plus
+    /// the jitter (5 to 12.5 s after that start), since `next_try_ms` only ever moves later here.
+    /// Two nodes freed by the same lease end otherwise both send pre-votes on their next tick,
+    /// grant each other's (a pre-vote binds nothing), vote for themselves, and split the vote;
+    /// each one's own vote is then a lease the other has to wait out. With three voters, where
+    /// neither can win without the other, this rules the split out; with more voters it only
+    /// makes it rarer (ADR-178). A candidate (it has voted for itself) and a primary don't give
+    /// way. Only when this node stands changes: no ballot, epoch, lease or reply does.
     fn give_way(&mut self, ask: &Ask, now_ms: u64) {
         if ask.candidate >= self.id {
             return;
@@ -881,10 +885,10 @@ mod tests {
                 .contains(&Out::Elected { epoch: 1 })
         );
         assert_eq!((c.ballot.epoch, c.ballot.candidate.as_str()), (1, "b"));
-        assert!(
-            c.tick(1_020 + ROUND_MS + 1, 0).is_empty(),
-            "c holds b's lease"
-        );
+        // At 7 s c's own retry time (set when its attempt started at 1 s: 1 s + LEASE_MS / 3,
+        // with no jitter) has passed, and b's lease on c's ballot runs until 1.015 s + LEASE_MS:
+        // only the lease keeps c from standing here.
+        assert!(c.tick(7_000, 0).is_empty(), "c holds b's lease");
     }
 
     // REQ: CLU-005 (ADR-178) — a follower that grants a pre-vote to a node that sorts before it
