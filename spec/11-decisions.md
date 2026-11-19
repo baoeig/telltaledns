@@ -149,6 +149,8 @@ Workspace crates set `publish = false`, so the short prefix can't collide on cra
 
 **Consequences:** One small request per list per day once lists are cached. A broken upstream list or a captive portal never empties a blocklist. Gzip transfer and per-list custom headers/auth are left for later (P1) if users need them.
 
+**Amended 2026-11-19 (inline lists that are refused; amendment Proposed):** the ladder above is for downloads. An inline list whose rules fail the sanity or usable-list check has no copy to keep, and its rules only change with the config, so trying again can't help (and the fetch loop re-asks `due` straight after a round, so a list that is always due is a loop: a synced metadata write and a log line per pass, about 50 a second in a debug build on a VM). It is tried when added or edited, when switched off and on, on "Refresh now", and after a restart (`[filter]` changes such as `max_invalid_percent` apply on restart and decide what is usable), and not otherwise; `consecutive_failures` and the error still report it. The refusal is remembered in memory only, per name and rules hash, so nothing about it is persisted.
+
 ## ADR-017 — List parsing rules and synthetic golden fixtures (Accepted)
 **Context:** FLT-001 and `spec/05` §2 list the syntaxes, but not how to tell them apart line by line or what to do with near-misses. `spec/09` §1 asks for golden tests on vendored copies of StevenBlack, HaGeZi Pro, OISD small, an AdGuard DNS filter, and Pi-hole regex samples. Several of those are GPL-licensed data (HaGeZi, AdGuard), which shouldn't be committed into an Apache-2.0/MIT repository.
 
