@@ -112,6 +112,13 @@ pub(crate) enum CtlCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    // REQ: OPS-014
+    /// Upgrade the cluster's native nodes to a version, one at a time: replicas
+    /// first and the primary last, each back on the version, ready, and in sync before the next.
+    /// Kubernetes pods are left to the chart (its `upgradeHook` runs this from the new image
+    /// before the pods roll). Each node needs `telltale-update.path` enabled. Needs an admin's
+    /// token (agents: `analytics:read` and `cluster:upgrade`).
+    Upgrade(UpgradeArgs),
     /// Flush the cache (everything, or one name).
     Flush {
         #[arg(long)]
@@ -252,6 +259,36 @@ pub(crate) enum DrillCmd {
     Report { id: Option<String> },
 }
 
+/// REQ: OPS-014 — `telltale ctl upgrade`.
+#[derive(Debug, clap::Args)]
+#[allow(clippy::struct_excessive_bools)] // independent command-line flags
+pub(crate) struct UpgradeArgs {
+    /// The version: a release (`0.8.0`) or an edge build (`0.8.0-edge.393`, which can be
+    /// installed only while it is the newest on the edge channel).
+    #[arg(long, required_unless_present = "to_self", conflicts_with = "to_self")]
+    pub(crate) to: Option<String>,
+    /// This binary's own version (the chart's upgrade hook runs the new image with it).
+    #[arg(long)]
+    pub(crate) to_self: bool,
+    /// Only this node (ID, site, or pod name); repeat for several. Default: every native node
+    /// that isn't on the version.
+    #[arg(long = "node")]
+    pub(crate) nodes: Vec<String>,
+    /// How long each node may take to install the version and come back in sync: `90s`,
+    /// `10m`, or seconds.
+    #[arg(long, value_parser = parse_duration, default_value = "10m")]
+    pub(crate) timeout: u32,
+    /// Leave nodes that are down out instead of stopping.
+    #[arg(long)]
+    pub(crate) skip_down: bool,
+    /// Succeed when nothing answers at `--url` (a first install: no cluster to upgrade yet).
+    #[arg(long)]
+    pub(crate) skip_if_unreachable: bool,
+    /// Say which nodes would be upgraded, in which order, without asking any.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+}
+
 /// REQ: CLU-013 — `telltale ctl rollout`.
 #[derive(Debug, Subcommand)]
 pub(crate) enum RolloutCmd {
@@ -339,6 +376,31 @@ impl Api {
         path: &str,
         body: Option<&Value>,
     ) -> Result<Value, String> {
+        match self.call_raw(method, path, body).await? {
+            Ok(v) => Ok(v),
+            Err((status, v)) => {
+                // problem+json: say what's wrong and how to fix it.
+                let title = v
+                    .get("detail")
+                    .or_else(|| v.get("title"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let hint = v
+                    .get("hint")
+                    .and_then(Value::as_str)
+                    .map_or_else(String::new, |h| format!(" ({h})"));
+                Err(format!("HTTP {status}: {title}{hint}"))
+            }
+        }
+    }
+
+    /// The answer, or its status and problem body: the outer error is "couldn't ask".
+    async fn call_raw(
+        &self,
+        method: http::Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Result<Value, (http::StatusCode, Value)>, String> {
         let url = self.url(path);
         let mut req = http::Request::builder()
             .method(method)
@@ -366,21 +428,11 @@ impl Api {
             serde_json::from_slice(&body)
                 .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&body).into_owned()))
         };
-        if status.is_success() {
+        Ok(if status.is_success() {
             Ok(v)
         } else {
-            // problem+json: say what's wrong and how to fix it.
-            let title = v
-                .get("detail")
-                .or_else(|| v.get("title"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let hint = v
-                .get("hint")
-                .and_then(Value::as_str)
-                .map_or_else(String::new, |h| format!(" ({h})"));
-            Err(format!("HTTP {status}: {title}{hint}"))
-        }
+            Err((status, v))
+        })
     }
 
     async fn get(&self, path: &str) -> Result<Value, String> {
@@ -711,6 +763,7 @@ pub(crate) async fn run(
             Some(Box::new(action_text)),
         ),
         // REQ: CLU-001 (ADR-155)
+        CtlCommand::Upgrade(a) => (upgrade(&api, a).await?, Some(Box::new(upgrade_text))),
         CtlCommand::RemoveNode {
             node,
             force,
@@ -1062,6 +1115,307 @@ pub(crate) async fn run(
 }
 
 type Rendered = (Value, Option<Box<dyn Fn(&Value) -> String>>);
+
+/// REQ: OPS-014 — one node to upgrade.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpgradeStep {
+    id: String,
+    label: String,
+    from: String,
+    primary: bool,
+}
+
+/// REQ: OPS-014 — who gets the version, in order, and who doesn't and why.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct UpgradePlan {
+    steps: Vec<UpgradeStep>,
+    skipped: Vec<(String, String)>,
+    down: Vec<String>,
+}
+
+/// REQ: OPS-014, CLU-010 — the order from a cluster view (`GET /cluster`): native replicas
+/// first (by site, then ID), the primary last; pods are the chart's, and nodes already on the
+/// version (or newer, or on a local build) are left alone. `only` keeps the nodes named.
+fn upgrade_plan(view: &Value, to: &str, only: &[String]) -> UpgradePlan {
+    use telltale_api::update_api::version_key;
+    let mut plan = UpgradePlan::default();
+    let want = version_key(to);
+    let mut steps = Vec::new();
+    for n in arr(&view["nodes"]) {
+        let (id, site, pod) = (s(n, "nodeId"), s(n, "site"), s(n, "pod"));
+        if !only.is_empty() && !only.iter().any(|o| *o == id || *o == site || *o == pod) {
+            continue;
+        }
+        let label = match (pod.is_empty(), site.is_empty()) {
+            (false, _) => pod.clone(),
+            (true, false) => format!("{site} ({id})"),
+            (true, true) => id.clone(),
+        };
+        let version = s(n, "version");
+        let have = version_key(&version);
+        let reason = if n["ephemeral"].as_bool() == Some(true) || !pod.is_empty() {
+            Some("a Kubernetes pod: the chart upgrades it".to_owned())
+        } else if version == to {
+            Some(format!("already on {to}"))
+        } else if have.is_none() {
+            Some(format!("a local build ({version})"))
+        } else if have > want {
+            Some(format!("runs {version}, newer than {to}"))
+        } else {
+            None
+        };
+        if let Some(r) = reason {
+            plan.skipped.push((label, r));
+        } else if n["up"].as_bool() != Some(true) {
+            plan.down.push(label);
+        } else {
+            steps.push((
+                s(n, "role") == "primary",
+                site,
+                id.clone(),
+                UpgradeStep {
+                    id,
+                    label,
+                    from: version,
+                    primary: false,
+                },
+            ));
+        }
+    }
+    steps.sort_by(|a, b| (a.0, &a.1, &a.2).cmp(&(b.0, &b.1, &b.2)));
+    plan.steps = steps
+        .into_iter()
+        .map(|(primary, _, _, step)| UpgradeStep { primary, ..step })
+        .collect();
+    plan
+}
+
+/// REQ: OPS-014 — whether `node` in a cluster view runs `to`, is up and ready, and has the
+/// newest configuration.
+fn upgraded(view: &Value, id: &str, to: &str) -> bool {
+    arr(&view["nodes"]).iter().any(|n| {
+        s(n, "nodeId") == id
+            && s(n, "version") == to
+            && n["up"].as_bool() == Some(true)
+            && n["ready"].as_bool() != Some(false)
+            && n["configLag"].as_u64().unwrap_or(0) == 0
+    })
+}
+
+/// REQ: OPS-014 — `telltale ctl upgrade`: the plan, then each node in turn; progress on stderr.
+#[allow(clippy::too_many_lines)] // one sequence: plan, ask, wait, report
+async fn upgrade(api: &Api, a: UpgradeArgs) -> Result<Value, String> {
+    let to = match (&a.to, a.to_self) {
+        (Some(v), _) => v.clone(),
+        (None, _) => crate::build_info::VERSION.to_owned(),
+    };
+    let to = telltale_api::update_api::check_version(&to).map_err(|p| {
+        if a.to_self {
+            format!("this binary is a local build ({to}), not a release: pass --to")
+        } else {
+            p.detail
+        }
+    })?;
+    let view = match api.call_raw(http::Method::GET, "cluster", None).await {
+        Ok(Ok(v)) => v,
+        Ok(Err((status, v))) => {
+            return Err(format!("GET /cluster: HTTP {status}: {}", s(&v, "detail")));
+        }
+        Err(e) if a.skip_if_unreachable => {
+            return Ok(
+                json!({"to": to, "upgraded": [], "skipped": [], "note": format!("nothing to upgrade yet: {e}")}),
+            );
+        }
+        Err(e) => return Err(e),
+    };
+    let mut plan = if view["enabled"].as_bool() == Some(true) {
+        upgrade_plan(&view, &to, &a.nodes)
+    } else {
+        // A standalone node: itself.
+        let info = api.get("system/info").await?;
+        let version = s(&info, "version");
+        let mut p = UpgradePlan::default();
+        if version == to {
+            p.skipped
+                .push(("this node".into(), format!("already on {to}")));
+        } else {
+            p.steps.push(UpgradeStep {
+                id: "local".into(),
+                label: "this node".into(),
+                from: version,
+                primary: true,
+            });
+        }
+        p
+    };
+    if !plan.down.is_empty() {
+        if !a.skip_down {
+            return Err(format!(
+                "{} {} down: replicas go first, so nothing was upgraded. Start {}, remove a node that is gone for good (telltale ctl remove-node), or pass --skip-down",
+                plan.down.join(", "),
+                if plan.down.len() == 1 { "is" } else { "are" },
+                if plan.down.len() == 1 { "it" } else { "them" }
+            ));
+        }
+        for d in std::mem::take(&mut plan.down) {
+            plan.skipped.push((d, "down (--skip-down)".into()));
+        }
+    }
+    let skipped: Vec<Value> = plan
+        .skipped
+        .iter()
+        .map(|(n, r)| json!({"node": n, "reason": r}))
+        .collect();
+    if a.dry_run {
+        let order: Vec<Value> = plan
+            .steps
+            .iter()
+            .map(|st| json!({"node": st.label, "from": st.from, "primary": st.primary}))
+            .collect();
+        return Ok(json!({"to": to, "dryRun": true, "order": order, "skipped": skipped}));
+    }
+    let mut done = Vec::new();
+    let mut skipped = skipped;
+    let timeout = std::time::Duration::from_secs(u64::from(a.timeout));
+    for st in &plan.steps {
+        let path = format!("nodes/{}/update", path_segment(&st.id));
+        eprintln!(
+            "{}: asking it to install {to} (it runs {})",
+            st.label, st.from
+        );
+        let started = std::time::Instant::now();
+        let r = match api
+            .call_raw(http::Method::POST, &path, Some(&json!({"to": to})))
+            .await?
+        {
+            Ok(v) => v,
+            Err((_, p)) if s(&p, "code") == "update_unsupported" => {
+                eprintln!("{}: {}", st.label, s(&p, "detail"));
+                skipped.push(json!({"node": st.label, "reason": s(&p, "detail")}));
+                continue;
+            }
+            Err((status, p)) => {
+                return Err(format!(
+                    "{}: HTTP {status}: {}{}",
+                    st.label,
+                    s(&p, "detail"),
+                    p.get("hint")
+                        .and_then(Value::as_str)
+                        .map_or_else(String::new, |h| format!(" ({h})"))
+                ));
+            }
+        };
+        if s(&r, "state") == "up_to_date" {
+            skipped.push(json!({"node": st.label, "reason": format!("already on {to}")}));
+            continue;
+        }
+        let id = r["pending"]["id"].as_str().unwrap_or_default().to_owned();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let waited = started.elapsed();
+            // The node restarts (and with it, for the primary, the API): failures are expected.
+            if let Ok(u) = api.get(&path).await {
+                let last = &u["last"];
+                if !id.is_empty() && s(last, "id") == id {
+                    match s(last, "state").as_str() {
+                        "failed" | "refused" => {
+                            return Err(format!(
+                                "{}: {} {to}: {}",
+                                st.label,
+                                s(last, "state"),
+                                s(last, "error")
+                            ));
+                        }
+                        _ => {}
+                    }
+                } else if s(&u["pending"], "id") == id
+                    && waited > std::time::Duration::from_secs(60)
+                {
+                    return Err(format!(
+                        "{}: its update service hasn't picked the request up in a minute: check telltale-update.path and `journalctl -u telltale-update` on the node",
+                        st.label
+                    ));
+                }
+            }
+            let caught_up = if st.id == "local" {
+                api.get("system/info")
+                    .await
+                    .is_ok_and(|i| s(&i, "version") == to)
+            } else {
+                api.get("cluster")
+                    .await
+                    .is_ok_and(|v| upgraded(&v, &st.id, &to))
+            };
+            if caught_up {
+                let secs = started.elapsed().as_secs();
+                eprintln!("{}: on {to}, ready and in sync ({secs} s)", st.label);
+                done.push(json!({"node": st.label, "from": st.from, "to": to, "seconds": secs}));
+                break;
+            }
+            if waited > timeout {
+                return Err(format!(
+                    "{}: not back on {to}, ready and in sync after {} s: the nodes after it were not upgraded",
+                    st.label,
+                    timeout.as_secs()
+                ));
+            }
+        }
+    }
+    Ok(json!({"to": to, "upgraded": done, "skipped": skipped}))
+}
+
+/// REQ: OPS-014 — what `ctl upgrade` did (or would do) as text.
+fn upgrade_text(v: &Value) -> String {
+    let mut out = String::new();
+    let to = s(v, "to");
+    if let Some(note) = v["note"].as_str() {
+        let _ = writeln!(out, "Nothing to upgrade to {to}: {note}");
+        return out;
+    }
+    if v["dryRun"].as_bool() == Some(true) {
+        if arr(&v["order"]).is_empty() {
+            let _ = writeln!(out, "No node needs {to}.");
+        } else {
+            let _ = writeln!(out, "Would upgrade to {to}, in this order:");
+        }
+        for (i, n) in arr(&v["order"]).iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "  {}. {} (now {}){}",
+                i + 1,
+                s(n, "node"),
+                s(n, "from"),
+                if n["primary"].as_bool() == Some(true) {
+                    ", the primary"
+                } else {
+                    ""
+                }
+            );
+        }
+    } else if arr(&v["upgraded"]).is_empty() {
+        let _ = writeln!(out, "No node needed {to}.");
+    } else {
+        let _ = writeln!(out, "Upgraded to {to}:");
+        for n in arr(&v["upgraded"]) {
+            let _ = writeln!(
+                out,
+                "  {} (was {}, {} s)",
+                s(n, "node"),
+                s(n, "from"),
+                s(n, "seconds")
+            );
+        }
+    }
+    for n in arr(&v["skipped"]) {
+        let _ = writeln!(out, "  left alone: {}: {}", s(n, "node"), s(n, "reason"));
+    }
+    out
+}
+
+/// A JSON array's items (none for anything else).
+fn arr(v: &Value) -> &[Value] {
+    v.as_array().map_or(&[], Vec::as_slice)
+}
 
 /// REQ: OBS-024 — a simulation as text: the counts, then the top names of each kind.
 fn simulation_text(v: &Value) -> String {
@@ -1435,5 +1789,203 @@ mod tests {
         assert!(parse_duration("2w").is_err() && parse_duration("h").is_err());
         assert_eq!(path_segment("telltale-0"), "telltale-0");
         assert_eq!(path_segment("a/b c"), "a%2Fb%20c");
+    }
+
+    fn node(id: &str, site: &str, role: &str, version: &str, up: bool, pod: Option<&str>) -> Value {
+        json!({"nodeId": id, "site": site, "role": role, "version": version, "up": up,
+               "ready": true, "configLag": 0, "ephemeral": false, "pod": pod})
+    }
+
+    /// REQ: OPS-014, CLU-010 — native replicas first (by site), the primary last; pods,
+    /// nodes already on the version, newer ones, and local builds are left alone; nodes that are
+    /// down are listed apart; `--node` keeps the ones named.
+    #[test]
+    fn ops_014_upgrade_order() {
+        let view = json!({"enabled": true, "nodes": [
+            node("c0", "k3s", "replica", "0.7.0", true, Some("telltale-0")),
+            node("p1", "proxmox", "primary", "0.7.0", true, None),
+            node("z9", "pi", "replica", "0.7.0", true, None),
+            node("a1", "attic", "replica", "0.8.0", true, None),
+            node("n2", "new", "replica", "0.9.0", true, None),
+            node("d3", "dev", "replica", "dev", true, None),
+            node("x4", "gone", "replica", "0.7.0", false, None),
+        ]});
+        let p = upgrade_plan(&view, "0.8.0", &[]);
+        let order: Vec<(&str, bool)> = p.steps.iter().map(|s| (s.id.as_str(), s.primary)).collect();
+        assert_eq!(order, vec![("z9", false), ("p1", true)]);
+        assert_eq!(p.steps[0].label, "pi (z9)");
+        assert_eq!(p.down, vec!["gone (x4)".to_owned()]);
+        let why: Vec<&str> = p.skipped.iter().map(|(_, r)| r.as_str()).collect();
+        assert_eq!(
+            why,
+            vec![
+                "a Kubernetes pod: the chart upgrades it",
+                "already on 0.8.0",
+                "runs 0.9.0, newer than 0.8.0",
+                "a local build (dev)",
+            ]
+        );
+        let only = upgrade_plan(&view, "0.8.0", &["proxmox".into()]);
+        assert_eq!(only.steps.len(), 1);
+        assert!(only.down.is_empty() && only.skipped.is_empty());
+        // An edge build sorts before its release.
+        let p = upgrade_plan(&view, "0.8.0-edge.5", &[]);
+        assert!(
+            p.skipped
+                .iter()
+                .any(|(n, r)| n == "attic (a1)" && r.contains("newer"))
+        );
+    }
+
+    /// A fake API: `versions` per node; a POST "installs" by moving the node to the version
+    /// (or fails it when the node is in `fail`).
+    #[derive(Default)]
+    struct FakeCluster {
+        versions: std::sync::Mutex<Vec<(String, String)>>,
+        asked: std::sync::Mutex<Vec<String>>,
+        fail: Vec<String>,
+    }
+
+    async fn fake_api(f: Arc<FakeCluster>) -> String {
+        use axum::extract::{Path as P, State};
+        use axum::routing::get;
+        let reply = |v: Value| {
+            (
+                [(http::header::CONTENT_TYPE, "application/json")],
+                v.to_string(),
+            )
+        };
+        let cluster = move |State(f): State<Arc<FakeCluster>>| async move {
+            let nodes: Vec<Value> = f
+                .versions
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(id, v)| {
+                    let pod = (id == "c0").then_some("telltale-0");
+                    node(
+                        id,
+                        id,
+                        if id == "c0" { "primary" } else { "replica" },
+                        v,
+                        true,
+                        pod,
+                    )
+                })
+                .collect();
+            reply(json!({"enabled": true, "nodes": nodes}))
+        };
+        let status = move |State(f): State<Arc<FakeCluster>>, P(id): P<String>| async move {
+            let failed = f.fail.contains(&id) && f.asked.lock().unwrap().contains(&id);
+            let last = if failed {
+                json!({"id": "r-1", "state": "failed", "error": "checksum mismatch"})
+            } else {
+                Value::Null
+            };
+            reply(json!({"node": id, "last": last}))
+        };
+        let post = move |State(f): State<Arc<FakeCluster>>, P(id): P<String>, body: String| async move {
+            let to = serde_json::from_str::<Value>(&body).unwrap()["to"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            f.asked.lock().unwrap().push(id.clone());
+            if !f.fail.contains(&id) {
+                for (n, v) in f.versions.lock().unwrap().iter_mut() {
+                    if *n == id {
+                        v.clone_from(&to);
+                    }
+                }
+            }
+            reply(json!({"node": id, "state": "requested", "pending": {"id": "r-1", "to": to}}))
+        };
+        let app = axum::Router::new()
+            .route("/api/v1/cluster", get(cluster))
+            .route("/api/v1/nodes/{id}/update", get(status).post(post))
+            .with_state(f);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        format!("http://{addr}")
+    }
+
+    fn args(to: &str) -> UpgradeArgs {
+        UpgradeArgs {
+            to: Some(to.into()),
+            to_self: false,
+            nodes: Vec::new(),
+            timeout: 30,
+            skip_down: false,
+            skip_if_unreachable: false,
+            dry_run: false,
+        }
+    }
+
+    fn fake(nodes: &[&str], fail: &[&str]) -> Arc<FakeCluster> {
+        Arc::new(FakeCluster {
+            versions: std::sync::Mutex::new(
+                nodes
+                    .iter()
+                    .map(|n| ((*n).to_owned(), "0.7.0".to_owned()))
+                    .collect(),
+            ),
+            asked: std::sync::Mutex::default(),
+            fail: fail.iter().map(|n| (*n).to_owned()).collect(),
+        })
+    }
+
+    /// REQ: OPS-014 — `ctl upgrade` asks one node at a time, waits for each to be back on the
+    /// version, never asks the pod, and stops at the first failure with the node's error.
+    #[tokio::test]
+    async fn ops_014_ctl_upgrade_goes_one_node_at_a_time_and_stops_on_failure() {
+        let f = fake(&["c0", "dns-01", "dns-02"], &[]);
+        let base = fake_api(Arc::clone(&f)).await;
+        let out = run(&base, None, "t", CtlCommand::Upgrade(args("0.8.0")), false)
+            .await
+            .unwrap();
+        assert_eq!(*f.asked.lock().unwrap(), vec!["dns-01", "dns-02"]);
+        assert!(out.contains("Upgraded to 0.8.0:"), "{out}");
+        assert!(
+            out.contains("left alone: telltale-0: a Kubernetes pod"),
+            "{out}"
+        );
+
+        let f = fake(&["c0", "dns-01", "dns-02"], &["dns-01"]);
+        let base = fake_api(Arc::clone(&f)).await;
+        let e = run(&base, None, "t", CtlCommand::Upgrade(args("0.8.0")), false)
+            .await
+            .unwrap_err();
+        assert!(
+            e.contains("dns-01") && e.contains("checksum mismatch"),
+            "{e}"
+        );
+        assert_eq!(
+            *f.asked.lock().unwrap(),
+            vec!["dns-01"],
+            "dns-02 is never asked"
+        );
+
+        // Nothing listening: an error, or "nothing to upgrade yet" for the chart's first install.
+        let mut a = args("0.8.0");
+        let e = run(
+            "http://127.0.0.1:9",
+            None,
+            "t",
+            CtlCommand::Upgrade(args("0.8.0")),
+            false,
+        )
+        .await;
+        assert!(e.is_err());
+        a.skip_if_unreachable = true;
+        let out = run(
+            "http://127.0.0.1:9",
+            None,
+            "t",
+            CtlCommand::Upgrade(a),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("Nothing to upgrade to 0.8.0"), "{out}");
     }
 }

@@ -1,0 +1,586 @@
+//! Updates driven from the cluster (REQ: OPS-014, CLU-010; ADR-177): an admin, or
+//! `telltale ctl upgrade`, asks a native node to install a version, and the node's root update
+//! service installs it.
+//!
+//! - **The node never replaces its own binary.** It runs as `telltale` under
+//!   `ProtectSystem=strict` (ADR-038), so it can't, and ADR-046 keeps it that way. It writes
+//!   `<data_dir>/update-request.json` and nothing else. `telltale-update.path` (root, installed by
+//!   `install.sh`, off until enabled) starts `telltale-update.service`, which runs
+//!   `telltale self-update --request …` as root: [`serve_request`] reads the request, removes it,
+//!   checks it again, installs the signed release with [`crate::selfupdate`], records the outcome
+//!   in [`RESULT_PATH`] (a root-owned directory the node can read), and restarts the node.
+//! - **What the request file can do is bounded.** The root side trusts nothing in it: it reads
+//!   only a small regular file owned by the data directory's owner, and acts only on a release or
+//!   edge build version that is newer than the one installed. The binary still has to carry the
+//!   release signature, so the most a compromised `telltale` user can do is ask for a newer
+//!   signed release.
+//! - **Containers and Kubernetes pods** are upgraded by their image and say so
+//!   (`update_unsupported`); a Helm chart's pre-upgrade hook (`upgradeHook`) runs
+//!   `telltale ctl upgrade` from the new image, so the native nodes go first.
+//!
+//! Nothing here is on the query path.
+
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use telltale_api::NodeUpdateCall;
+use telltale_api::model::{NodeUpdate, NodeUpdatePending, NodeUpdateRun};
+use telltale_api::problem::{Code, Problem};
+use telltale_api::update_api::{check_version, is_edge, version_key};
+use telltale_cluster::net::Cluster;
+use tracing::{info, warn};
+
+/// The request, in the node's data directory.
+pub(crate) const REQUEST_FILE: &str = "update-request.json";
+/// The update service's latest run, in its own state directory (`StateDirectory=telltale-update`).
+pub(crate) const RESULT_PATH: &str = "/var/lib/telltale-update/result.json";
+/// `systemctl enable telltale-update.path` makes this link (`WantedBy=paths.target`).
+const ENABLED_LINK: &str = "/etc/systemd/system/paths.target.wants/telltale-update.path";
+/// The RPC to the node a request or read is for.
+pub(crate) const KIND: &str = "update";
+/// How long the entry node waits for the target's answer.
+const DEADLINE: Duration = Duration::from_secs(5);
+/// An RPC older than this when the target reads it is dropped, as for maintenance.
+const STALE_RPC_MS: u64 = 30_000;
+/// The update service refuses a request file older than this (or this far in the future): one
+/// left behind while the service was off isn't acted on when it's switched on months later.
+const STALE_REQUEST_MS: u64 = 3_600_000;
+/// The largest request file the update service reads.
+const MAX_REQUEST: u64 = 4096;
+/// The longest `by` kept.
+const MAX_BY: usize = 200;
+
+/// `<data_dir>/update-request.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RequestFile {
+    pub(crate) id: String,
+    pub(crate) to: String,
+    pub(crate) by: String,
+    pub(crate) requested_ms: u64,
+}
+
+/// [`RESULT_PATH`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ResultFile {
+    pub(crate) id: String,
+    pub(crate) to: String,
+    pub(crate) from: String,
+    /// `installing`, `updated`, `up_to_date`, `failed`, or `refused`.
+    pub(crate) state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
+    pub(crate) by: String,
+    pub(crate) at_ms: u64,
+}
+
+/// A request on the cluster channel: the call and when the entry node sent it.
+#[derive(Debug, Serialize, Deserialize)]
+struct Envelope {
+    call: NodeUpdateCall,
+    sent_ms: u64,
+}
+
+fn now_ms() -> u64 {
+    crate::maintenance::now_ms()
+}
+
+fn rfc3339(ms: u64) -> String {
+    telltale_api::time::format_us(ms.saturating_mul(1000))
+}
+
+/// What a node knows about itself, for [`status`] and [`request`].
+#[derive(Debug, Clone)]
+pub(crate) struct Here {
+    /// The node's label (pod, site, or ID).
+    pub(crate) node: String,
+    pub(crate) version: String,
+    /// `native`, `container`, or `helm`.
+    pub(crate) install: String,
+    /// The update service is enabled.
+    pub(crate) enabled: bool,
+    pub(crate) data_dir: PathBuf,
+    pub(crate) result: PathBuf,
+}
+
+impl Here {
+    /// This process.
+    fn of(src: &crate::http::Sources) -> Self {
+        Self {
+            node: crate::maintenance::label(src),
+            version: crate::build_info::VERSION.to_owned(),
+            install: crate::build_info::install_type().to_owned(),
+            enabled: Path::new(ENABLED_LINK).exists(),
+            data_dir: PathBuf::from(src.config.load().node.data_dir.as_str()),
+            result: PathBuf::from(RESULT_PATH),
+        }
+    }
+
+    fn request_path(&self) -> PathBuf {
+        self.data_dir.join(REQUEST_FILE)
+    }
+}
+
+/// A JSON file, if it's there and parses (a missing or half-written file reads as none).
+fn read_json<T: serde::de::DeserializeOwned>(p: &Path) -> Option<T> {
+    let bytes = std::fs::read(p).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// REQ: OPS-014 — the node's version, its update service, a request not picked up yet, and the
+/// service's latest run.
+pub(crate) fn status(h: &Here) -> NodeUpdate {
+    let pending = read_json::<RequestFile>(&h.request_path()).map(|r| NodeUpdatePending {
+        id: r.id,
+        to: r.to,
+        by: r.by,
+        requested_at: rfc3339(r.requested_ms),
+    });
+    let last = read_json::<ResultFile>(&h.result).map(|r| NodeUpdateRun {
+        id: r.id,
+        to: r.to,
+        from: r.from,
+        state: r.state,
+        error: r.error,
+        by: r.by,
+        at: rfc3339(r.at_ms),
+    });
+    NodeUpdate {
+        node: h.node.clone(),
+        version: h.version.clone(),
+        install: h.install.clone(),
+        enabled: h.enabled,
+        state: None,
+        pending,
+        last,
+    }
+}
+
+/// REQ: OPS-014 — whether this node can take `to`, and if so the request to hand over (`None`:
+/// it already runs `to`).
+pub(crate) fn plan(h: &Here, to: &str) -> Result<Option<String>, Problem> {
+    let to = check_version(to)?;
+    if h.install != "native" {
+        let (what, hint) = if h.install == "helm" {
+            (
+                "a Kubernetes pod",
+                "Upgrade the chart (or its image.tag). With the chart's upgradeHook enabled, the native nodes are upgraded first.",
+            )
+        } else {
+            (
+                "a container",
+                "Pull the new image and restart it: docker compose pull && docker compose up -d.",
+            )
+        };
+        return Err(Problem::new(
+            Code::UpdateUnsupported,
+            format!(
+                "{} runs in {what}: its image is upgraded by its deployment, not by TelltaleDNS",
+                h.node
+            ),
+        )
+        .hint(hint));
+    }
+    let (Some(have), Some(want)) = (version_key(&h.version), version_key(&to)) else {
+        return Err(Problem::new(
+            Code::UpdateUnsupported,
+            format!(
+                "{} runs a local build ({}), not a release",
+                h.node, h.version
+            ),
+        )
+        .hint("Install a release or edge build with install.sh first."));
+    };
+    if want == have {
+        return Ok(None);
+    }
+    if want < have {
+        return Err(Problem::new(
+            Code::UpdateDowngrade,
+            format!("{} runs {}, which is newer than {to}", h.node, h.version),
+        )
+        .hint(format!(
+            "The cluster only moves nodes forward. To go back, as root on the node: telltale self-update --to {to} --restart"
+        )));
+    }
+    if !h.enabled {
+        return Err(Problem::new(
+            Code::UpdateNotEnabled,
+            format!("{}'s update service is off, so nothing would install {to}", h.node),
+        )
+        .hint("On the node, as root: systemctl enable --now telltale-update.path (install.sh adds it; re-run install.sh to add it to an older install)."));
+    }
+    Ok(Some(to))
+}
+
+/// REQ: OPS-014 — hands `to` to this node's update service (or answers that it runs it).
+pub(crate) fn request(h: &Here, to: &str, by: &str, now: u64) -> Result<NodeUpdate, Problem> {
+    let Some(to) = plan(h, to)? else {
+        let mut s = status(h);
+        s.state = Some("up_to_date".into());
+        return Ok(s);
+    };
+    let r = RequestFile {
+        id: format!("{now:x}-{:08x}", rand::random::<u32>()),
+        to: to.clone(),
+        by: by.chars().take(MAX_BY).collect(),
+        requested_ms: now,
+    };
+    write_atomic(&h.request_path(), &r, 0o640)
+        .map_err(|e| Problem::internal(format!("can't write the update request: {e}")))?;
+    info!(to = %to, by = %r.by, "update: requested {to} (the update service installs it and restarts this node)");
+    let mut s = status(h);
+    s.state = Some("requested".into());
+    Ok(s)
+}
+
+/// Writes `v` as JSON next to `path` and renames it over `path` (a reader never sees half a
+/// file, and a symlink planted at `path` is replaced, not followed).
+fn write_atomic<T: Serialize>(path: &Path, v: &T, mode: u32) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = dir.join(format!(".{name}.{:08x}.tmp", rand::random::<u32>()));
+    let body = serde_json::to_vec_pretty(v).map_err(std::io::Error::other)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    let mut f = opts.open(&tmp)?;
+    let written = f.write_all(&body).and_then(|()| f.sync_all());
+    drop(f);
+    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+// ---- The API and the cluster channel ----
+
+/// REQ: OPS-014 — a call for this node, on a blocking thread.
+pub(crate) fn local_backend_call(
+    src: Arc<crate::http::Sources>,
+    node: &str,
+    call: NodeUpdateCall,
+) -> telltale_api::BoxFuture<Result<NodeUpdate, Problem>> {
+    if !crate::maintenance::is_local(&src, node) {
+        let node = node.to_owned();
+        return Box::pin(async move {
+            Err(Problem::new(
+                Code::NodeUnknown,
+                format!("no node `{node}`: this node isn't in a cluster"),
+            )
+            .hint("Use `local` for this node."))
+        });
+    }
+    Box::pin(async move {
+        tokio::task::spawn_blocking(move || apply_here(&src, call))
+            .await
+            .map_err(|e| Problem::internal(format!("update: {e}")))?
+    })
+}
+
+fn apply_here(src: &crate::http::Sources, call: NodeUpdateCall) -> Result<NodeUpdate, Problem> {
+    let h = Here::of(src);
+    match call {
+        NodeUpdateCall::Status => Ok(status(&h)),
+        NodeUpdateCall::Request { to, by } => request(&h, &to, &by, now_ms()),
+    }
+}
+
+/// REQ: OPS-014 — sends a call to `peer` over the cluster channel.
+pub(crate) async fn send(
+    cluster: Arc<Cluster>,
+    peer: String,
+    label: String,
+    call: NodeUpdateCall,
+) -> Result<NodeUpdate, Problem> {
+    let body = serde_json::to_vec(&Envelope {
+        call,
+        sent_ms: now_ms(),
+    })
+    .map_err(|e| Problem::internal(e.to_string()))?;
+    let reply = cluster.call(&peer, KIND, body, DEADLINE).await.map_err(|e| {
+        let older = e.contains("unknown call");
+        Problem::new(
+            Code::NodeUnreachable,
+            if older {
+                format!("{label} runs a version without updates from the cluster")
+            } else {
+                format!("{label} isn't reachable over the cluster channel: {e}")
+            },
+        )
+        .hint(if older {
+            "Upgrade it by hand this once (as root: telltale self-update --restart), then enable telltale-update.path."
+        } else {
+            "The node installs the version itself, so it must be up. Check the Cluster page."
+        })
+    })?;
+    crate::forward::decode_answer(&reply)
+}
+
+/// REQ: OPS-014 — a peer's call for this node: applied and, for a request, audited here with
+/// the user and the entry node.
+pub(crate) fn handle(
+    src: &crate::http::Sources,
+    cluster: &Cluster,
+    peer: &str,
+    body: &[u8],
+) -> Result<Vec<u8>, String> {
+    let Envelope { call, sent_ms } =
+        serde_json::from_slice(body).map_err(|e| format!("bad update request: {e}"))?;
+    if now_ms() > sent_ms.saturating_add(STALE_RPC_MS) {
+        return Err("the request is too old; the node that sent it gave up on it".into());
+    }
+    let via = cluster
+        .members()
+        .into_iter()
+        .find(|m| m.node_id == peer)
+        .map(|m| if m.pod.is_empty() { m.site } else { m.pod })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| peer.to_owned());
+    let (call, by) = match call {
+        NodeUpdateCall::Request { to, by } => (
+            NodeUpdateCall::Request {
+                to,
+                by: format!("{by} via {via}"),
+            },
+            Some(by),
+        ),
+        NodeUpdateCall::Status => (NodeUpdateCall::Status, None),
+    };
+    let to = match &call {
+        NodeUpdateCall::Request { to, .. } => Some(to.clone()),
+        NodeUpdateCall::Status => None,
+    };
+    let r = apply_here(src, call);
+    if let (Ok(res), Some(by), Some(auth)) = (&r, by, src.auth.get()) {
+        let actor = telltale_api::auth::Actor {
+            name: format!("{by} via {via}"),
+            kind: "cluster",
+            remote: Some(format!("node {peer}")),
+            reason: None,
+        };
+        auth.record(
+            &actor,
+            "node.update.request",
+            &res.node,
+            &serde_json::json!({ "to": to, "from": res.version, "state": res.state }),
+        );
+    }
+    crate::forward::encode_answer(r)
+}
+
+// ---- The root update service ----
+
+/// What [`serve_request`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Served {
+    /// No request file.
+    Nothing,
+    /// The state written, and whether the node should be restarted.
+    Done { state: String, restart: bool },
+}
+
+/// Reads the request at `path` if it is a small regular file owned by its directory's owner (not
+/// a symlink or a hard link to someone else's file), then removes it.
+fn take_request(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("can't read the request: {e}")),
+    };
+    // Whatever it is, it goes: a request is acted on once at most.
+    let gone = || {
+        let _ = std::fs::remove_file(path);
+    };
+    if !meta.file_type().is_file() || meta.len() > MAX_REQUEST {
+        gone();
+        return Err("the request isn't a small regular file: ignored".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let owner = std::fs::metadata(dir).map(|d| d.uid()).ok();
+        if meta.nlink() != 1 || owner != Some(meta.uid()) {
+            gone();
+            return Err("the request isn't owned by its directory's owner: ignored".into());
+        }
+    }
+    let mut f = std::fs::File::open(path).map_err(|e| format!("can't open the request: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let open = f.metadata().map_err(|e| e.to_string())?;
+        if (open.dev(), open.ino()) != (meta.dev(), meta.ino()) {
+            gone();
+            return Err("the request changed while it was read: ignored".into());
+        }
+    }
+    let mut body = Vec::new();
+    Read::take(&mut f, MAX_REQUEST)
+        .read_to_end(&mut body)
+        .map_err(|e| format!("can't read the request: {e}"))?;
+    gone();
+    Ok(Some(body))
+}
+
+/// Checks a request the update service read, against the version installed now.
+fn check_request(
+    body: &[u8],
+    current: &str,
+    now: u64,
+) -> Result<RequestFile, (RequestFile, String)> {
+    let r: RequestFile = serde_json::from_slice(body).map_err(|_| {
+        (
+            RequestFile {
+                id: String::new(),
+                to: String::new(),
+                by: String::new(),
+                requested_ms: 0,
+            },
+            "the request isn't valid JSON of the expected shape".to_owned(),
+        )
+    })?;
+    let bad = |why: String| Err((r.clone(), why));
+    let id_ok = !r.id.is_empty()
+        && r.id.len() <= 40
+        && r.id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-');
+    if !id_ok {
+        return bad("the request's id is malformed".into());
+    }
+    if r.by.chars().count() > MAX_BY || r.by.chars().any(char::is_control) {
+        return bad("the request's `by` is malformed".into());
+    }
+    if r.requested_ms.saturating_add(STALE_REQUEST_MS) < now
+        || r.requested_ms > now.saturating_add(300_000)
+    {
+        return bad("the request is more than an hour old (or from the future): ask again".into());
+    }
+    if check_version(&r.to).is_err() {
+        return bad(format!(
+            "`{}` isn't a release or edge build version",
+            r.to.escape_debug()
+        ));
+    }
+    match (version_key(current), version_key(&r.to)) {
+        (None, _) => bad(format!(
+            "the installed binary is a local build ({current}): install a release by hand"
+        )),
+        (Some(have), Some(want)) if want < have => bad(format!(
+            "{} is older than the installed {current}: the cluster only moves nodes forward",
+            r.to
+        )),
+        _ => Ok(r),
+    }
+}
+
+/// REQ: OPS-014 — the update service's run: reads and removes the request at `request`, checks
+/// it, records `installing` and then the outcome in `result`, and installs with `install` (the
+/// signed self-update in production). `current` is the installed version.
+pub(crate) fn serve_request(
+    request: &Path,
+    result: &Path,
+    current: &str,
+    now: u64,
+    install: impl FnOnce(&str) -> Result<crate::selfupdate::Outcome, String>,
+) -> Served {
+    let record = |r: &RequestFile, state: &str, error: Option<String>| {
+        let out = ResultFile {
+            id: r.id.clone(),
+            to: r.to.clone(),
+            from: current.to_owned(),
+            state: state.to_owned(),
+            error,
+            by: r.by.clone(),
+            at_ms: now_ms().max(now),
+        };
+        if let Some(dir) = result.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(e) = write_atomic(result, &out, 0o644) {
+            warn!(
+                "update: can't record the outcome in {}: {e}",
+                result.display()
+            );
+        }
+    };
+    let blank = RequestFile {
+        id: String::new(),
+        to: String::new(),
+        by: String::new(),
+        requested_ms: 0,
+    };
+    let body = match take_request(request) {
+        Ok(None) => return Served::Nothing,
+        Ok(Some(b)) => b,
+        Err(e) => {
+            warn!("update: {e}");
+            record(&blank, "refused", Some(e));
+            return done("refused", false);
+        }
+    };
+    let r = match check_request(&body, current, now) {
+        Ok(r) => r,
+        Err((r, why)) => {
+            warn!("update: refused: {why}");
+            record(&r, "refused", Some(why));
+            return done("refused", false);
+        }
+    };
+    if version_key(&r.to) == version_key(current) {
+        record(&r, "up_to_date", None);
+        return done("up_to_date", false);
+    }
+    info!(to = %r.to, by = %r.by, "update: installing {} (was {current})", r.to);
+    record(&r, "installing", None);
+    match install(&r.to) {
+        Ok(crate::selfupdate::Outcome::Updated { .. }) => {
+            info!("update: installed {}; restarting the node", r.to);
+            record(&r, "updated", None);
+            done("updated", true)
+        }
+        Ok(_) => {
+            record(&r, "up_to_date", None);
+            done("up_to_date", false)
+        }
+        Err(e) => {
+            warn!("update: {} not installed: {e}", r.to);
+            record(&r, "failed", Some(e));
+            done("failed", false)
+        }
+    }
+}
+
+fn done(state: &str, restart: bool) -> Served {
+    Served::Done {
+        state: state.to_owned(),
+        restart,
+    }
+}
+
+/// The channel a version is published on.
+pub(crate) fn channel_for(to: &str) -> crate::selfupdate::Channel {
+    if is_edge(to) {
+        crate::selfupdate::Channel::Edge
+    } else {
+        crate::selfupdate::Channel::Stable
+    }
+}
+
+#[cfg(test)]
+#[path = "node_update_tests.rs"]
+mod tests;

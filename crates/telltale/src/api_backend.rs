@@ -2343,6 +2343,16 @@ impl Backend for ApiBackend {
         crate::maintenance::local_backend_call(Arc::clone(&self.src), node, w)
     }
 
+    // REQ: OPS-014 (ADR-177) — this node's own update state and requests (in a cluster, the
+    // federated backend sends calls for other nodes to them).
+    fn node_update(
+        &self,
+        node: &str,
+        call: telltale_api::NodeUpdateCall,
+    ) -> telltale_api::BoxFuture<Result<telltale_api::model::NodeUpdate, Problem>> {
+        crate::node_update::local_backend_call(Arc::clone(&self.src), node, call)
+    }
+
     // REQ: CLU-014 (ADR-151) — failover drills on this node (a cluster routes them first).
     fn drill(
         &self,
