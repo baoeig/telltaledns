@@ -823,7 +823,7 @@ pub enum ManagedKind {
     KubernetesMap,
     /// REQ: T8.2, API-002 — a router integration (`/routers/{name}`): a UniFi console or an
     /// OPNsense box whose clients name devices. Its key, secret, or password may come in the
-    /// body; they're written to files in the data directory, never stored or returned (ADR-173).
+    /// body; they're written to files in the data directory, never stored or returned (ADR-176).
     Router,
 }
 
@@ -1030,7 +1030,7 @@ fn rest_router(backend: Shared, auth: Arc<auth::Auth>) -> Router {
             blocking_api::write_routes(Arc::clone(&backend), Arc::clone(&auth))
                 .route_layer(from_fn(auth::routes::require_operator)),
         )
-        // REQ: T8.2 (ADR-173) — routers hold credentials and say where they're sent: admin.
+        // REQ: T8.2 (ADR-176) — routers hold credentials and say where they're sent: admin.
         .merge(
             config_api::router_routes(Arc::clone(&backend), Arc::clone(&auth))
                 .route_layer(from_fn(auth::routes::require_admin)),
@@ -1152,7 +1152,8 @@ async fn fallback(
         auth::routes::LoginResponse, auth::routes::PasswordChange, auth::routes::TotpSetup,
         auth::routes::TotpCode, auth::routes::PasswordConfirm, auth::routes::RecoveryCodes,
         auth::routes::TokenInfo, auth::routes::TokenKind, auth::routes::CreateToken, auth::routes::NewToken, auth::routes::DisplayInfo, auth::routes::CreateDisplay, auth::routes::NewDisplay, auth::routes::OpenDisplay, auth::routes::DisplayOpened,
-        auth::routes::UserInfo, auth::routes::CreateUser, auth::routes::UpdateUser,
+        auth::routes::UserInfo, auth::routes::UserList, auth::PasswordLogin,
+        auth::routes::CreateUser, auth::routes::UpdateUser,
         auth::routes::AuditInfo, auth::routes::AuditPage, auth::routes::AuditVerify,
         auth::routes::OidcButton, auth::routes::LogoutResult
     )),
@@ -1899,27 +1900,37 @@ async fn groups(State(b): State<Shared>) -> Json<Items<GroupInfo>> {
 /// priority order (the first group's settings apply). Unknown devices use the `default` group.
 #[utoipa::path(get, path = "/api/v1/clients", tag = "config",
     responses((status = 200, body = Items<ClientInfo>, description = "The result.")))]
-async fn clients(State(b): State<Shared>, ext: axum::http::Extensions) -> impl IntoResponse {
-    // The config version for `If-Match` on writes (ADR-040).
-    let etag = format!("\"{}\"", b.config_version());
-    let mut items = b.clients();
+async fn clients(
+    State(b): State<Shared>,
+    ext: axum::http::Extensions,
+) -> Result<impl IntoResponse, Problem> {
     // REQ: AGT-004 — a group-restricted agent sees its group's devices only.
-    if let Some(g) = ext
+    let group = ext
         .get::<auth::Principal>()
         .and_then(|p| p.agent.as_ref())
-        .and_then(|a| a.group.as_deref())
-    {
-        items.retain(|c| {
-            c.groups.iter().any(|x| x == g) || c.effective_groups.iter().any(|x| x == g)
-        });
-    }
-    (
-        [(axum::http::header::ETAG, etag)],
+        .and_then(|a| a.group.clone());
+    // REQ: CLU-004 (ADR-174) — both reads can wait for the cluster (a replica asks the primary
+    // for the version, and every node for the identities): off the runtime's worker, in one
+    // closure so they hold one pool thread.
+    let (version, items) = blocking(move || {
+        // The config version for `If-Match` on writes (ADR-040).
+        let version = b.config_version();
+        let mut items = b.clients();
+        if let Some(g) = &group {
+            items.retain(|c| {
+                c.groups.iter().any(|x| x == g) || c.effective_groups.iter().any(|x| x == g)
+            });
+        }
+        Ok((version, items))
+    })
+    .await?;
+    Ok((
+        [(axum::http::header::ETAG, format!("\"{version}\""))],
         Json(Items {
             missing_nodes: Vec::new(),
             items,
         }),
-    )
+    ))
 }
 
 /// Device anomalies: rate spikes, heavy volume to one domain, drift, beaconing (OBS-013).
@@ -2075,15 +2086,16 @@ async fn zones(State(b): State<Shared>) -> Json<Items<ZoneInfo>> {
 /// editable with `PUT /records/{name}`). The `ETag` is the config version for `If-Match`.
 #[utoipa::path(get, path = "/api/v1/records", tag = "config",
     responses((status = 200, body = Items<LocalName>, description = "The result.")))]
-async fn local_names(State(b): State<Shared>) -> impl IntoResponse {
-    let etag = format!("\"{}\"", b.config_version());
-    (
-        [(axum::http::header::ETAG, etag)],
+async fn local_names(State(b): State<Shared>) -> Result<impl IntoResponse, Problem> {
+    // REQ: CLU-004 (ADR-174) — the version can wait for the primary: off the worker.
+    let (version, items) = blocking(move || Ok((b.config_version(), b.local_names()))).await?;
+    Ok((
+        [(axum::http::header::ETAG, format!("\"{version}\""))],
         Json(Items {
             missing_nodes: Vec::new(),
-            items: b.local_names(),
+            items,
         }),
-    )
+    ))
 }
 
 /// Domains sent to other DNS servers (conditional forwarding).
@@ -2092,15 +2104,16 @@ async fn local_names(State(b): State<Shared>) -> impl IntoResponse {
 /// with where it's defined (`file` or `api`). The `ETag` is the config version for `If-Match`.
 #[utoipa::path(get, path = "/api/v1/forwards", tag = "config",
     responses((status = 200, body = Items<ForwardInfo>, description = "The result.")))]
-async fn forwards(State(b): State<Shared>) -> impl IntoResponse {
-    let etag = format!("\"{}\"", b.config_version());
-    (
-        [(axum::http::header::ETAG, etag)],
+async fn forwards(State(b): State<Shared>) -> Result<impl IntoResponse, Problem> {
+    // REQ: CLU-004 (ADR-174) — the version can wait for the primary: off the worker.
+    let (version, items) = blocking(move || Ok((b.config_version(), b.forwards()))).await?;
+    Ok((
+        [(axum::http::header::ETAG, format!("\"{version}\""))],
         Json(Items {
             missing_nodes: Vec::new(),
-            items: b.forwards(),
+            items,
         }),
-    )
+    ))
 }
 
 /// The configuration's upstreams, upstream groups, lists, and groups, with their sources.
@@ -2116,11 +2129,13 @@ async fn forwards(State(b): State<Shared>) -> impl IntoResponse {
 async fn config_entries(
     State(b): State<Shared>,
     Query(q): Query<EntriesQuery>,
-) -> Json<Items<ConfigEntry>> {
-    Json(Items {
+) -> Result<Json<Items<ConfigEntry>>, Problem> {
+    // REQ: CLU-004 (ADR-174) — a replica asks the primary for the entries: off the worker.
+    let items = blocking(move || Ok(b.config_entries(q.kind.as_deref()))).await?;
+    Ok(Json(Items {
         missing_nodes: Vec::new(),
-        items: b.config_entries(q.kind.as_deref()),
-    })
+        items,
+    }))
 }
 
 /// Quick rules: per-device and per-group allow and block (T6.12, ADR-067).
@@ -2131,15 +2146,16 @@ async fn config_entries(
 /// `If-Match`.
 #[utoipa::path(get, path = "/api/v1/rules", tag = "config",
     responses((status = 200, body = Items<crate::model::RuleInfo>, description = "The result.")))]
-async fn rules(State(b): State<Shared>) -> impl IntoResponse {
-    let etag = format!("\"{}\"", b.config_version());
-    (
-        [(axum::http::header::ETAG, etag)],
+async fn rules(State(b): State<Shared>) -> Result<impl IntoResponse, Problem> {
+    // REQ: CLU-004 (ADR-174) — the version can wait for the primary: off the worker.
+    let (version, items) = blocking(move || Ok((b.config_version(), b.rules()))).await?;
+    Ok((
+        [(axum::http::header::ETAG, format!("\"{version}\""))],
         Json(Items {
             missing_nodes: Vec::new(),
-            items: b.rules(),
+            items,
         }),
-    )
+    ))
 }
 
 /// Upstream servers with health and latency.

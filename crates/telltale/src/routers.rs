@@ -24,7 +24,7 @@ use tracing::{debug, info, warn};
 
 use crate::devices::{Lease, Leases};
 
-/// How often the routers in effect are compared with the ones last read (ADR-173).
+/// How often the routers in effect are compared with the ones last read (ADR-176).
 const CHANGE_CHECK: Duration = Duration::from_secs(5);
 
 /// Most bytes one answer may have.
@@ -432,7 +432,7 @@ pub(crate) async fn run(
     let mut parts: HashMap<String, Polled> = HashMap::new();
     let mut failing: HashMap<String, bool> = HashMap::new();
     // The routers last read: one removed, or now pointing at another device (type, address,
-    // site), drops its answer, so no names linger from a router that's gone (ADR-173). Other
+    // site), drops its answer, so no names linger from a router that's gone (ADR-176). Other
     // changes (credentials, TLS, timing) keep it until the next answer replaces it.
     let mut read_with: Vec<RouterConfig> = Vec::new();
     loop {
@@ -515,7 +515,7 @@ pub(crate) async fn run(
         } else {
             interval
         };
-        // REQ: T8.2 (ADR-173) — until the next read, or sooner when the routers change.
+        // REQ: T8.2 (ADR-176) — until the next read, or sooner when the routers change.
         let until = tokio::time::Instant::now() + Duration::from_secs(u64::from(wait));
         while tokio::time::Instant::now() < until {
             tokio::select! {
