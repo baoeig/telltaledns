@@ -1430,7 +1430,9 @@ Notes on the table:
 - `clu_005_a_failover_with_one_candidate_takes_one_round`.
 - `clu_005_failover_timing_never_elects_two_primaries`: adversarial delays up to 3 s, up to 5 % lost, every topology.
 - `tests/sim.rs`.
-- `gitops-failover-e2e.sh` on real processes, against the base binary.
+- `gitops-failover-e2e.sh` on real processes, against the base binary: on the build VM, 2 CPUs per cluster, two clusters at once with the binaries alternating, 21 runs each. The new binary needed one round in 21 of 21 (14 to 16 s). The base binary needed one round in 20 and two in 1 (36 s). All 42 passed.
+- `failover-e2e.sh` and `deploy/cluster/e2e.sh` pass on the new binary.
+- Twenty runs can't show a rate of 10⁻⁴; the simulation is the proof.
 
 ## ADR-172 — A cluster support package: each node redacts its own part under one key, with labels every node agrees on (Accepted)
 **Context:** GitHub issue #55 (the later phase of #50, ADR-156): in a cluster the problem is often on another node, and a package of the node that answered covers only that one. ADR-156 settled the direction (each node redacts before its data leaves it, the asking node's key travels over the mutually authenticated stream) and left three points: how the key reaches the others, what an older peer does, and the size cap across nodes. One more came up in building it: ADR-156 numbers a name by when it is first met (`device-3`), so two nodes would give one device two labels, and the issue asks that a device have one name on every node.
