@@ -627,6 +627,9 @@ async fn flt_004_a_failing_inline_list_waits_for_a_config_change() {
             0,
             "{what}: idle stays idle"
         );
+        // Refused rules wait for a change, not for a timer: a month later it is still not due.
+        let (later, _) = f.due(std::slice::from_ref(&bad), unix_now() + 30 * 86_400);
+        assert!(later.is_empty(), "{what}: held until the rules change");
 
         // A change to the rules is a new list: tried at once, and counted again when refused.
         let mut more = rules.to_vec();
@@ -712,6 +715,109 @@ async fn flt_004_a_refused_inline_list_is_retried_when_re_enabled_and_after_a_re
     );
 }
 
+/// REQ: FLT-004 — a failure the rules did not cause (the disk is full, the card is read-only) is
+/// not held until the rules change: the list is retried on the usual ladder (5 minutes, then 10,
+/// and so on), so it loads once storage works again instead of waiting for a restart.
+#[tokio::test]
+async fn flt_004_an_inline_list_that_cannot_be_stored_is_retried_on_the_ladder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = fetcher(tmp.path(), settings(), &[]);
+    let list = inline("l", &["||ads.example.com^"]);
+    let specs = std::slice::from_ref(&list);
+    // A directory where the temporary file goes makes `File::create` fail, the way a full disk
+    // does, every time and without depending on the machine.
+    let blocker = f.store().dir().join("l.src.zst.tmp");
+    std::fs::create_dir(&blocker).unwrap();
+
+    let Outcome::Failed(e) = f.refresh_one(&list).await else {
+        panic!("a list that can't be stored was accepted");
+    };
+    assert!(e.contains("cannot store source"), "{e}");
+    let now = unix_now();
+    assert!(f.due(specs, now).0.is_empty(), "not again at once");
+    assert_eq!(
+        f.due(specs, now + 301).0.len(),
+        1,
+        "first rung of the ladder: five minutes, not 'until the rules change'"
+    );
+
+    // Still failing: the second rung is ten minutes.
+    assert!(matches!(f.refresh_one(&list).await, Outcome::Failed(_)));
+    assert_eq!(meta_of(&f, "l").consecutive_failures, 2);
+    let now = unix_now();
+    assert!(f.due(specs, now + 301).0.is_empty(), "second rung: not yet");
+    assert_eq!(
+        f.due(specs, now + 601).0.len(),
+        1,
+        "second rung: ten minutes"
+    );
+
+    // Storage works again: the next try loads it, and it is then left alone.
+    std::fs::remove_dir(&blocker).unwrap();
+    assert_eq!(f.refresh_one(&list).await, Outcome::Updated);
+    let m = meta_of(&f, "l");
+    assert!(m.has_content() && m.consecutive_failures == 0, "{m:?}");
+    assert!(f.due(specs, now + 30 * 86_400).0.is_empty());
+}
+
+/// REQ: FLT-004 — an inline list that loaded one set of rules and was then edited to rules that are
+/// refused keeps serving the old copy; like a list that never loaded, it is tried once, and tried
+/// again once after being switched off and on and after a restart (not in a loop).
+#[tokio::test]
+async fn flt_004_an_edited_inline_list_that_is_refused_is_retried_after_off_on_and_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = fetcher(tmp.path(), settings(), &[]);
+    let good = inline("l", &["||ads.example.com^"]);
+    let junk = inline("l", &[" "]);
+    let old_copy: &[u8] = b"||ads.example.com^\n";
+    assert_eq!(
+        refresh_until_idle(&f, std::slice::from_ref(&good), 1000).await,
+        1
+    );
+
+    // Edited to rules that are refused: one attempt in 1000 rounds, the old copy stays.
+    assert_eq!(
+        refresh_until_idle(&f, std::slice::from_ref(&junk), 1000).await,
+        1,
+        "tried once, no loop"
+    );
+    let m = meta_of(&f, "l");
+    assert!(m.has_content() && m.consecutive_failures == 1, "{m:?}");
+    assert_eq!(f.store().read_source("l").unwrap(), old_copy);
+
+    // Off and on again: one more attempt, then idle.
+    let off = ListSpec {
+        enabled: false,
+        ..junk.clone()
+    };
+    assert_eq!(refresh_until_idle(&f, &[off], 1000).await, 0);
+    assert_eq!(
+        refresh_until_idle(&f, std::slice::from_ref(&junk), 1000).await,
+        1,
+        "off and on is a retry, even though an older copy is stored"
+    );
+    assert_eq!(meta_of(&f, "l").consecutive_failures, 2);
+    assert_eq!(
+        refresh_until_idle(&f, std::slice::from_ref(&junk), 1000).await,
+        0,
+        "and then no loop"
+    );
+
+    // A restart: one more attempt, the old copy still serves, then idle.
+    let restarted = fetcher(tmp.path(), settings(), &[]);
+    assert_eq!(
+        refresh_until_idle(&restarted, std::slice::from_ref(&junk), 1000).await,
+        1,
+        "a restart is a retry, even though an older copy is stored"
+    );
+    assert_eq!(restarted.store().read_source("l").unwrap(), old_copy);
+    assert_eq!(meta_of(&restarted, "l").consecutive_failures, 3);
+    assert_eq!(
+        refresh_until_idle(&restarted, std::slice::from_ref(&junk), 1000).await,
+        0
+    );
+}
+
 /// REQ: FLT-004 — the same through the real `run` loop: a refused inline list is tried when it is
 /// added, when someone asks for a refresh, when its rules change, and when it is switched off and
 /// on again, and at no other time. A second inline list whose rules change in the same step is the
@@ -733,7 +839,7 @@ async fn flt_004_run_loop_retries_a_refused_inline_list_only_on_a_change() {
     changed(&mut changed_rx).await;
     assert_eq!(failures(&f), 1, "tried when added");
 
-    // "Refresh now" refreshes every enabled list, a refused one too.
+    // A manual refresh (SIGUSR1) refreshes every enabled list, a refused one too.
     f.request_refresh();
     wait_until("the manual refresh", || failures(&f) >= 2).await;
     assert_eq!(failures(&f), 2, "tried when asked");

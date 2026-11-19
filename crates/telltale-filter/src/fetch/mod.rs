@@ -143,10 +143,36 @@ pub enum Outcome {
 }
 
 /// Retry a failing URL or file list after 5 min, doubling up to 1 h (but never later than its
-/// normal refresh), instead of waiting a whole refresh interval. (Inline rules are different:
-/// see [`Fetcher::is_refused`].)
+/// normal refresh), instead of waiting a whole refresh interval. (Inline rules that were
+/// refused are different: see [`Hold`].)
 const FAIL_RETRY_BASE: u64 = 300;
 const FAIL_RETRY_MAX: u64 = 3600;
+
+/// The wait after the `failures`-th failure in a row: 5 min, doubling to 1 h, never past the
+/// list's normal refresh.
+fn retry_after(failures: u32, refresh: u64) -> u64 {
+    let shift = failures.saturating_sub(1).min(10);
+    (FAIL_RETRY_BASE << shift).min(FAIL_RETRY_MAX).min(refresh)
+}
+
+/// REQ: FLT-004 — how long an inline list whose attempt failed waits before `due` offers it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    /// The rules themselves were refused (blank, mostly invalid): the same rules are refused
+    /// again, so nothing but a change brings the list back (an edit, off and on, a restart).
+    UntilChange,
+    /// Something other than the rules failed (storing the list: a full or read-only disk): on
+    /// the retry ladder, at this unix time.
+    Until(u64),
+}
+
+/// Why `accept_body` didn't store a body.
+enum Rejected {
+    /// The content was refused (`sanity_check`, `usable_check`): the same body fails again.
+    Content(String),
+    /// The content was fine but could not be stored: it may work later.
+    Storage(String),
+}
 
 /// Stored copies smaller than this many lines aren't held for shrinking: a short list's size
 /// swings a lot from a few edits.
@@ -166,10 +192,11 @@ pub struct Fetcher {
     client: Client,
     settings: FetchSettings,
     metas: Mutex<HashMap<String, ListMeta>>,
-    /// REQ: FLT-004 — the inline lists whose rules this process tried and refused, by list name,
-    /// each with the source key of the refused rules. Memory only: a restart tries again, because
-    /// `[filter]` settings (what counts as usable) and the parser can have changed since.
-    refused: Mutex<HashMap<String, String>>,
+    /// REQ: FLT-004 — the inline lists this process tried and failed to load, by list name, each
+    /// with the source key of the rules that failed and how long it waits ([`Hold`]). Memory
+    /// only: a restart tries again, because `[filter]` settings (what counts as usable) and the
+    /// parser can have changed since.
+    refused: Mutex<HashMap<String, (String, Hold)>>,
     refresh_now: Notify,
 }
 
@@ -197,7 +224,8 @@ impl Fetcher {
         out
     }
 
-    /// Makes `run` refresh every list now, regardless of schedule (`POST /lists/refresh`).
+    /// Makes `run` refresh every list now, regardless of schedule (`SIGUSR1`; there is no HTTP
+    /// endpoint for it).
     pub fn request_refresh(&self) {
         self.refresh_now.notify_one();
     }
@@ -220,38 +248,48 @@ impl Fetcher {
             .insert(name.to_owned(), meta);
     }
 
-    /// REQ: FLT-004 — remembers that an inline list's rules (identified by `key`) were refused,
-    /// or forgets it once they load.
-    fn note_inline_outcome(&self, spec: &ListSpec, key: &str, outcome: &Outcome) {
+    /// REQ: FLT-004 — remembers how long an inline list's rules (identified by `key`) wait after
+    /// a failed attempt (`Some`), or forgets the list once it loads (`None`).
+    fn note_inline_outcome(&self, spec: &ListSpec, key: &str, hold: Option<Hold>) {
         if !matches!(spec.source, ListSource::Inline(_)) {
             return;
         }
         let mut refused = self.refused.lock().unwrap_or_else(PoisonError::into_inner);
-        if matches!(outcome, Outcome::Failed(_)) {
-            refused.insert(spec.name.clone(), key.to_owned());
-        } else {
-            refused.remove(&spec.name);
+        match hold {
+            Some(hold) => {
+                refused.insert(spec.name.clone(), (key.to_owned(), hold));
+            }
+            None => {
+                refused.remove(&spec.name);
+            }
         }
     }
 
-    /// REQ: FLT-004 — true while `spec` is an inline list whose current rules this process has
-    /// already refused. Inline rules change only with the config (which changes their key), so
-    /// trying them again can't give another answer; offering them as due again would also make
-    /// `run`, which asks `due` straight after a round, refresh them in a loop (a synced metadata
-    /// write and a warning per pass, dozens a second). The URL ladder doesn't apply: there is no
-    /// server to wait for.
-    fn is_refused(&self, spec: &ListSpec, meta: &ListMeta) -> bool {
+    /// REQ: FLT-004 — when `spec`, an inline list this process already tried and failed to load,
+    /// may be tried again (`u64::MAX`: only after a change); `None` if nothing here holds it.
+    /// Rules that were refused give the same answer again, and `run` asks `due` straight after a
+    /// round, so offering them as due would make it refresh them in a loop (a synced metadata
+    /// write and a warning per pass, dozens a second): they wait for a change (their key, off
+    /// and on, a restart). A failure the rules didn't cause (a full or read-only disk) can pass,
+    /// so that one waits on the retry ladder instead ([`Hold::Until`]).
+    fn hold_until(&self, spec: &ListSpec, meta: &ListMeta) -> Option<u64> {
         if !matches!(spec.source, ListSource::Inline(_)) {
-            return false;
+            return None;
         }
         let key = spec.source.key();
-        meta.source == key
-            && self
-                .refused
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get(&spec.name)
-                .is_some_and(|k| *k == key)
+        if meta.source != key {
+            return None;
+        }
+        match self
+            .refused
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&spec.name)
+        {
+            Some((k, Hold::UntilChange)) if *k == key => Some(u64::MAX),
+            Some((k, Hold::Until(at))) if *k == key => Some(*at),
+            _ => None,
+        }
     }
 
     fn spawn_refreshes(self: &Arc<Self>, specs: &[ListSpec]) -> JoinSet<(String, Outcome)> {
@@ -353,6 +391,8 @@ impl Fetcher {
             }
         };
 
+        // Set when the content was fine but could not be stored (see `Hold`).
+        let mut storage_failed = false;
         let outcome = match fetched {
             Ok(Response::NotModified) if same_source => Outcome::Unchanged,
             Ok(Response::NotModified) => {
@@ -375,16 +415,23 @@ impl Fetcher {
                 match processed {
                     Ok((r, m)) => {
                         meta = m;
-                        r.map_or_else(Outcome::Failed, |outcome| {
-                            // A held body keeps the stored copy's validators, so the next
-                            // conditional GET fetches it again rather than answering 304.
-                            if !matches!(outcome, Outcome::Held(_)) {
-                                meta.source.clone_from(&key);
-                                meta.etag = etag;
-                                meta.last_modified = last_modified;
+                        match r {
+                            Ok(outcome) => {
+                                // A held body keeps the stored copy's validators, so the next
+                                // conditional GET fetches it again rather than answering 304.
+                                if !matches!(outcome, Outcome::Held(_)) {
+                                    meta.source.clone_from(&key);
+                                    meta.etag = etag;
+                                    meta.last_modified = last_modified;
+                                }
+                                outcome
                             }
-                            outcome
-                        })
+                            Err(Rejected::Content(e)) => Outcome::Failed(e),
+                            Err(Rejected::Storage(e)) => {
+                                storage_failed = true;
+                                Outcome::Failed(e)
+                            }
+                        }
                     }
                     Err(e) => Outcome::Failed(format!("processing the list failed: {e}")),
                 }
@@ -428,8 +475,17 @@ impl Fetcher {
                 warn!(list = %spec.name, "list update held: {why}");
             }
         }
+        // REQ: FLT-004 — an inline list that failed waits: for a change if its rules were
+        // refused, on the retry ladder if only storing it failed.
+        let hold = match &outcome {
+            Outcome::Failed(_) if storage_failed => Some(Hold::Until(now.saturating_add(
+                retry_after(meta.consecutive_failures, spec.refresh.as_secs()),
+            ))),
+            Outcome::Failed(_) => Some(Hold::UntilChange),
+            _ => None,
+        };
         self.put_meta(&spec.name, meta);
-        self.note_inline_outcome(spec, &key, &outcome);
+        self.note_inline_outcome(spec, &key, hold);
         outcome
     }
 
@@ -500,11 +556,9 @@ impl Fetcher {
                 continue;
             }
             let meta = self.meta(&spec.name);
-            let at = if self.is_refused(spec, &meta) {
-                u64::MAX
-            } else {
-                next_attempt(spec, &meta)
-            };
+            let at = self
+                .hold_until(spec, &meta)
+                .unwrap_or_else(|| next_attempt(spec, &meta));
             if at <= now {
                 due.push(spec.clone());
             } else {
@@ -584,9 +638,9 @@ fn accept_body(
     data: &[u8],
     now: u64,
     checks: Checks,
-) -> Result<Outcome, String> {
-    sanity_check(data)?;
-    usable_check(data, checks.max_invalid_percent)?;
+) -> Result<Outcome, Rejected> {
+    sanity_check(data).map_err(Rejected::Content)?;
+    usable_check(data, checks.max_invalid_percent).map_err(Rejected::Content)?;
     let hash = content_hash(data);
     if same_source && meta.content_hash.as_deref() == Some(hash.as_str()) {
         return Ok(Outcome::Unchanged);
@@ -620,7 +674,7 @@ fn accept_body(
     }
     store
         .save_source(name, data)
-        .map_err(|e| format!("cannot store source: {e}"))?;
+        .map_err(|e| Rejected::Storage(format!("cannot store source: {e}")))?;
     meta.content_hash = Some(hash);
     meta.bytes = data.len() as u64;
     meta.lines = lines;
@@ -637,16 +691,20 @@ fn next_attempt(spec: &ListSpec, meta: &ListMeta) -> u64 {
         return 0;
     }
     if let ListSource::Inline(_) = spec.source {
-        // Inline rules only change with the config, which changes the key. With no stored copy
-        // this is the first try (or the first since a restart); rules that were refused are
-        // held back by `Fetcher::is_refused`, which `due` asks first.
-        return if meta.has_content() { u64::MAX } else { 0 };
+        // Inline rules only change with the config, which changes the key. A copy of these
+        // rules is current. With no copy, or after a failed attempt (earlier rules that were
+        // edited to ones that failed: the old copy keeps serving), this is the first try
+        // since a restart or an off and on; `Fetcher::hold_until`, which `due` asks first,
+        // holds back what this process already tried.
+        return if meta.has_content() && meta.consecutive_failures == 0 {
+            u64::MAX
+        } else {
+            0
+        };
     }
     let refresh = spec.refresh.as_secs();
     if meta.consecutive_failures > 0 {
-        let shift = (meta.consecutive_failures - 1).min(10);
-        let retry = (FAIL_RETRY_BASE << shift).min(FAIL_RETRY_MAX).min(refresh);
-        return last.saturating_add(retry);
+        return last.saturating_add(retry_after(meta.consecutive_failures, refresh));
     }
     last.saturating_add(refresh)
 }
@@ -805,6 +863,11 @@ mod tests {
             u64::MAX,
             "inline: only on config change"
         );
+        // A failed attempt behind a copy (earlier rules edited to ones that failed): offered
+        // again, and `Fetcher::hold_until` keeps it from looping.
+        m.consecutive_failures = 1;
+        assert_eq!(next_attempt(&inline, &m), 0, "inline: a failed edit");
+        m.consecutive_failures = 0;
         m.source = spec(ListSource::Inline(vec!["||b.com^".into()]))
             .source
             .key();
