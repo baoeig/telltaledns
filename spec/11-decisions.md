@@ -1381,13 +1381,11 @@ The engine can already express device-scoped rules (`$client` in the manual-rule
 
 **Decision:**
 - A node that **grants a pre-vote** to a candidate whose node ID **sorts before its own**, for the epoch it would stand for itself or a newer one, gives that candidate the round:
-  - a pre-candidate stands down (it becomes a follower);
-  - a follower doesn't stand for `ROUND_MS` (2 s) from then on (`next_try_ms` is pushed, never pulled forward).
+  - a pre-candidate stands down (it becomes a follower) and may stand again `ROUND_MS` (2 s) later. It does not wait for the retry time it set when its attempt started (`LEASE_MS / 3` plus the jitter, 5 to 12.5 s after that start);
+  - a follower doesn't stand for `ROUND_MS` from then on, or until a later retry time it already had (`next_try_ms` is pushed, never pulled forward).
+- So giving a node the round costs the giver that round and no more.
 - A node that grants a pre-vote to a node that sorts after it, that refuses one, or that grants a real vote isn't affected. Neither is a candidate (it has voted for itself) or a primary.
-- Nothing else changes: the reply is the ballot's as before, and a pre-vote still changes no ballot. One vote per epoch, the refusal of candidates behind, the lease and its margin, majority, pre-vote, epochs, the wire, and the registry are unchanged. The first attempt is still made at once, and the jitter and back-offs are as before, with one consequence:
-  - `give_way` only ever moves `next_try_ms` later, to at least 2 s from now.
-  - So a pre-candidate that gives way keeps the retry time it set when its attempt started: `LEASE_MS / 3` plus the jitter, 5 to 12.5 s after that start.
-  - Before this decision that retry time was always overwritten (`now + jitter`) when the round timed out, so it never counted; for a node that gives way it now does.
+- Nothing else changes: the reply is the ballot's as before, and a pre-vote still changes no ballot. One vote per epoch, the refusal of candidates behind, the lease and its margin, majority, pre-vote, epochs, the wire, and the registry are unchanged. The first attempt is still made at once, and the jitter and the back-offs after a round that times out are as before.
 - REQ: CLU-005, in `Elector::on_ask` / `give_way`.
 
 **Why it is safe (any number of voters):** two primaries in one epoch are prevented by `Ballot::decide` and the leases, which this doesn't touch. The change only makes a node stand later, or drop a pre-vote it hasn't turned into a vote, and in this protocol not standing is always safe.
@@ -1425,28 +1423,19 @@ What decides it is how the majority is made up, not how many candidates there ar
 Notes on the table:
 - With three voters, 0 of 200,000 runs needed a second round (a 95 % upper bound of 1.5 × 10⁻⁵).
 - A single candidate (two eligible nodes and a witness, three voters, `failover-e2e.sh`) always took one round, before and after.
-- The partition simulator (3 to 5 voters, 10,000 schedules) still passes, with its worst recovery after healing at 16.5 s.
+- The partition simulator (3 to 5 voters, 10,000 schedules) still passes, with its worst recovery after healing at 16.5 s. With the round-only wait, 8 of its 10,000 schedules took 10 s or more to recover; with a pre-candidate keeping its own retry time, 3 did.
 
-**What it costs: a lower node that can't win.** A node that keeps granting pre-votes to lower nodes that can't win is held back after each one.
-- Up to 2 s as a follower.
-- Until its own retry time (5 to 12.5 s after its attempt started) when it gives way as a pre-candidate.
-
-`rounds.rs` builds the case, with only one node, H, able to win once the primary is gone (200,000 seeds each; mean / p99 / worst seconds after the kill, before → after):
+**What it costs: a lower node that can't win.** A node that keeps granting pre-votes to lower nodes that can't win is held back after each one: for a round (2 s, plus the next tick of its loop) as a follower or as a pre-candidate that stands down. `rounds.rs` builds the case, with only one node, H, able to win once the primary is gone (200,000 seeds each; mean / p99 / worst seconds after the kill, before → after):
 
 | Scenario | the scripts' timing | independent phases |
 |---|---|---|
-| `Cut4`: four voters, L and X sort before H, the L-X link cut | 12.5 / 15.3 / 24.5 → 17.4 / 32.6 / 62.0 | 12.5 / 15.3 / 24.6 → 14.6 / 26.6 / 57.0 |
-| `Star5`: five voters, three lower leaves that reach only H | 12.9 / 15.2 / 24.4 → 17.4 / 33.8 / 64.3 | 12.9 / 15.2 / 24.4 → 15.0 / 26.8 / 50.3 |
+| `Cut4`: four voters, L and X sort before H, the L-X link cut | 12.5 / 15.3 / 24.5 → 14.5 / 19.3 / 27.1 | 12.5 / 15.3 / 24.6 → 14.0 / 17.5 / 26.1 |
+| `Star5`: five voters, three lower leaves that reach only H | 12.9 / 15.2 / 24.4 → 14.9 / 20.1 / 34.6 | 12.9 / 15.2 / 24.4 → 14.6 / 19.3 / 34.6 |
 
-- H is elected in every run, so the election is delayed, never stopped. The jitter is redrawn on every step, so each extra wait is a fresh draw.
-- With the scripts' near-lockstep ticks, all of them are freed together, so H's first attempt is usually spoiled: H waits 5 to 12.5 s. Later attempts are spoiled rarely.
-- The test's bound is `LEASE_MS` plus eight of the longest waits (115 s).
-- An exploratory run (not adopted) let a pre-candidate that gives way retry 2 s later instead of at its own retry time. It took (mean / p99 / worst, the scripts' timing and independent phases):
-  - `Cut4`: 14.5 / 19.3 / 27.1 and 14.0 / 17.5 / 26.1;
-  - `Star5`: 14.9 / 20.1 / 34.6 and 14.6 / 19.3 / 34.6;
-  - with the same split rates as above (0 with three voters; 2.3 % and 0.38 % with two witnesses).
-
-  Whether to adopt it is the owner's choice.
+- H is elected in every run, so the election is delayed, never stopped. The lower nodes' asks follow their own jitter, redrawn on every step, so each further delay is a fresh draw.
+- With the scripts' near-lockstep ticks, all of them are freed together, so H's first attempts are often spoiled; each spoil costs H a round.
+- The test's bound is `LEASE_MS` plus twenty spoiled attempts of a round and a tick each (60 s).
+- **In an earlier form of this decision**, a pre-candidate that gave way kept its own retry time (5 to 12.5 s after its attempt started). That took 17.4 / 32.6 / 62.0 and 14.6 / 26.6 / 57.0 (`Cut4`), and 17.4 / 33.8 / 64.3 and 15.0 / 26.8 / 50.3 (`Star5`) on the same seeds. Every split rate in the table above is the same either way.
 
 **Spec and tests:** with three voters the worst case in the model is one round, 15.3 s after the kill, so `spec/12` §10's 30 s holds and stays as written. `gitops-failover-e2e.sh` (three voters) keeps its 45 s limit, and its comment now says why: one round that splits for a reason the model doesn't have still passes.
 
@@ -1463,7 +1452,9 @@ Notes on the table:
 - Widening the e2e limit, which would only hide the split.
 
 **Verification:**
-- `clu_005_crossed_pre_votes_elect_the_lower_node_in_one_round` and `clu_005_a_follower_gives_a_lower_node_whose_pre_vote_it_grants_a_round` (unit tests). The first one's lease check fails when the follower's lease check is taken out of `tick`.
+- `clu_005_crossed_pre_votes_elect_the_lower_node_in_one_round`, `clu_005_a_follower_gives_a_lower_node_whose_pre_vote_it_grants_a_round` and `clu_005_giving_way_costs_the_giver_one_round` (unit tests).
+  - The first one's lease check fails when the follower's lease check is taken out of `tick`.
+  - The third one fails when a pre-candidate keeps its own retry time.
 - `clu_005_a_failover_with_two_candidates_takes_one_round` (three voters), `clu_005_four_candidates_split_the_vote_far_less_often` (five voters) and `clu_005_two_candidates_with_two_witnesses_split_less_often` (five voters): they fail before this decision and pass after.
 - `clu_005_a_failover_with_one_candidate_takes_one_round`.
 - `clu_005_a_lower_node_that_cannot_win_only_delays_the_election` (`Cut4`, `Star5`).
