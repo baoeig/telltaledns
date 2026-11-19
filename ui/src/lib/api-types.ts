@@ -2511,7 +2511,9 @@ export interface paths {
          * Query counts over time.
          * @description Buckets by status, query type, and response code, plus upstream exchanges. `step=second`
          *     covers the last 15 minutes, `step=minute` 7 days (48 hours live), `step=hour` 400 days,
-         *     `step=day` everything. Buckets without queries are omitted. Example:
+         *     `step=day` everything. On a cluster the longest ranges can come back partial: the nodes
+         *     whose answers were left out are in `missingNodes`. Buckets without queries are omitted.
+         *     Example:
          *     `GET /api/v1/stats/timeseries?from=-30d&step=hour`.
          */
         get: operations["stats_timeseries"];
