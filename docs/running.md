@@ -1798,14 +1798,18 @@ groups, query log, and live query stream cover every node:
   windows of 240 buckets a node (over 17 hours of seconds, 42 days of minutes, or 7 years of
   hours) is answered from this node alone, with the other nodes in `missingNodes`. Every range
   the API documents (15 minutes of seconds, 7 days of minutes, 400 days of hours, and every
-  day) is well under it. Reads that ask many nodes about many windows are bounded as well: one
-  read makes at most 4,096 calls (a node and a window of time is one call, so all of history by
-  the day is 87 calls a node, and a cluster of 47 nodes can ask for it whole), and all the reads
-  together have at most 32,768 calls in flight, so a few big requests at once can't use up the
-  node's memory. A read that doesn't fit is answered from this node alone, with the other nodes
-  in `missingNodes`; ask again a moment later. In Kubernetes, the controller counts each resolver
-  pod as a node. A node that refuses cluster reads, because too many are waiting, the call limit
-  is spent, or one asks for too much, says so in its log as a warning, once a minute at most.
+  day) is well under it. Reads that ask many nodes about many windows are limited by count as
+  well: one read makes at most 4,096 calls (a node and a window of time is one call, so all of
+  history by the day is 87 calls a node, and a cluster of 47 nodes can ask for it whole; that
+  gains a window every 240 days, so the number falls by one about that often), and all the reads
+  together have at most 32,768 calls running or holding an answer their read hasn't taken yet.
+  That limits how many calls and answers are held at once, not how many bytes: an answer can be
+  up to 1 MiB, and merging the answers into the page isn't limited by it. A read over the 4,096
+  is answered from this node alone, with the other nodes in `missingNodes`, every time: narrow
+  the `scope`, or ask for a coarser `step` or a shorter range. A read that finds too many reads
+  waiting or the call limit spent is answered the same way, and works again a moment later. In
+  Kubernetes, the controller counts each resolver pod as a node. A node that refuses cluster
+  reads, for any of these reasons, says so in its log as a warning, once a minute at most.
 - `scope` on a stats or query-log request narrows it: `cluster` (the default, every node),
   `site:<name>` (the nodes of one site, e.g. `site:k8s`), `node:<name or ID>` (one node, by
   site, pod, or node ID), or `node:local` (the node you're asking). For example

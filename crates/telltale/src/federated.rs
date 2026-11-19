@@ -918,15 +918,19 @@ impl Federated {
             _ => Vec::new(),
         };
         let mut ok = Vec::new();
+        // A peer is labelled once, however many of its calls failed (a refused range of time is
+        // hundreds of calls to each peer, and a label reads the member list).
+        let mut failed = std::collections::BTreeSet::new();
         for (peer, r) in answers {
             match r {
                 Ok(body) => ok.push((peer, body)),
                 Err(e) => {
                     tracing::debug!(peer, error = %e, "federated read failed");
-                    missing.push(self.label_of(&peer));
+                    failed.insert(peer);
                 }
             }
         }
+        missing.extend(failed.iter().map(|peer| self.label_of(peer)));
         self.record_missing(missing);
         ok
     }
