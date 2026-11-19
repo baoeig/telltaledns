@@ -7,6 +7,9 @@
 # Usage: deploy/systemd/portwait-test.sh [path/to/telltale]
 #   With the real binary it also checks the effective-config format that install.sh reads to know
 #   which addresses TelltaleDNS will bind (`telltale config check FILE --no-env --print`).
+# The same way it also runs two blocks cut out of other scripts: the failure report of
+# deploy/systemd/e2e.sh (it must say who held port 53 and never hang), and the epoch reads of
+# deploy/cluster/gitops-failover-e2e.sh (REQ: CLU-005; they must not end that script silently).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 INSTALL=deploy/systemd/install.sh
@@ -27,8 +30,10 @@ FAKEROOT="$T/root"
 mkdir -p "$FAKE" "$FAKEBIN" "$FAKEROOT/bin"
 
 # ---- the fakes ---------------------------------------------------------------------------------
-# ss: a "check" is one `ss -Hlun` plus one `ss -Hltn`. The first $FAKE/busy_checks checks find the
-# port held ("always": every check); later ones find it free. `ss -Hlunpt` is the report with
+# ss: a "check" is one `ss -Hlun[p]` plus one `ss -Hltn[p]`. The first $FAKE/busy_checks checks find
+# the port held ("always": every check); later ones find it free, or show what the
+# `*_holder_after` files hold if there are any. The holder files carry the `users:(...)` column as
+# `ss -p` prints it; it is left off unless `p` was asked for. `ss -Hlunpt` is the report with
 # process names. $FAKE/ss_fails makes it refuse like an old `ss` that doesn't know -H.
 cat > "$FAKEBIN/ss" <<'EOF'
 #!/bin/sh
@@ -40,8 +45,20 @@ case "$*" in
   *) exit 1 ;;
 esac
 busy=$(cat "$FAKE/busy_checks")
-if [ "$busy" = always ] || [ "$c" -le "$busy" ]; then cat "$FAKE/$held"; fi
+if [ "$busy" = always ] || [ "$c" -le "$busy" ]; then f="$FAKE/$held"; else f="$FAKE/${held}_after"; fi
+[ -f "$f" ] || exit 0
+case "$*" in
+  *-Hlunp*|*-Hltnp*) cat "$f" ;;
+  *) sed 's/ users:.*$//' "$f" ;;
+esac
 exit 0
+EOF
+# systemctl: only `show -p MainPID telltale`: the pid in $FAKE/mainpid (0: not running), or a failure.
+cat > "$FAKEBIN/systemctl" <<'EOF'
+#!/bin/sh
+[ -f "$FAKE/systemctl_fails" ] && exit 1
+[ "$*" = "show -p MainPID telltale" ] || exit 2
+echo "MainPID=$(cat "$FAKE/mainpid")"
 EOF
 # telltale: only `config check FILE --no-env --print`, which prints the canned effective config.
 cat > "$FAKEROOT/bin/telltale" <<'EOF'
@@ -51,12 +68,13 @@ cat > "$FAKEROOT/bin/telltale" <<'EOF'
 [ -f "$FAKE/config_fails" ] && exit 1
 cat "$FAKE/config.printed"
 EOF
-chmod +x "$FAKEBIN/ss" "$FAKEROOT/bin/telltale"
+chmod +x "$FAKEBIN/ss" "$FAKEBIN/systemctl" "$FAKEROOT/bin/telltale"
 
 # A tool directory without `ss`, for the machine that doesn't have it.
 NOSS="$T/noss"
 mkdir -p "$NOSS"
 for tool in awk tr sleep cat sed date; do ln -s "$(command -v "$tool")" "$NOSS/$tool"; done
+TIMEOUT=$(command -v timeout)   # a hung install.sh function fails the test instead of the job
 
 DEFAULT_CONFIG='config_version = 1
 
@@ -83,19 +101,21 @@ proxy_protocol = false
 [api]
 listen = "0.0.0.0:8053"
 '
-STUB_UDP='UNCONN 0      0       127.0.0.53%lo:53 0.0.0.0:*'
-STUB_TCP='LISTEN 0      4096    127.0.0.53%lo:53 0.0.0.0:*'
+STUB_UDP='UNCONN 0      0       127.0.0.53%lo:53 0.0.0.0:* users:(("systemd-resolve",pid=612,fd=13))'
+STUB_TCP='LISTEN 0      4096    127.0.0.53%lo:53 0.0.0.0:* users:(("systemd-resolve",pid=612,fd=14))'
 STUB_WHO='udp UNCONN 0      0       127.0.0.53%lo:53 0.0.0.0:* users:(("systemd-resolve",pid=612,fd=13))
 tcp LISTEN 0      4096    127.0.0.53%lo:53 0.0.0.0:* users:(("systemd-resolve",pid=612,fd=14))'
 
-# fixture BUSY [CONFIG [UDP_LINE TCP_LINE WHO]]: resets the fakes for one case.
+# fixture BUSY [CONFIG [UDP_LINE TCP_LINE WHO [MAINPID]]]: resets the fakes for one case. MAINPID is
+# the pid systemd reports for the telltale service (default 0: the service isn't running).
 fixture() {
-  rm -f "$FAKE"/checks "$FAKE"/ss_fails "$FAKE"/config_fails
+  rm -f "$FAKE"/checks "$FAKE"/ss_fails "$FAKE"/config_fails "$FAKE"/systemctl_fails "$FAKE"/udp_holder_after "$FAKE"/tcp_holder_after
   printf '%s\n' "$1" > "$FAKE/busy_checks"
   printf '%s\n' "${2-$DEFAULT_CONFIG}" > "$FAKE/config.printed"
   printf '%s\n' "${3-$STUB_UDP}" > "$FAKE/udp_holder"
   printf '%s\n' "${4-$STUB_TCP}" > "$FAKE/tcp_holder"
   printf '%s\n' "${5-$STUB_WHO}" > "$FAKE/who"
+  printf '%s\n' "${6-0}" > "$FAKE/mainpid"
   echo "# the installed config (the fake binary ignores it)" > "$T/telltale.toml"
 }
 checks() { cat "$FAKE/checks" 2>/dev/null || echo 0; }
@@ -107,7 +127,7 @@ run_wait() {
   start=$(date +%s%N)
   set +e
   OUT=$(PATH="${2:-$FAKEBIN:$PATH}" FAKE="$FAKE" PREFIX="$FAKEROOT" TELLTALE_PORT_WAIT="${1:-}" \
-    "$SH" -c 'set -eu; say() { printf "==> %s\n" "$*"; }; . "$1"; wait_for_port53 "$2"' sh "$T/lib.sh" "$T/telltale.toml" 2>&1)
+    "$TIMEOUT" 90 "$SH" -c 'set -eu; say() { printf "==> %s\n" "$*"; }; . "$1"; wait_for_port53 "$2"' sh "$T/lib.sh" "$T/telltale.toml" 2>&1)
   RC=$?
   set -e
   end=$(date +%s%N)
@@ -118,6 +138,7 @@ has() { printf '%s\n' "$OUT" | grep -qF -- "$1"; }
 # ---- the wait functions come out of install.sh -------------------------------------------------
 sed -n '/^# BEGIN port53-wait/,/^# END port53-wait/p' "$INSTALL" > "$T/lib.sh"
 [ -s "$T/lib.sh" ] || fail "ops_004_port53_wait: $INSTALL has no port53-wait block (the wait for port 53)"
+grep -q '^# END port53-wait' "$T/lib.sh" || fail "ops_004_port53_wait: the port53-wait block in $INSTALL has no END marker"
 "$SH" -n "$T/lib.sh" || fail "ops_004_port53_wait: the block isn't valid sh"
 
 # ---- 1. free at once: nothing to say, no waiting -----------------------------------------------
@@ -160,6 +181,29 @@ fixture 1
 run_wait abc
 [ "$RC" = 0 ] && has "up to 15s" || fail "ops_004_port53_wait_default_limit: rc=$RC: $OUT"
 ok ops_004_port53_wait_default_limit
+# The limit is plain decimal seconds, 0 to 300. A leading zero is decimal (`08` once ended the
+# install through an octal arithmetic error, after the resolver had been turned off); anything
+# else gets the default and one line saying so.
+for pair in 08:8 09:9 010:10 0015:15 007:7 300:300 0300:300; do
+  fixture 1
+  run_wait "${pair%%:*}"
+  { [ "$RC" = 0 ] && has "up to ${pair##*:}s" && ! has "isn't a whole number"; } \
+    || fail "ops_004_port53_wait_limit_is_decimal: TELLTALE_PORT_WAIT=${pair%%:*}: rc=$RC: $OUT"
+done
+ok ops_004_port53_wait_limit_is_decimal
+for junk in abc 1.5 -3 301 1000 99999999999999999999 ' 5' '5 ' 0x10; do
+  fixture 1
+  run_wait "$junk"
+  { [ "$RC" = 0 ] && has "up to 15s" && [ "$(printf '%s\n' "$OUT" | grep -c "isn't a whole number")" = 1 ]; } \
+    || fail "ops_004_port53_wait_limit_junk_gets_the_default: TELLTALE_PORT_WAIT='$junk': rc=$RC: $OUT"
+done
+ok ops_004_port53_wait_limit_junk_gets_the_default
+# 0 means don't wait: it still says what holds the port, at once.
+fixture always
+run_wait 0
+{ [ "$RC" = 1 ] && [ "$MS" -lt 2000 ] && has "still held after 0s" && ! has "Waiting up to"; } \
+  || fail "ops_004_port53_wait_limit_zero: rc=$RC ms=$MS: $OUT"
+ok ops_004_port53_wait_limit_zero
 
 # ---- 5. no `ss` on the machine: one line, no waiting, no failure -------------------------------
 fixture always
@@ -236,6 +280,64 @@ run_wait
 [ "$RC" = 0 ] && has "Waiting" && [ "$(checks)" = 2 ] || fail "ops_004_port53_wait_unreadable_config: rc=$RC checks=$(checks): $OUT"
 ok ops_004_port53_wait_unreadable_config
 
+# ---- 7b. TelltaleDNS's own sockets aren't a holder -----------------------------------------------
+# A re-run in a terminal can turn the stub off for the first time while the service is already
+# running (the stub was left on, with a LAN-only [[listen]]; or turned off in a spelling the
+# installer doesn't look for). The old instance's sockets are what `restart` replaces: they must
+# not make the install wait 15 s and warn that port 53 is "still held".
+OWN_UDP='UNCONN 0      0       192.0.2.10:53 0.0.0.0:* users:(("telltale",pid=700,fd=7))'
+OWN_TCP='LISTEN 0      4096    192.0.2.10:53 0.0.0.0:* users:(("telltale",pid=700,fd=8))'
+OWN_WHO="udp $OWN_UDP
+tcp $OWN_TCP"
+# (f) the service itself holds its LAN address: free at once, silent.
+fixture always "$LAN_CONFIG" "$OWN_UDP" "$OWN_TCP" "$OWN_WHO" 700
+run_wait
+{ [ "$RC" = 0 ] && [ -z "$OUT" ] && [ "$(checks)" = 1 ] && [ "$MS" -lt 2000 ]; } \
+  || fail "ops_004_port53_wait_ignores_the_services_own_sockets: rc=$RC checks=$(checks) ms=$MS: $OUT"
+# (g) and on every address (the default config, the stub already off in another spelling).
+fixture always "$DEFAULT_CONFIG" \
+  'UNCONN 0      0       0.0.0.0:53 0.0.0.0:* users:(("telltale",pid=700,fd=7))' \
+  'LISTEN 0      4096    0.0.0.0:53 0.0.0.0:* users:(("telltale",pid=700,fd=8))' '' 700
+run_wait
+{ [ "$RC" = 0 ] && [ -z "$OUT" ] && [ "$(checks)" = 1 ]; } \
+  || fail "ops_004_port53_wait_ignores_the_services_own_sockets: wildcard: rc=$RC checks=$(checks): $OUT"
+ok ops_004_port53_wait_ignores_the_services_own_sockets
+# (h) its own sockets and a real foreign holder: it waits, and names only the foreign one.
+fixture always "$DEFAULT_CONFIG" \
+  "$OWN_UDP
+$STUB_UDP" "$OWN_TCP
+$STUB_TCP" "$OWN_WHO
+$STUB_WHO" 700
+run_wait 1
+{ [ "$RC" = 1 ] && has "still held after 1s" && has 'systemd-resolve' && ! has '"telltale"'; } \
+  || fail "ops_004_port53_wait_still_waits_for_a_foreign_holder: rc=$RC: $OUT"
+ok ops_004_port53_wait_still_waits_for_a_foreign_holder
+# (h2) the foreign holder lets go while the service's own sockets stay: the wait ends (the polls
+# leave the service out too, not only the first look).
+fixture 1 "$DEFAULT_CONFIG" \
+  "$OWN_UDP
+$STUB_UDP" "$OWN_TCP
+$STUB_TCP" '' 700
+printf '%s\n' "$OWN_UDP" > "$FAKE/udp_holder_after"
+printf '%s\n' "$OWN_TCP" > "$FAKE/tcp_holder_after"
+run_wait
+{ [ "$RC" = 0 ] && has "Waiting up to" && has "Port 53 is free" && [ "$(checks)" = 2 ] && [ "$MS" -lt 8000 ]; } \
+  || fail "ops_004_port53_wait_ends_when_only_its_own_sockets_remain: rc=$RC checks=$(checks) ms=$MS: $OUT"
+ok ops_004_port53_wait_ends_when_only_its_own_sockets_remain
+# (i) a telltale that isn't the service's main process (a stray `telltale run`) is a holder.
+fixture always "$LAN_CONFIG" "$OWN_UDP" "$OWN_TCP" "$OWN_WHO" 999
+run_wait 1
+{ [ "$RC" = 1 ] && has "still held after 1s" && has 'pid=700'; } \
+  || fail "ops_004_port53_wait_a_stray_telltale_is_a_holder: rc=$RC: $OUT"
+ok ops_004_port53_wait_a_stray_telltale_is_a_holder
+# (j) systemd can't say which process is the service: nothing is excluded (the old behaviour).
+fixture always "$LAN_CONFIG" "$OWN_UDP" "$OWN_TCP" "$OWN_WHO" 700
+touch "$FAKE/systemctl_fails"
+run_wait 1
+{ [ "$RC" = 1 ] && has "still held after 1s" && has 'pid=700'; } \
+  || fail "ops_004_port53_wait_without_the_service_pid: rc=$RC: $OUT"
+ok ops_004_port53_wait_without_the_service_pid
+
 # ---- 8. the real binary prints the effective config the way install.sh reads it ----------------
 REAL=${1:-}
 if [ -n "$REAL" ] && [ -x "$REAL" ]; then
@@ -274,6 +376,7 @@ ok ops_004_install_starts_once
 E2E=deploy/systemd/e2e.sh
 sed -n '/^# BEGIN failure-report/,/^# END failure-report/p' "$E2E" > "$T/report.sh"
 [ -s "$T/report.sh" ] || fail "ops_004_e2e_failure_report: $E2E has no failure-report block"
+grep -q '^# END failure-report' "$T/report.sh" || fail "ops_004_e2e_failure_report: the failure-report block in $E2E has no END marker"
 bash -n "$T/report.sh" || fail "ops_004_e2e_failure_report: the block isn't valid bash"
 RFAKE="$T/rfake"
 RBIN="$T/rbin"
@@ -324,7 +427,7 @@ run_report() {
   start=$(date +%s%N)
   set +e
   OUT=$(PATH="${1:-$RBIN:$PATH}" RFAKE="$RFAKE" WORK="$T/work" REPORT_TIMEOUT="${REPORT_TIMEOUT_TEST:-8}" \
-    bash "$T/harness.sh" "$T/report.sh" 2>&1)
+    "$TIMEOUT" 120 bash "$T/harness.sh" "$T/report.sh" 2>&1)
   RC=$?
   set -e
   end=$(date +%s%N)
