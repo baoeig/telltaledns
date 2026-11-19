@@ -2012,7 +2012,8 @@ telltale cluster set-failover auto
 - **How it decides:** every eligible node and witness is a voter. The primary renews a 15 s
   *lease* with a majority every 5 s, and publishes only while the lease holds. If it disappears,
   the eligible nodes wait for the lease to run out, and one is elected by a majority vote in a
-  new epoch, typically within 15–25 s.
+  new epoch, typically within 15–25 s. When two nodes are free to stand at the same moment, the
+  one whose node ID sorts first goes first and the other gives way, so they don't split the vote.
 - **Never two primaries writing:** a voter votes once per epoch and won't vote for anyone else
   while the lease it granted runs. A primary that loses its majority (for example, cut off by a
   network split) stops taking changes before anyone else can be elected. Proven by a simulator

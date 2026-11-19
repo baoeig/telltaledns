@@ -154,11 +154,12 @@ done
 took=$(( $(date +%s) - t0 ))
 epoch=$(epoch_of "$EMERG_MET")
 # REQ: CLU-005 — spec/12 §10: after the primary is killed, a new primary within 30 s. One election
-# round takes about one lease (15 s) and moves the epoch by one. When both candidates ask at once
-# the vote splits and the next round costs another lease, so two rounds (31 to 35 s seen) already
-# pass the spec's 30 s. This limit tolerates that one split and no more: a third round (about 50 s)
-# fails the step on purpose, with how far the epoch moved in the message, because it is a finding
-# about the election (spec/12 §5), not noise in the test. Widening the limit would hide it.
+# round takes about one lease (15 s) and moves the epoch by one. When both candidates ask at once,
+# the one whose node ID sorts after the other's gives way (ADR-178), so the vote doesn't split; a
+# split round would cost another lease (31 to 35 s, seen before ADR-178 in 12 of 79 CI runs), which
+# already passes the spec's 30 s. This limit tolerates one such round and no more: a third round
+# (about 50 s) fails the step on purpose, with how far the epoch moved in the message, because it
+# is a finding about the election (spec/12 §5), not noise in the test. Widening it would hide it.
 advanced=$(epoch_advance "$epoch_before" "$epoch")
 [ "$took" -le 45 ] || fail "the election took $took s: the epoch advanced $advanced time(s), from ${epoch_before:-?} to ${epoch:-?} (a round takes about 15 s and moves it by one; a second round means the candidates split the vote, and spec/12 §10 allows 30 s in all)"
 [ "${epoch:-0}" -ge 2 ] || fail "the new primary's epoch is '${epoch}' (its metrics couldn't be read, or it is below 2)"
