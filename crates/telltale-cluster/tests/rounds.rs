@@ -38,7 +38,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
 
-use telltale_cluster::election::{Ask, Ballot, Elector, LEASE_MS, Out, Phase, Reply};
+use telltale_cluster::election::{Ask, Ballot, Elector, LEASE_MS, Out, Phase, ROUND_MS, Reply};
 
 /// The election loop's tick (`failover::TICK`).
 const TICK_US: u64 = 250_000;
@@ -894,16 +894,14 @@ fn clu_005_failover_timing_never_elects_two_primaries() {
 /// How long after the kill the one node that can win may take when lower nodes that can't win
 /// keep asking it for pre-votes (`clu_005_a_lower_node_that_cannot_win_only_delays_the_election`).
 /// The lease ends at most `LEASE_MS` after the kill. Every pre-vote H grants a lower node then
-/// keeps H from standing for `ROUND_MS`; if one lands inside H's own pre-vote round, H stands
-/// down and waits for the retry time it set when that round started, at most `LEASE_MS / 3`
-/// plus the largest jitter (`LEASE_MS / 2`), 12.5 s, the longest single wait giving way adds
-/// (each grant as a follower adds at most `ROUND_MS`). The bound is the lease plus eight of the
-/// longest waits: 15 + 100 = 115 s. It is not a worst case in theory: the jitter is redrawn on
-/// every step, so each further wait is a fresh draw and the tail falls off geometrically. With
-/// the scripts' near-lockstep ticks the first attempt after the lease is usually spoiled (all of
-/// them are freed together), later ones rarely; the measured worst is about half the bound
-/// (ADR-178).
-const HELD_BACK_BOUND_MS: u64 = LEASE_MS + 8 * (LEASE_MS / 3 + LEASE_MS / 2);
+/// keeps H from standing for `ROUND_MS`, as a follower or as a pre-candidate that stands down, and
+/// H stands again on the next tick of its loop after that: each spoiled attempt costs H at most
+/// `ROUND_MS` plus one tick, 2.25 s. The bound is the lease plus twenty of those: 15 + 45 = 60 s.
+/// It is not a worst case in theory: the lower nodes' asks follow their own jitter, redrawn on
+/// every step, so each further spoil is a fresh draw and the tail falls off geometrically. With
+/// the scripts' near-lockstep ticks all of them are freed together, so H's first attempts are
+/// often spoiled; the measured worst is well inside the bound (ADR-178).
+const HELD_BACK_BOUND_MS: u64 = LEASE_MS + 20 * (ROUND_MS + TICK_US / 1_000);
 
 // REQ: CLU-005 (ADR-178) — a lower node that can't win only delays the election; it never stops
 // it. `Cut4`: four voters {P, L, X, H}, L and X sort before H, the L-X link is cut, so once P dies

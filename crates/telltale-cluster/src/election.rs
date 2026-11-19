@@ -367,9 +367,10 @@ impl Elector {
 
     /// REQ: CLU-005 (ADR-178) — this node has just granted `ask`, a pre-vote. When the candidate
     /// sorts before this node and asks for the epoch this node would stand for (or a newer one),
-    /// this node gives it the round. A follower doesn't stand for [`ROUND_MS`]. A pre-candidate
-    /// stands down and keeps the retry time it set when its attempt started, `LEASE_MS / 3` plus
-    /// the jitter (5 to 12.5 s after that start), since `next_try_ms` only ever moves later here.
+    /// this node gives it the round, and that round is all it costs this node. A pre-candidate
+    /// stands down and may stand again [`ROUND_MS`] from now (not at the retry time it set when
+    /// its attempt started, 5 to 12.5 s after that start). A follower doesn't stand for
+    /// [`ROUND_MS`], or until a later retry time it already had.
     /// Two nodes freed by the same lease end otherwise both send pre-votes on their next tick,
     /// grant each other's (a pre-vote binds nothing), vote for themselves, and split the vote;
     /// each one's own vote is then a lease the other has to wait out. With three voters, where
@@ -386,8 +387,12 @@ impl Elector {
             Phase::Candidate { .. } | Phase::Leader { .. } => return,
         };
         if ask.epoch >= contest {
+            self.next_try_ms = if matches!(self.phase, Phase::PreCandidate { .. }) {
+                now_ms + ROUND_MS
+            } else {
+                self.next_try_ms.max(now_ms + ROUND_MS)
+            };
             self.phase = Phase::Follower;
-            self.next_try_ms = self.next_try_ms.max(now_ms + ROUND_MS);
         }
     }
 
@@ -885,10 +890,51 @@ mod tests {
                 .contains(&Out::Elected { epoch: 1 })
         );
         assert_eq!((c.ballot.epoch, c.ballot.candidate.as_str()), (1, "b"));
-        // At 7 s c's own retry time (set when its attempt started at 1 s: 1 s + LEASE_MS / 3,
-        // with no jitter) has passed, and b's lease on c's ballot runs until 1.015 s + LEASE_MS:
-        // only the lease keeps c from standing here.
+        // At 7 s c's retry time (a round after it gave way at 1.005 s) has long passed, and b's
+        // lease on c's ballot runs until 1.015 s + LEASE_MS: only the lease keeps c from
+        // standing here.
         assert!(c.tick(7_000, 0).is_empty(), "c holds b's lease");
+    }
+
+    // REQ: CLU-005 (ADR-178) — giving a node the round costs the giver that round and no more: a
+    // pre-candidate that gives way may stand again exactly ROUND_MS later, not at the retry time
+    // it set when its attempt started; a follower waits at least ROUND_MS and keeps a later
+    // retry time it already had.
+    #[test]
+    fn clu_005_giving_way_costs_the_giver_one_round() {
+        let voters: Vec<String> = ["a", "b", "c"].iter().map(|v| (*v).to_owned()).collect();
+        let pre = |who: &str| Ask {
+            epoch: 1,
+            candidate: who.into(),
+            round: 1,
+            pre: true,
+            applied: (0, 0),
+        };
+        let stands = |outs: &[Out]| outs.iter().any(|o| matches!(o, Out::Send { .. }));
+        // c starts an attempt at 1 s with the largest jitter: its own retry time is 13.5 s.
+        let mut c = Elector::new("c", voters.clone(), true, Ballot::default());
+        assert!(stands(&c.tick(1_000, LEASE_MS / 2 - 1)));
+        assert!(matches!(c.phase, Phase::PreCandidate { epoch: 1, .. }));
+        assert_eq!(c.next_try_ms, 1_000 + LEASE_MS / 3 + LEASE_MS / 2 - 1);
+        // It grants a's pre-vote at t and gives way: it may stand again at t + ROUND_MS.
+        let t = 1_010;
+        assert!(c.on_ask(&pre("a"), t).0.granted);
+        assert_eq!(c.phase, Phase::Follower);
+        assert_eq!(
+            c.next_try_ms,
+            t + ROUND_MS,
+            "a pre-candidate waits one round"
+        );
+        assert!(!stands(&c.tick(t + ROUND_MS - 1, 0)));
+        assert!(stands(&c.tick(t + ROUND_MS, 0)), "c stands a round later");
+        // A follower: a later retry time it had stays, and none becomes a round from now.
+        let mut f = Elector::new("c", voters.clone(), true, Ballot::default());
+        f.next_try_ms = 50_000;
+        assert!(f.on_ask(&pre("a"), 10_000).0.granted);
+        assert_eq!(f.next_try_ms, 50_000);
+        let mut g = Elector::new("c", voters, true, Ballot::default());
+        assert!(g.on_ask(&pre("a"), 10_000).0.granted);
+        assert_eq!(g.next_try_ms, 10_000 + ROUND_MS);
     }
 
     // REQ: CLU-005 (ADR-178) — a follower that grants a pre-vote to a node that sorts before it
