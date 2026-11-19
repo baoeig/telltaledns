@@ -78,7 +78,8 @@ telltale 0.1.0-edge.64 (commit 3f46fd4, built 2026-10-05T12:00:00Z, channel edge
       <p>For an install made with <code>install.sh</code>:</p>
 <pre><code>sudo telltale self-update --check                 # only look
 sudo telltale self-update --restart               # upgrade and restart
-sudo telltale self-update --channel edge --restart  # builds from main</code></pre>
+sudo telltale self-update --channel edge --restart  # builds from main
+sudo telltale self-update --to 0.8.0 --restart    # one version (older ones too)</code></pre>
       <ul>
         <li>It verifies the signature with the release key built into the binary and checks the binary's SHA-256, test-runs the download, swaps it in atomically, and keeps the previous binary as <code>telltale.old</code>.</li>
         <li><b>Or re-run the installer:</b> <code>sudo sh install.sh</code> upgrades the binary in place. When <code>/etc/telltale/telltale.toml</code> already exists it asks no questions and only upgrades; your config is kept.</li>
@@ -110,6 +111,18 @@ sudo telltale self-update --channel edge --restart  # builds from main</code></p
   <ul>
     <li><b>A half-upgraded cluster is fine.</b> Versions one cluster protocol apart work together (N and N−1, either way round).</li>
     <li><b>A replica older than its primary keeps working</b>, unless the primary starts using settings the older version doesn't know. Then the replica keeps serving its last version, and its sync status says to upgrade it.</li>
+  </ul>
+  <h3 id="from-the-cluster">Let the cluster do it</h3>
+  <p>Native nodes (installed with <code>install.sh</code>) can be upgraded by the cluster, in that order, one at a time. Turn on each node's update service once:</p>
+<pre><code>sudo systemctl enable --now telltale-update.path     # or: sudo sh install.sh --cluster-updates</code></pre>
+  <p>Then, with an admin's token:</p>
+<pre><code>telltale ctl --url https://dns.example.com upgrade --to 0.8.0 --dry-run   # the order
+telltale ctl --url https://dns.example.com upgrade --to 0.8.0</code></pre>
+  <ul>
+    <li><b>Replicas first, the primary last</b>, each back on the version, ready, and in sync before the next. The first failure stops it, and the error is the node's own.</li>
+    <li><b>The node's service never gets root.</b> It writes a request; a root update service checks it, installs only a newer release carrying the release signature, and restarts it. It never downgrades.</li>
+    <li><b>With the Helm chart</b>, set <code>upgradeHook.enabled</code> and a token Secret: a bump of the chart (or a merged Renovate pull request) upgrades the native nodes first, then the pods.</li>
+    <li><b>Edge builds</b> can be installed this way only while they are the newest on the edge channel.</li>
   </ul>
   <p class="muted">More in <a href="guide-cluster.html#upgrade">Build a cluster</a> and the <a href="https://github.com/paimonsoror/telltaledns/blob/main/docs/running.md#clusters">cluster docs</a>.</p>
 </section>
