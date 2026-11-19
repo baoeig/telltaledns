@@ -1063,7 +1063,7 @@ pub(crate) fn wedge_for_test(handle: &tokio::runtime::Handle) {
 #[cfg(feature = "wedge-test")]
 fn wedge_deadline(now: Instant, hold_secs: u64) -> Instant {
     now.checked_add(Duration::from_secs(hold_secs))
-        .or_else(|| now.checked_add(Duration::from_secs(100 * 365 * 24 * 3600)))
+        .or_else(|| now.checked_add(Duration::from_hours(100 * 365 * 24)))
         .unwrap_or(now)
 }
 
