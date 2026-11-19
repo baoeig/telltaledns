@@ -57,18 +57,11 @@ fn save(id: &Identity, r: &Rotation) -> Result<(), String> {
     write(&path(id), &b, false)
 }
 
+/// REQ: CLU-001 (ADR-066) — the cluster directory's one way to write a file: atomically, through
+/// a temporary file of its own (`ca.key` and `ca.crt` used to share `ca.tmp`), and a secret is
+/// owner-only from its first byte.
 fn write(p: &Path, data: &[u8], secret: bool) -> Result<(), String> {
-    let tmp = p.with_extension("tmp");
-    std::fs::write(&tmp, data).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    if secret {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| e.to_string())?;
-    }
-    #[cfg(not(unix))]
-    let _ = secret;
-    std::fs::rename(&tmp, p).map_err(|e| e.to_string())
+    crate::node::write(p, data, secret).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -369,5 +362,39 @@ mod tests {
             "the share stored a copy of the signing key as the next key"
         );
         assert!(id.reload().signs_now());
+    }
+
+    // REQ: CLU-001 (ADR-066) — each file a rotation writes has a temporary file of its own:
+    // `ca.key` and `ca.crt` written at the same moment never trade contents, and neither write
+    // fails because the other renamed its temporary file away.
+    #[test]
+    fn clu_001_rotation_writes_never_share_a_temporary_file() {
+        use std::sync::{Arc, Barrier};
+        let dir = tempfile::tempdir().unwrap();
+        let (key, crt) = (dir.path().join("ca.key"), dir.path().join("ca.crt"));
+        let rounds = 500;
+        let mut clashes = 0;
+        for round in 0..rounds {
+            let barrier = Arc::new(Barrier::new(2));
+            let t = {
+                let (key, barrier) = (key.clone(), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    write(&key, format!("key {round}").as_bytes(), true)
+                })
+            };
+            barrier.wait();
+            let wrote_crt = write(&crt, format!("crt {round}").as_bytes(), false);
+            let wrote_key = t.join().unwrap();
+            let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+            if wrote_key.is_err()
+                || wrote_crt.is_err()
+                || read(&key) != format!("key {round}")
+                || read(&crt) != format!("crt {round}")
+            {
+                clashes += 1;
+            }
+        }
+        assert_eq!(clashes, 0, "{clashes} of {rounds} rounds clashed");
     }
 }

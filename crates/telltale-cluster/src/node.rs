@@ -194,7 +194,7 @@ fn now() -> u64 {
 }
 
 /// Writes `data` to `path` atomically; owner-only when `secret`.
-fn write(path: &Path, data: &[u8], secret: bool) -> std::io::Result<()> {
+pub(crate) fn write(path: &Path, data: &[u8], secret: bool) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
     // A name per write: two streams can store the same thing at once (a key share arrives on
