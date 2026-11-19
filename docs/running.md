@@ -1817,7 +1817,8 @@ groups, query log, and live query stream cover every node:
   range. A read that finds too many reads waiting, the call limit spent, or the 40 MiB held is
   answered the same way, and works again a moment later. In Kubernetes, the controller counts
   each resolver pod as a node. A node that refuses cluster reads, for any of these reasons,
-  says so in its log as a warning, once a minute at most.
+  says so in its log as a warning, once a minute at most, and counts them in
+  `telltale_federated_refused_total{reason}` (`waits`, `spent`, `ceiling`, `bytes`).
 - `scope` on a stats or query-log request narrows it: `cluster` (the default, every node),
   `site:<name>` (the nodes of one site, e.g. `site:k8s`), `node:<name or ID>` (one node, by
   site, pod, or node ID), or `node:local` (the node you're asking). For example
@@ -2167,7 +2168,14 @@ telltale cluster status
     primary, the other voters under automatic failover, and any other node only while a link
     to it is open or it was heard from in the last 15 seconds;
   - this node: `telltale_cluster_config_seq`, `telltale_cluster_behind_seconds`,
-    `telltale_cluster_sync_error` and `telltale_cluster_cert_expiry_timestamp_seconds`.
+    `telltale_cluster_sync_error` and `telltale_cluster_cert_expiry_timestamp_seconds`;
+  - the cluster reads this node refused since it started: `telltale_federated_refused_total{reason}`,
+    a counter. `waits`: too many reads were already waiting for a slow node; `spent`: the
+    32,768 calls all reads may have were in use; `ceiling`: the read asked for too much at once
+    (over 4,096 calls, or over 256 windows of time a node); `bytes`: it was sent, but an answer
+    was dropped because it would have passed the 20 MiB a read may hold or the 40 MiB all may.
+    The nodes it was for are in that read's `missingNodes`. A rate above zero for long means the
+    pages show partial results: see "One view of the whole cluster" under [Clusters](#clusters).
 
   The Helm chart's PrometheusRule alerts on a peer down for over a minute, configuration behind
   for over 30 s, failing syncs, and a certificate within 14 days of expiry.

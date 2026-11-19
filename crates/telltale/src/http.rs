@@ -579,6 +579,8 @@ fn cluster_metrics(src: &Sources, w: &mut PromWriter) {
         election_metrics(c, w);
         rollout_metrics(src, w);
         git_metrics(src, w);
+        // REQ: CLU-004 (ADR-174) — the federated reads this node refused, by reason.
+        crate::federated::render_metrics(w);
         w.family(
             "telltale_cluster_behind_seconds",
             "gauge",

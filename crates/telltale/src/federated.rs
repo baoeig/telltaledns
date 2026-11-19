@@ -729,6 +729,32 @@ pub(crate) struct Federated {
     limiter: &'static bridge::Limiter,
 }
 
+/// REQ: CLU-004 (ADR-174) — `telltale_federated_refused_total{reason}`: the federated reads this
+/// node did not send, or (`bytes`) did not keep whole, since it started.
+pub(crate) fn render_metrics(w: &mut telltale_telemetry::prom::PromWriter) {
+    render_refusals(&bridge::WAITS, w);
+}
+
+fn render_refusals(limiter: &bridge::Limiter, w: &mut telltale_telemetry::prom::PromWriter) {
+    let name = "telltale_federated_refused_total";
+    let help = format!(
+        "Federated reads this node refused since it started, by reason: waits (too many reads \
+         were already waiting for slow nodes), spent (the budget of {} calls was spent), ceiling \
+         (over {} calls, or over {} windows of time a node), bytes (sent, but an answer was \
+         dropped: it would have passed the {} MiB of answers a read may hold or the {} MiB all \
+         may). The nodes they were for are in missingNodes.",
+        bridge::CALL_BUDGET,
+        bridge::MAX_READ_CALLS,
+        federation::TIMESERIES_MAX_WINDOWS,
+        bridge::READ_BYTES >> 20,
+        bridge::HELD_BYTES >> 20,
+    );
+    w.family(name, "counter", &help);
+    for (why, n) in limiter.refusals() {
+        w.sample(name, &[("reason", why.label())], n);
+    }
+}
+
 /// The nodes a scoped read covers.
 #[derive(Debug, Clone)]
 struct Only {
@@ -3394,5 +3420,79 @@ mod bridge_tests {
             [label],
             "the peer is listed as one that didn't answer"
         );
+    }
+
+    // REQ: CLU-004 (ADR-174) — the refusals are a counter with a closed set of reasons, one
+    // sample each from the start (0 until something is refused), and each refusal counts under
+    // its own: a read over the ceiling (`ceiling`), one with no place left (`waits`), one the
+    // budget of calls has no room for (`spent`), and one that lost an answer to a cap on bytes
+    // (`bytes`). Peers' names and what a user asked are never labels.
+    #[test]
+    fn clu_004_refused_reads_are_a_metric_with_a_closed_set_of_reasons() {
+        let render = |l: &bridge::Limiter| {
+            let mut w = telltale_telemetry::prom::PromWriter::new();
+            render_refusals(l, &mut w);
+            w.finish()
+        };
+        let reasons = |text: &str| -> Vec<(String, u64)> {
+            text.lines()
+                .filter(|l| l.starts_with("telltale_federated_refused_total{"))
+                .filter_map(|l| {
+                    let (labels, n) = l.rsplit_once(' ')?;
+                    let reason =
+                        labels.strip_prefix("telltale_federated_refused_total{reason=\"")?;
+                    Some((reason.strip_suffix("\"}")?.to_owned(), n.parse().ok()?))
+                })
+                .collect()
+        };
+        let n = two_nodes_answering(peer_with_one_big_window(1_791_000_240, 400));
+        let _in = n.rt.enter();
+        // One place, room for 4 calls, and 4,096 bytes a read.
+        let limiter: &'static bridge::Limiter = Box::leak(Box::new(bridge::Limiter::with_caps(
+            1,
+            4,
+            64 * 1024,
+            4 * 1024,
+        )));
+        let text = render(limiter);
+        assert!(text.contains("# TYPE telltale_federated_refused_total counter\n"));
+        let zero: Vec<(String, u64)> = ["waits", "spent", "ceiling", "bytes"]
+            .iter()
+            .map(|r| ((*r).to_owned(), 0))
+            .collect();
+        assert_eq!(reasons(&text), zero, "every reason, from the start");
+        let fed = with_limiter(&n, limiter);
+        // Over the ceiling: a range of more windows than a read may have.
+        let _ = fed.timeseries(Step::Second, 1_791_000_000, 1_791_000_000 + 300 * 240);
+        // Over the budget of calls: five windows, with room for four.
+        let _ = fed.timeseries(Step::Second, 1_791_000_000, 1_791_000_000 + 5 * 240);
+        // Over a cap on bytes: four windows, the second one big.
+        let _ = fed.timeseries(Step::Second, 1_791_000_000, 1_791_000_000 + 4 * 240);
+        // No place left: a read waits on a call the runtime can't run, and the next is refused.
+        // (The last read's place goes back as its last task ends, a moment after it answered.)
+        let until = Instant::now() + Duration::from_secs(10);
+        while limiter.in_flight() > 0 {
+            assert!(
+                Instant::now() < until,
+                "the last read's place never came back"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let gate = wedge(&n.rt);
+        let waiting = fed.start_calls(
+            n.rt.handle(),
+            vec![(n.primary.clone(), b"{}".to_vec())],
+            Duration::from_secs(5),
+        );
+        let _ = fed.gather(vec![(n.primary.clone(), Read::ConfigVersion)]);
+        // Its call isn't sent: nobody waits for it when the runtime runs it.
+        drop(waiting);
+        let _ = gate.send(());
+        let got = reasons(&render(limiter));
+        let want: Vec<(String, u64)> = ["waits", "spent", "ceiling", "bytes"]
+            .iter()
+            .map(|r| ((*r).to_owned(), 1))
+            .collect();
+        assert_eq!(got, want);
     }
 }

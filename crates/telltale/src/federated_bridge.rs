@@ -37,8 +37,9 @@
 //!    the caller does with the answers once `wait` has returned them (parsing them, merging them,
 //!    writing the response) is not covered (ADR-174 says why and what bounds it).
 //!
-//! A read that is refused, or that loses an answer to rule 4, is counted and said in the log, as
-//! a warning at most once a minute ([`Limiter::refused`]).
+//! A read that is refused, or that loses an answer to rule 4, is counted (the metric
+//! `telltale_federated_refused_total`, [`Limiter::refusals`]) and said in the log, as a warning
+//! at most once a minute ([`Limiter::refused`]).
 //!
 //! What this does not do: a read made on a worker thread of a multi-thread runtime costs its
 //! deadline even when the runtime is healthy. Tokio puts a task a worker spawns in that worker's
@@ -134,6 +135,9 @@ pub(super) enum Refused {
 }
 
 impl Refused {
+    /// Every reason, in the order the metric lists them.
+    pub(super) const ALL: [Self; 4] = [Self::Full, Self::Spent, Self::TooBig, Self::Bytes];
+
     /// What each call of the read is told: after "wasn't asked", or (`Bytes`) "wasn't kept".
     fn why(self) -> &'static str {
         match self {
@@ -141,6 +145,16 @@ impl Refused {
             Self::Spent => "too many cluster calls are already running or waiting to be read",
             Self::TooBig => "the read has too many calls at once",
             Self::Bytes => "the answers held would pass the bytes cluster reads may hold",
+        }
+    }
+
+    /// The metric's label: a closed set.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Full => "waits",
+            Self::Spent => "spent",
+            Self::TooBig => "ceiling",
+            Self::Bytes => "bytes",
         }
     }
 
@@ -163,13 +177,16 @@ struct Tally {
     bytes: u64,
 }
 
-/// What was refused since the last line said so, and when that was.
+/// What was refused since the last line said so, and when that was; and every refusal since the
+/// process started (the metric), which nothing resets.
 #[derive(Debug, Default)]
 struct RefusalLog {
     /// The clock (milliseconds, any origin) of the last line, plus one: zero is "never".
     last: AtomicU64,
     /// Since the last line, by [`Refused::index`].
     unsaid: [AtomicU64; 4],
+    /// Since the start, by [`Refused::index`].
+    total: [AtomicU64; 4],
 }
 
 impl RefusalLog {
@@ -177,6 +194,7 @@ impl RefusalLog {
     /// a minute at most, with what was counted since the last line (which this resets). Of any
     /// number of threads that find a line due, one gets it, and a refusal is in exactly one line.
     fn note(&self, why: Refused, now_ms: u64) -> Option<Tally> {
+        self.total[why.index()].fetch_add(1, Ordering::AcqRel);
         self.unsaid[why.index()].fetch_add(1, Ordering::AcqRel);
         let stamp = now_ms.saturating_add(1);
         let last = self.last.load(Ordering::Acquire);
@@ -193,6 +211,11 @@ impl RefusalLog {
             too_big: take(Refused::TooBig),
             bytes: take(Refused::Bytes),
         })
+    }
+
+    /// Refusals since the start, for `why`.
+    fn total(&self, why: Refused) -> u64 {
+        self.total[why.index()].load(Ordering::Acquire)
     }
 
     /// What is counted and not yet said.
@@ -233,7 +256,7 @@ pub(super) struct Limiter {
 }
 
 /// What a limiter shares with each read it lets go: the bytes all reads hold, the caps on them,
-/// and the refusals (the log), so an answer can be weighed, and a read that loses
+/// and the refusals (the log and the metric), so an answer can be weighed, and a read that loses
 /// one counted, without the limiter.
 #[derive(Debug)]
 struct Ledger {
@@ -468,6 +491,12 @@ impl Limiter {
     /// ([`Ledger::refused`]).
     pub(super) fn refused(&self, why: Refused) {
         self.ledger.refused(why);
+    }
+
+    /// REQ: CLU-004 (ADR-174) — the reads refused since the start, for each reason (the metric
+    /// `telltale_federated_refused_total`).
+    pub(super) fn refusals(&self) -> [(Refused, u64); 4] {
+        Refused::ALL.map(|why| (why, self.ledger.log.total(why)))
     }
 
     /// REQ: CLU-004, CLU-002 (ADR-174) — a place among the reads and a share for each of `n`
