@@ -58,7 +58,7 @@ docker run -d --name telltale --restart unless-stopped \
 Build it yourself with `docker buildx build -t telltale:dev .` (add `--platform linux/amd64,linux/arm64,linux/arm/v7` for all three). The build cross-compiles, so it doesn't need QEMU.
 
 ## Raspberry Pi and Linux
-Two ways, both with real client addresses (host networking) and port 53 without running as a full root process. Native is the simplest on a Pi or any Linux machine, because it needs no Docker; use the Docker Compose bundle (after the native steps) if you already run Docker. Pi 3, 4, 5, and Zero 2 W are supported (64-bit or 32-bit OS); ARMv6 boards (Pi 1, Zero W) aren't.
+Two ways, both with real client addresses (host networking) and port 53 without running as a full root process. Native is the simplest on a Pi or any Linux machine, because it needs no Docker; use the Docker Compose bundle (described after the native steps) if you already run Docker. Pi 3, 4, 5, and Zero 2 W are supported (64-bit or 32-bit OS); ARMv6 boards (Pi 1, Zero W) aren't.
 
 **Native (systemd), recommended:** `deploy/systemd/install.sh` downloads the static binary for your CPU, checks the release signature (minisign) and its SHA-256, creates a `telltale` system user, installs a sandboxed systemd unit (`ProtectSystem=strict`, only `CAP_NET_BIND_SERVICE`, `MemoryMax=256M`) and the starter config (an existing `/etc/telltale/telltale.toml` is kept), then starts the service and waits until it's ready.
 ```sh
@@ -67,7 +67,7 @@ less install.sh                     # read before running as root
 sudo sh install.sh                  # the latest release; --edge: builds from main
 sudo -u telltale telltale auth setup-token -c /etc/telltale/telltale.toml
 ```
-**Guided setup.** Run in a terminal on a new machine, the installer asks one question first: press Enter for the recommended settings (the starter config above), or choose **Walk me through the options**. Each step shows its default in `[brackets]`; Enter or `skip` keeps it:
+**Guided setup.** Run in a terminal on a new machine, the installer asks one question first: press Enter for the recommended settings (the starter config: encrypted upstreams, one balanced blocklist, a 7-day query log), or choose **Walk me through the options**. Each step shows its default in `[brackets]`; Enter or `skip` keeps it:
 1. **Builds:** releases or edge.
 2. **Upstreams:** Cloudflare and Quad9 (encrypted, the default), one provider (Cloudflare, Quad9, Google, Mullvad, AdGuard), plain DNS for networks that block port 853, or your own server.
 3. **Starting blocklists:** one or more of HaGeZi Pro (the default), Light, Pro++, Threat Intelligence, Steven Black's hosts, and OISD small, or none (add lists later on the Lists page).

@@ -48,7 +48,7 @@ less install.sh                     # read it before running it as root
 sudo sh install.sh
 sudo -u telltale telltale auth setup-token -c /etc/telltale/telltale.toml     # then open http://<host>:8053/
 ```
-Prefer Docker? On any Docker host:
+Prefer Docker? On any Linux host with Docker:
 ```sh
 mkdir telltale && cd telltale
 curl -fsSLO https://raw.githubusercontent.com/paimonsoror/telltaledns/main/deploy/compose/compose.yaml
