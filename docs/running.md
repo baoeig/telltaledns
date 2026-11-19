@@ -1806,16 +1806,25 @@ groups, query log, and live query stream cover every node:
   the API documents (15 minutes of seconds, 7 days of minutes, 400 days of hours, and every
   day) is well under it. Reads that ask many nodes about many windows are limited by count as
   well: one read makes at most 4,096 calls (a node and a window of time is one call, so all of
-  history by the day is 87 calls a node, and a cluster of 47 nodes can ask for it whole; that
-  gains a window every 240 days, so the number falls by one about that often), and all the reads
-  together have at most 32,768 calls running or holding an answer their read hasn't taken yet.
-  That limits how many calls and answers are held at once, not how many bytes: an answer can be
-  up to 1 MiB, and merging the answers into the page isn't limited by it. A read over the 4,096
-  is answered from this node alone, with the other nodes in `missingNodes`, every time: narrow
-  the `scope`, or ask for a coarser `step` or a shorter range. A read that finds too many reads
-  waiting or the call limit spent is answered the same way, and works again a moment later. In
-  Kubernetes, the controller counts each resolver pod as a node. A node that refuses cluster
-  reads, for any of these reasons, says so in its log as a warning, once a minute at most.
+  history by the day is 87 calls a node, and a cluster of 47 nodes can ask for it whole; the
+  range gains a window every 240 days, and the number of nodes is 4,096 divided by the windows,
+  plus this node, so it falls by one every one or two windows), and all the reads together have
+  at most 32,768 calls running or holding an answer their read hasn't taken yet. They are limited
+  in bytes too: the answers one read holds can be at most 20 MiB, and the answers all reads hold
+  40 MiB. An answer that would pass that is dropped as it arrives, and its node is listed in
+  `missingNodes` as one that didn't answer; the rest of the read is kept. On a cluster of 3 or
+  more nodes that happens to the API's longest ranges (7 days of minutes or 400 days of hours,
+  about 15 MiB of answers from each other node), not to the dashboard's (48 hours of minutes is
+  about 4 MiB a node, 17 MiB from 4). Reading a range takes the node that merges it about 7
+  times the answers' bytes in memory, which is why the limit is there: one read at 20 MiB takes
+  a node to about 185 MiB, under the 256 MiB the Pi's service may use. A read over the 4,096 is
+  answered from this node alone, with the other nodes in `missingNodes`, every time, and so is
+  the part of a read over 20 MiB: narrow the `scope`, or ask for a coarser `step` or a shorter
+  range. A read that finds too many reads waiting, the call limit spent, or the 40 MiB held is
+  answered the same way, and works again a moment later. In Kubernetes, the controller counts
+  each resolver pod as a node. A node that refuses cluster reads, for any of these reasons,
+  says so in its log as a warning, once a minute at most, and counts them in
+  `telltale_federated_refused_total{reason}` (`waits`, `spent`, `ceiling`, `bytes`).
 - `scope` on a stats or query-log request narrows it: `cluster` (the default, every node),
   `site:<name>` (the nodes of one site, e.g. `site:k8s`), `node:<name or ID>` (one node, by
   site, pod, or node ID), or `node:local` (the node you're asking). For example
@@ -2165,7 +2174,14 @@ telltale cluster status
     primary, the other voters under automatic failover, and any other node only while a link
     to it is open or it was heard from in the last 15 seconds;
   - this node: `telltale_cluster_config_seq`, `telltale_cluster_behind_seconds`,
-    `telltale_cluster_sync_error` and `telltale_cluster_cert_expiry_timestamp_seconds`.
+    `telltale_cluster_sync_error` and `telltale_cluster_cert_expiry_timestamp_seconds`;
+  - the cluster reads this node refused since it started: `telltale_federated_refused_total{reason}`,
+    a counter. `waits`: too many reads were already waiting for a slow node; `spent`: the
+    32,768 calls all reads may have were in use; `ceiling`: the read asked for too much at once
+    (over 4,096 calls, or over 256 windows of time a node); `bytes`: it was sent, but an answer
+    was dropped because it would have passed the 20 MiB a read may hold or the 40 MiB all may.
+    The nodes it was for are in that read's `missingNodes`. A rate above zero for long means the
+    pages show partial results: see "One view of the whole cluster" under [Clusters](#clusters).
 
   The Helm chart's PrometheusRule alerts on a peer down for over a minute, configuration behind
   for over 30 s, failing syncs, and a certificate within 14 days of expiry.
