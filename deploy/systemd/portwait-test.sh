@@ -267,4 +267,113 @@ grep -qE '^[[:space:]]*systemctl[[:space:]]+enable[[:space:]]+telltale([[:space:
   || fail "ops_004_install_starts_once: the service isn't enabled (without --now)"
 ok ops_004_install_starts_once
 
+# ---- 10. e2e.sh's failure report says who held port 53, and never hangs -------------------------
+# The systemd e2e step failed on "Address already in use" on port 53 and the log didn't say who
+# held it. fail() in deploy/systemd/e2e.sh now records the sockets with their processes,
+# systemd-resolved's state, journal and configuration. Here it runs against fake tools.
+E2E=deploy/systemd/e2e.sh
+sed -n '/^# BEGIN failure-report/,/^# END failure-report/p' "$E2E" > "$T/report.sh"
+[ -s "$T/report.sh" ] || fail "ops_004_e2e_failure_report: $E2E has no failure-report block"
+bash -n "$T/report.sh" || fail "ops_004_e2e_failure_report: the block isn't valid bash"
+RFAKE="$T/rfake"
+RBIN="$T/rbin"
+mkdir -p "$RFAKE" "$RBIN" "$T/work"
+cat > "$RBIN/ss" <<'EOF'
+#!/bin/sh
+[ -f "$RFAKE/hang" ] && exec sleep 30
+[ -f "$RFAKE/nobody" ] && exit 0
+case "$*" in
+  *-Hulpn*) echo 'UNCONN 0      0       127.0.0.53%lo:53 0.0.0.0:* users:(("systemd-resolve",pid=612,fd=13))' ;;
+  *-Htlpn*) echo 'LISTEN 0      4096    127.0.0.53%lo:53 0.0.0.0:* users:(("systemd-resolve",pid=612,fd=14))' ;;
+esac
+EOF
+cat > "$RBIN/systemctl" <<'EOF'
+#!/bin/sh
+[ -f "$RFAKE/hang" ] && exec sleep 30
+echo '● systemd-resolved.service - Network Name Resolution'
+echo '     Active: active (running) since Wed 2026-11-18 00:35:14 UTC; 1s ago'
+EOF
+cat > "$RBIN/journalctl" <<'EOF'
+#!/bin/sh
+[ -f "$RFAKE/hang" ] && exec sleep 30
+case "$*" in
+  *systemd-resolved*) echo 'Nov 18 00:35:14 runner systemd-resolved[612]: Listening on stub address 127.0.0.54' ;;
+  *telltale*)
+    echo 'Nov 18 00:35:14 runner systemd[1]: Started telltale.service - TelltaleDNS resolver.'
+    echo 'Nov 18 00:35:14 runner telltale[700]: 14.100 INFO anomaly baselines loaded'
+    echo 'Nov 18 00:35:14 runner telltale[700]: telltale: Udp 0.0.0.0:53: Address already in use (os error 98)'
+    echo 'Nov 18 00:35:14 runner systemd[1]: telltale.service: Main process exited, code=exited, status=1/FAILURE' ;;
+esac
+EOF
+cat > "$RBIN/systemd-analyze" <<'EOF'
+#!/bin/sh
+[ -f "$RFAKE/hang" ] && exec sleep 30
+printf '%s\n' '# /etc/systemd/resolved.conf' '[Resolve]' '#DNS=' '' '# /etc/systemd/resolved.conf.d/telltale.conf' '[Resolve]' 'DNSStubListener=no'
+EOF
+chmod +x "$RBIN"/*
+# e2e.sh's own wiring: the block, then the ERR trap that calls fail, then a failing command.
+cat > "$T/harness.sh" <<'EOF'
+set -euo pipefail
+. "$1"
+trap 'fail "line $LINENO: \`$BASH_COMMAND\` failed"' ERR
+false
+EOF
+# run_report [PATH]: the failure path as e2e.sh takes it; sets RC, OUT, MS.
+run_report() {
+  local start end
+  start=$(date +%s%N)
+  set +e
+  OUT=$(PATH="${1:-$RBIN:$PATH}" RFAKE="$RFAKE" WORK="$T/work" REPORT_TIMEOUT="${REPORT_TIMEOUT_TEST:-8}" \
+    bash "$T/harness.sh" "$T/report.sh" 2>&1)
+  RC=$?
+  set -e
+  end=$(date +%s%N)
+  MS=$(((end - start) / 1000000))
+}
+rm -f "$RFAKE/hang" "$RFAKE/nobody" "$T/work/guided.out"
+printf 'install line one\nTelltaleDNS is running\n' > "$T/work/guided.out"
+run_report
+[ "$RC" = 1 ] || fail "ops_004_e2e_failure_report_names_the_holder: rc=$RC: $OUT"
+[ "$(printf '%s\n' "$OUT" | head -1 | cut -c1-6)" = 'FAIL: ' ] \
+  || fail "ops_004_e2e_failure_report_names_the_holder: no FAIL line first: $OUT"
+for want in 'udp UNCONN' 'tcp LISTEN' 'systemd-resolve",pid=612' 'Active: active (running)' 'Listening on stub address' \
+            '# /etc/systemd/resolved.conf.d/telltale.conf' 'DNSStubListener=no' 'Address already in use' 'install line one'; do
+  has "$want" || fail "ops_004_e2e_failure_report_names_the_holder: the report lacks '$want': $OUT"
+done
+has '#DNS=' && fail "ops_004_e2e_failure_report_names_the_holder: commented defaults weren't left out of the resolved.conf listing"
+[ "$(printf '%s\n' "$OUT" | grep -c '^::error title=systemd-e2e::')" = 1 ] \
+  || fail "ops_004_e2e_failure_report_names_the_holder: not exactly one annotation: $OUT"
+ann=$(printf '%s\n' "$OUT" | grep '^::error title=systemd-e2e::')
+for want in 'port 53: udp UNCONN' 'DNSStubListener=no' 'Address already in use' 'install line one'; do
+  case "$ann" in *"$want"*) ;; *) fail "ops_004_e2e_failure_report_names_the_holder: the annotation lacks '$want': $ann" ;; esac
+done
+[ "${#ann}" -lt 6000 ] || fail "ops_004_e2e_failure_report_names_the_holder: the annotation is ${#ann} characters"
+ok ops_004_e2e_failure_report_names_the_holder
+
+# Nobody holds the port: it says so.
+touch "$RFAKE/nobody"
+run_report
+[ "$RC" = 1 ] && has '(nothing)' && has 'port 53: nothing' || fail "ops_004_e2e_failure_report_nobody: rc=$RC: $OUT"
+ok ops_004_e2e_failure_report_nobody
+rm -f "$RFAKE/nobody"
+
+# Every tool hangs: still finishes, still prints the FAIL line and the annotation, exit 1.
+touch "$RFAKE/hang"
+REPORT_TIMEOUT_TEST=1 run_report
+[ "$RC" = 1 ] || fail "ops_004_e2e_failure_report_never_hangs: rc=$RC: $OUT"
+[ "$MS" -lt 30000 ] || fail "ops_004_e2e_failure_report_never_hangs: took $MS ms with every tool hanging (1 s timeouts)"
+[ "$(printf '%s\n' "$OUT" | grep -c '^::error title=systemd-e2e::')" = 1 ] || fail "ops_004_e2e_failure_report_never_hangs: no annotation: $OUT"
+ok ops_004_e2e_failure_report_never_hangs
+rm -f "$RFAKE/hang"
+
+# The tools aren't there at all (a minimal machine): the same.
+mkdir -p "$T/rnotools"
+for tool in awk tr sleep cat sed date grep head tail cut timeout bash printf; do
+  p=$(command -v "$tool" 2>/dev/null) && [ -x "$p" ] && ln -sf "$p" "$T/rnotools/$tool"
+done
+run_report "$T/rnotools"
+[ "$RC" = 1 ] && [ "$(printf '%s\n' "$OUT" | grep -c '^::error title=systemd-e2e::')" = 1 ] \
+  || fail "ops_004_e2e_failure_report_without_tools: rc=$RC: $OUT"
+ok ops_004_e2e_failure_report_without_tools
+
 echo "PASS ($n checks)"
