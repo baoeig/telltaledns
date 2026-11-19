@@ -33,9 +33,11 @@
     { key: 'from', label: 'From (email)', type: 'text', placeholder: 'you@gmail.com' },
     { key: 'to', label: 'To (email, one per line)', type: 'lines', placeholder: 'you@gmail.com' },
     { key: 'username', label: 'Account (email)', type: 'text', placeholder: 'you@gmail.com' },
+    // REQ: OBS-010 (ADR-179) — a destination with a credential file is an administrator's.
     { key: 'password_file', label: 'Password file (email)', type: 'text', placeholder: '/run/secrets/smtp-password',
-      help: 'A file on the node holding the password (a Gmail app password, for example). The password itself never goes through the UI.' },
-    { key: 'token_file', label: 'Token file (ntfy, Gotify)', type: 'text', placeholder: '/run/secrets/ntfy-token', advanced: true },
+      help: 'A file on the node holding the password (a Gmail app password, for example). The password itself never goes through the UI. An administrator sets this.' },
+    { key: 'token_file', label: 'Token file (ntfy, Gotify)', type: 'text', placeholder: '/run/secrets/ntfy-token', advanced: true,
+      help: 'A file on the node holding the access token. An administrator sets this.' },
     { key: 'tls_ca', label: 'Private CA (email)', type: 'text', placeholder: '/etc/telltale/mail-ca.pem', advanced: true },
   ];
   const conditions = [

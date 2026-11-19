@@ -185,6 +185,7 @@ to = ["phone"]</code></pre>
         <li><code>POST /api/v1/alerts/destinations/{name}/test</code>: send a test message.</li>
       </ul>
       <p class="muted">Agent tokens need <code>config:write:alerts</code>. Only file paths for secrets go through the API.</p>
+      <p class="muted"><b>Credential files are set by an administrator:</b> a destination that names <code>token_file</code> or <code>password_file</code> is added or changed in the UI or the API only by an admin (not by an agent token), because the node sends what the file holds to the destination. The operator role still covers every other destination, deleting any, and <b>Send test</b>. Destinations in the config files aren't affected.</p>
     </div>
   </div>
   <p><b>Rules worth starting with:</b> <code>upstream_down</code>, <code>servfail_rate</code>, <code>list_failing</code>, <code>disk_full</code>, <code>slo_burn</code>, <code>probe_failing</code>, and <code>cert_expiring</code> if you serve encrypted DNS. In a cluster add <code>node_down</code>, and <code>sync_lag</code> with <code>for_secs</code> around 300 so a normal sync stays quiet. Every condition, and what each sends one alert per, is in the <a href="https://github.com/paimonsoror/telltaledns/blob/main/docs/running.md#alerts">Alerts docs</a>.</p>

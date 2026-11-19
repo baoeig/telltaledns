@@ -37,7 +37,7 @@
           "config"
         ],
         "summary": "Add or change an alert destination (OBS-010, T9.6).",
-        "description": "The body has the same fields as `[[alerts.destination]]` (the name comes from the path):\n`{\"type\": \"ntfy\", \"url\": \"https://ntfy.sh/my-topic\"}`, or for email\n`{\"type\": \"email\", \"url\": \"smtp://smtp.gmail.com:587\", \"from\": \"me@gmail.com\", \"to\":\n[\"me@gmail.com\"], \"username\": \"me@gmail.com\", \"password_file\": \"/run/secrets/smtp\"}`.\nSecrets stay in files on the node (`token_file`, `password_file`): only the path is sent.\nA destination the config files define is overridden until this one is deleted.",
+        "description": "The body has the same fields as `[[alerts.destination]]` (the name comes from the path):\n`{\"type\": \"ntfy\", \"url\": \"https://ntfy.sh/my-topic\"}`, or for email\n`{\"type\": \"email\", \"url\": \"smtp://smtp.gmail.com:587\", \"from\": \"me@gmail.com\", \"to\":\n[\"me@gmail.com\"], \"username\": \"me@gmail.com\", \"password_file\": \"/run/secrets/smtp\"}`.\nSecrets stay in files on the node (`token_file`, `password_file`): only the path is sent.\nA destination that names either file, before or after the change, is added or changed only\nby an administrator (an admin's sign-in or API token; agent tokens can't); without one, or to\ndelete one, the operator role is enough.\nA destination the config files define is overridden until this one is deleted.",
         "operationId": "put_alert_destination",
         "parameters": [
           {
@@ -94,6 +94,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ConfigChange"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The destination names a credential file (`token_file`, `password_file`), before or after the change, and the caller isn't an administrator.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
                 }
               }
             }

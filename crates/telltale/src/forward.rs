@@ -41,6 +41,12 @@ pub(crate) enum Write {
         /// REQ: OBS-024 — absent from older nodes (N−1): no simulation.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         simulate: Option<SimulateOpts>,
+        /// REQ: OBS-010, API-002 (ADR-179) — the entry node found the caller to be an
+        /// administrator. Absent from older nodes (N−1): not an administrator's write, so the
+        /// primary refuses it whatever needs one (it trusts the entry node for who the caller
+        /// is, as it does for `by`).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        by_admin: bool,
     },
     Client {
         name: String,
@@ -65,6 +71,7 @@ impl From<ManagedWrite> for Write {
             expect: w.expect,
             by: w.by,
             simulate: w.simulate,
+            by_admin: w.by_admin,
         }
     }
 }
@@ -159,6 +166,7 @@ async fn apply(src: &Sources, local: &Shared, cluster: &Cluster, peer: &str, w: 
             expect,
             by,
             simulate,
+            by_admin,
         } => {
             let action = match kind {
                 ManagedKind::Record => "record",
@@ -188,6 +196,7 @@ async fn apply(src: &Sources, local: &Shared, cluster: &Cluster, peer: &str, w: 
                     expect,
                     by: format!("{by} via {via}"),
                     simulate,
+                    by_admin,
                 })
                 .await
                 .map(|c| serde_json::to_value(c).unwrap_or_default());
@@ -423,6 +432,7 @@ mod tests {
                 auto: false,
                 until_s: None,
             }),
+            by_admin: false,
         }
         .into();
         let back: Write = serde_json::from_slice(&serde_json::to_vec(&w).unwrap()).unwrap();
@@ -447,5 +457,37 @@ mod tests {
             panic!("expected managed")
         };
         assert!(simulate.is_none());
+    }
+
+    // REQ: OBS-010, API-002 (ADR-179) — whether the caller is an administrator crosses the
+    // channel; a write from an older node, which doesn't say, is not an administrator's, and a
+    // write that isn't one's sends nothing new (an older primary reads it as before).
+    #[test]
+    fn obs_010_a_forwarded_write_says_whether_an_admin_made_it() {
+        let w = |by_admin| -> Write {
+            ManagedWrite {
+                kind: ManagedKind::AlertDestination,
+                name: "phone".into(),
+                body: Some(serde_json::json!({"type": "ntfy", "url": "https://ntfy.sh/x"})),
+                dry_run: false,
+                expect: None,
+                by: "root".into(),
+                simulate: None,
+                by_admin,
+            }
+            .into()
+        };
+        let admin = serde_json::to_vec(&w(true)).unwrap();
+        let Write::Managed { by_admin, .. } = serde_json::from_slice(&admin).unwrap() else {
+            panic!("expected managed")
+        };
+        assert!(by_admin);
+        let plain = serde_json::to_string(&w(false)).unwrap();
+        assert!(!plain.contains("by_admin"), "{plain}");
+        let old = br#"{"write":"managed","kind":"alert_destination","name":"x","body":null,"dry_run":false,"expect":null,"by":"bob"}"#;
+        let Write::Managed { by_admin, .. } = serde_json::from_slice(old).unwrap() else {
+            panic!("expected managed")
+        };
+        assert!(!by_admin, "an older node's write isn't an administrator's");
     }
 }

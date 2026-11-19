@@ -837,6 +837,11 @@ pub struct ManagedWrite {
     pub by: String,
     /// REQ: OBS-024 — with `dry_run`: also replay the query log (`simulation`).
     pub simulate: Option<SimulateOpts>,
+    /// REQ: OBS-010, API-002 (ADR-179) — the caller is an administrator: an admin's own sign-in,
+    /// HTTP Basic, or API token, not an agent token. Only an administrator adds or changes an
+    /// alert destination that names a credential file. Writes the server makes itself, and a
+    /// forwarded write that doesn't say (from an older node), are not an administrator's.
+    pub by_admin: bool,
 }
 
 /// REQ: OBS-024 (T13.1) — a dry run's `simulate` and `simulateUntil` parameters.

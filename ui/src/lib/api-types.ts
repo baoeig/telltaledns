@@ -42,6 +42,9 @@ export interface paths {
          *     `{"type": "email", "url": "smtp://smtp.gmail.com:587", "from": "me@gmail.com", "to":
          *     ["me@gmail.com"], "username": "me@gmail.com", "password_file": "/run/secrets/smtp"}`.
          *     Secrets stay in files on the node (`token_file`, `password_file`): only the path is sent.
+         *     A destination that names either file, before or after the change, is added or changed only
+         *     by an administrator (an admin's sign-in or API token; agent tokens can't); without one, or to
+         *     delete one, the operator role is enough.
          *     A destination the config files define is overridden until this one is deleted.
          */
         put: operations["put_alert_destination"];
@@ -8181,6 +8184,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ConfigChange"];
+                };
+            };
+            /** @description The destination names a credential file (`token_file`, `password_file`), before or after the change, and the caller isn't an administrator. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
             /** @description The configuration changed since the If-Match version: re-read it and retry. */

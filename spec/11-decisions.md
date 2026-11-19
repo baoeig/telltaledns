@@ -1500,6 +1500,20 @@ Notes on the table:
 - `failover-e2e.sh` and `deploy/cluster/e2e.sh` pass on the new binary.
 - Twenty runs can't show a rate of 10⁻⁴; the simulation is the proof.
 
+## ADR-179 — A credential file on an alert destination made through the API is set by an administrator (Proposed)
+**Context:** an alert destination can name `token_file` (ntfy, Gotify) or `password_file` (email). The node reads the file when it sends and passes what it holds on: as a Bearer token or in Gotify's URL to the destination's address, or in the login to the mail server. Destinations made through the API and the UI (T9.6, an override kind of ADR-069) needed the operator role (agents: `config:write:alerts`), and nothing said which file one could name. So the choice of a file, and of where its content goes, was open to a role that isn't trusted with the node's secrets: backups, users and the cluster's keys are an administrator's. Found in a code review on 2026-11-19.
+**Decision:**
+- **Who.** Only an administrator adds or changes an alert destination made through the API that names a credential file, before or after the change: an admin's own sign-in (a session or HTTP Basic) or an admin-scoped API token. An agent token never counts as one, whoever owns it and whatever else it may do (an admin's token that also holds `cluster:admin` included): a credential file is the kind of secret a backup holds, and agents can't download backups either. MCP calls are agent calls.
+- Anyone else gets 403 `forbidden` naming the field, with the hint "Setting or changing a credential file needs an administrator", and a dry run is refused the same way. They keep every destination without a credential file, may delete any destination (that only takes something away), and may send a test to any (it goes where an administrator chose).
+- The check runs where the write is planned, on the node that applies it, against the destination in effect (the files' or the API's), before anything else in the body is checked. A write forwarded from a replica carries whether the entry node found the caller to be an administrator (`by_admin`). The primary trusts the entry node for that as it already does for who the caller is (ADR-054: members authenticate each other with mTLS, and an ephemeral member can't forward writes), so the flag gives a member nothing it couldn't do before. A write from a node that doesn't send the flag is not an administrator's.
+- Every route that writes an alert destination goes through this: `PUT`/`DELETE /api/v1/alerts/destinations/{name}`, their dry runs, a replica's forwarded write, and MCP (whose tools call the same routes with the agent's own credentials). There is no other: no bulk or import route, no MCP tool, and no plan tool writes one.
+- REQ: OBS-010, API-002, in `credential_guard` (`api_backend.rs`), `ManagedWrite::by_admin` and the forwarded `Write::Managed`.
+**Not covered:** destinations in the config files, the Helm values or Git (whoever writes those controls the node); an administrator (trusted with the node's secrets already).
+**Consequences:**
+- An admin's agent token, or an admin working through MCP, can no longer add or change a destination with a credential file; the admin's own sign-in or an admin-scoped API token can.
+- Mixed versions: an older primary applies a forwarded write without this check (the node that applies the write decides, so the rule holds once the primary runs this version); a primary that runs it refuses an administrator's credential-file change that an older replica forwards, until that replica is upgraded or the change is made on the primary.
+**Verification:** `obs_010_only_an_admin_sets_a_credential_file` and `obs_010_only_an_admin_changes_a_destination_with_a_credential_file` (the real routes, sign-in and backend: operators, an operator's and an admin's agent tokens, dry runs, an address, account or file change, deletes); `obs_010_a_write_says_whether_an_administrator_made_it` (which callers are an administrator); `obs_010_a_forwarded_write_says_whether_an_admin_made_it` (the flag on the wire, and a write from an older node).
+
 ## ADR-172 — A cluster support package: each node redacts its own part under one key, with labels every node agrees on (Accepted)
 **Context:** GitHub issue #55 (the later phase of #50, ADR-156): in a cluster the problem is often on another node, and a package of the node that answered covers only that one. ADR-156 settled the direction (each node redacts before its data leaves it, the asking node's key travels over the mutually authenticated stream) and left three points: how the key reaches the others, what an older peer does, and the size cap across nodes. One more came up in building it: ADR-156 numbers a name by when it is first met (`device-3`), so two nodes would give one device two labels, and the issue asks that a device have one name on every node.
 **Decision:**
@@ -2613,6 +2627,7 @@ A list the configuration disables (`enabled = false`) is left out of the `tellta
 - Not done: HTML mail, DKIM (the provider signs), a queue (a failed alert is logged like any destination).
 
 **Consequences:** email works with any provider that offers SMTP submission, for about 30 KiB of code and no new dependency.
+**Amended by ADR-179:** on a destination made through the API, `password_file` (and ntfy's or Gotify's `token_file`) is set by an administrator.
 
 ## ADR-084 — WASM upstream plugins: deferred, and wasmi rather than wasmtime if built (Accepted)
 **Context:** M8 lists WASM upstream plugins; `04` §3 and ADR-007 name wasmtime behind a feature flag. T7.16 shipped the out-of-process plugins (`unix://` and `exec://`, DNS wire format), which already let any language implement an upstream.
