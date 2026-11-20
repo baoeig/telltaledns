@@ -417,8 +417,10 @@ async fn simulate(
 /// program or socket that the configuration in effect doesn't already name: a candidate with a
 /// new zone file, hosts file, list file, upstream TLS file or plugin upstream is refused before
 /// anything is read (alike whether the file is there or not), and nothing from the file comes
-/// back. A candidate that names only the configuration's own files runs as before, and so does an
-/// administrator's.
+/// back. A candidate that names only the configuration's own files isn't refused, and neither is
+/// an administrator's: both go on to this node's own checks. (The query log is off here, so those
+/// stop before anything is read or replayed, and the test never takes the node's one simulation
+/// slot, which other tests in this binary use.)
 #[tokio::test]
 async fn obs_024_a_simulation_below_admin_names_no_new_local_file() {
     let n = Node::new(telltale_config::Config::default());
@@ -431,9 +433,9 @@ async fn obs_024_a_simulation_below_admin_names_no_new_local_file() {
     std::fs::write(path("list-new.txt"), format!("{mark}.example\n")).unwrap();
     std::fs::write(path("ca-new.pem"), format!("-----BEGIN {mark}\n")).unwrap();
     let missing = path("not-there");
-    // The configuration in effect reads one zone file of its own.
+    // The configuration in effect reads one zone file of its own; no query log.
     let cfg: telltale_config::Config = toml::from_str(&format!(
-        "[[zone]]\nname = \"corp.example\"\nfile = \"{}\"\n",
+        "[[zone]]\nname = \"corp.example\"\nfile = \"{}\"\n[telemetry.qlog]\nenabled = false\n",
         path("zone-ok.db")
     ))
     .unwrap();
@@ -492,26 +494,36 @@ async fn obs_024_a_simulation_below_admin_names_no_new_local_file() {
             assert_eq!(v1, v2, "{who}, {what}: there or not, the same answer");
         }
     }
-    // The configuration's own zone file, and a new inline list: not refused.
-    let (s, v) = simulate(
-        &n,
-        &n.viewer,
-        serde_json::json!({ "zone": own_zone, "list": [{ "name": "new", "rules": ["||x.example^"] }] }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "{v}");
-    // An administrator's candidate is read as before: the new zone file's mistake is named.
-    let (s, v) = simulate(&n, &n.admin, zone(&path("zone-new.db"))).await;
-    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
-    assert!(v.to_string().contains(&mark), "{v}");
+    // The configuration's own zone file, and a new inline list: not refused; nor is an
+    // administrator's new zone file. Both reach this node's own checks (no query log here).
+    for (who, creds, candidate) in [
+        (
+            "viewer, the configuration's own files",
+            &n.viewer,
+            serde_json::json!({ "zone": own_zone, "list": [{ "name": "new", "rules": ["||x.example^"] }] }),
+        ),
+        (
+            "admin, a new zone file",
+            &n.admin,
+            zone(&path("zone-new.db")),
+        ),
+    ] {
+        let (s, v) = simulate(&n, creds, candidate).await;
+        assert_eq!(
+            (s, v["reason"].as_str()),
+            (StatusCode::OK, Some("no_query_log")),
+            "{who}: {v}"
+        );
+    }
 }
 
 /// REQ: OBS-024 (ADR-180) — a dry run's simulation is the same door: an operator's change that
 /// names a new TLS file is planned as before, and its simulation says it wasn't run, without
-/// reading the file; an administrator's runs as before.
+/// reading the file; an administrator's goes on to this node's own checks (the query log is off
+/// here, so nothing is read and the node's one simulation slot isn't taken).
 #[tokio::test]
 async fn obs_024_a_dry_run_simulation_below_admin_reads_no_new_local_file() {
-    let n = Node::new(telltale_config::Config::default());
+    let n = Node::new(toml::from_str("[telemetry.qlog]\nenabled = false\n").unwrap());
     let d = n.data();
     let ca = format!("{d}/ca-new.pem");
     std::fs::write(&ca, format!("-----BEGIN {}\n", marker())).unwrap();
@@ -524,6 +536,112 @@ async fn obs_024_a_dry_run_simulation_below_admin_reads_no_new_local_file() {
     assert_eq!(v["simulation"]["available"], false, "{v}");
     assert_eq!(v["simulation"]["reason"], "local_file", "{v}");
     let (s, v) = while_busy(&n, "PUT", uri, &n.admin, &body).await;
-    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
-    assert!(v.to_string().contains("illegal section start"), "{v}");
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["simulation"]["reason"], "no_query_log", "{v}");
+}
+
+/// A plain HTTP server on loopback that answers every request with `body`.
+fn serve(body: Vec<u8>) -> String {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut c) = conn else { continue };
+            let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while let Ok(k) = c.read(&mut chunk) {
+                if k == 0 {
+                    break;
+                }
+                head.extend_from_slice(&chunk[..k]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = c.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = c.write_all(&body);
+        }
+    });
+    url
+}
+
+/// REQ: OBS-024 (ADR-180) — a simulation downloads a candidate's lists under this node's rules:
+/// the candidate's `[filter]` settings (link-local addresses allowed, the byte cap, the timeout)
+/// take effect only after a restart, and a list's own `max_bytes` can't go past what this node
+/// allows. For every caller, an administrator included.
+#[tokio::test]
+async fn obs_024_a_simulation_keeps_this_nodes_download_rules() {
+    let n = Node::new(telltale_config::Config::default());
+    // This node: at most 1 KiB per list.
+    configure(
+        &n,
+        toml::from_str("[filter]\nmax_list_bytes = \"1KiB\"\n").unwrap(),
+    );
+    let url = serve("a.example\n".repeat(400).into_bytes());
+    let loose = serde_json::json!({
+        "allow_link_local_urls": true, "max_list_bytes": "64MiB", "fetch_timeout_secs": 5,
+    });
+    for (who, creds) in [("viewer", &n.viewer), ("admin", &n.admin)] {
+        for (what, candidate, refusal) in [
+            (
+                "a link-local address",
+                // An IPv6 link-local address without a zone: refused before any connection, and
+                // nothing could be reached there anyway.
+                serde_json::json!({ "filter": loose, "list": [{ "name": "remote", "url": "http://[fe80::1]:9/list.txt" }] }),
+                "link-local",
+            ),
+            (
+                "this node's byte cap",
+                serde_json::json!({ "filter": loose, "list": [{ "name": "big", "url": format!("{url}/big.txt") }] }),
+                "-byte limit",
+            ),
+            (
+                "a list's own cap",
+                serde_json::json!({ "list": [{ "name": "big2", "url": format!("{url}/big2.txt"), "max_bytes": "64MiB" }] }),
+                "-byte limit",
+            ),
+        ] {
+            let (s, v) = simulate(&n, creds, candidate).await;
+            assert!(
+                v["detail"].as_str().unwrap_or("").contains(refusal),
+                "{who}, {what}: {s} {v}"
+            );
+        }
+    }
+}
+
+/// REQ: API-002 (ADR-180) — what a caller below admin can still tell from a check that names a
+/// valid TLS file: that it parses as certificates (the upstream is then built and asked), never
+/// what it holds. Here nothing listens where it's asked (loopback), so no network is used.
+#[tokio::test]
+async fn api_002_a_valid_tls_file_in_a_check_shows_only_that_it_builds() {
+    let n = Node::new(telltale_config::Config::default());
+    let pem = rcgen::generate_simple_self_signed(vec!["ca.example".to_owned()])
+        .unwrap()
+        .cert
+        .pem();
+    let ca = format!("{}/ca-valid.pem", n.data());
+    std::fs::write(&ca, &pem).unwrap();
+    let body = serde_json::json!({ "url": "tls://127.0.0.1:9", "tls_server_name": "dns.example", "tls_ca": ca });
+    let (s, v) = n
+        .send("POST", "/api/v1/checks/upstream", &n.operator, Some(body))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["ok"], false, "{v}");
+    assert_ne!(v["detail"], "not built", "it builds: {v}");
+    let text = v.to_string();
+    for line in pem
+        .lines()
+        .filter(|l| l.len() > 16 && !l.starts_with("-----"))
+    {
+        assert!(!text.contains(line), "{v}");
+    }
 }
