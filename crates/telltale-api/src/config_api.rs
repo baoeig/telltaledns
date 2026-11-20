@@ -166,14 +166,16 @@ pub(crate) fn routes(backend: Arc<dyn Backend>, auth: Arc<Auth>) -> Router {
 /// e.g. `{"url": "tls://9.9.9.9", "tls_server_name": "dns.quad9.net"}`. A name the config files use is overridden: this definition replaces theirs
 /// until it's deleted again (`GET /api/v1/config/overrides` lists such changes). The whole
 /// configuration is checked before anything is stored. On a node whose configuration comes from
-/// Git, the response's `toml` says what to add to the repository to keep the change.
+/// Git, the response's `toml` says what to add to the repository to keep the change. Plugin
+/// upstreams (`exec://`, `unix://`, and `args`) are defined in the config file: such a body is
+/// refused for everyone, an administrator included (422, ADR-180).
 #[utoipa::path(put, path = "/api/v1/upstreams/{name}", tag = "config",
     params(("name" = String, Path, description = "The name."), DryRun),
     request_body = Object,
     responses(
         (status = 200, body = ConfigChange, description = "Applied (or, with dryRun, what would change)."),
         (status = 412, body = Problem, description = "The configuration changed since the If-Match version: re-read it and retry."),
-        (status = 422, body = Problem, description = "A field is wrong, or the configuration wouldn't be valid: problem+json says which."),
+        (status = 422, body = Problem, description = "A field is wrong, the configuration wouldn't be valid, or the upstream is a plugin (`exec://`, `unix://`): problem+json says which."),
     ))]
 pub(crate) async fn put_upstream(
     State((backend, auth)): State<Ctx>,
@@ -839,12 +841,14 @@ pub(crate) async fn test_alert_destination(
 /// builds it and asks it for the root's NS records, as health checks do, and answers with what
 /// happened: `ok` with the rcode, records, and time, or the error (a bad URL, a TLS name that
 /// doesn't match, a timeout). Nothing is saved; the check is audited. Needs the operator role
-/// (agents: `config:write:upstreams`).
+/// (agents: `config:write:upstreams`). A plugin draft (`exec://`, `unix://`, `args`) is refused
+/// before anything is built, for everyone: plugin upstreams are defined in the config file
+/// (ADR-180).
 #[utoipa::path(post, path = "/api/v1/checks/upstream", tag = "config",
     request_body = Object,
     responses(
         (status = 200, body = crate::model::CheckResult, description = "Answered, or why not."),
-        (status = 422, body = Problem, description = "The body isn't an upstream (an unknown or mistyped field)."),
+        (status = 422, body = Problem, description = "The body isn't an upstream (an unknown or mistyped field), or it's a plugin (`exec://`, `unix://`)."),
     ))]
 pub(crate) async fn check_upstream(
     State((backend, auth)): State<Ctx>,
@@ -1671,7 +1675,8 @@ pub(crate) async fn delete_records(
 /// Every name under `domain` is asked of `servers` (in order, failing over) instead of the
 /// public upstreams: a work network's DNS over a VPN, a router that knows your devices, another
 /// lab. A bare address means plain DNS; `tls://` and `https://` URLs work too. Local names still
-/// answer first. Domains routed in the config files are read-only here (409).
+/// answer first. Domains routed in the config files are read-only here (409). A server can't be a
+/// plugin (`exec://`, `unix://`): those are defined in the config file (422, ADR-180).
 #[utoipa::path(put, path = "/api/v1/forwards/{domain}", tag = "config",
     params(("domain" = String, Path, description = "The domain, e.g. corp.example (its whole subtree is sent)."), DryRun),
     request_body = ForwardInput,
@@ -1679,7 +1684,7 @@ pub(crate) async fn delete_records(
         (status = 200, body = ConfigChange, description = "Applied (or, with dryRun, what would change)."),
         (status = 409, body = Problem, description = "Conflicts with the current state: problem+json says what to change."),
         (status = 412, body = Problem, description = "The configuration changed since the If-Match version: re-read it and retry."),
-        (status = 422, body = Problem, description = "A server isn't an address or a supported URL."),
+        (status = 422, body = Problem, description = "A server isn't an address or a supported URL, or it's a plugin (`exec://`, `unix://`)."),
     ))]
 pub(crate) async fn put_forward(
     State((backend, auth)): State<Ctx>,

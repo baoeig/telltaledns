@@ -3944,6 +3944,13 @@ fn forward_of(v: &serde_json::Value, name: &str) -> Result<crate::managed::Forwa
             format!("`{name}`: give at least one server"),
         ));
     }
+    // REQ: UPS-011, API-002 (ADR-180) — a server becomes an upstream: not a program or a socket.
+    if let Some(i) = servers
+        .iter()
+        .position(|s| crate::managed::is_plugin_url(&crate::managed::server_url(s)))
+    {
+        return Err(plugin_refused(&format!("servers[{i}]")));
+    }
     // REQ: DNS-022 — a stub zone's servers are asked directly, by address.
     if input.stub
         && let Some(bad) = servers
@@ -4495,14 +4502,16 @@ type AlsoStored = Vec<(&'static str, String, Option<String>)>;
 fn upstream_cascade(
     name: &str,
     file: &telltale_config::Config,
-    before_cfg: &telltale_config::Config,
     entries: &mut crate::managed::Entries,
 ) -> Result<(AlsoStored, Vec<String>), Problem> {
     use crate::managed::Named;
     let mut also = Vec::new();
     let mut groups = Vec::new();
-    for g in before_cfg
-        .upstream_group
+    // The groups as the files and the API define them: one made through the API may still name
+    // an upstream that the merge leaves out (REQ: UPS-011, ADR-180), and loses it here too.
+    let mut defined = file.upstream_group.clone();
+    crate::managed::apply_ovr(&mut defined, &entries.upstream_groups);
+    for g in defined
         .iter()
         .filter(|g| g.members.iter().any(|m| m.as_str() == name))
     {
@@ -4628,6 +4637,32 @@ fn named_json<T: crate::managed::Named + Serialize>(
         .map(|x| serde_json::to_value(x).unwrap_or_default())
 }
 
+/// REQ: UPS-011, API-002 (ADR-180) — an upstream that names a program the server would start
+/// (`exec://`, its `args`) or a local socket it would connect to (`unix://`) is a configuration
+/// file matter: a write through the API, a dry run, a forward's servers, and a pre-save check are
+/// refused for every caller, an administrator included. `field` is the one that says so.
+pub(crate) fn plugin_refused(field: &str) -> Problem {
+    Problem::new(
+        Code::InvalidConfig,
+        format!(
+            "`{field}`: an upstream that names a program or a local socket isn't set through the API"
+        ),
+    )
+    .hint("Plugin upstreams (`exec://`, `unix://`) are defined in the config file.")
+}
+
+/// REQ: UPS-011, API-002 (ADR-180) — the plugin field of an upstream's body (JSON), if any.
+fn plugin_field_of(body: &serde_json::Value) -> Option<&'static str> {
+    crate::managed::plugin_field(
+        body.get("url")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(""),
+        body.get("args")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|a| !a.is_empty()),
+    )
+}
+
 /// REQ: OBS-010, API-002 (ADR-179) — the credential-file fields an alert destination (as JSON)
 /// names.
 fn credential_fields(d: &serde_json::Value) -> Vec<&'static str> {
@@ -4717,13 +4752,19 @@ fn plan_override(
             .map(|d| serde_json::to_value(d).unwrap_or_default());
         credential_guard(w, current.as_ref())?;
     }
+    // REQ: UPS-011, API-002 (ADR-180) — likewise first: plugin upstreams are the config file's.
+    if w.kind == ManagedKind::Upstream
+        && let Some(field) = w.body.as_ref().and_then(plugin_field_of)
+    {
+        return Err(plugin_refused(field));
+    }
     // REQ: API-002 (T9.22) — removing an upstream also takes it out of its upstream groups.
     // A DELETE that reverts an override of the files' entry (or un-hides it) brings the
     // upstream back: nothing to cascade.
     let reverting = entries.upstreams.iter().any(|(n, _)| *n == name)
         && file.upstream.iter().any(|u| u.name() == name);
     let (also, also_groups) = if w.kind == ManagedKind::Upstream && w.body.is_none() && !reverting {
-        upstream_cascade(&name, &file, &before_cfg, &mut entries)?
+        upstream_cascade(&name, &file, &mut entries)?
     } else {
         (Vec::new(), Vec::new())
     };
@@ -6191,3 +6232,8 @@ mod rule_edit_tests {
 #[cfg(test)]
 #[path = "api_backend_cred_tests.rs"]
 mod cred_file_tests;
+
+// REQ: UPS-011, API-002 (ADR-180) — plugin upstreams and the API.
+#[cfg(test)]
+#[path = "api_backend_local_access_tests.rs"]
+mod local_access_tests;

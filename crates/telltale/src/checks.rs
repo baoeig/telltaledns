@@ -36,6 +36,11 @@ pub(crate) async fn upstream(
     body: serde_json::Value,
 ) -> Result<CheckResult, Problem> {
     let u: Upstream = draft(body, "upstream")?;
+    // REQ: UPS-011, API-002 (ADR-180) — refused before anything is built: a check starts no
+    // program and connects to no local socket, for anyone.
+    if let Some(field) = crate::managed::plugin_field(u.url.as_str(), !u.args.is_empty()) {
+        return Err(crate::api_backend::plugin_refused(field));
+    }
     // A configuration with only this upstream, in the default group.
     let mut c = cfg.clone();
     c.route.clear();

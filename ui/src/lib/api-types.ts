@@ -917,7 +917,9 @@ export interface paths {
          *     builds it and asks it for the root's NS records, as health checks do, and answers with what
          *     happened: `ok` with the rcode, records, and time, or the error (a bad URL, a TLS name that
          *     doesn't match, a timeout). Nothing is saved; the check is audited. Needs the operator role
-         *     (agents: `config:write:upstreams`).
+         *     (agents: `config:write:upstreams`). A plugin draft (`exec://`, `unix://`, `args`) is refused
+         *     before anything is built, for everyone: plugin upstreams are defined in the config file
+         *     (ADR-180).
          */
         post: operations["check_upstream"];
         delete?: never;
@@ -1628,7 +1630,8 @@ export interface paths {
          * @description Every name under `domain` is asked of `servers` (in order, failing over) instead of the
          *     public upstreams: a work network's DNS over a VPN, a router that knows your devices, another
          *     lab. A bare address means plain DNS; `tls://` and `https://` URLs work too. Local names still
-         *     answer first. Domains routed in the config files are read-only here (409).
+         *     answer first. Domains routed in the config files are read-only here (409). A server can't be a
+         *     plugin (`exec://`, `unix://`): those are defined in the config file (422, ADR-180).
          */
         put: operations["put_forward"];
         post?: never;
@@ -2834,7 +2837,9 @@ export interface paths {
          *     e.g. `{"url": "tls://9.9.9.9", "tls_server_name": "dns.quad9.net"}`. A name the config files use is overridden: this definition replaces theirs
          *     until it's deleted again (`GET /api/v1/config/overrides` lists such changes). The whole
          *     configuration is checked before anything is stored. On a node whose configuration comes from
-         *     Git, the response's `toml` says what to add to the repository to keep the change.
+         *     Git, the response's `toml` says what to add to the repository to keep the change. Plugin
+         *     upstreams (`exec://`, `unix://`, and `args`) are defined in the config file: such a body is
+         *     refused for everyone, an administrator included (422, ADR-180).
          */
         put: operations["put_upstream"];
         post?: never;
@@ -9658,7 +9663,7 @@ export interface operations {
                     "application/json": components["schemas"]["CheckResult"];
                 };
             };
-            /** @description The body isn't an upstream (an unknown or mistyped field). */
+            /** @description The body isn't an upstream (an unknown or mistyped field), or it's a plugin (`exec://`, `unix://`). */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -11016,7 +11021,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description A server isn't an address or a supported URL. */
+            /** @description A server isn't an address or a supported URL, or it's a plugin (`exec://`, `unix://`). */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -13738,7 +13743,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description A field is wrong, or the configuration wouldn't be valid: problem+json says which. */
+            /** @description A field is wrong, the configuration wouldn't be valid, or the upstream is a plugin (`exec://`, `unix://`): problem+json says which. */
             422: {
                 headers: {
                     [name: string]: unknown;

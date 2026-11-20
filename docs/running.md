@@ -757,6 +757,8 @@ args = ["--datacenter", "home"]
 ```
 - With `exec://`, TelltaleDNS starts the program and tells it where to listen in `TELLTALE_PLUGIN_SOCKET` (under `<data_dir>/plugins/`; `TELLTALE_UPSTREAM` has the upstream's name). If it exits, it's restarted after 1 s, then 2, 4, ... up to 60 s (back to 1 s once it has run for a minute). Its output goes to TelltaleDNS's log. It's stopped when the configuration changes or TelltaleDNS stops.
 - A plugin can't hurt the resolver: it's another process, every exchange has the upstream's timeout, and a dead plugin is a failing upstream like any other (health, breaker, the group's other members).
+- **Plugin upstreams are defined in the config file** (`telltale.toml`, the Helm values, or Git), since they name a program the node starts or a socket it connects to. The UI and the API refuse an upstream with `exec://`, `unix://` or `args`, and a forwarded domain with such a server, for every role, an administrator included (422, saying which field), and **Test it** (`POST /api/v1/checks/upstream`) refuses such a draft before anything is started (ADR-180).
+- **After upgrading,** a plugin upstream or forwarded domain made earlier in the UI or the API isn't used: nothing is started for it, the node logs one warning naming it, and an upstream of the same name in the config files is the one in effect. Its entry stays until you remove it (`DELETE /api/v1/upstreams/{name}` or `/api/v1/forwards/{domain}`); define the plugin in the config file instead. In a cluster, **upgrade the primary first**: a replica can't tell an entry an older primary made through the API from one in that primary's config files.
 
 ## How a query is answered
 ```mermaid
@@ -3091,7 +3093,7 @@ Changes are stored in `state.db`, next to named devices and local names. **The c
 
 **Keep it in Git.** On a node whose configuration comes from Git (`[cluster] config_source = "gitops"`, as with the Helm chart and Argo CD or Flux), the change works at once, but a rebuild from Git won't have it. After **Apply** the UI shows the TOML to add to the repository (with the Helm chart: under `config:` in the values) with a **Copy** button, or which block to remove. Once Git has it, **Revert to the file** removes the UI's copy. The API returns the same text as `keepInGit`.
 
-The same through the API: `PUT` or `DELETE` on `/api/v1/upstreams/{name}`, `/api/v1/upstream-groups/{name}`, `/api/v1/lists/{name}`, and `/api/v1/groups/{name}`, with `?dryRun=true` to preview. The body has the same fields as the TOML section. `GET /api/v1/config/entries?kind=list` lists the entries with their sources.
+The same through the API: `PUT` or `DELETE` on `/api/v1/upstreams/{name}`, `/api/v1/upstream-groups/{name}`, `/api/v1/lists/{name}`, and `/api/v1/groups/{name}`, with `?dryRun=true` to preview. The body has the same fields as the TOML section. `GET /api/v1/config/entries?kind=list` lists the entries with their sources. Plugin upstreams (`exec://`, `unix://`) aren't made here: they're defined in the config file ([Plugin upstreams](#plugin-upstreams)).
 
 ## API
 A REST API (JSON) listens on `0.0.0.0:8053` by default and also serves `/metrics` and the health probes:

@@ -326,6 +326,114 @@ pub(crate) fn server_url(s: &str) -> String {
     }
 }
 
+/// REQ: UPS-011 (ADR-180) — an upstream URL that names a program the server starts (`exec://`)
+/// or a local socket it connects to (`unix://`): a plugin upstream.
+pub(crate) fn is_plugin_url(url: &str) -> bool {
+    url.trim_start()
+        .split_once("://")
+        .is_some_and(|(s, _)| s.eq_ignore_ascii_case("exec") || s.eq_ignore_ascii_case("unix"))
+}
+
+/// REQ: UPS-011, API-002 (ADR-180) — the field that makes an upstream a plugin one: its `url`, or
+/// `args` (a program's arguments). Plugin upstreams are defined in the config file, so a write
+/// through the API, or a pre-save check, that has one is refused.
+pub(crate) fn plugin_field(url: &str, has_args: bool) -> Option<&'static str> {
+    if is_plugin_url(url) {
+        Some("url")
+    } else if has_args {
+        Some("args")
+    } else {
+        None
+    }
+}
+
+/// REQ: UPS-011 (ADR-180) — an entry made through the API that the merge leaves out: an upstream
+/// or a forwarded domain that names a program or a local socket. Plugin upstreams are defined in
+/// the config file; such an entry was stored by an older version, restored from a backup, or
+/// written into `state.db` by hand. It isn't deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LeftOut {
+    /// `upstream` or `forward`.
+    pub(crate) kind: &'static str,
+    pub(crate) name: String,
+}
+
+/// The entries the merge leaves out (see [`LeftOut`]).
+pub(crate) fn plugin_entries(e: &Entries) -> Vec<LeftOut> {
+    let upstreams = e.upstreams.iter().filter_map(|(n, o)| match o {
+        Ovr::Set(u) if is_plugin_url(u.url.as_str()) => Some(LeftOut {
+            kind: "upstream",
+            name: n.clone(),
+        }),
+        _ => None,
+    });
+    let forwards = e
+        .forwards
+        .iter()
+        .filter(|(_, f)| f.servers.iter().any(|s| is_plugin_url(&server_url(s))))
+        .map(|(d, _)| LeftOut {
+            kind: "forward",
+            name: d.clone(),
+        });
+    upstreams.chain(forwards).collect()
+}
+
+/// `e` without the entries [`plugin_entries`] names (`None`: there are none). An upstream left
+/// out is also taken out of the upstream groups made through the API, unless the files define an
+/// upstream of that name: their entry is then the one in effect.
+fn without_plugins(file: &Config, e: &Entries) -> Option<Entries> {
+    let left = plugin_entries(e);
+    if left.is_empty() {
+        return None;
+    }
+    let gone: Vec<&str> = left
+        .iter()
+        .filter(|l| l.kind == "upstream")
+        .map(|l| l.name.as_str())
+        .filter(|n| !file.upstream.iter().any(|u| u.name.as_str() == *n))
+        .collect();
+    let mut e = e.clone();
+    e.upstreams
+        .retain(|(_, o)| !matches!(o, Ovr::Set(u) if is_plugin_url(u.url.as_str())));
+    e.forwards
+        .retain(|(_, f)| !f.servers.iter().any(|s| is_plugin_url(&server_url(s))));
+    for (_, g) in &mut e.upstream_groups {
+        if let Ovr::Set(g) = g {
+            g.members.retain(|m| !gone.contains(&m.as_str()));
+        }
+    }
+    Some(e)
+}
+
+/// REQ: UPS-011 (ADR-180) — one warning per entry the merge leaves out, when it starts being left
+/// out: a configuration that is built again with the same ones logs nothing (per data directory,
+/// so each node in a test process keeps its own).
+fn warn_left_out(file: &Config, left: &[LeftOut]) {
+    static LAST: std::sync::Mutex<std::collections::BTreeMap<String, Vec<LeftOut>>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let mut last = LAST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let key = file.node.data_dir.to_string();
+    let before = last.get(&key).cloned().unwrap_or_default();
+    for l in left.iter().filter(|l| !before.contains(l)) {
+        let (what, route) = if l.kind == "forward" {
+            ("forwarded domain", "forwards")
+        } else {
+            ("upstream", "upstreams")
+        };
+        warn!(
+            "{what} `{}` made through the API isn't used: it names a program or a local socket (`exec://`, `unix://`), and plugin upstreams are defined in the config file; define it there, or remove this one (DELETE /api/v1/{route}/{})",
+            l.name, l.name
+        );
+    }
+    if left.is_empty() {
+        last.remove(&key);
+    } else {
+        last.insert(key, left.to_vec());
+    }
+}
+
 fn safe(s: &str) -> Result<SafeString, String> {
     SafeString::new(s)
 }
@@ -347,8 +455,11 @@ fn apply_one_of(cfg: &mut Config, e: &Entries) {
 }
 
 /// `file` plus the entries (names the files already use are skipped), if the result validates
-/// (including record values); otherwise `Err` with the reasons.
+/// (including record values); otherwise `Err` with the reasons. Entries that name a program or a
+/// local socket are left out (REQ: UPS-011, ADR-180; [`plugin_entries`]).
 pub(crate) fn merge(file: &Config, e: &Entries) -> Result<Config, Vec<String>> {
+    let kept = without_plugins(file, e);
+    let e = kept.as_ref().unwrap_or(e);
     let mut cfg = file.clone();
     // ADR-069 — upstreams, upstream groups, lists, and groups made through the API override
     // or hide the files' entries of the same name (before forwards add their own).
@@ -512,7 +623,10 @@ pub(crate) fn effective(file: &Config) -> Config {
             return file.clone();
         }
     };
-    match merge(file, &entries(&state)) {
+    let stored = entries(&state);
+    // REQ: UPS-011 (ADR-180) — what the merge leaves out, logged once.
+    warn_left_out(file, &plugin_entries(&stored));
+    match merge(file, &stored) {
         Ok(c) => c,
         Err(errs) => {
             for e in &errs {
@@ -620,6 +734,36 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("nope"))
         );
+    }
+
+    /// REQ: UPS-011 (ADR-180) — a plugin upstream is known by its URL's scheme, whatever its
+    /// case or leading blanks; `args` count only beside another URL.
+    #[test]
+    fn ups_011_plugin_upstreams_are_known_by_their_scheme() {
+        for url in [
+            "exec:///usr/local/bin/x",
+            "EXEC:///x",
+            " unix:///run/x.sock",
+            "Unix:///x",
+        ] {
+            assert!(is_plugin_url(url), "{url}");
+            assert_eq!(plugin_field(url, false), Some("url"));
+        }
+        for url in [
+            "udp://192.0.2.1",
+            "tls://dns.example",
+            "https://dns.example/dns-query",
+            "recursive://",
+            "sdns://AgcAAAAAAAAA",
+            "executable://x",
+            "192.0.2.1",
+        ] {
+            assert!(!is_plugin_url(url), "{url}");
+            assert_eq!(plugin_field(url, false), None, "{url}");
+        }
+        assert_eq!(plugin_field("udp://192.0.2.1", true), Some("args"));
+        assert!(is_plugin_url(&server_url("exec:///x")));
+        assert!(!is_plugin_url(&server_url("192.0.2.1")));
     }
 
     #[test]
