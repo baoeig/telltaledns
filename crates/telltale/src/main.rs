@@ -1459,7 +1459,15 @@ impl node_update::Host for RootHost {
             .as_ref()
             .ok_or("the installed binary's path isn't known")?;
         std::fs::rename(previous, exe)
-            .map_err(|e| format!("can't put {} back: {e}", previous.display()))
+            .map_err(|e| format!("can't put {} back: {e}", previous.display()))?;
+        // A build that doesn't start makes systemd restart it (`Restart=on-failure`) until the
+        // unit hits its start limit, which would refuse the restart onto the previous binary:
+        // clear it first (nothing to clear is fine).
+        let _ = std::process::Command::new(selfupdate::systemctl())
+            .args(["reset-failed", "telltale"])
+            .env_clear()
+            .status();
+        Ok(())
     }
 }
 
