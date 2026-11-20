@@ -856,6 +856,15 @@ async fn start_http(
 // The startup sequence and the main loop read best in one place.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn serve(files: Vec<PathBuf>, cfg: Config) -> io::Result<()> {
+    // REQ: OPS-007, OPS-009 — the signals are this process's from the start, before DNS answers
+    // (review round 3, F2): one that arrives during start-up (a stop, `systemctl reload`) is kept
+    // by the runtime and acted on once the node is up, a drained stop or a reload, rather than
+    // ending the process by the signal's default action (systemd counts a death by SIGHUP as
+    // clean, so `Restart=on-failure` wouldn't bring it back).
+    let mut term = signal(SignalKind::terminate())?;
+    let mut hup = signal(SignalKind::hangup())?;
+    let mut usr1 = signal(SignalKind::user_defined1())?;
+    let mut int = signal(SignalKind::interrupt())?;
     // spec/04 §7: tag outbound queries so a forwarding loop back to us is detectable.
     telltale_upstream::set_node_tag(rand::random());
     let workers = workers(&cfg);
@@ -1198,14 +1207,11 @@ pub(crate) async fn serve(files: Vec<PathBuf>, cfg: Config) -> io::Result<()> {
         );
     }
 
-    let mut term = signal(SignalKind::terminate())?;
-    let mut hup = signal(SignalKind::hangup())?;
-    let mut usr1 = signal(SignalKind::user_defined1())?;
     let mut current = cfg;
     loop {
         tokio::select! {
             _ = term.recv() => { info!(signal = "SIGTERM", "shutting down"); break; }
-            _ = tokio::signal::ctrl_c() => { info!(signal = "SIGINT", "shutting down"); break; }
+            _ = int.recv() => { info!(signal = "SIGINT", "shutting down"); break; }
             _ = hup.recv() => { reload(&files, &mut current, &mut listeners, &mut health, &pipeline, &sources, &mut lists, false).await; }
             // ADR-040 — a change made through the API: re-read files + state.db and apply.
             Some(done) = reload_rx.recv() => {
