@@ -54,7 +54,7 @@
     const s = Object.values(e.credentials ?? {});
     if (s.length === 0) return null;
     if (s.includes('missing')) return { text: 'key missing: enter it again', cls: 'bad' };
-    if (s.includes('file_missing')) return { text: 'key file missing: put the file there', cls: 'bad' };
+    if (s.includes('file_missing')) return { text: 'key file missing: put the file there, or paste the key', cls: 'bad' };
     if (s.includes('not_used')) return { text: 'key not used: enter it again', cls: 'bad' };
     return { text: 'key saved', cls: 'ok' };
   };
