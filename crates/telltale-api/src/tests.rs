@@ -3568,3 +3568,179 @@ async fn obs_010_a_write_says_whether_an_administrator_made_it() {
         ]
     );
 }
+
+/// REQ: API-002, T8.2 (ADR-181) — security F3: a pinned primary whose routers differ from the
+/// pinned version. The rollout status and a write's `409 cluster_pinned` carry the diff the pin
+/// holds back. Everything else is [`Fake`]'s.
+struct PinnedBackend {
+    inner: Fake,
+}
+
+/// A pin's diff that touches routers (key files, a username) and an upstream.
+fn pin_ops() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({"op": "replace", "path": "/router/0/api_key_file",
+            "value": "/data/secrets/router-udm.api_key.0123456789abcdef"}),
+        serde_json::json!({"op": "add", "path": "/router/1", "value": {
+            "name": "fw", "type": "opnsense", "url": "https://fw.example.test",
+            "api_key_file": "/data/secrets/router-fw.api_key.fedcba9876543210",
+            "api_secret_file": "/data/secrets/router-fw.api_secret.fedcba9876543210",
+            "username": "reader-one"}}),
+        serde_json::json!({"op": "add", "path": "/router", "value": [
+            {"name": "ctl", "type": "unifi", "url": "https://ctl.example.test",
+             "username": "reader-two", "password_file": "/data/secrets/router-ctl.password.0"}]}),
+        serde_json::json!({"op": "replace", "path": "/router/2/username", "value": "reader-three"}),
+        serde_json::json!({"op": "replace", "path": "/upstream/0/url", "value": "tls://9.9.9.9"}),
+    ]
+}
+
+impl Backend for PinnedBackend {
+    fn now_unix_seconds(&self) -> u64 {
+        NOW
+    }
+    fn system_info(&self) -> SystemInfo {
+        self.inner.system_info()
+    }
+    fn timeseries(&self, step: Step, from_s: u64, to_s: u64) -> Vec<TimeBucket> {
+        self.inner.timeseries(step, from_s, to_s)
+    }
+    fn top(&self, kind: TopKind, hour: Hour, limit: usize, client: Option<IpAddr>) -> Vec<TopItem> {
+        self.inner.top(kind, hour, limit, client)
+    }
+    fn latency(&self, by: LatencyBy, hour: Hour) -> Vec<LatencyRow> {
+        self.inner.latency(by, hour)
+    }
+    fn queries(
+        &self,
+        q: &QueryParams,
+        from_us: u64,
+        to_us: u64,
+        limit: usize,
+    ) -> Result<QueryPage, Problem> {
+        self.inner.queries(q, from_us, to_us, limit)
+    }
+    fn explain(&self, p: &ExplainParams) -> Result<Explanation, Problem> {
+        self.inner.explain(p)
+    }
+    fn lists(&self) -> Vec<ListInfo> {
+        self.inner.lists()
+    }
+    fn groups(&self) -> Vec<GroupInfo> {
+        self.inner.groups()
+    }
+    fn clients(&self) -> Vec<ClientInfo> {
+        self.inner.clients()
+    }
+    fn upstreams(&self) -> Vec<UpstreamInfo> {
+        self.inner.upstreams()
+    }
+    fn rollout_status(&self) -> BoxFuture<Result<crate::model::RolloutStatus, Problem>> {
+        Box::pin(async {
+            Ok(crate::model::RolloutStatus {
+                stage: "pinned".into(),
+                pinned: Some(crate::model::ClusterPin {
+                    to: "3.124".into(),
+                    diff: pin_ops(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        })
+    }
+    fn write_managed(
+        &self,
+        w: ManagedWrite,
+    ) -> BoxFuture<Result<crate::model::ConfigChange, Problem>> {
+        let _ = w;
+        Box::pin(async {
+            Err(
+                Problem::new(crate::problem::Code::ClusterPinned, "the cluster is pinned")
+                    .diff(serde_json::Value::Array(pin_ops())),
+            )
+        })
+    }
+}
+
+/// A bearer token for a new user of `role`.
+fn bearer_for(app: &TestApp, name: &str, role: auth::Role, scope: &str) -> String {
+    let user = app
+        .auth
+        .create_user(name, "a long enough password", role, false, NOW)
+        .unwrap();
+    let (id, secret) = (auth::crypto::random_id(), auth::crypto::random_secret());
+    app.auth
+        .state()
+        .create_token(
+            &id,
+            user.id,
+            "tests",
+            &auth::crypto::secret_hash(&secret),
+            scope,
+            None,
+            auth_now(),
+        )
+        .unwrap();
+    format!("tt_{id}_{secret}")
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — security F3: the diff a pin holds back names no router key
+/// file or username to a caller below admin (the rollout status, which viewers read, and the
+/// `409 cluster_pinned` an operator's write gets); the rest of the diff is as it was, and an
+/// administrator sees all of it.
+#[tokio::test]
+async fn api_002_a_pin_diff_names_no_router_key_file() {
+    let app = app_over(Arc::new(PinnedBackend {
+        inner: Fake::default(),
+    }));
+    let viewer = bearer_for(&app, "vic", auth::Role::Viewer, "read");
+    let operator = bearer_for(&app, "olga", auth::Role::Operator, "write");
+    let hidden = [
+        "router-udm.api_key",
+        "router-fw.api_key",
+        "router-fw.api_secret",
+        "router-ctl.password",
+        "reader-one",
+        "reader-two",
+        "reader-three",
+    ];
+    let call = |bearer: &str, method: &str, uri: &str| {
+        let mut r = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {bearer}"));
+        let body = if method == "PUT" {
+            r = r.header("content-type", "application/json");
+            Body::from(serde_json::json!({"url": "udp://9.9.9.9"}).to_string())
+        } else {
+            Body::empty()
+        };
+        r.body(body).unwrap()
+    };
+    for (who, bearer) in [("viewer", &viewer), ("operator", &operator)] {
+        let (s, _, v) = send(&app, call(bearer, "GET", "/api/v1/cluster/rollout")).await;
+        assert_eq!(s, StatusCode::OK, "{who}: {v}");
+        let text = v.to_string();
+        for h in hidden {
+            assert!(!text.contains(h), "{who} sees {h}: {text}");
+        }
+        assert!(
+            text.contains("tls://9.9.9.9"),
+            "{who}: the rest stays: {text}"
+        );
+        assert!(text.contains("https://fw.example.test"), "{who}: {text}");
+    }
+    let (s, _, v) = send(&app, call(&operator, "PUT", "/api/v1/upstreams/up")).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    let text = v.to_string();
+    for h in hidden {
+        assert!(!text.contains(h), "the operator's 409 shows {h}: {text}");
+    }
+    assert!(text.contains("tls://9.9.9.9"), "{text}");
+    // An administrator sees the whole diff.
+    let (s, _, v) = send(&app, call(&app.bearer, "GET", "/api/v1/cluster/rollout")).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let text = v.to_string();
+    for h in hidden {
+        assert!(text.contains(h), "the admin sees {h}: {text}");
+    }
+}

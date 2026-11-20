@@ -233,9 +233,80 @@ fn write_secret(path: &Path, token: &str) -> io::Result<()> {
     f.write_all(b"\n")
 }
 
+/// REQ: API-002, AGT-003 (ADR-181) — where this node's request key is (`Auth::request_digest`):
+/// in the data directory's `secrets/` folder, so it is neither in state.db nor in a backup.
+const REQUEST_KEY_FILE: &str = "secrets/.request-key";
+
+/// This node's request key: read from `<data_dir>/secrets/.request-key` (64 hex digits), or
+/// made there on the first start (random, readable by this user only, the folder by this user
+/// only). A file that isn't a key is an error: it is left as it is.
+fn request_key(dir: &Path) -> io::Result<[u8; 32]> {
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    let file = dir.join(REQUEST_KEY_FILE);
+    let parse = |t: &str| -> Option<[u8; 32]> {
+        let t = t.trim();
+        let mut k = [0u8; 32];
+        if t.len() != 64 {
+            return None;
+        }
+        for (i, b) in k.iter_mut().enumerate() {
+            *b = u8::from_str_radix(t.get(i * 2..i * 2 + 2)?, 16).ok()?;
+        }
+        Some(k)
+    };
+    let read = |file: &Path| -> io::Result<[u8; 32]> {
+        let t = std::fs::read_to_string(file)?;
+        parse(&t).ok_or_else(|| {
+            io::Error::other(format!(
+                "{}: not a request key (64 hex digits); remove it and restart to make a new one",
+                file.display()
+            ))
+        })
+    };
+    match read(&file) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        other => return other,
+    }
+    if let Some(parent) = file.parent() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+    let mut key = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut key)
+        .map_err(|_| io::Error::other("the system's random source failed"))?;
+    let made = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&file);
+    match made {
+        Ok(mut f) => {
+            let wrote = f
+                .write_all(crypto::hex(&key).as_bytes())
+                .and_then(|()| f.sync_all());
+            if let Err(e) = wrote {
+                let _ = std::fs::remove_file(&file);
+                return Err(e);
+            }
+            Ok(key)
+        }
+        // Made at the same moment by another start: that one.
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => read(&file),
+        Err(e) => Err(e),
+    }
+}
+
 /// Opens the auth service for the server. Blocking (Argon2 for a bootstrap password).
 pub(crate) fn open(cfg: &Config) -> io::Result<Arc<Auth>> {
     let auth = Arc::new(Auth::new(Arc::new(open_state(cfg)?), settings(cfg)));
+    match request_key(&data_dir(cfg)) {
+        Ok(k) => auth.set_request_key(k),
+        Err(e) => warn!(
+            "the request key couldn't be read or made ({e}): a router change with a pasted key, retried with its Idempotency-Key after a restart, is refused rather than replayed"
+        ),
+    }
     // REQ: API-004 (issue #63) — before the providers, so it is said even when they fail.
     log_break_glass(cfg);
     // A broken provider setup (say, a missing secret file) changes nothing about password

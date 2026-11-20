@@ -61,9 +61,17 @@ pub fn parse_version(v: &str) -> Result<(u64, u64), Problem> {
         (status = 200, body = RolloutStatus, description = "The stage, the version baking, the canaries, the guard's readings, and the pin."),
         (status = 503, body = Problem, description = "Not in a cluster (`unavailable`)."),
     ))]
-async fn rollout_status(State(backend): State<Shared>) -> Response {
+async fn rollout_status(State(backend): State<Shared>, ext: axum::http::Extensions) -> Response {
+    // REQ: API-002, T8.2 (ADR-181) — security F3: a router's key files and username in the pin's
+    // diff are an administrator's to see.
+    let admin = principal(&ext).is_ok_and(|p| crate::config_api::by_admin(&p));
     match backend.rollout_status().await {
-        Ok(s) => Json(s).into_response(),
+        Ok(mut s) => {
+            if !admin && let Some(p) = s.pinned.as_mut() {
+                crate::mask_router_diff(&mut p.diff);
+            }
+            Json(s).into_response()
+        }
         Err(e) => e.into_response(),
     }
 }

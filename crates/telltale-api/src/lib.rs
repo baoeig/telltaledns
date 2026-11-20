@@ -2190,6 +2190,51 @@ async fn config_entries(
     }))
 }
 
+/// The router fields a caller below admin isn't shown: where its keys are, who it signs in as.
+fn router_hidden(field: &str) -> bool {
+    field == "username" || ROUTER_CREDENTIALS.iter().any(|(_, f)| *f == field)
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — security F3: a pin's diff (JSON Patch over the shared
+/// configuration) as a caller below admin sees it. A router's key-file paths and `username` read
+/// "(hidden)", in an operation on one of those fields and inside an added or replaced router (or
+/// list of routers); every other operation is as it was. Before this change the same diff showed
+/// them for routers in the config files.
+pub(crate) fn mask_router_diff(ops: &mut [serde_json::Value]) {
+    fn hide_in(v: &mut serde_json::Value) {
+        if let Some(o) = v.as_object_mut() {
+            for (k, x) in o.iter_mut() {
+                if router_hidden(k) {
+                    *x = "(hidden)".into();
+                }
+            }
+        }
+    }
+    for op in ops {
+        let path = op
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        if parts.first() != Some(&"router") {
+            continue;
+        }
+        let Some(value) = op.get_mut("value") else {
+            continue;
+        };
+        match parts.get(2) {
+            None if parts.len() == 1 => match value.as_array_mut() {
+                Some(a) => a.iter_mut().for_each(hide_in),
+                None => hide_in(value),
+            },
+            None => hide_in(value),
+            Some(field) if router_hidden(field) => *value = "(hidden)".into(),
+            Some(_) => {}
+        }
+    }
+}
+
 /// REQ: API-002, T8.2 (ADR-181) — F7: a router as a caller below admin sees it (a viewer, an
 /// operator, any agent token, an MCP resource read): without where its keys are (the `*_file`
 /// fields) and who it signs in as (`username`). Its `credentials` status stays. Applied where

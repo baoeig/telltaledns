@@ -35,6 +35,44 @@ fn api_003_setup_token_is_kept_private_and_reused_across_restarts() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// REQ: API-002, AGT-003 (ADR-181) — security F5: the request key is made once, private, in the
+// data directory's secrets/ folder, and the same after a restart (so a retry still replays); a
+// file that isn't a key is left alone and is an error.
+#[test]
+fn api_002_the_request_key_is_private_and_kept_across_restarts() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = temp_dir();
+    let c = cfg(&dir);
+    let a = open(&c).unwrap();
+    let file = dir.join(REQUEST_KEY_FILE);
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&file), 0o600);
+    assert_eq!(mode(file.parent().unwrap()), 0o700);
+    let first = a.request_digest("the-key");
+    assert_ne!(
+        first,
+        blake3::hash(b"the-key").to_hex().to_string(),
+        "keyed, not a plain hash"
+    );
+    drop(a);
+    let a = open(&c).unwrap();
+    assert_eq!(
+        a.request_digest("the-key"),
+        first,
+        "the same key after a restart"
+    );
+    drop(a);
+    std::fs::write(&file, "not a key").unwrap();
+    let e = request_key(&dir).unwrap_err().to_string();
+    assert!(e.contains("not a request key"), "{e}");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "not a key",
+        "left alone"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// What a test subscriber saw: each event's level and message, in order.
 #[derive(Clone, Default)]
 struct Seen(Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);

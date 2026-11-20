@@ -2164,14 +2164,17 @@ export interface paths {
          *     "tls_insecure_skip_verify": true}`. The UniFi API key, the OPNsense key and secret, or a
          *     UniFi password are sent as `api_key`, `api_secret`, and `password`: TelltaleDNS writes
          *     each to a new file only it can read under `<data_dir>/secrets/` on this node and stores that
-         *     file's path; the value is never stored, logged, or returned (ADR-181). A pasted key goes only
-         *     to an `https://` address (or a loopback one). The body names no key file (`api_key_file`, …)
+         *     file's path. The value itself is never stored, logged, or returned; with an `Idempotency-Key`,
+         *     the record kept for a retry holds only a keyed hash of it, for a day (ADR-181). A pasted key goes only
+         *     to an `https://` address (or a loopback one), and with `tls_insecure_skip_verify` only to an
+         *     address written as a number, not a host name. The body names no key file (`api_key_file`, …)
          *     but the router's own, sent back unchanged at the same address: paste the key instead (a file
-         *     elsewhere, such as a Docker or Kubernetes secret, is named in the config file). Leave a
-         *     credential out to keep the current one, unless the type, address, site, or TLS settings
-         *     change: then it must be entered again. Admins only: an administrator's own sign-in or an admin
-         *     API token; agent tokens can't. The routers are read again within seconds; a router the config
-         *     files define is overridden until this one is deleted.
+         *     elsewhere, such as a Docker or Kubernetes secret, is named in the config file); with a pasted
+         *     value, the file named for it is replaced. Leave a credential out to keep the current one,
+         *     unless the type, address, site, or TLS settings change: then it must be entered again. Admins
+         *     only: an administrator's own sign-in or an admin API token; agent tokens can't. The routers
+         *     are read again within 5 seconds, or once a read in progress ends; a router the config files
+         *     define is overridden until this one is deleted.
          */
         put: operations["put_router"];
         post?: never;
@@ -12523,7 +12526,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description A field is wrong (the URL, missing credentials, a key file named, a pasted key for an http:// address, the key not entered again for a new address), or the configuration wouldn't be valid. */
+            /** @description A field is wrong (the URL, missing credentials, a key file named, a pasted key for an http:// address or, with an unchecked certificate, for a host name, the key not entered again for a new address, a node whose data_dir isn't a plain absolute path), or the configuration wouldn't be valid. */
             422: {
                 headers: {
                     [name: string]: unknown;

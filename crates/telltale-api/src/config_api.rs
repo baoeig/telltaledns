@@ -983,14 +983,17 @@ pub(crate) async fn put_schedule(
 /// "tls_insecure_skip_verify": true}`. The UniFi API key, the OPNsense key and secret, or a
 /// UniFi password are sent as `api_key`, `api_secret`, and `password`: TelltaleDNS writes
 /// each to a new file only it can read under `<data_dir>/secrets/` on this node and stores that
-/// file's path; the value is never stored, logged, or returned (ADR-181). A pasted key goes only
-/// to an `https://` address (or a loopback one). The body names no key file (`api_key_file`, …)
+/// file's path. The value itself is never stored, logged, or returned; with an `Idempotency-Key`,
+/// the record kept for a retry holds only a keyed hash of it, for a day (ADR-181). A pasted key goes only
+/// to an `https://` address (or a loopback one), and with `tls_insecure_skip_verify` only to an
+/// address written as a number, not a host name. The body names no key file (`api_key_file`, …)
 /// but the router's own, sent back unchanged at the same address: paste the key instead (a file
-/// elsewhere, such as a Docker or Kubernetes secret, is named in the config file). Leave a
-/// credential out to keep the current one, unless the type, address, site, or TLS settings
-/// change: then it must be entered again. Admins only: an administrator's own sign-in or an admin
-/// API token; agent tokens can't. The routers are read again within seconds; a router the config
-/// files define is overridden until this one is deleted.
+/// elsewhere, such as a Docker or Kubernetes secret, is named in the config file); with a pasted
+/// value, the file named for it is replaced. Leave a credential out to keep the current one,
+/// unless the type, address, site, or TLS settings change: then it must be entered again. Admins
+/// only: an administrator's own sign-in or an admin API token; agent tokens can't. The routers
+/// are read again within 5 seconds, or once a read in progress ends; a router the config files
+/// define is overridden until this one is deleted.
 #[utoipa::path(put, path = "/api/v1/routers/{name}", tag = "config",
     params(("name" = String, Path, description = "The name."), DryRun),
     request_body = Object,
@@ -998,7 +1001,7 @@ pub(crate) async fn put_schedule(
         (status = 200, body = ConfigChange, description = "Applied (or, with dryRun, what would change)."),
         (status = 403, body = Problem, description = "Not an administrator (agent tokens never are)."),
         (status = 412, body = Problem, description = "The configuration changed since the If-Match version: re-read it and retry."),
-        (status = 422, body = Problem, description = "A field is wrong (the URL, missing credentials, a key file named, a pasted key for an http:// address, the key not entered again for a new address), or the configuration wouldn't be valid."),
+        (status = 422, body = Problem, description = "A field is wrong (the URL, missing credentials, a key file named, a pasted key for an http:// address or, with an unchecked certificate, for a host name, the key not entered again for a new address, a node whose data_dir isn't a plain absolute path), or the configuration wouldn't be valid."),
     ))]
 pub(crate) async fn put_router(
     State((backend, auth)): State<Ctx>,
@@ -1012,17 +1015,18 @@ pub(crate) async fn put_router(
         Ok(i) => i,
         Err(p) => return p.into_response(),
     };
-    // ADR-181 — the idempotency record keeps the request: a secret is kept as its hash.
+    // REQ: API-002, AGT-003, T8.2 (ADR-181) — security F5: the idempotency record (in state.db)
+    // keeps the request, so a retry with the same key and body replays and another body is
+    // refused. A pasted secret is kept there only as a hash keyed with this node's request key
+    // (`Auth::request_digest`: a random key in a file only this user reads, outside state.db and
+    // outside backups), so the record can't be used to test guesses of the secret.
     let mut shown = input.clone();
     if let Some(o) = shown.as_object_mut() {
         for (k, _) in crate::ROUTER_CREDENTIALS {
             if let Some(v) = o.get_mut(k)
                 && let Some(s) = v.as_str()
             {
-                *v = serde_json::Value::String(format!(
-                    "blake3:{}",
-                    blake3::hash(s.as_bytes()).to_hex()
-                ));
+                *v = serde_json::Value::String(format!("keyed:{}", auth.request_digest(s)));
             }
         }
     }
@@ -2009,61 +2013,94 @@ async fn write(
         op.audit_kind(),
         if op.deleting() { "delete" } else { "put" }
     );
-    let result: Result<serde_json::Value, Problem> = match op {
-        Op::Client(input) => backend
-            .write_client(ClientWrite {
-                name: name.clone(),
-                input,
-                dry_run,
-                expect,
-                by: actor.name.clone(),
-                simulate: simulate.clone(),
-            })
-            .await
-            .map(|c| serde_json::to_value(c).unwrap_or_default()),
-        Op::Managed(kind, body) => backend
-            .write_managed(ManagedWrite {
-                kind,
-                name: name.clone(),
-                body,
-                dry_run,
-                expect,
-                by: actor.name.clone(),
-                simulate,
-                // REQ: OBS-010, API-002 (ADR-179) — an agent token is never an administrator
-                // here, whoever owns it and whatever else it may do.
-                by_admin: by_admin(&p),
-            })
-            .await
-            .map(|c| serde_json::to_value(c).unwrap_or_default()),
-    };
-    let result = result.map_err(|e| crate::simulate_api::sanitize_problem(&p, e));
-    let (status, text) = match &result {
-        Ok(c) => (StatusCode::OK, c.to_string()),
-        Err(e) => (e.code_status(), json_of(e)),
-    };
-    if let Ok(c) = &result
-        && c["applied"].as_bool() == Some(true)
-    {
-        auth.record(
-            &actor,
-            &action,
-            &name,
-            &serde_json::json!({ "before": c["before"], "after": c["after"], "configVersion": c["configVersion"] }),
-        );
-    }
-    if let Some(k) = &key
-        && status.is_success()
-    {
-        let r = Replay {
-            request: request.into_bytes(),
-            status: status.as_u16(),
-            response: text.clone(),
-        };
-        if let Err(e) = auth.state().remember_idempotent(k, &r, now) {
-            tracing::warn!("idempotency key not stored: {e}");
+    let work = {
+        let (backend, auth) = (Arc::clone(&backend), Arc::clone(&auth));
+        async move {
+            let admin = by_admin(&p);
+            let result: Result<serde_json::Value, Problem> = match op {
+                Op::Client(input) => backend
+                    .write_client(ClientWrite {
+                        name: name.clone(),
+                        input,
+                        dry_run,
+                        expect,
+                        by: actor.name.clone(),
+                        simulate: simulate.clone(),
+                    })
+                    .await
+                    .map(|c| serde_json::to_value(c).unwrap_or_default()),
+                Op::Managed(kind, body) => backend
+                    .write_managed(ManagedWrite {
+                        kind,
+                        name: name.clone(),
+                        body,
+                        dry_run,
+                        expect,
+                        by: actor.name.clone(),
+                        simulate,
+                        // REQ: OBS-010, API-002 (ADR-179) — an agent token is never an
+                        // administrator here, whoever owns it and whatever else it may do.
+                        by_admin: admin,
+                    })
+                    .await
+                    .map(|c| serde_json::to_value(c).unwrap_or_default()),
+            };
+            let result = result.map_err(|e| {
+                let mut e = crate::simulate_api::sanitize_problem(&p, e);
+                // REQ: API-002, T8.2 (ADR-181) — security F3: the diff of a `409 cluster_pinned`
+                // shows a router's key files and username to an administrator only.
+                if !admin
+                    && let Some(d) = e
+                        .diff
+                        .as_deref_mut()
+                        .and_then(serde_json::Value::as_array_mut)
+                {
+                    crate::mask_router_diff(d);
+                }
+                e
+            });
+            let (status, text) = match &result {
+                Ok(c) => (StatusCode::OK, c.to_string()),
+                Err(e) => (e.code_status(), json_of(e)),
+            };
+            if let Ok(c) = &result
+                && c["applied"].as_bool() == Some(true)
+            {
+                auth.record(
+                    &actor,
+                    &action,
+                    &name,
+                    &serde_json::json!({ "before": c["before"], "after": c["after"], "configVersion": c["configVersion"] }),
+                );
+            }
+            if let Some(k) = &key
+                && status.is_success()
+            {
+                let r = Replay {
+                    request: request.into_bytes(),
+                    status: status.as_u16(),
+                    response: text,
+                };
+                if let Err(e) = auth.state().remember_idempotent(k, &r, now) {
+                    tracing::warn!("idempotency key not stored: {e}");
+                }
+            }
+            result
         }
-    }
+    };
+    // REQ: API-002, API-006, AGT-003, T8.2 (ADR-181) — correctness F4: a change runs to its end
+    // in a task of its own, with its audit entry and its Idempotency-Key record, whether or not
+    // the client waits for the answer (a client that went away before used to leave a change
+    // made but not audited, and its retry made it again). For every kind of change: each is one
+    // bounded unit under `config_writes`, and only where it stops changes, not what it does. A
+    // dry run changes nothing and stays tied to its request.
+    let result = if dry_run {
+        work.await
+    } else {
+        tokio::spawn(work)
+            .await
+            .unwrap_or_else(|e| Err(Problem::internal(format!("request worker failed: {e}"))))
+    };
     match result {
         Ok(c) => {
             let mut r = Json(c).into_response();
