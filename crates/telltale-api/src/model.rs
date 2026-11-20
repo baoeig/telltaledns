@@ -1527,7 +1527,8 @@ pub struct ConfigEntry {
     /// the files' entry of that name), or `hidden` (the files' entry is left out).
     pub source: String,
     /// The definition in effect, with the same fields as in `telltale.toml` (absent when
-    /// hidden).
+    /// hidden). REQ: API-002, T8.2 (ADR-181) — a router's key-file fields and `username` are
+    /// shown to an administrator only.
     #[schema(value_type = Option<Object>)]
     pub definition: Option<serde_json::Value>,
     /// REQ: API-002, T8.2 (ADR-181) — a router's credentials, by name (`api_key`, `api_secret`,

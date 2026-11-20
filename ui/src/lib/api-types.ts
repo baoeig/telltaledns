@@ -1414,7 +1414,9 @@ export interface paths {
          *     from (ADR-069): `file`, `added` (made through the UI or API), `override` (replaces the
          *     config files' entry of the same name), or `hidden` (the files' entry is left out; listed so
          *     it can be brought back). `DELETE` on an override's or a hidden entry's path brings the
-         *     files' version back. Secrets aren't part of these sections.
+         *     files' version back. Secrets aren't part of these sections. A router's key-file paths and
+         *     `username` are shown to an administrator only (their own sign-in or an admin API token);
+         *     everyone gets each router's `credentials` status.
          */
         get: operations["config_entries"];
         put?: never;
@@ -4350,7 +4352,8 @@ export interface components {
             } | null;
             /**
              * @description The definition in effect, with the same fields as in `telltale.toml` (absent when
-             *     hidden).
+             *     hidden). REQ: API-002, T8.2 (ADR-181) — a router's key-file fields and `username` are
+             *     shown to an administrator only.
              */
             definition?: Record<string, never> | null;
             /** @description `upstream`, `upstream_group`, `list`, or `group`. */
@@ -5457,7 +5460,8 @@ export interface components {
                 } | null;
                 /**
                  * @description The definition in effect, with the same fields as in `telltale.toml` (absent when
-                 *     hidden).
+                 *     hidden). REQ: API-002, T8.2 (ADR-181) — a router's key-file fields and `username` are
+                 *     shown to an administrator only.
                  */
                 definition?: Record<string, never> | null;
                 /** @description `upstream`, `upstream_group`, `list`, or `group`. */

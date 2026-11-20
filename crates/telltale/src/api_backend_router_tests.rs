@@ -84,6 +84,8 @@ struct Node {
     /// earlier build gave routers (and `cluster:admin`).
     operator_agent: Creds,
     admin_agent: Creds,
+    /// A viewer's agent token with the default scopes.
+    viewer_agent: Creds,
     dir: tempfile::TempDir,
 }
 
@@ -160,6 +162,7 @@ impl Node {
                 "write",
                 Some("config:write:routers cluster:admin config:read"),
             ),
+            viewer_agent: token(&auth, vic.id, "read", Some("analytics:read config:read")),
             admin_session,
             src,
             app,
@@ -958,4 +961,112 @@ async fn api_002_a_key_its_own_stored_entry_names_is_kept() {
     let _ = stop.send(true);
     let _ = task.await;
     assert!(Path::new(&udm_file).exists(), "named by the stored entry");
+}
+
+// ---- T6: what a caller below admin sees.
+
+/// REQ: API-002, T8.2 (ADR-181) — F7: only an administrator (own sign-in or admin API token) sees
+/// a router's key-file paths and `username`; a viewer, an operator, an agent token with the
+/// default scopes, an operator's and an admin's agent tokens see the definition without them, with
+/// the credentials' status. Routers from the files and from the API alike, by kind or not, and
+/// through an MCP resource read (which calls the same route with the caller's credentials).
+#[tokio::test]
+async fn api_002_router_definitions_redacted_for_viewers() {
+    let n = Node::new(Reload::Applies);
+    let d = n.data();
+    let (s, v) = n.put("udm", &n.admin, false, unifi(HERE, "k1")).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let mut file = (*n.src.file_config.load_full()).clone();
+    file.router.push(
+        serde_json::from_value(serde_json::json!({
+            "name": "fw", "type": "opnsense", "url": "https://opnsense.example.test",
+            "api_key_file": format!("{d}/fw.key"), "api_secret_file": format!("{d}/fw.secret"),
+        }))
+        .unwrap(),
+    );
+    file.router.push(
+        serde_json::from_value(serde_json::json!({
+            "name": "ctl", "type": "unifi", "url": "https://unifi.example.test",
+            "username": "telltale-reader", "password_file": format!("{d}/ctl.pass"),
+        }))
+        .unwrap(),
+    );
+    n.src.file_config.store(Arc::new(file));
+    apply(&n.src);
+    let hidden = [
+        "api_key_file",
+        "api_secret_file",
+        "password_file",
+        "username",
+    ];
+    for (who, creds) in [
+        ("viewer", &n.viewer),
+        ("operator", &n.operator),
+        ("default agent", &n.viewer_agent),
+        ("operator's agent", &n.operator_agent),
+        ("admin's agent", &n.admin_agent),
+    ] {
+        for uri in [
+            "/api/v1/config/entries?kind=router",
+            "/api/v1/config/entries",
+        ] {
+            let (s, v) = n.send("GET", uri, creds, None).await;
+            assert_eq!(s, StatusCode::OK, "{who} {uri}: {v}");
+            let routers: Vec<&serde_json::Value> = v["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["kind"] == "router")
+                .collect();
+            assert_eq!(routers.len(), 3, "{who} {uri}: {v}");
+            for e in routers {
+                for f in hidden {
+                    assert!(
+                        e["definition"].get(f).is_none(),
+                        "{who} {uri} sees {f}: {e}"
+                    );
+                }
+                assert!(e["definition"]["url"].is_string(), "{e}");
+                assert!(
+                    e["credentials"].is_object(),
+                    "{who}: the status is there: {e}"
+                );
+            }
+            assert!(!v.to_string().contains("telltale-reader"), "{who}: {v}");
+            assert!(!v.to_string().contains("/secrets/router-"), "{who}: {v}");
+        }
+    }
+    // An MCP resource read, as an agent.
+    for creds in [&n.viewer_agent, &n.admin_agent] {
+        let (s, v) = n
+            .send(
+                "POST",
+                "/mcp",
+                creds,
+                Some(
+                    serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "resources/read",
+                    "params": {"uri": "telltale://config"}}),
+                ),
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let text = v["result"]["contents"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("opnsense.example.test"),
+            "the routers are there: {v}"
+        );
+        assert!(
+            !text.contains("telltale-reader")
+                && !text.contains("/secrets/router-")
+                && !text.contains("fw.secret"),
+            "{text}"
+        );
+    }
+    for creds in [&n.admin, &n.admin_session] {
+        let items = n.routers(creds).await;
+        let of = |name: &str| items.iter().find(|e| e["name"] == name).unwrap().clone();
+        assert!(of("udm")["definition"]["api_key_file"].is_string());
+        assert!(of("fw")["definition"]["api_secret_file"].is_string());
+        assert_eq!(of("ctl")["definition"]["username"], "telltale-reader");
+    }
 }

@@ -37,19 +37,14 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use telltale_api::problem::{Code, Problem};
+// The fields of a router body that carry a secret, and the `[[router]]` field naming the file
+// each is written to (REQ: T8.2, ADR-181 — F9: one list, shared with the API layer).
+use telltale_api::ROUTER_CREDENTIALS as FIELDS;
 use telltale_api::{ManagedKind, ManagedWrite};
 use telltale_config::RouterConfig;
 use tracing::{info, warn};
 
 use crate::http::Sources;
-
-/// The fields of a router body that carry a secret, and the `[[router]]` field naming the file
-/// each is written to.
-pub(crate) const FIELDS: [(&str, &str); 3] = [
-    ("api_key", "api_key_file"),
-    ("api_secret", "api_secret_file"),
-    ("password", "password_file"),
-];
 
 /// The list of files the API wrote, in the secrets directory.
 const WRITTEN: &str = ".written";

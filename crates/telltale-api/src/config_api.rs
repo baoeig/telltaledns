@@ -976,9 +976,6 @@ pub(crate) async fn put_schedule(
     .await
 }
 
-/// The fields of a router body that carry a secret, written to a file and never stored.
-pub(crate) const ROUTER_SECRETS: [&str; 3] = ["api_key", "api_secret", "password"];
-
 /// Add or change a router integration (T8.2, API-002).
 ///
 /// The body has the same fields as `[[router]]` (the name comes from the path), e.g. a UniFi
@@ -1018,7 +1015,7 @@ pub(crate) async fn put_router(
     // ADR-181 — the idempotency record keeps the request: a secret is kept as its hash.
     let mut shown = input.clone();
     if let Some(o) = shown.as_object_mut() {
-        for k in ROUTER_SECRETS {
+        for (k, _) in crate::ROUTER_CREDENTIALS {
             if let Some(v) = o.get_mut(k)
                 && let Some(s) = v.as_str()
             {

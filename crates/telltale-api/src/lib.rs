@@ -839,6 +839,16 @@ pub enum ManagedKind {
     Router,
 }
 
+/// REQ: T8.2, API-002 (ADR-181) — the credentials of a router, as a body pastes them, and the
+/// `[[router]]` field naming the file each is saved to: the one list the API layer (hashing a
+/// pasted value for the idempotency record, what a caller below admin is shown) and the backend
+/// (saving, using and removing the files) both use.
+pub const ROUTER_CREDENTIALS: [(&str, &str); 3] = [
+    ("api_key", "api_key_file"),
+    ("api_secret", "api_secret_file"),
+    ("password", "password_file"),
+];
+
 /// A write to a local name or a forwarded domain.
 #[derive(Debug, Clone)]
 pub struct ManagedWrite {
@@ -2156,20 +2166,48 @@ async fn forwards(State(b): State<Shared>) -> Result<impl IntoResponse, Problem>
 /// from (ADR-069): `file`, `added` (made through the UI or API), `override` (replaces the
 /// config files' entry of the same name), or `hidden` (the files' entry is left out; listed so
 /// it can be brought back). `DELETE` on an override's or a hidden entry's path brings the
-/// files' version back. Secrets aren't part of these sections.
+/// files' version back. Secrets aren't part of these sections. A router's key-file paths and
+/// `username` are shown to an administrator only (their own sign-in or an admin API token);
+/// everyone gets each router's `credentials` status.
 #[utoipa::path(get, path = "/api/v1/config/entries", tag = "config",
     params(EntriesQuery),
     responses((status = 200, body = Items<ConfigEntry>, description = "The entries, by kind and name.")))]
 async fn config_entries(
     State(b): State<Shared>,
     Query(q): Query<EntriesQuery>,
+    ext: axum::http::Extensions,
 ) -> Result<Json<Items<ConfigEntry>>, Problem> {
+    // REQ: API-002, T8.2 (ADR-181) — F7: who may see where a router's keys are.
+    let admin = auth::routes::principal(&ext).is_ok_and(|p| config_api::by_admin(&p));
     // REQ: CLU-004 (ADR-174) — a replica asks the primary for the entries: off the worker.
-    let items = blocking(move || Ok(b.config_entries(q.kind.as_deref()))).await?;
+    let mut items = blocking(move || Ok(b.config_entries(q.kind.as_deref()))).await?;
+    if !admin {
+        items.iter_mut().for_each(redact_router);
+    }
     Ok(Json(Items {
         missing_nodes: Vec::new(),
         items,
     }))
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — F7: a router as a caller below admin sees it (a viewer, an
+/// operator, any agent token, an MCP resource read): without where its keys are (the `*_file`
+/// fields) and who it signs in as (`username`). Its `credentials` status stays. Applied where
+/// the answer leaves the node, so a replica's copy of the primary's entries is redacted too.
+fn redact_router(e: &mut ConfigEntry) {
+    if e.kind != "router" {
+        return;
+    }
+    if let Some(o) = e
+        .definition
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for (_, file_field) in ROUTER_CREDENTIALS {
+            o.remove(file_field);
+        }
+        o.remove("username");
+    }
 }
 
 /// Quick rules: per-device and per-group allow and block (T6.12, ADR-067).

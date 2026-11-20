@@ -3319,7 +3319,7 @@
           "config"
         ],
         "summary": "The configuration's upstreams, upstream groups, lists, and groups, with their sources.",
-        "description": "Each definition in effect, with the same fields as in `telltale.toml`, and where it comes\nfrom (ADR-069): `file`, `added` (made through the UI or API), `override` (replaces the\nconfig files' entry of the same name), or `hidden` (the files' entry is left out; listed so\nit can be brought back). `DELETE` on an override's or a hidden entry's path brings the\nfiles' version back. Secrets aren't part of these sections.",
+        "description": "Each definition in effect, with the same fields as in `telltale.toml`, and where it comes\nfrom (ADR-069): `file`, `added` (made through the UI or API), `override` (replaces the\nconfig files' entry of the same name), or `hidden` (the files' entry is left out; listed so\nit can be brought back). `DELETE` on an override's or a hidden entry's path brings the\nfiles' version back. Secrets aren't part of these sections. A router's key-file paths and\n`username` are shown to an administrator only (their own sign-in or an admin API token);\neveryone gets each router's `credentials` status.",
         "operationId": "config_entries",
         "parameters": [
           {
@@ -11637,7 +11637,7 @@
               "object",
               "null"
             ],
-            "description": "The definition in effect, with the same fields as in `telltale.toml` (absent when\nhidden)."
+            "description": "The definition in effect, with the same fields as in `telltale.toml` (absent when\nhidden). REQ: API-002, T8.2 (ADR-181) — a router's key-file fields and `username` are\nshown to an administrator only."
           },
           "kind": {
             "type": "string",
@@ -14458,7 +14458,7 @@
                     "object",
                     "null"
                   ],
-                  "description": "The definition in effect, with the same fields as in `telltale.toml` (absent when\nhidden)."
+                  "description": "The definition in effect, with the same fields as in `telltale.toml` (absent when\nhidden). REQ: API-002, T8.2 (ADR-181) — a router's key-file fields and `username` are\nshown to an administrator only."
                 },
                 "kind": {
                   "type": "string",
