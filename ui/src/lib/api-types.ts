@@ -1970,10 +1970,13 @@ export interface paths {
          *     node; `GET` on the same path shows how it went. The version is a release (`0.8.0`) or an edge
          *     build (`0.8.0-edge.393`); an edge build can be installed only while it is the newest on the
          *     edge channel. Never older than the node's version (`update_downgrade`: downgrade by hand), and
-         *     the same version answers `up_to_date` without a request. A node in a container or Kubernetes
-         *     is upgraded by its image (`update_unsupported`), and a node whose update service isn't enabled
-         *     says so (`update_not_enabled`). In a cluster, upgrade replicas before the primary, one at a
-         *     time: `telltale ctl upgrade` does this. `id` as for the read. It changes no configuration, so a
+         *     never a change of channel: a node on releases takes only a release (`update_channel`). The
+         *     same version answers `up_to_date` without a request. One at a time per node: while a request
+         *     waits for the update service or an update runs, another gets `update_in_progress`. A node in a
+         *     container or Kubernetes is upgraded by its image (`update_unsupported`), and a node whose
+         *     update service isn't enabled says so (`update_not_enabled`). In a cluster, upgrade replicas
+         *     before the primary, one at a time: `telltale ctl upgrade` does this. `id` as for the read.
+         *     `?dryRun=true` makes every check and writes nothing. It changes no configuration, so a
          *     GitOps-managed cluster takes it too. Needs the admin role (agents: the `cluster:upgrade`
          *     scope); audit-logged as `node.update.request`.
          */
@@ -4345,7 +4348,7 @@ export interface components {
          * @description Stable error codes.
          * @enum {string}
          */
-        Code: "invalid_parameter" | "not_found" | "unsupported_scope" | "unavailable" | "internal" | "unauthorized" | "totp_required" | "forbidden" | "csrf_rejected" | "conflict" | "version_conflict" | "invalid_config" | "rate_limited" | "gitops_managed" | "maintenance_too_long" | "maintenance_invalid" | "node_unreachable" | "node_unknown" | "simulation_busy" | "simulation_window" | "cluster_pinned" | "no_rollout" | "version_unknown" | "version_blobs_missing" | "annotation_text" | "annotation_time" | "method_not_allowed" | "heatmap_window" | "privacy_level" | "kubernetes_disabled" | "drill_refused" | "drill_active" | "drill_targets" | "node_is_primary" | "node_is_up" | "change_in_progress" | "update_unsupported" | "update_not_enabled" | "update_downgrade" | "update_invalid" | "update_channel";
+        Code: "invalid_parameter" | "not_found" | "unsupported_scope" | "unavailable" | "internal" | "unauthorized" | "totp_required" | "forbidden" | "csrf_rejected" | "conflict" | "version_conflict" | "invalid_config" | "rate_limited" | "gitops_managed" | "maintenance_too_long" | "maintenance_invalid" | "node_unreachable" | "node_unknown" | "simulation_busy" | "simulation_window" | "cluster_pinned" | "no_rollout" | "version_unknown" | "version_blobs_missing" | "annotation_text" | "annotation_time" | "method_not_allowed" | "heatmap_window" | "privacy_level" | "kubernetes_disabled" | "drill_refused" | "drill_active" | "drill_targets" | "node_is_primary" | "node_is_up" | "change_in_progress" | "update_unsupported" | "update_not_enabled" | "update_downgrade" | "update_invalid" | "update_channel" | "update_in_progress";
         /** @description What a change to local names or forwarded domains did (or would do, with `dryRun`). */
         ConfigChange: {
             /** @description The entry after (absent after a delete). */
@@ -12417,7 +12420,13 @@ export interface operations {
     };
     node_update_request: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description REQ: AGT-002 — run every check the node makes and say what would happen; nothing is
+                 *     written and nothing installed (`state: would_request` or `up_to_date`).
+                 */
+                dryRun?: boolean;
+            };
             header?: never;
             path: {
                 /** @description `local`, or a node's ID, site, or pod name. */
@@ -12431,7 +12440,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description `state`: `requested` (handed to the update service) or `up_to_date`. */
+            /** @description `state`: `requested` (handed to the update service) or `up_to_date`; with `dryRun`, `would_request` or `up_to_date`. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -12449,7 +12458,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The node is upgraded by its image (`update_unsupported`), its update service is off (`update_not_enabled`), or the version is older than its own (`update_downgrade`). */
+            /** @description The node is upgraded by its image (`update_unsupported`), its update service is off (`update_not_enabled`), the version is older than its own (`update_downgrade`) or on another channel (`update_channel`), or an update is already under way there (`update_in_progress`). */
             409: {
                 headers: {
                     [name: string]: unknown;

@@ -5474,7 +5474,7 @@
           "system"
         ],
         "summary": "Install a version on a node.",
-        "description": "A native node (installed with `install.sh`) hands the request to its root update service,\nwhich verifies the release's signature and checksum, installs the binary, and restarts the\nnode; `GET` on the same path shows how it went. The version is a release (`0.8.0`) or an edge\nbuild (`0.8.0-edge.393`); an edge build can be installed only while it is the newest on the\nedge channel. Never older than the node's version (`update_downgrade`: downgrade by hand), and\nthe same version answers `up_to_date` without a request. A node in a container or Kubernetes\nis upgraded by its image (`update_unsupported`), and a node whose update service isn't enabled\nsays so (`update_not_enabled`). In a cluster, upgrade replicas before the primary, one at a\ntime: `telltale ctl upgrade` does this. `id` as for the read. It changes no configuration, so a\nGitOps-managed cluster takes it too. Needs the admin role (agents: the `cluster:upgrade`\nscope); audit-logged as `node.update.request`.",
+        "description": "A native node (installed with `install.sh`) hands the request to its root update service,\nwhich verifies the release's signature and checksum, installs the binary, and restarts the\nnode; `GET` on the same path shows how it went. The version is a release (`0.8.0`) or an edge\nbuild (`0.8.0-edge.393`); an edge build can be installed only while it is the newest on the\nedge channel. Never older than the node's version (`update_downgrade`: downgrade by hand), and\nnever a change of channel: a node on releases takes only a release (`update_channel`). The\nsame version answers `up_to_date` without a request. One at a time per node: while a request\nwaits for the update service or an update runs, another gets `update_in_progress`. A node in a\ncontainer or Kubernetes is upgraded by its image (`update_unsupported`), and a node whose\nupdate service isn't enabled says so (`update_not_enabled`). In a cluster, upgrade replicas\nbefore the primary, one at a time: `telltale ctl upgrade` does this. `id` as for the read.\n`?dryRun=true` makes every check and writes nothing. It changes no configuration, so a\nGitOps-managed cluster takes it too. Needs the admin role (agents: the `cluster:upgrade`\nscope); audit-logged as `node.update.request`.",
         "operationId": "node_update_request",
         "parameters": [
           {
@@ -5484,6 +5484,15 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "dryRun",
+            "in": "query",
+            "description": "REQ: AGT-002 — run every check the node makes and say what would happen; nothing is\nwritten and nothing installed (`state: would_request` or `up_to_date`).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           }
         ],
@@ -5499,7 +5508,7 @@
         },
         "responses": {
           "200": {
-            "description": "`state`: `requested` (handed to the update service) or `up_to_date`.",
+            "description": "`state`: `requested` (handed to the update service) or `up_to_date`; with `dryRun`, `would_request` or `up_to_date`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -5519,7 +5528,7 @@
             }
           },
           "409": {
-            "description": "The node is upgraded by its image (`update_unsupported`), its update service is off (`update_not_enabled`), or the version is older than its own (`update_downgrade`).",
+            "description": "The node is upgraded by its image (`update_unsupported`), its update service is off (`update_not_enabled`), the version is older than its own (`update_downgrade`) or on another channel (`update_channel`), or an update is already under way there (`update_in_progress`).",
             "content": {
               "application/json": {
                 "schema": {
@@ -12317,7 +12326,8 @@
           "update_not_enabled",
           "update_downgrade",
           "update_invalid",
-          "update_channel"
+          "update_channel",
+          "update_in_progress"
         ]
       },
       "ConfigChange": {

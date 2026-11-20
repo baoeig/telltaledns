@@ -625,6 +625,103 @@ fn ops_014_the_units_watch_and_write_only_the_request_folder() {
     }
 }
 
+/// REQ: OPS-014 (ADR-182) — one at a time per node: a second request while the first waits for
+/// the update service gets `update_in_progress` (409) and the first is kept as it was; so does
+/// one while a run says `installing`, but not once that run is older than the update service's
+/// limit (it died), nor once the first request is older than the service would take.
+#[test]
+fn ops_014_a_second_request_waits_for_the_first() {
+    let d = tempfile::tempdir().unwrap();
+    let h = here(d.path(), "native", "0.7.0", true);
+    let first = request(&h, "0.8.0", "alice", NOW).unwrap().pending.unwrap();
+    let code_of = |e: &Problem| serde_json::to_value(e.code).unwrap();
+    let e = request(&h, "0.8.1", "bob", NOW + 1000).unwrap_err();
+    assert_eq!(
+        (code_of(&e), e.status),
+        (serde_json::json!("update_in_progress"), 409),
+        "{e:?}"
+    );
+    let kept: RequestFile =
+        serde_json::from_slice(&std::fs::read(h.request_path()).unwrap()).unwrap();
+    assert_eq!(
+        (kept.id.as_str(), kept.to.as_str()),
+        (first.id.as_str(), "0.8.0")
+    );
+    // A request the update service would refuse for its age is replaced.
+    let later = NOW + STALE_REQUEST_MS + 1;
+    assert_eq!(
+        request(&h, "0.8.1", "bob", later)
+            .unwrap()
+            .pending
+            .unwrap()
+            .to,
+        "0.8.1"
+    );
+    // A run under way holds a new request off; one that has said `installing` for longer than
+    // the update service may run doesn't.
+    std::fs::remove_file(h.request_path()).unwrap();
+    let installing = |at_ms: u64| ResultFile {
+        id: "1a-2b".into(),
+        to: "0.8.1".into(),
+        from: "0.7.0".into(),
+        state: "installing".into(),
+        error: None,
+        by: "bob".into(),
+        at_ms,
+    };
+    std::fs::create_dir_all(h.result.parent().unwrap()).unwrap();
+    std::fs::write(&h.result, serde_json::to_vec(&installing(later)).unwrap()).unwrap();
+    let e = request(&h, "0.8.2", "carol", later + 60_000).unwrap_err();
+    assert_eq!(
+        code_of(&e),
+        serde_json::json!("update_in_progress"),
+        "{e:?}"
+    );
+    assert!(!h.request_path().exists());
+    let after = later + 15 * 60 * 1000 + 1;
+    assert_eq!(
+        request(&h, "0.8.2", "carol", after)
+            .unwrap()
+            .state
+            .as_deref(),
+        Some("requested")
+    );
+}
+
+/// REQ: OPS-014, AGT-002 (ADR-182) — a dry run makes the node's checks and says what would
+/// happen, and writes nothing: `would_request`, `up_to_date`, or the same refusal a request
+/// gets.
+#[test]
+fn ops_014_a_dry_run_writes_nothing() {
+    let d = tempfile::tempdir().unwrap();
+    let h = here(d.path(), "native", "0.7.0", true);
+    assert_eq!(
+        dry_run(&h, "0.8.0", NOW).unwrap().state.as_deref(),
+        Some("would_request")
+    );
+    assert_eq!(
+        dry_run(&h, "0.7.0", NOW).unwrap().state.as_deref(),
+        Some("up_to_date")
+    );
+    assert_eq!(
+        dry_run(&h, "0.6.0", NOW).unwrap_err().code,
+        Code::UpdateDowngrade
+    );
+    assert_eq!(
+        dry_run(&h, "0.8.0-edge.1", NOW).unwrap_err().code,
+        Code::UpdateChannel
+    );
+    assert!(
+        std::fs::read_dir(d.path()).unwrap().next().is_none(),
+        "nothing written"
+    );
+    request(&h, "0.8.0", "alice", NOW).unwrap();
+    assert_eq!(
+        dry_run(&h, "0.8.1", NOW).unwrap_err().code,
+        Code::UpdateInProgress
+    );
+}
+
 #[test]
 fn ops_014_a_version_picks_its_channel() {
     assert_eq!(channel_for("0.8.0"), crate::selfupdate::Channel::Stable);

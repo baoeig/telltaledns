@@ -776,6 +776,13 @@ pub enum NodeUpdateCall {
         by: String,
     },
     Status,
+    /// REQ: OPS-014, AGT-002 (ADR-182) — every check a request gets, and what it would do, with
+    /// nothing written. Its own variant, so a node that doesn't know it refuses it rather than
+    /// taking it for a request.
+    DryRun {
+        /// The version, as for a request.
+        to: String,
+    },
 }
 
 /// REQ: CLU-014 — a drill start or end, as the API checked it (and as it crosses the cluster

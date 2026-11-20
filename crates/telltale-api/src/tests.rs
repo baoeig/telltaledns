@@ -437,6 +437,14 @@ impl Backend for Fake {
                 Some("requested".to_owned())
             }
             crate::NodeUpdateCall::Status => None,
+            // REQ: OPS-014, AGT-002 — the node's checks, nothing written.
+            crate::NodeUpdateCall::DryRun { to } => {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(format!("dry-run {node} to={to}"));
+                Some("would_request".to_owned())
+            }
         };
         let r = if node == "pod" && state.is_some() {
             Err(Problem::new(
@@ -2366,6 +2374,35 @@ async fn ops_010_maintenance_requests_over_http() {
     )
     .await;
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+}
+
+// REQ: OPS-014, AGT-002 (ADR-182) — `?dryRun=true` asks the node to make its checks only: the
+// call is a dry run, never a request.
+#[tokio::test]
+async fn ops_014_a_dry_run_reaches_the_node_as_one() {
+    let (app, fake) = app();
+    let (s, _, v) = send(
+        &app,
+        Request::post("/api/v1/nodes/dns-02/update?dryRun=true")
+            .header("authorization", format!("Bearer {}", app.bearer))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"to":"0.8.0"}"#))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        (s, v["state"].as_str()),
+        (StatusCode::OK, Some("would_request")),
+        "{v}"
+    );
+    {
+        let seen = fake.seen.lock().unwrap();
+        assert!(
+            seen.iter().any(|l| l == "dry-run dns-02 to=0.8.0")
+                && !seen.iter().any(|l| l.starts_with("update ")),
+            "a dry run reaches the node as one, never as a request: {seen:?}"
+        );
+    }
 }
 
 // REQ: OPS-014, AGT-004 — update requests over HTTP: the version is checked (422), the request

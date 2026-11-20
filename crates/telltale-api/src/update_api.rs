@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -20,6 +20,7 @@ use crate::auth::routes::{body, principal, reason, remote};
 use crate::model::{NodeUpdate, NodeUpdateRequest};
 use crate::problem::{Code, Problem};
 use crate::{NodeUpdateCall, Shared};
+use utoipa::IntoParams;
 
 /// The longest version string taken.
 const MAX_VERSION: usize = 40;
@@ -119,6 +120,16 @@ async fn node_update_status(State(backend): State<Shared>, Path(id): Path<String
     }
 }
 
+/// Query parameters of an update request.
+#[derive(Debug, Default, serde::Deserialize, IntoParams)]
+#[serde(rename_all = "camelCase")]
+#[into_params(parameter_in = Query)]
+pub struct UpdateQuery {
+    /// REQ: AGT-002 — run every check the node makes and say what would happen; nothing is
+    /// written and nothing installed (`state: would_request` or `up_to_date`).
+    pub dry_run: Option<bool>,
+}
+
 /// Install a version on a node.
 ///
 /// A native node (installed with `install.sh`) hands the request to its root update service,
@@ -126,25 +137,29 @@ async fn node_update_status(State(backend): State<Shared>, Path(id): Path<String
 /// node; `GET` on the same path shows how it went. The version is a release (`0.8.0`) or an edge
 /// build (`0.8.0-edge.393`); an edge build can be installed only while it is the newest on the
 /// edge channel. Never older than the node's version (`update_downgrade`: downgrade by hand), and
-/// the same version answers `up_to_date` without a request. A node in a container or Kubernetes
-/// is upgraded by its image (`update_unsupported`), and a node whose update service isn't enabled
-/// says so (`update_not_enabled`). In a cluster, upgrade replicas before the primary, one at a
-/// time: `telltale ctl upgrade` does this. `id` as for the read. It changes no configuration, so a
+/// never a change of channel: a node on releases takes only a release (`update_channel`). The
+/// same version answers `up_to_date` without a request. One at a time per node: while a request
+/// waits for the update service or an update runs, another gets `update_in_progress`. A node in a
+/// container or Kubernetes is upgraded by its image (`update_unsupported`), and a node whose
+/// update service isn't enabled says so (`update_not_enabled`). In a cluster, upgrade replicas
+/// before the primary, one at a time: `telltale ctl upgrade` does this. `id` as for the read.
+/// `?dryRun=true` makes every check and writes nothing. It changes no configuration, so a
 /// GitOps-managed cluster takes it too. Needs the admin role (agents: the `cluster:upgrade`
 /// scope); audit-logged as `node.update.request`.
 #[utoipa::path(post, path = "/api/v1/nodes/{id}/update", tag = "system",
-    params(("id" = String, Path, description = "`local`, or a node's ID, site, or pod name.")),
+    params(("id" = String, Path, description = "`local`, or a node's ID, site, or pod name."), UpdateQuery),
     request_body = NodeUpdateRequest,
     responses(
-        (status = 200, body = NodeUpdate, description = "`state`: `requested` (handed to the update service) or `up_to_date`."),
+        (status = 200, body = NodeUpdate, description = "`state`: `requested` (handed to the update service) or `up_to_date`; with `dryRun`, `would_request` or `up_to_date`."),
         (status = 404, body = Problem, description = "No such node (`node_unknown`)."),
-        (status = 409, body = Problem, description = "The node is upgraded by its image (`update_unsupported`), its update service is off (`update_not_enabled`), or the version is older than its own (`update_downgrade`)."),
+        (status = 409, body = Problem, description = "The node is upgraded by its image (`update_unsupported`), its update service is off (`update_not_enabled`), the version is older than its own (`update_downgrade`) or on another channel (`update_channel`), or an update is already under way there (`update_in_progress`)."),
         (status = 422, body = Problem, description = "Not a release or edge build version (`update_invalid`)."),
         (status = 503, body = Problem, description = "The node isn't reachable over the cluster channel (`node_unreachable`)."),
     ))]
 async fn node_update_request(
     State((backend, auth)): State<(Shared, Arc<Auth>)>,
     Path(id): Path<String>,
+    Query(q): Query<UpdateQuery>,
     headers: HeaderMap,
     ext: axum::http::Extensions,
     b: Result<Json<NodeUpdateRequest>, JsonRejection>,
@@ -162,6 +177,16 @@ async fn node_update_request(
         Err(e) => return e.into_response(),
     };
     let actor = auth.actor(&p, remote(&auth, &ext, &headers), reason(&headers));
+    if q.dry_run.unwrap_or(false) {
+        // REQ: AGT-002 — the node's own checks, nothing written: not audited, as other dry runs.
+        return match backend
+            .node_update(&id, NodeUpdateCall::DryRun { to: to.clone() })
+            .await
+        {
+            Ok(r) => Json(r).into_response(),
+            Err(e) => e.into_response(),
+        };
+    }
     let call = NodeUpdateCall::Request {
         to: to.clone(),
         by: actor.name.clone(),

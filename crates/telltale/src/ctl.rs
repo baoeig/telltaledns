@@ -278,7 +278,8 @@ pub(crate) struct UpgradeArgs {
     /// `10m`, or seconds.
     #[arg(long, value_parser = parse_duration, default_value = "10m")]
     pub(crate) timeout: u32,
-    /// Leave nodes that are down out instead of stopping.
+    /// Leave nodes that are down, or that can't take a request now (their update service is off,
+    /// an update is already running, a channel they don't follow), out instead of stopping.
     #[arg(long)]
     pub(crate) skip_down: bool,
     /// Succeed when nothing answers at `--url` (a first install: no cluster to upgrade yet).
@@ -1134,8 +1135,10 @@ struct UpgradePlan {
 }
 
 /// REQ: OPS-014, CLU-010 — the order from a cluster view (`GET /cluster`): native replicas
-/// first (by site, then ID), the primary last; pods are the chart's, and nodes already on the
-/// version (or newer, or on a local build) are left alone. `only` keeps the nodes named.
+/// first (by site, then ID), the primary last; pods are the chart's, witnesses only vote (they
+/// answer nothing else, so they are upgraded by hand), and nodes already on the version (or
+/// newer, or on a local build) are left alone. A member the cluster has never heard from (no
+/// version) is down. `only` keeps the nodes named.
 fn upgrade_plan(view: &Value, to: &str, only: &[String]) -> UpgradePlan {
     use telltale_api::update_api::version_key;
     let mut plan = UpgradePlan::default();
@@ -1155,6 +1158,13 @@ fn upgrade_plan(view: &Value, to: &str, only: &[String]) -> UpgradePlan {
         let have = version_key(&version);
         let reason = if n["ephemeral"].as_bool() == Some(true) || !pod.is_empty() {
             Some("a Kubernetes pod: the chart upgrades it".to_owned())
+        } else if n["witness"].as_bool() == Some(true) {
+            // REQ: OPS-014 (ADR-182) — a witness answers only votes ("a witness only votes").
+            Some("a witness: upgrade it by hand (telltale self-update)".to_owned())
+        } else if version.is_empty() {
+            // Listed in the registry, never heard from since this node started: down.
+            plan.down.push(label);
+            continue;
         } else if version == to {
             Some(format!("already on {to}"))
         } else if have.is_none() {
@@ -1190,6 +1200,78 @@ fn upgrade_plan(view: &Value, to: &str, only: &[String]) -> UpgradePlan {
     plan
 }
 
+/// REQ: OPS-014 (ADR-182) — what the pre-flight read of a planned node (`GET …/update`) says.
+#[derive(Debug, PartialEq, Eq)]
+enum Preflight {
+    /// It can take the request.
+    Ready,
+    /// Not the cluster's to upgrade (a container): left alone, as pods are.
+    Leave(String),
+    /// It can't take a request now: the run stops before asking anyone (`--skip-down` leaves it
+    /// out instead).
+    Block(String),
+}
+
+/// How long an `installing` run counts as running (the node's own lock is the same).
+const INSTALLING_MS: u64 = 15 * 60 * 1000;
+
+/// REQ: OPS-014 (ADR-182) — whether a node whose update state is `u` can be asked for `to` now
+/// (`now_ms`: this machine's clock, for the age of a run that says `installing`).
+fn preflight(u: &Value, to: &str, now_ms: u64) -> Preflight {
+    let install = s(u, "install");
+    if install != "native" {
+        return Preflight::Leave(format!(
+            "installed as {}: its image is upgraded by its deployment",
+            if install.is_empty() {
+                "unknown"
+            } else {
+                &install
+            }
+        ));
+    }
+    if u["enabled"].as_bool() != Some(true) {
+        return Preflight::Block(
+            "its update service is off (on the node, as root: systemctl enable --now telltale-update.path)"
+                .into(),
+        );
+    }
+    if u["pending"].is_object() {
+        return Preflight::Block(format!(
+            "a request for {} is already waiting for its update service",
+            s(&u["pending"], "to")
+        ));
+    }
+    let last = &u["last"];
+    if s(last, "state") == "installing" {
+        let at = telltale_api::time::parse_time_ms(&s(last, "at"), now_ms).unwrap_or(now_ms);
+        if now_ms.saturating_sub(at) < INSTALLING_MS {
+            return Preflight::Block(format!("an update to {} is running on it", s(last, "to")));
+        }
+    }
+    if let Err(why) = telltale_api::update_api::same_channel(&s(u, "version"), to) {
+        return Preflight::Block(why);
+    }
+    Preflight::Ready
+}
+
+/// The hint for an entry node that answers a bare 404 for the update route: it is older.
+const OLDER_ENTRY: &str = "the node at --url doesn't have updates from the cluster (it runs an older version): upgrade it by hand first (telltale self-update --restart), or point --url at a node that does";
+
+/// A problem answer as one line: its detail and hint (an older node's bare 404 gets a hint).
+fn problem_line(status: http::StatusCode, p: &Value) -> String {
+    let code = s(p, "code");
+    if status == http::StatusCode::NOT_FOUND && (code.is_empty() || code == "not_found") {
+        return format!("HTTP {status}: {OLDER_ENTRY}");
+    }
+    format!(
+        "HTTP {status}: {}{}",
+        s(p, "detail"),
+        p.get("hint")
+            .and_then(Value::as_str)
+            .map_or_else(String::new, |h| format!(" ({h})"))
+    )
+}
+
 /// REQ: OPS-014 — whether `node` in a cluster view runs `to`, is up and ready, and has the
 /// newest configuration.
 fn upgraded(view: &Value, id: &str, to: &str) -> bool {
@@ -1222,6 +1304,14 @@ async fn upgrade(api: &Api, a: UpgradeArgs) -> Result<Value, String> {
             return Err(format!("GET /cluster: HTTP {status}: {}", s(&v, "detail")));
         }
         Err(e) if a.skip_if_unreachable => {
+            // REQ: OPS-014 (ADR-182) — loud: on a first install nothing answers yet, but on an
+            // upgrade this lets the chart's pods roll before the native nodes.
+            eprintln!(
+                "WARNING: nothing answered at the API ({e}), so no node was asked to upgrade \
+                 (--skip-if-unreachable). Expected on a first install; on an upgrade the chart's \
+                 pods now roll before the native nodes: check the API Service and run `telltale \
+                 ctl upgrade --to {to}` by hand."
+            );
             return Ok(
                 json!({"to": to, "upgraded": [], "skipped": [], "note": format!("nothing to upgrade yet: {e}")}),
             );
@@ -1261,6 +1351,44 @@ async fn upgrade(api: &Api, a: UpgradeArgs) -> Result<Value, String> {
             plan.skipped.push((d, "down (--skip-down)".into()));
         }
     }
+    // REQ: OPS-014 (ADR-182) — pre-flight: every planned node is read before any is asked, so a
+    // node that couldn't take the request stops the run with nothing asked (one at a time,
+    // replicas first, holds only if every one of them can go).
+    let now_ms = crate::maintenance::now_ms();
+    let mut blocked: Vec<(String, String)> = Vec::new();
+    let mut ready = Vec::new();
+    for st in std::mem::take(&mut plan.steps) {
+        let path = format!("nodes/{}/update", path_segment(&st.id));
+        let read = match api.call_raw(http::Method::GET, &path, None).await {
+            Err(e) => Err(format!("not reachable: {e}")),
+            Ok(Err((status, p))) => Err(problem_line(status, &p)),
+            Ok(Ok(u)) => Ok(preflight(&u, &to, now_ms)),
+        };
+        match read {
+            Ok(Preflight::Ready) => ready.push(st),
+            Ok(Preflight::Leave(why)) => plan.skipped.push((st.label, why)),
+            Ok(Preflight::Block(why)) | Err(why) => blocked.push((st.label, why)),
+        }
+    }
+    plan.steps = ready;
+    if !blocked.is_empty() && !a.skip_down && !a.dry_run {
+        let list: Vec<String> = blocked.iter().map(|(n, w)| format!("{n}: {w}")).collect();
+        return Err(format!(
+            "nothing was asked: {} can't take the upgrade now ({}); fix {} or pass --skip-down",
+            if blocked.len() == 1 {
+                "a node"
+            } else {
+                "nodes"
+            },
+            list.join("; "),
+            if blocked.len() == 1 { "it" } else { "them" }
+        ));
+    }
+    if a.skip_down {
+        for (n, why) in std::mem::take(&mut blocked) {
+            plan.skipped.push((n, format!("{why} (--skip-down)")));
+        }
+    }
     let skipped: Vec<Value> = plan
         .skipped
         .iter()
@@ -1272,7 +1400,13 @@ async fn upgrade(api: &Api, a: UpgradeArgs) -> Result<Value, String> {
             .iter()
             .map(|st| json!({"node": st.label, "from": st.from, "primary": st.primary}))
             .collect();
-        return Ok(json!({"to": to, "dryRun": true, "order": order, "skipped": skipped}));
+        let blocked: Vec<Value> = blocked
+            .iter()
+            .map(|(n, r)| json!({"node": n, "reason": r}))
+            .collect();
+        return Ok(
+            json!({"to": to, "dryRun": true, "order": order, "skipped": skipped, "blocked": blocked}),
+        );
     }
     let mut done = Vec::new();
     let mut skipped = skipped;
@@ -1295,14 +1429,7 @@ async fn upgrade(api: &Api, a: UpgradeArgs) -> Result<Value, String> {
                 continue;
             }
             Err((status, p)) => {
-                return Err(format!(
-                    "{}: HTTP {status}: {}{}",
-                    st.label,
-                    s(&p, "detail"),
-                    p.get("hint")
-                        .and_then(Value::as_str)
-                        .map_or_else(String::new, |h| format!(" ({h})"))
-                ));
+                return Err(format!("{}: {}", st.label, problem_line(status, &p)));
             }
         };
         if s(&r, "state") == "up_to_date" {
@@ -1408,6 +1535,15 @@ fn upgrade_text(v: &Value) -> String {
     }
     for n in arr(&v["skipped"]) {
         let _ = writeln!(out, "  left alone: {}: {}", s(n, "node"), s(n, "reason"));
+    }
+    if !arr(&v["blocked"]).is_empty() {
+        let _ = writeln!(
+            out,
+            "Would stop before asking any node (--skip-down leaves these out):"
+        );
+        for n in arr(&v["blocked"]) {
+            let _ = writeln!(out, "  {}: {}", s(n, "node"), s(n, "reason"));
+        }
     }
     out
 }
@@ -1835,15 +1971,84 @@ mod tests {
                 .iter()
                 .any(|(n, r)| n == "attic (a1)" && r.contains("newer"))
         );
+        // REQ: OPS-014 (ADR-182) — a witness only votes (it would answer "a witness only votes"
+        // and stop the run): left alone, to upgrade by hand. A member of the registry never heard
+        // from (no version) is down, not "a local build".
+        let mut witness = node("w5", "attic-witness", "replica", "0.7.0", true, None);
+        witness["witness"] = json!(true);
+        let mut unheard = node("u6", "shed", "replica", "", false, None);
+        unheard["ready"] = json!(false);
+        let view = json!({"enabled": true, "nodes": [
+            node("p1", "proxmox", "primary", "0.7.0", true, None), witness, unheard,
+        ]});
+        let p = upgrade_plan(&view, "0.8.0", &[]);
+        assert_eq!(p.steps.len(), 1, "{p:?}");
+        assert_eq!(
+            p.skipped,
+            vec![(
+                "attic-witness (w5)".to_owned(),
+                "a witness: upgrade it by hand (telltale self-update)".to_owned()
+            )]
+        );
+        assert_eq!(p.down, vec!["shed (u6)".to_owned()]);
+    }
+
+    /// REQ: OPS-014 (ADR-182) — what the pre-flight read says of a node: ready; a container left
+    /// alone; its update service off, a request waiting, a run under way (not one older than the
+    /// node's own lock), or a stable node asked for an edge build: the run stops first.
+    #[test]
+    fn ops_014_the_preflight_reads_each_node() {
+        let now = 1_795_000_000_000;
+        let at = |ms: u64| telltale_api::time::format_us(ms * 1000);
+        let ok = json!({"node": "pi", "version": "0.7.0", "install": "native", "enabled": true});
+        assert_eq!(preflight(&ok, "0.8.0", now), Preflight::Ready);
+        let with = |k: &str, v: Value| {
+            let mut u = ok.clone();
+            u[k] = v;
+            u
+        };
+        assert!(matches!(
+            preflight(&with("install", json!("container")), "0.8.0", now),
+            Preflight::Leave(_)
+        ));
+        for (u, why) in [
+            (with("enabled", json!(false)), "update service is off"),
+            (with("pending", json!({"to": "0.8.0"})), "already waiting"),
+            (
+                with(
+                    "last",
+                    json!({"state": "installing", "to": "0.8.0", "at": at(now - 60_000)}),
+                ),
+                "is running on it",
+            ),
+        ] {
+            match preflight(&u, "0.8.0", now) {
+                Preflight::Block(w) => assert!(w.contains(why), "{w}"),
+                other => panic!("{u}: {other:?}"),
+            }
+        }
+        assert!(matches!(
+            preflight(&ok, "0.8.0-edge.3", now),
+            Preflight::Block(w) if w.contains("stable channel")
+        ));
+        // A run that says `installing` for longer than the node's lock is over (it died).
+        let stale = with(
+            "last",
+            json!({"state": "installing", "to": "0.8.0", "at": at(now - INSTALLING_MS - 1)}),
+        );
+        assert_eq!(preflight(&stale, "0.8.0", now), Preflight::Ready);
     }
 
     /// A fake API: `versions` per node; a POST "installs" by moving the node to the version
-    /// (or fails it when the node is in `fail`).
+    /// (or fails it when the node is in `fail`). A node in `disabled` has its update service
+    /// off. `calls` has every request to a node's update route, in order.
     #[derive(Default)]
     struct FakeCluster {
         versions: std::sync::Mutex<Vec<(String, String)>>,
         asked: std::sync::Mutex<Vec<String>>,
+        calls: std::sync::Mutex<Vec<String>>,
         fail: Vec<String>,
+        disabled: Vec<String>,
     }
 
     async fn fake_api(f: Arc<FakeCluster>) -> String {
@@ -1876,15 +2081,26 @@ mod tests {
             reply(json!({"enabled": true, "nodes": nodes}))
         };
         let status = move |State(f): State<Arc<FakeCluster>>, P(id): P<String>| async move {
+            f.calls.lock().unwrap().push(format!("GET {id}"));
             let failed = f.fail.contains(&id) && f.asked.lock().unwrap().contains(&id);
             let last = if failed {
                 json!({"id": "r-1", "state": "failed", "error": "checksum mismatch"})
             } else {
                 Value::Null
             };
-            reply(json!({"node": id, "last": last}))
+            let version = f
+                .versions
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(n, _)| *n == id)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+            reply(json!({"node": id, "version": version, "install": "native",
+                         "enabled": !f.disabled.contains(&id), "last": last}))
         };
         let post = move |State(f): State<Arc<FakeCluster>>, P(id): P<String>, body: String| async move {
+            f.calls.lock().unwrap().push(format!("POST {id}"));
             let to = serde_json::from_str::<Value>(&body).unwrap()["to"]
                 .as_str()
                 .unwrap()
@@ -1930,8 +2146,46 @@ mod tests {
                     .collect(),
             ),
             asked: std::sync::Mutex::default(),
+            calls: std::sync::Mutex::default(),
             fail: fail.iter().map(|n| (*n).to_owned()).collect(),
+            disabled: Vec::new(),
         })
+    }
+
+    /// REQ: OPS-014 (ADR-182) — pre-flight: every planned node is read before any is asked, and
+    /// one that can't take the request (here its update service is off) stops the run with
+    /// nothing asked, the error naming it; `--skip-down` leaves it out and goes on.
+    #[tokio::test]
+    async fn ops_014_a_node_that_cant_take_the_upgrade_stops_the_run_before_any_is_asked() {
+        let f = Arc::new(FakeCluster {
+            disabled: vec!["dns-02".into()],
+            ..Arc::into_inner(fake(&["c0", "dns-01", "dns-02"], &[])).unwrap()
+        });
+        let base = fake_api(Arc::clone(&f)).await;
+        let e = run(&base, None, "t", CtlCommand::Upgrade(args("0.8.0")), false)
+            .await
+            .unwrap_err();
+        assert!(
+            e.contains("nothing was asked") && e.contains("dns-02") && e.contains("off"),
+            "{e}"
+        );
+        assert!(f.asked.lock().unwrap().is_empty(), "no node was asked");
+        assert_eq!(
+            *f.calls.lock().unwrap(),
+            vec!["GET dns-01", "GET dns-02"],
+            "only the pre-flight reads"
+        );
+        // --skip-down: dns-02 is left out, dns-01 is upgraded.
+        let mut a = args("0.8.0");
+        a.skip_down = true;
+        let out = run(&base, None, "t", CtlCommand::Upgrade(a), false)
+            .await
+            .unwrap();
+        assert_eq!(*f.asked.lock().unwrap(), vec!["dns-01"]);
+        assert!(
+            out.contains("dns-02 (dns-02): its update service is off"),
+            "{out}"
+        );
     }
 
     /// REQ: OPS-014 — `ctl upgrade` asks one node at a time, waits for each to be back on the

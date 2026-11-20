@@ -235,6 +235,9 @@ pub(crate) fn request(h: &Here, to: &str, by: &str, now: u64) -> Result<NodeUpda
         s.state = Some("up_to_date".into());
         return Ok(s);
     };
+    if let Some(busy) = in_progress(h, now) {
+        return Err(busy);
+    }
     let r = RequestFile {
         id: format!("{now:x}-{:08x}", rand::random::<u32>()),
         to: to.clone(),
@@ -242,14 +245,133 @@ pub(crate) fn request(h: &Here, to: &str, by: &str, now: u64) -> Result<NodeUpda
         requested_ms: now,
     };
     // REQ: OPS-014 (ADR-182) — the request's own folder (0750, this node's user's), the only
-    // place of the data directory the update service writes.
-    create_folder(&h.data_dir.join(REQUEST_DIR))
-        .and_then(|()| write_atomic(&h.request_path(), &r, 0o640))
-        .map_err(|e| Problem::internal(format!("can't write the update request: {e}")))?;
+    // place of the data directory the update service writes. A request is created, never
+    // renamed over another: of two at once, one is written and the other waits.
+    let written = create_folder(&h.data_dir.join(REQUEST_DIR))
+        .and_then(|()| write_new(&h.request_path(), &r, 0o640));
+    match written {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(busy_waiting(h)),
+        Err(e) => {
+            return Err(Problem::internal(format!(
+                "can't write the update request: {e}"
+            )));
+        }
+    }
     info!(to = %to, by = %r.by, "update: requested {to} (the update service installs it and restarts this node)");
     let mut s = status(h);
     s.state = Some("requested".into());
     Ok(s)
+}
+
+/// REQ: OPS-014, AGT-002 (ADR-182) — every check [`request`] makes, and what it would do
+/// (`would_request`, or `up_to_date`), with nothing written.
+pub(crate) fn dry_run(h: &Here, to: &str, now: u64) -> Result<NodeUpdate, Problem> {
+    let mut s = status(h);
+    if plan(h, to)?.is_none() {
+        s.state = Some("up_to_date".into());
+        return Ok(s);
+    }
+    if let Some(busy) = in_progress(h, now) {
+        return Err(busy);
+    }
+    s.state = Some("would_request".into());
+    Ok(s)
+}
+
+/// REQ: OPS-014 (ADR-182) — a run that says `installing` holds a new request off this long (the
+/// update service's own limit, `TimeoutStartSec=900`): one that died is no lock for ever.
+const RUNNING_MS: u64 = 15 * 60 * 1000;
+
+fn busy_waiting(h: &Here) -> Problem {
+    Problem::new(
+        Code::UpdateInProgress,
+        format!("{} has a request waiting for its update service", h.node),
+    )
+    .hint("One at a time: GET on the same path shows it; ask again once it is done.")
+    .retry_after(30)
+}
+
+/// REQ: OPS-014 (ADR-182) — one at a time per node: a request waiting for the update service, or
+/// a run that says `installing` and isn't older than [`RUNNING_MS`], holds a new one off. A
+/// request older than the update service would take (an hour) is dead, and is replaced.
+fn in_progress(h: &Here, now: u64) -> Option<Problem> {
+    let path = h.request_path();
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        let at = read_json::<RequestFile>(&path)
+            .map(|r| r.requested_ms)
+            .or_else(|| {
+                let t = meta.modified().ok()?;
+                let d = t.duration_since(std::time::UNIX_EPOCH).ok()?;
+                u64::try_from(d.as_millis()).ok()
+            });
+        if at.is_none_or(|at| now.saturating_sub(at) <= STALE_REQUEST_MS) {
+            return Some(busy_waiting(h));
+        }
+        // Dead: the update service would refuse it. Only a file of ours is removed here.
+        if meta.file_type().is_file() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    let last = read_json::<ResultFile>(&h.result)?;
+    (last.state == "installing" && now.saturating_sub(last.at_ms) < RUNNING_MS).then(|| {
+        Problem::new(
+            Code::UpdateInProgress,
+            format!("{} is installing {}", h.node, last.to),
+        )
+        .hint("One at a time: GET on the same path shows how it goes; ask again once it is done.")
+        .retry_after(60)
+    })
+}
+
+/// Writes `v` as JSON to a temporary file beside `path` and renames it to `path`, which must not
+/// exist (`AlreadyExists` if it does: nothing is replaced, and a reader never sees half a file
+/// or a file with two names).
+fn write_new<T: Serialize>(path: &Path, v: &T, mode: u32) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let tmp = dir.join(format!(".request.{:08x}.tmp", rand::random::<u32>()));
+    let body = serde_json::to_vec_pretty(v).map_err(std::io::Error::other)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    let mut f = opts.open(&tmp)?;
+    let written = f.write_all(&body).and_then(|()| f.sync_all());
+    drop(f);
+    let moved = written.and_then(|()| rename_new(&tmp, path));
+    if moved.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    moved
+}
+
+/// `rename(from, to)` that never replaces `to` (`RENAME_NOREPLACE`).
+#[cfg(target_os = "linux")]
+fn rename_new(from: &Path, to: &Path) -> std::io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags};
+    match rustix::fs::renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE) {
+        Ok(()) => Ok(()),
+        // A filesystem without it: the plain rename, after a look (not atomic, but no worse).
+        Err(rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS) => rename_if_absent(from, to),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rename_new(from: &Path, to: &Path) -> std::io::Result<()> {
+    rename_if_absent(from, to)
+}
+
+fn rename_if_absent(from: &Path, to: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(to).is_ok() {
+        return Err(std::io::ErrorKind::AlreadyExists.into());
+    }
+    std::fs::rename(from, to)
 }
 
 /// Makes the folder `p` (mode 0750) unless it is there.
@@ -325,6 +447,7 @@ fn apply_here(src: &crate::http::Sources, call: NodeUpdateCall) -> Result<NodeUp
     match call {
         NodeUpdateCall::Status => Ok(status(&h)),
         NodeUpdateCall::Request { to, by } => request(&h, &to, &by, now_ms()),
+        NodeUpdateCall::DryRun { to } => dry_run(&h, &to, now_ms()),
     }
 }
 
@@ -397,11 +520,12 @@ pub(crate) fn handle(
             },
             Some(by),
         ),
-        NodeUpdateCall::Status => (NodeUpdateCall::Status, None),
+        // A read, or a dry run (nothing written): not audited.
+        other => (other, None),
     };
     let to = match &call {
         NodeUpdateCall::Request { to, .. } => Some(to.clone()),
-        NodeUpdateCall::Status => None,
+        NodeUpdateCall::Status | NodeUpdateCall::DryRun { .. } => None,
     };
     let r = apply_here(src, call);
     if let (Some(said), Some(auth)) = (said, src.auth.get()) {
