@@ -81,7 +81,7 @@ A summary comes before anything is installed. The answers become `/etc/telltale/
 - **Automation:** `--interactive` asks even without a terminal and reads the answers from stdin; `--config-only FILE` writes the config and stops (no root needed), to see what the answers produce.
 - **The first admin "now"** is created on the service's first start from an Argon2id hash in a root-only systemd drop-in, which the installer removes once the service is up. The password itself isn't stored.
 
-Re-running it upgrades the binary in place. `sudo telltale self-update --restart` does the same check-and-swap from the binary itself (`--channel edge` for builds from main, `--check` to only look): it verifies the signature with the release key built into the binary and the binary's SHA-256, test-runs the download, swaps it in atomically, and keeps the previous binary as `telltale.old`. In containers it refuses (pull a new image instead).
+Re-running it upgrades the binary in place. `sudo telltale self-update --restart` does the same check-and-swap from the binary itself (`--channel edge` for builds from main, `--check` to only look): it verifies the signature with the release key built into the binary and the binary's SHA-256, test-runs the download, swaps it in atomically, and keeps the previous binary as `telltale.old`. In containers it refuses (pull a new image instead). `--to 0.8.0` installs that version only, from its own release page (older than the running one too: that's how to go back), and `--to 0.8.0-edge.393` an edge build while it is still the newest on the edge channel (edge binaries are replaced on every build, so an older one can't be downloaded); the release's signed `releases.json` must name the version and list the same checksum. To let the cluster upgrade the node for you, see [Upgrading from the cluster](#upgrading-from-the-cluster) (`install.sh --cluster-updates`).
 
 **Uninstalling:** `sudo sh install.sh --uninstall` stops and disables the service and removes its unit and the binary (`telltale.old` too).
 - **The system resolver:** if the install turned off systemd-resolved's stub listener, it asks to restore it (the default). `/etc/resolv.conf` is put back as the install found it (the install records the link it replaced, or keeps a copy of the file), and systemd-resolved is restarted, so the machine resolves names again without TelltaleDNS. Without a terminal or with `--yes` it restores without asking; `--keep-resolver` leaves it as the install set it. Installs from before this was recorded get the usual stub link (`/run/systemd/resolve/stub-resolv.conf`).
@@ -185,12 +185,12 @@ The same build identity, and how the node was installed (`native`, `container`, 
 - **What's inside:** each binary carries its dependency list (`cargo audit bin telltale` reads it), and every release has a CycloneDX SBOM per binary (`telltale-<arch>-linux.cdx.json`, listed in the signed `SHA256SUMS`).
 - **Rebuilding:** a release builds the same bytes from the same commit. The build date in `--version` is the commit's time. To compare, build the Dockerfile's `bin` stage with the build arguments `--version` shows (`TELLTALE_BUILD_VERSION`, `TELLTALE_BUILD_COMMIT`, `TELLTALE_BUILD_DATE`, `TELLTALE_BUILD_CHANNEL`) and `SOURCE_DATE_EPOCH` set to the commit's Unix time, then compare checksums. A nightly job builds every commit twice from scratch and fails if the two differ.
 
-TelltaleDNS never updates itself from the UI. The panel shows the step for your install:
+The UI never replaces a node's binary itself. The panel shows the step for your install:
 - **Native:** `sudo telltale self-update --restart` (`--channel edge` for edge).
 - **Container:** `docker compose pull && docker compose up -d`.
 - **Helm:** `helm upgrade`, or bump the chart version in your GitOps values.
 
-In a cluster, upgrade replicas first.
+In a cluster, upgrade replicas first. A cluster can do this for its native nodes: see [Upgrading from the cluster](#upgrading-from-the-cluster).
 
 ## Backups and moving to a new machine
 ```sh
@@ -2009,6 +2009,9 @@ DNS keeps answering throughout if your clients have two DNS servers (each node i
 - A replica older than its primary keeps working, unless the primary starts using settings
   the older version doesn't know. Then the replica keeps serving its last version, and its
   sync status says to upgrade it.
+- `telltale ctl upgrade` does the native nodes in this order for you, and the Helm chart's
+  `upgradeHook` runs it before the pods roll: see
+  [Upgrading from the cluster](#upgrading-from-the-cluster).
 
 **Certificates renew themselves.** Each node's cluster certificate lasts 90 days, and a node
 renews it when fewer than 30 days remain (checked every 6 hours). It keeps its key and node
@@ -2245,6 +2248,76 @@ telltale cluster status
 - **Table** shows the same numbers with their 95 % intervals, such as `0.04 % (0.02–0.06 %)`: a wide interval means few answers. **Open in dashboard** opens the dashboard for that node alone. On a phone, pick one measure at a time.
 - The tab says **1 odd** from any tab of the Cluster page. It's a lens, not an alarm: it doesn't change the health icon or alert. Nodes that don't answer are listed and the rest compared; one node alone has nothing to compare.
 - `GET /api/v1/cluster/compare?from=-24h` and the MCP tool `compare_nodes` return the numbers and the findings. Grafana's **Nodes** row has the SERVFAIL and slow shares by node and a table that highlights a node with little traffic.
+
+## Upgrading from the cluster
+A cluster whose nodes run outside Kubernetes (installed with `install.sh`) can upgrade them for
+you, one at a time, in the order a cluster needs: **replicas first, the primary last**, each back
+on the new version, ready, and in sync before the next one starts. With the Helm chart's
+`upgradeHook`, bumping the chart (or merging the Renovate pull request in a GitOps repository)
+upgrades the native nodes first and the pods after them: nothing to do by hand.
+
+**How it works.** The node's service runs as the `telltale` user in a sandbox and can't replace
+its own binary, so it doesn't: asked for a version, it writes
+`/var/lib/telltale/update-request.json` and nothing else. A second, root unit installed next to
+it, `telltale-update.path`, sees the file and starts `telltale-update.service`, which runs
+`telltale self-update --request …`:
+1. it reads the request (a small regular file owned by `telltale`, nothing else) and removes it;
+2. it refuses anything but a release or edge build **newer** than the one installed, and a
+   request more than an hour old;
+3. it downloads the version, checks the release signature and the checksum (the release's
+   signed `releases.json` must name that version), test-runs it, and swaps it in;
+4. it records the outcome in `/var/lib/telltale-update/result.json` (`installing`, `updated`,
+   `up_to_date`, `failed`, or `refused`, with the error), and restarts the node.
+
+So the most anyone who can write that file can do is ask for a newer signed release. The
+cluster never moves a node backwards: to go back, run `sudo telltale self-update --to <version>
+--restart` on the node.
+
+**Turning it on.** The update service is installed and **off**. On each native node:
+```sh
+sudo systemctl enable --now telltale-update.path     # or: sudo sh install.sh --cluster-updates
+```
+A node installed before this feature gets the units by running `install.sh` again (or by
+upgrading by hand once, then re-running it).
+
+**Upgrading.** From anywhere with an admin's token (or an agent token with `analytics:read` and
+`cluster:upgrade`):
+```sh
+telltale ctl --url https://dns.example.com upgrade --to 0.8.0 --dry-run   # the order, nothing asked
+telltale ctl --url https://dns.example.com upgrade --to 0.8.0
+```
+It reads the Cluster page's view, leaves Kubernetes pods to the chart (and nodes already on the
+version, or newer), then asks each node in turn and waits (`--timeout`, 10 minutes each by
+default). A node that fails stops it: the nodes after it keep their version, and the error says
+why (from the node's `result.json`). A node that is down stops it before anything starts
+(`--skip-down` leaves it out). One node: `--node dns-02`. The same call for one node is
+`POST /api/v1/nodes/{id}/update {"to": "0.8.0"}` (admin), and `GET` on the same path shows the
+node's version, whether its update service is on, a request it hasn't picked up yet, and the
+latest outcome.
+
+**Edge builds.** An edge build can be installed only while it is the newest on the edge channel:
+edge binaries are replaced on every build. If a newer one was published since, the node refuses
+("the edge channel now serves …"): ask for that one, or wait for the release.
+
+**With the Helm chart.** When the controller runs in Kubernetes and the other nodes don't, turn
+on the chart's hook: a Job that runs before the pods roll (`helm.sh/hook: pre-upgrade`, a
+PreSync hook in Argo CD), from the **new** image, with `telltale ctl upgrade --to-self`:
+```yaml
+upgradeHook:
+  enabled: true
+  tokenSecret:
+    name: telltale-upgrade   # key `token`: an agent token with analytics:read and cluster:upgrade
+```
+- It upgrades every native node to the image's version and waits for each; only then does Helm
+  (or Argo CD) roll the pods. A node that fails fails the hook, and the pods keep their version.
+- Under Argo CD it runs on every sync: with every node on the version it finishes at once, and on
+  the first install (no API answering yet) it has nothing to do.
+- A NetworkPolicy that limits the API (`networkPolicy.apiFrom`) gets a rule that lets the hook in.
+- With an edge image, the native nodes can take its build only while it is the newest edge build,
+  so pin the chart to the newest edge build when you move to one.
+
+**What it doesn't do.** It doesn't upgrade containers or Compose installs (pull the new image), it
+doesn't choose a version for you (that's your chart bump, or `--to`), and it never downgrades.
 
 ## Taking a node down for maintenance
 Swapping a Pi's SD card, moving a box, or upgrading a node by hand: put the node in maintenance
@@ -3190,6 +3263,7 @@ Give an AI assistant (or any automation) an **agent token** instead of your own 
 | `ops:pause`, `ops:cache`, `ops:anomalies`, `ops:maintenance`, `ops:annotate` | pause blocking; flush the cache; acknowledge device anomalies; start and end [node maintenance](#taking-a-node-down-for-maintenance) (at most 2 hours); leave [notes](#change-markers) on the time charts |
 | `ops:drill` | start and end [failover drills](#failover-drills) (at most 5 minutes; never a default scope) |
 | `cluster:admin` | promote a node to primary |
+| `cluster:upgrade` | ask native nodes to [install a newer version](#upgrading-from-the-cluster) (never a default scope) |
 
 The default is `analytics:read` and `config:read`: read-only, without the query log. A token never gets more than its owner's role allows.
 

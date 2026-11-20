@@ -62,6 +62,7 @@ fn options(base: String, check: bool) -> Options {
         channel: Channel::Stable,
         check,
         restart: false,
+        to: None,
         base_url: Some(base),
         exe: None,
     }
@@ -160,4 +161,134 @@ async fn ops_004_refuses_bad_signature_or_checksum() {
             .await
             .is_err()
     );
+}
+
+// ---- REQ: OPS-014 — pinned installs (`--to`) ----
+
+fn pinned(name: &str) -> Vec<u8> {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("testdata/pinned")
+        .join(name);
+    std::fs::read(p).unwrap()
+}
+
+fn pinned_key() -> String {
+    String::from_utf8(pinned("test.pub"))
+        .unwrap()
+        .trim()
+        .to_owned()
+}
+
+/// A release page whose `releases.json` is `index`.
+fn pinned_release(index: &str) -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        ("/r/SHA256SUMS", pinned("SHA256SUMS")),
+        ("/r/SHA256SUMS.minisig", pinned("SHA256SUMS.minisig")),
+        ("/r/telltale-x86_64-linux", pinned("release-binary")),
+        ("/r/releases.json", pinned(index)),
+        (
+            "/r/releases.json.minisig",
+            pinned(&format!("{index}.minisig")),
+        ),
+    ]
+}
+
+fn pinned_options(base: String, to: &str) -> Options {
+    Options {
+        channel: crate::node_update::channel_for(to),
+        check: false,
+        restart: false,
+        to: Some(to.into()),
+        base_url: Some(base),
+        exe: None,
+    }
+}
+
+#[test]
+fn ops_014_a_pinned_release_is_downloaded_from_its_own_page() {
+    let o = |channel, to: Option<&str>| Options {
+        channel,
+        check: false,
+        restart: false,
+        to: to.map(str::to_owned),
+        base_url: None,
+        exe: None,
+    };
+    assert_eq!(
+        base_url(&o(Channel::Stable, Some("0.8.0"))),
+        format!("{RELEASES}/download/v0.8.0")
+    );
+    assert_eq!(
+        base_url(&o(Channel::Stable, None)),
+        format!("{RELEASES}/latest/download")
+    );
+    assert_eq!(
+        base_url(&o(Channel::Edge, Some("0.8.0-edge.393"))),
+        format!("{RELEASES}/download/edge")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ops_014_a_pinned_install_takes_only_the_version_its_signed_index_names() {
+    let key = pinned_key();
+    // The release: installed.
+    let dir = tempfile::tempdir().unwrap();
+    let exe = old_binary(dir.path());
+    let base = serve(pinned_release("releases.json")).await;
+    let out = update(&pinned_options(base.clone(), "9.9.9"), &exe, ASSET, &key)
+        .await
+        .unwrap();
+    assert!(matches!(out, Outcome::Updated { .. }), "{out:?}");
+    assert_eq!(std::fs::read(&exe).unwrap(), pinned("release-binary"));
+
+    // Another version under that release's index: nothing is installed.
+    let dir = tempfile::tempdir().unwrap();
+    let exe = old_binary(dir.path());
+    let err = update(&pinned_options(base, "9.9.8"), &exe, ASSET, &key)
+        .await
+        .unwrap_err();
+    assert!(err.contains("names 9.9.9: not trusted"), "{err}");
+    assert_eq!(std::fs::read(&exe).unwrap(), b"#!/bin/sh\necho old\n");
+
+    // An index that lists another SHA-256 than SHA256SUMS: refused.
+    let base = serve(pinned_release("releases-mismatch.json")).await;
+    let err = update(&pinned_options(base, "9.9.9"), &exe, ASSET, &key)
+        .await
+        .unwrap_err();
+    assert!(err.contains("disagree"), "{err}");
+
+    // An index signed by another key: refused.
+    let base = serve(pinned_release("releases.json")).await;
+    let err = update(&pinned_options(base, "9.9.9"), &exe, ASSET, TEST_KEY)
+        .await
+        .unwrap_err();
+    assert!(err.contains("signature"), "{err}");
+    assert_eq!(std::fs::read(&exe).unwrap(), b"#!/bin/sh\necho old\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ops_014_an_edge_build_installs_only_while_it_is_the_newest() {
+    let key = pinned_key();
+    let dir = tempfile::tempdir().unwrap();
+    let exe = old_binary(dir.path());
+    let base = serve(pinned_release("releases-edge.json")).await;
+    let err = update(
+        &pinned_options(base.clone(), "9.9.9-edge.6"),
+        &exe,
+        ASSET,
+        &key,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains("now serves 9.9.9-edge.7") && err.contains("only the newest edge build"),
+        "{err}"
+    );
+    assert_eq!(std::fs::read(&exe).unwrap(), b"#!/bin/sh\necho old\n");
+    let out = update(&pinned_options(base, "9.9.9-edge.7"), &exe, ASSET, &key)
+        .await
+        .unwrap();
+    assert!(matches!(out, Outcome::Updated { .. }), "{out:?}");
 }

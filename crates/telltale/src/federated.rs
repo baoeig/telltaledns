@@ -375,6 +375,15 @@ pub(crate) fn rpc_handler(
                 .await
                 .map_err(|e| format!("maintenance worker failed: {e}"))?;
             }
+            if kind == crate::node_update::KIND {
+                // REQ: OPS-014 — another node asks this node to install a version, or reads its
+                // update state (a user or `telltale ctl upgrade` acted there).
+                return tokio::task::spawn_blocking(move || {
+                    crate::node_update::handle(&src, &cluster, &peer, &body)
+                })
+                .await
+                .map_err(|e| format!("update worker failed: {e}"))?;
+            }
             if kind == crate::drill::KIND {
                 // REQ: CLU-014 — a drill started or ended here (a user acted elsewhere; never
                 // through an ephemeral member), a drill's window to record, or a read.
@@ -2022,6 +2031,50 @@ impl Backend for Federated {
                     .hint(
                         "Maintenance is the node's own state, so the node must be up to take it.",
                     ))
+                })
+            }
+            Err(_) => {
+                let node = node.to_owned();
+                Box::pin(async move {
+                    Err(Problem::new(Code::NodeUnknown, format!("no cluster node `{node}`"))
+                        .hint("Use `local`, or a node's ID, site, or pod name from the Cluster page (or cluster_status)."))
+                })
+            }
+        }
+    }
+    // REQ: OPS-014 (ADR-177) — installing a version is the node's own business, like
+    // maintenance: a request (or a read) for another node goes to that node.
+    fn node_update(
+        &self,
+        node: &str,
+        call: telltale_api::NodeUpdateCall,
+    ) -> BoxFuture<Result<telltale_api::model::NodeUpdate, Problem>> {
+        use telltale_api::problem::Code;
+        if node == "local" {
+            return self.local.node_update("local", call);
+        }
+        match self.resolve_node(node) {
+            Ok(None) => self.local.node_update("local", call),
+            Ok(Some(peer)) => {
+                let cluster = Arc::clone(&self.cluster);
+                let label = self.label_of(&peer);
+                Box::pin(crate::node_update::send(cluster, peer, label, call))
+            }
+            Err(_)
+                if self
+                    .cluster
+                    .identity
+                    .registry()
+                    .iter()
+                    .any(|n| n.node_id == node) =>
+            {
+                let node = node.to_owned();
+                Box::pin(async move {
+                    Err(Problem::new(
+                        Code::NodeUnreachable,
+                        format!("{node} isn't reachable over the cluster channel"),
+                    )
+                    .hint("The node installs the version itself, so it must be up."))
                 })
             }
             Err(_) => {

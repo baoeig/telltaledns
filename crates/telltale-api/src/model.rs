@@ -2468,6 +2468,79 @@ pub struct MaintenanceRequest {
     pub handover: Option<bool>,
 }
 
+/// REQ: OPS-014 (ADR-177) — `POST /api/v1/nodes/{id}/update`: install this version on the node.
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NodeUpdateRequest {
+    /// A release (`0.8.0`) or an edge build (`0.8.0-edge.393`), never older than the version the
+    /// node runs. An edge build can only be installed while it is the newest on the edge channel.
+    #[schema(example = "0.8.0")]
+    pub to: String,
+}
+
+/// REQ: OPS-014 — a request handed to a node's update service and not picked up yet.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeUpdatePending {
+    pub id: String,
+    #[schema(example = "0.8.0")]
+    pub to: String,
+    /// Who asked: a user, `<user> via <site>` from another node, or an agent.
+    pub by: String,
+    /// When (RFC 3339).
+    pub requested_at: String,
+}
+
+/// REQ: OPS-014 — the update service's latest run on a node.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeUpdateRun {
+    /// The request it answers.
+    pub id: String,
+    #[schema(example = "0.8.0")]
+    pub to: String,
+    /// The version the node ran when the run started.
+    #[schema(example = "0.7.0")]
+    pub from: String,
+    /// `installing`, `updated` (the service then restarts the node), `up_to_date`, `failed`, or
+    /// `refused` (the request was stale, malformed, or older than the node's version).
+    #[schema(example = "updated")]
+    pub state: String,
+    /// What went wrong, for `failed` and `refused`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub by: String,
+    /// When the state was written (RFC 3339).
+    pub at: String,
+}
+
+/// REQ: OPS-014 (ADR-177) — a node's update state (`GET`), or what it did with a request
+/// (`POST`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeUpdate {
+    /// The node (its pod, site, or ID).
+    pub node: String,
+    /// The version it runs.
+    #[schema(example = "0.7.0")]
+    pub version: String,
+    /// `native`, `container`, or `helm`. Only a native node installs a version itself; the others
+    /// are upgraded by their image.
+    pub install: String,
+    /// Its root update service (`telltale-update.path`) is enabled, so a request is picked up.
+    pub enabled: bool,
+    /// After a `POST`: `requested` (handed to the update service) or `up_to_date` (it already runs
+    /// that version). Absent from a `GET`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// A request the update service hasn't picked up yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<NodeUpdatePending>,
+    /// The update service's latest run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<NodeUpdateRun>,
+}
+
 /// A node's maintenance after a start or end.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]

@@ -1946,6 +1946,44 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/nodes/{id}/update": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * A node's version and update state.
+         * @description The version it runs, how it was installed, whether its root update service
+         *     (`telltale-update.path`) is enabled, a request it hasn't picked up yet, and the service's
+         *     latest run (`installing`, `updated`, `up_to_date`, `failed`, or `refused`, with the error).
+         *     `id` is `local` (the node answering) or a cluster node's ID, site, or pod name: the read goes
+         *     to that node over the cluster channel.
+         */
+        get: operations["node_update_status"];
+        put?: never;
+        /**
+         * Install a version on a node.
+         * @description A native node (installed with `install.sh`) hands the request to its root update service,
+         *     which verifies the release's signature and checksum, installs the binary, and restarts the
+         *     node; `GET` on the same path shows how it went. The version is a release (`0.8.0`) or an edge
+         *     build (`0.8.0-edge.393`); an edge build can be installed only while it is the newest on the
+         *     edge channel. Never older than the node's version (`update_downgrade`: downgrade by hand), and
+         *     the same version answers `up_to_date` without a request. A node in a container or Kubernetes
+         *     is upgraded by its image (`update_unsupported`), and a node whose update service isn't enabled
+         *     says so (`update_not_enabled`). In a cluster, upgrade replicas before the primary, one at a
+         *     time: `telltale ctl upgrade` does this. `id` as for the read. It changes no configuration, so a
+         *     GitOps-managed cluster takes it too. Needs the admin role (agents: the `cluster:upgrade`
+         *     scope); audit-logged as `node.update.request`.
+         */
+        post: operations["node_update_request"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/plans": {
         parameters: {
             query?: never;
@@ -4307,7 +4345,7 @@ export interface components {
          * @description Stable error codes.
          * @enum {string}
          */
-        Code: "invalid_parameter" | "not_found" | "unsupported_scope" | "unavailable" | "internal" | "unauthorized" | "totp_required" | "forbidden" | "csrf_rejected" | "conflict" | "version_conflict" | "invalid_config" | "rate_limited" | "gitops_managed" | "maintenance_too_long" | "maintenance_invalid" | "node_unreachable" | "node_unknown" | "simulation_busy" | "simulation_window" | "cluster_pinned" | "no_rollout" | "version_unknown" | "version_blobs_missing" | "annotation_text" | "annotation_time" | "method_not_allowed" | "heatmap_window" | "privacy_level" | "kubernetes_disabled" | "drill_refused" | "drill_active" | "drill_targets" | "node_is_primary" | "node_is_up" | "change_in_progress";
+        Code: "invalid_parameter" | "not_found" | "unsupported_scope" | "unavailable" | "internal" | "unauthorized" | "totp_required" | "forbidden" | "csrf_rejected" | "conflict" | "version_conflict" | "invalid_config" | "rate_limited" | "gitops_managed" | "maintenance_too_long" | "maintenance_invalid" | "node_unreachable" | "node_unknown" | "simulation_busy" | "simulation_window" | "cluster_pinned" | "no_rollout" | "version_unknown" | "version_blobs_missing" | "annotation_text" | "annotation_time" | "method_not_allowed" | "heatmap_window" | "privacy_level" | "kubernetes_disabled" | "drill_refused" | "drill_active" | "drill_targets" | "node_is_primary" | "node_is_up" | "change_in_progress" | "update_unsupported" | "update_not_enabled" | "update_downgrade" | "update_invalid";
         /** @description What a change to local names or forwarded domains did (or would do, with `dryRun`). */
         ConfigChange: {
             /** @description The entry after (absent after a delete). */
@@ -4405,7 +4443,7 @@ export interface components {
              * @description Agent tokens: any of `analytics:read`, `querylog:read`, `config:read`,
              *     `config:write:clients`, `config:write:records`, `config:write:forwards`
              *     (`config:write:*` for all three), `ops:pause`, `ops:cache`, `ops:anomalies`,
-             *     `cluster:admin`.
+             *     `cluster:admin`, `cluster:upgrade`.
              *     Default: `analytics:read` and `config:read` (read-only, no query log). Each needs a
              *     role you have.
              */
@@ -6696,6 +6734,75 @@ export interface components {
             /** @description Each span's start, Unix seconds. */
             start: number[];
             upstreamFailPct: (number | null)[];
+        };
+        /**
+         * @description REQ: OPS-014 (ADR-177) — a node's update state (`GET`), or what it did with a request
+         *     (`POST`).
+         */
+        NodeUpdate: {
+            /** @description Its root update service (`telltale-update.path`) is enabled, so a request is picked up. */
+            enabled: boolean;
+            /**
+             * @description `native`, `container`, or `helm`. Only a native node installs a version itself; the others
+             *     are upgraded by their image.
+             */
+            install: string;
+            last?: components["schemas"]["NodeUpdateRun"] | null;
+            /** @description The node (its pod, site, or ID). */
+            node: string;
+            pending?: components["schemas"]["NodeUpdatePending"] | null;
+            /**
+             * @description After a `POST`: `requested` (handed to the update service) or `up_to_date` (it already runs
+             *     that version). Absent from a `GET`.
+             */
+            state?: string | null;
+            /**
+             * @description The version it runs.
+             * @example 0.7.0
+             */
+            version: string;
+        };
+        /** @description REQ: OPS-014 — a request handed to a node's update service and not picked up yet. */
+        NodeUpdatePending: {
+            /** @description Who asked: a user, `<user> via <site>` from another node, or an agent. */
+            by: string;
+            id: string;
+            /** @description When (RFC 3339). */
+            requestedAt: string;
+            /** @example 0.8.0 */
+            to: string;
+        };
+        /** @description REQ: OPS-014 (ADR-177) — `POST /api/v1/nodes/{id}/update`: install this version on the node. */
+        NodeUpdateRequest: {
+            /**
+             * @description A release (`0.8.0`) or an edge build (`0.8.0-edge.393`), never older than the version the
+             *     node runs. An edge build can only be installed while it is the newest on the edge channel.
+             * @example 0.8.0
+             */
+            to: string;
+        };
+        /** @description REQ: OPS-014 — the update service's latest run on a node. */
+        NodeUpdateRun: {
+            /** @description When the state was written (RFC 3339). */
+            at: string;
+            by: string;
+            /** @description What went wrong, for `failed` and `refused`. */
+            error?: string | null;
+            /**
+             * @description The version the node ran when the run started.
+             * @example 0.7.0
+             */
+            from: string;
+            /** @description The request it answers. */
+            id: string;
+            /**
+             * @description `installing`, `updated` (the service then restarts the node), `up_to_date`, `failed`, or
+             *     `refused` (the request was stale, malformed, or older than the node's version).
+             * @example updated
+             */
+            state: string;
+            /** @example 0.8.0 */
+            to: string;
         };
         /** @description REQ: OBS-033 — `POST /api/v1/annotations`: a note on every time chart. */
         NoteRequest: {
@@ -12249,6 +12356,110 @@ export interface operations {
             };
             /** @description No such node (`node_unknown`). */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The node isn't reachable over the cluster channel (`node_unreachable`). */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    node_update_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description `local`, or a node's ID, site, or pod name. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The node's version and update state. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NodeUpdate"];
+                };
+            };
+            /** @description No such node (`node_unknown`). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The node isn't reachable over the cluster channel (`node_unreachable`). */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    node_update_request: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description `local`, or a node's ID, site, or pod name. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NodeUpdateRequest"];
+            };
+        };
+        responses: {
+            /** @description `state`: `requested` (handed to the update service) or `up_to_date`. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NodeUpdate"];
+                };
+            };
+            /** @description No such node (`node_unknown`). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The node is upgraded by its image (`update_unsupported`), its update service is off (`update_not_enabled`), or the version is older than its own (`update_downgrade`). */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not a release or edge build version (`update_invalid`). */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

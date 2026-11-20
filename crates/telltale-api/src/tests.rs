@@ -422,6 +422,40 @@ impl Backend for Fake {
     fn promote(&self, _: PromoteRequest, _: String) -> Result<ClusterView, Problem> {
         panic!("a dry run must not promote")
     }
+    // REQ: OPS-014 — `pod` is upgraded by its image; every other node takes a request.
+    fn node_update(
+        &self,
+        node: &str,
+        call: crate::NodeUpdateCall,
+    ) -> BoxFuture<Result<crate::model::NodeUpdate, Problem>> {
+        let state = match &call {
+            crate::NodeUpdateCall::Request { to, by } => {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(format!("update {node} to={to} by={by}"));
+                Some("requested".to_owned())
+            }
+            crate::NodeUpdateCall::Status => None,
+        };
+        let r = if node == "pod" && state.is_some() {
+            Err(Problem::new(
+                crate::problem::Code::UpdateUnsupported,
+                "pod runs in a Kubernetes pod",
+            ))
+        } else {
+            Ok(crate::model::NodeUpdate {
+                node: node.to_owned(),
+                version: "0.7.0".into(),
+                install: "native".into(),
+                enabled: true,
+                state,
+                pending: None,
+                last: None,
+            })
+        };
+        Box::pin(async move { r })
+    }
     // REQ: CLU-001 (ADR-155) — `stale` can be removed, `up` only with force, `primary` never.
     fn remove_node(
         &self,
@@ -1605,8 +1639,9 @@ async fn api_001_openapi_is_served_and_documents_every_route() {
     // 112 with CLU-014's /nodes/{id}/drill, /drills, /drills/{id} and /clients/affinity.
     // 113 with CLU-001's /cluster/nodes/{id}.
     // 114 with OBS-038's /anomaly-mutes/{name}; 116 with OPS-011's /system/support-package and
-    // /system/support-package/{id}/map.
-    assert_eq!(paths.len(), 117);
+    // /system/support-package/{id}/map; 117 with T8.2's router routes; 118 with OPS-014's
+    // /nodes/{id}/update.
+    assert_eq!(paths.len(), 118);
     for (path, ops) in paths {
         for (method, op) in ops.as_object().unwrap() {
             // AGT-001: every operation has a summary and a description for agents.
@@ -2331,6 +2366,96 @@ async fn ops_010_maintenance_requests_over_http() {
     )
     .await;
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+}
+
+// REQ: OPS-014, AGT-004 — update requests over HTTP: the version is checked (422), the request
+// reaches the node's backend with the actor, a pod says it's upgraded by its image (409), the
+// read is for any agent with `analytics:read`, and the request only for `cluster:upgrade`.
+#[tokio::test]
+async fn ops_014_update_requests_over_http() {
+    let (app, fake) = app();
+    let post = |token: &str, node: &str, body: &str| {
+        Request::post(format!("/api/v1/nodes/{node}/update"))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .header("x-telltale-reason", "release day")
+            .body(Body::from(body.to_owned()))
+            .unwrap()
+    };
+    let get = |token: &str| {
+        Request::get("/api/v1/nodes/dns-02/update")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (s, _, v) = send(&app, post(&app.bearer, "dns-02", r#"{"to":"0.8"}"#)).await;
+    assert_eq!(
+        (s, v["code"].as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, Some("update_invalid")),
+        "{v}"
+    );
+    let (s, _, v) = send(
+        &app,
+        post(&app.bearer, "dns-02", r#"{"to":"0.8.0","force":true}"#),
+    )
+    .await;
+    assert!(s.is_client_error(), "unknown fields are refused: {s} {v}");
+    let (s, _, v) = send(
+        &app,
+        post(&app.bearer, "dns-02", r#"{"to":"0.8.0-edge.393"}"#),
+    )
+    .await;
+    assert_eq!(
+        (s, v["state"].as_str()),
+        (StatusCode::OK, Some("requested")),
+        "{v}"
+    );
+    assert!(
+        fake.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("update dns-02 to=0.8.0-edge.393 by=")),
+        "{:?}",
+        fake.seen.lock().unwrap()
+    );
+    let (s, _, v) = send(&app, post(&app.bearer, "pod", r#"{"to":"0.8.0"}"#)).await;
+    assert_eq!(
+        (s, v["code"].as_str()),
+        (StatusCode::CONFLICT, Some("update_unsupported")),
+        "{v}"
+    );
+    let token = |scopes: &str| {
+        Request::post("/api/v1/tokens")
+            .header("cookie", &app.cookie)
+            .header("x-csrf-token", &app.csrf)
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"name":"up-{}","kind":"agent","scopes":[{scopes}]}}"#,
+                scopes.len()
+            )))
+            .unwrap()
+    };
+    let (s, _, v) = send(&app, token(r#""analytics:read""#)).await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    let reader = v["token"].as_str().unwrap().to_owned();
+    let (s, _, v) = send(&app, token(r#""analytics:read","cluster:upgrade""#)).await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    let upgrader = v["token"].as_str().unwrap().to_owned();
+    let (s, _, v) = send(&app, get(&reader)).await;
+    assert_eq!(
+        (s, v["version"].as_str()),
+        (StatusCode::OK, Some("0.7.0")),
+        "{v}"
+    );
+    let (s, _, v) = send(&app, post(&reader, "dns-02", r#"{"to":"0.8.0"}"#)).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+    let (s, _, v) = send(&app, post(&upgrader, "dns-02", r#"{"to":"0.8.0"}"#)).await;
+    assert_eq!(
+        (s, v["state"].as_str()),
+        (StatusCode::OK, Some("requested")),
+        "{v}"
+    );
 }
 
 // REQ: OBS-024, AGT-004 — simulations over HTTP: `simulate` needs a dry run; agents need

@@ -7,6 +7,11 @@
 //! binary, checks its SHA-256, test-runs it (`--version`), and swaps it in with an atomic
 //! rename (the previous binary stays next to it as `telltale.old`). Containers are refused:
 //! they update by pulling a new image.
+//!
+//! REQ: OPS-014 (ADR-177) — `--to <version>` installs that version only: a release from its own
+//! release page, or an edge build while it is the newest on the edge channel (edge binaries are
+//! replaced on every build). The release's signed `releases.json` must name that version and
+//! list the same SHA-256 as `SHA256SUMS`, so a version is never installed under another's name.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -38,6 +43,8 @@ pub(crate) struct Options {
     pub(crate) check: bool,
     /// Run `systemctl restart telltale` after updating.
     pub(crate) restart: bool,
+    /// REQ: OPS-014 — install this version only (its channel must be `channel`).
+    pub(crate) to: Option<String>,
     /// Where to download from (tests, mirrors); default: GitHub releases for the channel.
     pub(crate) base_url: Option<String>,
     /// The binary to replace (default: this one).
@@ -66,10 +73,46 @@ pub(crate) fn asset_name() -> Option<&'static str> {
 }
 
 fn base_url(o: &Options) -> String {
-    o.base_url.clone().unwrap_or_else(|| match o.channel {
-        Channel::Stable => format!("{RELEASES}/latest/download"),
-        Channel::Edge => format!("{RELEASES}/download/edge"),
-    })
+    o.base_url
+        .clone()
+        .unwrap_or_else(|| match (o.channel, &o.to) {
+            (Channel::Stable, Some(v)) => format!("{RELEASES}/download/v{v}"),
+            (Channel::Stable, None) => format!("{RELEASES}/latest/download"),
+            (Channel::Edge, _) => format!("{RELEASES}/download/edge"),
+        })
+}
+
+/// REQ: OPS-014 — the signed index of the release at `base` must name `to` and list `want` for
+/// `asset`.
+fn check_pinned(
+    key: &str,
+    index: &[u8],
+    sig: &[u8],
+    to: &str,
+    asset: &str,
+    want: &str,
+) -> Result<(), String> {
+    let ix = crate::updates::verified(key, index, sig)?;
+    if ix.version != to {
+        return Err(if telltale_api::update_api::is_edge(to) {
+            format!(
+                "the edge channel now serves {} (commit {}), not {to}: only the newest edge build can be downloaded. Ask for {} instead, or wait for the release",
+                ix.version, ix.commit, ix.version
+            )
+        } else {
+            format!(
+                "the index of release v{to} names {}: not trusted",
+                ix.version
+            )
+        });
+    }
+    match ix.assets.values().find(|a| a.name == asset) {
+        None => Err(format!("{to} has no {asset}")),
+        Some(a) if !a.sha256.eq_ignore_ascii_case(want) => Err(format!(
+            "{asset}: the release index and SHA256SUMS disagree: not installed"
+        )),
+        Some(_) => Ok(()),
+    }
 }
 
 fn in_container() -> bool {
@@ -124,6 +167,11 @@ pub(crate) async fn update(
     let sig = fetch(&client, &format!("{base}/SHA256SUMS.minisig"), MAX_SUMS).await?;
     verify_signature(key, &sums, &sig)?;
     let want = expected_sha256(&sums, asset)?;
+    if let Some(to) = &o.to {
+        let index = fetch(&client, &format!("{base}/releases.json"), MAX_SUMS).await?;
+        let isig = fetch(&client, &format!("{base}/releases.json.minisig"), MAX_SUMS).await?;
+        check_pinned(key, &index, &isig, to, asset, &want)?;
+    }
     let current = std::fs::read(exe).map_err(|e| format!("cannot read {}: {e}", exe.display()))?;
     if sha256_hex(&current) == want {
         return Ok(Outcome::UpToDate);

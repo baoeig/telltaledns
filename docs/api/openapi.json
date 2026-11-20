@@ -5417,6 +5417,140 @@
         }
       }
     },
+    "/api/v1/nodes/{id}/update": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "A node's version and update state.",
+        "description": "The version it runs, how it was installed, whether its root update service\n(`telltale-update.path`) is enabled, a request it hasn't picked up yet, and the service's\nlatest run (`installing`, `updated`, `up_to_date`, `failed`, or `refused`, with the error).\n`id` is `local` (the node answering) or a cluster node's ID, site, or pod name: the read goes\nto that node over the cluster channel.",
+        "operationId": "node_update_status",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "`local`, or a node's ID, site, or pod name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The node's version and update state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeUpdate"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such node (`node_unknown`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The node isn't reachable over the cluster channel (`node_unreachable`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Install a version on a node.",
+        "description": "A native node (installed with `install.sh`) hands the request to its root update service,\nwhich verifies the release's signature and checksum, installs the binary, and restarts the\nnode; `GET` on the same path shows how it went. The version is a release (`0.8.0`) or an edge\nbuild (`0.8.0-edge.393`); an edge build can be installed only while it is the newest on the\nedge channel. Never older than the node's version (`update_downgrade`: downgrade by hand), and\nthe same version answers `up_to_date` without a request. A node in a container or Kubernetes\nis upgraded by its image (`update_unsupported`), and a node whose update service isn't enabled\nsays so (`update_not_enabled`). In a cluster, upgrade replicas before the primary, one at a\ntime: `telltale ctl upgrade` does this. `id` as for the read. It changes no configuration, so a\nGitOps-managed cluster takes it too. Needs the admin role (agents: the `cluster:upgrade`\nscope); audit-logged as `node.update.request`.",
+        "operationId": "node_update_request",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "`local`, or a node's ID, site, or pod name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NodeUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`state`: `requested` (handed to the update service) or `up_to_date`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeUpdate"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such node (`node_unknown`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The node is upgraded by its image (`update_unsupported`), its update service is off (`update_not_enabled`), or the version is older than its own (`update_downgrade`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Not a release or edge build version (`update_invalid`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The node isn't reachable over the cluster channel (`node_unreachable`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/plans": {
       "get": {
         "tags": [
@@ -12178,7 +12312,11 @@
           "drill_targets",
           "node_is_primary",
           "node_is_up",
-          "change_in_progress"
+          "change_in_progress",
+          "update_unsupported",
+          "update_not_enabled",
+          "update_downgrade",
+          "update_invalid"
         ]
       },
       "ConfigChange": {
@@ -12385,7 +12523,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Agent tokens: any of `analytics:read`, `querylog:read`, `config:read`,\n`config:write:clients`, `config:write:records`, `config:write:forwards`\n(`config:write:*` for all three), `ops:pause`, `ops:cache`, `ops:anomalies`,\n`cluster:admin`.\nDefault: `analytics:read` and `config:read` (read-only, no query log). Each needs a\nrole you have."
+            "description": "Agent tokens: any of `analytics:read`, `querylog:read`, `config:read`,\n`config:write:clients`, `config:write:records`, `config:write:forwards`\n(`config:write:*` for all three), `ops:pause`, `ops:cache`, `ops:anomalies`,\n`cluster:admin`, `cluster:upgrade`.\nDefault: `analytics:read` and `config:read` (read-only, no query log). Each needs a\nrole you have."
           }
         }
       },
@@ -18191,6 +18329,152 @@
               ],
               "format": "double"
             }
+          }
+        }
+      },
+      "NodeUpdate": {
+        "type": "object",
+        "description": "REQ: OPS-014 (ADR-177) — a node's update state (`GET`), or what it did with a request\n(`POST`).",
+        "required": [
+          "node",
+          "version",
+          "install",
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Its root update service (`telltale-update.path`) is enabled, so a request is picked up."
+          },
+          "install": {
+            "type": "string",
+            "description": "`native`, `container`, or `helm`. Only a native node installs a version itself; the others\nare upgraded by their image."
+          },
+          "last": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NodeUpdateRun",
+                "description": "The update service's latest run."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "node": {
+            "type": "string",
+            "description": "The node (its pod, site, or ID)."
+          },
+          "pending": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NodeUpdatePending",
+                "description": "A request the update service hasn't picked up yet."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "state": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "After a `POST`: `requested` (handed to the update service) or `up_to_date` (it already runs\nthat version). Absent from a `GET`."
+          },
+          "version": {
+            "type": "string",
+            "description": "The version it runs.",
+            "example": "0.7.0"
+          }
+        }
+      },
+      "NodeUpdatePending": {
+        "type": "object",
+        "description": "REQ: OPS-014 — a request handed to a node's update service and not picked up yet.",
+        "required": [
+          "id",
+          "to",
+          "by",
+          "requestedAt"
+        ],
+        "properties": {
+          "by": {
+            "type": "string",
+            "description": "Who asked: a user, `<user> via <site>` from another node, or an agent."
+          },
+          "id": {
+            "type": "string"
+          },
+          "requestedAt": {
+            "type": "string",
+            "description": "When (RFC 3339)."
+          },
+          "to": {
+            "type": "string",
+            "example": "0.8.0"
+          }
+        }
+      },
+      "NodeUpdateRequest": {
+        "type": "object",
+        "description": "REQ: OPS-014 (ADR-177) — `POST /api/v1/nodes/{id}/update`: install this version on the node.",
+        "required": [
+          "to"
+        ],
+        "properties": {
+          "to": {
+            "type": "string",
+            "description": "A release (`0.8.0`) or an edge build (`0.8.0-edge.393`), never older than the version the\nnode runs. An edge build can only be installed while it is the newest on the edge channel.",
+            "example": "0.8.0"
+          }
+        },
+        "additionalProperties": false
+      },
+      "NodeUpdateRun": {
+        "type": "object",
+        "description": "REQ: OPS-014 — the update service's latest run on a node.",
+        "required": [
+          "id",
+          "to",
+          "from",
+          "state",
+          "by",
+          "at"
+        ],
+        "properties": {
+          "at": {
+            "type": "string",
+            "description": "When the state was written (RFC 3339)."
+          },
+          "by": {
+            "type": "string"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What went wrong, for `failed` and `refused`."
+          },
+          "from": {
+            "type": "string",
+            "description": "The version the node ran when the run started.",
+            "example": "0.7.0"
+          },
+          "id": {
+            "type": "string",
+            "description": "The request it answers."
+          },
+          "state": {
+            "type": "string",
+            "description": "`installing`, `updated` (the service then restarts the node), `up_to_date`, `failed`, or\n`refused` (the request was stale, malformed, or older than the node's version).",
+            "example": "updated"
+          },
+          "to": {
+            "type": "string",
+            "example": "0.8.0"
           }
         }
       },

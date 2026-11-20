@@ -39,6 +39,7 @@ pub mod support_api;
 pub mod time;
 pub mod timeline;
 pub mod ui;
+pub mod update_api;
 pub mod vqlog;
 
 use std::net::IpAddr;
@@ -614,6 +615,21 @@ pub trait Backend: Send + Sync + 'static {
             ))
         })
     }
+    /// REQ: OPS-014 (ADR-177) — asks `node` (`local`, or a cluster node's ID, site, or pod name)
+    /// to install a version, or reads its update state. A native node hands the request to its
+    /// root update service; it's the node's own business, so a cluster sends it to that node.
+    fn node_update(
+        &self,
+        node: &str,
+        call: NodeUpdateCall,
+    ) -> BoxFuture<Result<model::NodeUpdate, Problem>> {
+        let _ = (node, call);
+        Box::pin(async {
+            Err(Problem::unavailable(
+                "updates from the cluster aren't available on this node",
+            ))
+        })
+    }
     /// REQ: CLU-014 (ADR-151) — starts (or dry-runs) or ends a failover drill on `node`
     /// (`local`, or a cluster node's ID, site, or pod name), sent to that node like maintenance.
     fn drill(&self, node: &str, w: DrillWrite) -> BoxFuture<Result<model::DrillStart, Problem>> {
@@ -746,6 +762,20 @@ pub enum MaintenanceWrite {
     End {
         by: String,
     },
+}
+
+/// REQ: OPS-014 — an update request or a read of a node's update state, as the API checked it
+/// (and as it crosses the cluster channel to the node it's for).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum NodeUpdateCall {
+    Request {
+        /// The version, checked to be a release or edge build version.
+        to: String,
+        /// Who: the actor's name.
+        by: String,
+    },
+    Status,
 }
 
 /// REQ: CLU-014 — a drill start or end, as the API checked it (and as it crosses the cluster
@@ -1020,6 +1050,8 @@ fn rest_router(backend: Shared, auth: Arc<auth::Auth>) -> Router {
         .merge(kubernetes_api::routes(Arc::clone(&backend)))
         // REQ: CLU-014 — the running drill, reports, and the affinity view.
         .merge(drill_api::read_routes(Arc::clone(&backend)))
+        // REQ: OPS-014 — a node's version, update service, and latest update.
+        .merge(update_api::read_routes(Arc::clone(&backend)))
         .merge(rhythm_api::routes(Arc::clone(&backend)))
         .merge(timeline::routes(Arc::clone(&backend)))
         // REQ: CLU-013 — the rollout in progress and the kept versions.
@@ -1085,6 +1117,12 @@ fn rest_router(backend: Shared, auth: Arc<auth::Auth>) -> Router {
         .merge(
             maintenance_api::routes(Arc::clone(&backend), Arc::clone(&auth))
                 .route_layer(from_fn(auth::routes::require_operator)),
+        )
+        // REQ: OPS-014 — installing a version replaces a node's binary: admin (agents:
+        // cluster:upgrade).
+        .merge(
+            update_api::admin_routes(Arc::clone(&backend), Arc::clone(&auth))
+                .route_layer(from_fn(auth::routes::require_admin)),
         )
         // REQ: CLU-014 — drills need operator (agents: ops:drill).
         .merge(
@@ -1156,7 +1194,7 @@ async fn fallback(
         license(name = "Apache-2.0 OR MIT")
     ),
     paths(
-        system_info, system_health, system_probes, maintenance_api::start, maintenance_api::end, drill_api::start, drill_api::end, drill_api::active, drill_api::list, drill_api::report, drill_api::affinity, upstream_checks, shadow_lists, overblocking, update_check, plans::list, plans::approve, plans::reject, cluster, compare::cluster_compare, rhythm_api::client_rhythm, timeline::client_timeline, config_api::cluster_promote, config_api::backup_download, support_api::make, support_api::map, git_hook, stats_summary, stats_timeseries, stats_top, stats_latency, stats_slo, attribution::slo_attribution, heatmap::stats_heatmap, flow::stats_flow, latency_heatmap::latency_heatmap, latency_heatmap::latency_exemplars, queries,
+        system_info, system_health, system_probes, maintenance_api::start, maintenance_api::end, update_api::node_update_status, update_api::node_update_request, drill_api::start, drill_api::end, drill_api::active, drill_api::list, drill_api::report, drill_api::affinity, upstream_checks, shadow_lists, overblocking, update_check, plans::list, plans::approve, plans::reject, cluster, compare::cluster_compare, rhythm_api::client_rhythm, timeline::client_timeline, config_api::cluster_promote, config_api::backup_download, support_api::make, support_api::map, git_hook, stats_summary, stats_timeseries, stats_top, stats_latency, stats_slo, attribution::slo_attribution, heatmap::stats_heatmap, flow::stats_flow, latency_heatmap::latency_heatmap, latency_heatmap::latency_exemplars, queries,
         queries_stream,
         explain, lists, groups, services, clients, upstreams,
         auth::routes::status, auth::routes::setup, auth::routes::login, auth::routes::logout,
@@ -1171,7 +1209,7 @@ async fn fallback(
         config_api::put_forward, config_api::delete_forward
     ),
     components(schemas(
-        Problem, problem::Code, SystemInfo, MaskedClients, ClusterInfo, ClusterPeer, ClusterView, ClusterNode, ClusterEvent, ClusterCheck, ClusterConflict, ClusterFailover, ClusterSource, HostReport, HostInfo, HostPoint, model::RuleInput, model::RuleInfo, model::CacheNodeStats, model::CacheEntry, model::CacheLookup, model::CacheFlushRequest, model::CacheFlushNode, model::CacheFlushResult, model::CacheSettings, model::CacheWarmStart, model::CachePoint, model::CacheSizing, model::CacheSizingStep, model::CacheMakeup, model::CacheTopEntry, model::CacheNodeEntries, model::BlockingRequest, model::BlockingNode, model::PauseInfo, model::ConfigEntry, plans::Plan, model::ServiceInfo, PromoteRequest, model::PromotePlan, Summary, TimeBucket, TopItem, model::ClientStatusCounts, LatencyRow, QueryPage, QueryRow,
+        Problem, problem::Code, model::NodeUpdate, model::NodeUpdateRequest, model::NodeUpdatePending, model::NodeUpdateRun, SystemInfo, MaskedClients, ClusterInfo, ClusterPeer, ClusterView, ClusterNode, ClusterEvent, ClusterCheck, ClusterConflict, ClusterFailover, ClusterSource, HostReport, HostInfo, HostPoint, model::RuleInput, model::RuleInfo, model::CacheNodeStats, model::CacheEntry, model::CacheLookup, model::CacheFlushRequest, model::CacheFlushNode, model::CacheFlushResult, model::CacheSettings, model::CacheWarmStart, model::CachePoint, model::CacheSizing, model::CacheSizingStep, model::CacheMakeup, model::CacheTopEntry, model::CacheNodeEntries, model::BlockingRequest, model::BlockingNode, model::PauseInfo, model::ConfigEntry, plans::Plan, model::ServiceInfo, PromoteRequest, model::PromotePlan, Summary, TimeBucket, TopItem, model::ClientStatusCounts, LatencyRow, QueryPage, QueryRow,
         TailDropped,
         ScanStats, Explanation, ExplainClient, ExplainBlock, ExplainFilter, ExplainRule,
         ExplainLine, ExplainRoute, ListInfo, GroupInfo, ClientInfo, ClientInput, ClientChange, LocalName, RecordInput, RecordsInput, ForwardInfo, ForwardInput, ConfigChange, AnomalyFinding, model::AnomalyAckInfo, model::AnomalyAckRequest, model::AnomalyAckResult, model::Annotation, model::AnnotationPage, model::NoteRequest, model::Health, model::HealthReason, model::NodeMaintenance, model::MaintenanceRequest, model::MaintenanceResult, model::DrillAll, model::DrillTargets, model::DrillRequest, model::DrillMode, model::DrillCheck, model::DrillTargetDevice, model::DrillStart, model::ActiveDrill, model::DrillDevice, model::DrillNodeCount, model::DrillSummary, model::DrillReport, model::DrillPage, model::AffinityNode, model::AffinityRow, model::AffinityPage, model::GuardReadings, model::ClusterPin, model::ClusterRollout, model::RolloutFailure, model::RolloutNode, model::RolloutStatus, model::ClusterVersion, model::ClusterVersions, model::PinRequest, model::RolloutAction, model::NodeRemoval, model::SupportPackageRequest, model::DeviceIdentity, model::IdentityEvidence, model::WorkloadEvidence, model::ExplainWorkload, model::WorkloadInfo, model::WorkloadPod, model::WorkloadPage, model::KubernetesStatus, model::MatchedDomain, model::IdentityRunnerUp, model::Simulation, model::SimulatedClass, model::SimulatedName, model::SimulatedDevice, model::SimulatedGroup, model::SimulateRequest, model::SloStatus, attribution::SloAttribution, attribution::AttributionBudget, attribution::AttributionPoint, attribution::AttributionRow, attribution::AttributionCoverage, heatmap::Heatmap, flow::QueryFlow, flow::FlowNode, flow::FlowLink, compare::NodeCompare, compare::NodeNumbers, compare::NodeSeries, compare::NodeFinding, rhythm_api::ClientRhythm, rhythm_api::RhythmDomain, timeline::DeviceTimeline, timeline::TimelineLane, timeline::TimelineEvent, latency_heatmap::LatencyHeatmap, latency_heatmap::LatencyExemplar, latency_heatmap::LatencyExemplars, model::SloObjective, model::SloBurn, model::ProbeResult, model::UpstreamChecks, model::UpstreamQuality, model::EdeCount, model::UpstreamDisagreement, model::ShadowListStats, model::NameCount, model::OverblockSuspect, NewDomain, VqlogResult, VqlogCost, ZoneInfo, model::RewriteInfo, model::AlertsStatus, model::FiringAlert, model::AlertDelivery, model::AlertTest, model::CheckResult, ListShare, DhcpLease, UpstreamInfo, Step, TopKind,

@@ -38,6 +38,7 @@ mod masking;
 mod mcp_stdio;
 mod mdns;
 mod node_removal;
+mod node_update;
 mod otlp;
 mod pihole;
 mod pipeline;
@@ -310,6 +311,20 @@ enum Command {
         /// Restart the `telltale` systemd service after updating.
         #[arg(long)]
         restart: bool,
+        // REQ: OPS-014
+        /// Install this version only: a release (`0.8.0`), or an edge build
+        /// (`0.8.0-edge.393`) while it is the newest on the edge channel. It may be older than
+        /// this one (a downgrade by hand). Sets the channel.
+        #[arg(long, value_name = "VERSION", conflicts_with = "request")]
+        to: Option<String>,
+        // REQ: OPS-014
+        /// The root update service's run (`telltale-update.service`): install the version a
+        /// node's request file asks for, if it is newer, and record the outcome.
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["check", "channel"])]
+        request: Option<PathBuf>,
+        /// With `--request`: where to record the outcome (the node reads it).
+        #[arg(long, value_name = "FILE", requires = "request", default_value = node_update::RESULT_PATH)]
+        result: PathBuf,
     },
 }
 
@@ -781,7 +796,13 @@ fn main() -> ExitCode {
             channel,
             check,
             restart,
-        } => Ok(run_self_update(channel, check, restart)),
+            to,
+            request,
+            result,
+        } => Ok(match request {
+            Some(request) => run_update_request(&request, &result, restart),
+            None => run_self_update(channel, check, restart, to),
+        }),
         Command::Import { command } => Ok(run_import(command)),
         Command::Backup { command } => Ok(run_backup(command)),
         Command::Mcp {
@@ -1307,11 +1328,28 @@ fn health(url: &str) -> Result<(), String> {
     }
 }
 
-fn run_self_update(channel: selfupdate::Channel, check: bool, restart: bool) -> ExitCode {
+fn run_self_update(
+    channel: selfupdate::Channel,
+    check: bool,
+    restart: bool,
+    to: Option<String>,
+) -> ExitCode {
+    let to = match to
+        .map(|v| telltale_api::update_api::check_version(&v))
+        .transpose()
+    {
+        Ok(v) => v,
+        Err(p) => {
+            eprintln!("error: {}", p.detail);
+            return ExitCode::FAILURE;
+        }
+    };
+    let channel = to.as_deref().map_or(channel, node_update::channel_for);
     let opts = selfupdate::Options {
         channel,
         check,
         restart,
+        to,
         base_url: None,
         exe: None,
     };
@@ -1320,9 +1358,13 @@ fn run_self_update(channel: selfupdate::Channel, check: bool, restart: bool) -> 
             format!("TelltaleDNS is up to date ({channel:?} channel).")
         }
         Ok(selfupdate::Outcome::Available { sha256 }) => {
+            let again = opts
+                .to
+                .as_deref()
+                .map_or_else(String::new, |v| format!(" --to {v}"));
             format!(
                 "An update is available ({channel:?} channel, sha256 {sha256}).\n\
-                 Install it with: telltale self-update --restart"
+                 Install it with: telltale self-update{again} --restart"
             )
         }
         Ok(selfupdate::Outcome::Updated { previous }) => {
@@ -1342,6 +1384,65 @@ fn run_self_update(channel: selfupdate::Channel, check: bool, restart: bool) -> 
     };
     let _ = writeln!(io::stdout().lock(), "{msg}");
     ExitCode::SUCCESS
+}
+
+/// REQ: OPS-014 — `telltale self-update --request`: the root update service's run.
+fn run_update_request(request: &Path, result: &Path, restart: bool) -> ExitCode {
+    let served = node_update::serve_request(
+        request,
+        result,
+        build_info::VERSION,
+        node_update_now(),
+        |to| {
+            selfupdate::run(&selfupdate::Options {
+                channel: node_update::channel_for(to),
+                check: false,
+                restart: false,
+                to: Some(to.to_owned()),
+                base_url: None,
+                exe: None,
+            })
+        },
+    );
+    let out = |m: String| {
+        let _ = writeln!(io::stdout().lock(), "{m}");
+    };
+    match served {
+        node_update::Served::Nothing => {
+            out(format!("No update request at {}.", request.display()));
+            ExitCode::SUCCESS
+        }
+        node_update::Served::Done {
+            state,
+            restart: due,
+        } => {
+            let ok = state == "updated" || state == "up_to_date";
+            out(format!(
+                "Update request: {state} (recorded in {}).",
+                result.display()
+            ));
+            if due && restart {
+                let status = std::process::Command::new("systemctl")
+                    .args(["restart", "telltale"])
+                    .status();
+                if !status.is_ok_and(|s| s.success()) {
+                    eprintln!("error: installed, but `systemctl restart telltale` failed");
+                    return ExitCode::FAILURE;
+                }
+            }
+            if ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+fn node_update_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 fn init_logging() {

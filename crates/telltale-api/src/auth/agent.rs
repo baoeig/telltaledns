@@ -95,6 +95,10 @@ pub const SCOPES: &[(&str, &str)] = &[
         "cluster:admin",
         "promote a node to primary; change the staged-rollout settings; promote or abort a rollout; pin and unpin the cluster",
     ),
+    (
+        "cluster:upgrade",
+        "ask native nodes to install a newer TelltaleDNS release or edge build (their update service verifies and installs it, then restarts them)",
+    ),
 ];
 
 /// What an agent token gets when none are named: read-only, without the query log.
@@ -102,7 +106,7 @@ pub const DEFAULT_SCOPES: &[&str] = &["analytics:read", "config:read"];
 
 /// The role a scope needs from the token's owner (a token never exceeds its owner).
 fn scope_role(scope: &str) -> Role {
-    if scope == "cluster:admin" {
+    if scope == "cluster:admin" || scope == "cluster:upgrade" {
         Role::Admin
     } else if scope.starts_with("config:write:") || scope.starts_with("ops:") {
         Role::Operator
@@ -310,6 +314,15 @@ fn analytics_extra(p: &str) -> bool {
             .is_some_and(|id| !id.is_empty() && !id.contains('/'))
         || drill_path(p)
         || p == "/api/v1/clients/affinity"
+        // REQ: OPS-014 — a node's version and update state.
+        || update_path(p)
+}
+
+/// REQ: OPS-014 — `/api/v1/nodes/{id}/update`.
+fn update_path(p: &str) -> bool {
+    p.strip_prefix("/api/v1/nodes/")
+        .and_then(|r| r.strip_suffix("/update"))
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
 /// REQ: CLU-014 — `/api/v1/nodes/{id}/drill`.
@@ -351,6 +364,8 @@ fn post_need(p: &str) -> Option<Need> {
     Some(match p {
         // REQ: OPS-010 — maintenance is an immediate op (agents at most two hours).
         _ if maintenance_path(p) => Need::Scope("ops:maintenance"),
+        // REQ: OPS-014 — installing a version on a node (admin; never in the default scopes).
+        _ if update_path(p) => Need::Scope("cluster:upgrade"),
         // REQ: CLU-014 — a drill (at most five minutes; never in the default scopes).
         _ if drill_path(p) => Need::Scope("ops:drill"),
         _ if p.starts_with("/api/v1/alerts/destinations/") && p.ends_with("/test") => {
@@ -721,6 +736,30 @@ mod tests {
         assert_eq!(
             implied_role(&parse_scopes(&["ops:maintenance".into()]).unwrap()),
             Role::Operator
+        );
+    }
+
+    /// REQ: OPS-014, AGT-004 — asking a node to install a version needs `cluster:upgrade` (an
+    /// admin scope, and nothing else grants it); reading its update state is analytics.
+    #[test]
+    fn ops_014_update_routes_need_their_scope() {
+        use Need::{Forbidden, Scope};
+        for node in ["local", "dns-02", "4846e5a9974bc21c"] {
+            let p = format!("/api/v1/nodes/{node}/update");
+            assert_eq!(required(&Method::POST, &p), Scope("cluster:upgrade"));
+            assert_eq!(required(&Method::GET, &p), Scope("analytics:read"));
+        }
+        for (m, p) in [
+            (Method::PUT, "/api/v1/nodes/pi/update"),
+            (Method::DELETE, "/api/v1/nodes/pi/update"),
+            (Method::POST, "/api/v1/nodes//update"),
+            (Method::POST, "/api/v1/nodes/a/b/update"),
+        ] {
+            assert_eq!(required(&m, p), Forbidden, "{m} {p}");
+        }
+        assert_eq!(
+            implied_role(&parse_scopes(&["cluster:upgrade".into()]).unwrap()),
+            Role::Admin
         );
     }
 
