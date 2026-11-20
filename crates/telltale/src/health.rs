@@ -33,7 +33,7 @@ const SYNC_LAG_SECONDS: u64 = 60;
 /// error can quote a line of it or say whether it is there (an administrator sees it on
 /// `GET /api/v1/lists`, and the node's log has it).
 pub(crate) fn list_failing_summary(list: &ListInfo) -> String {
-    let why = if telltale_api::list_reads_a_local_file(&list.source) {
+    let why = if list.local {
         "its local file couldn't be used (an administrator sees why on the Lists page, and the node's log says)"
     } else {
         list.error.as_deref().unwrap_or("unknown error")
@@ -771,15 +771,16 @@ mod tests {
 
     // REQ: FLT-004, OBS-015 (ADR-180) — a failing list read from a local file is named in the
     // health reasons without what reading it went wrong with (a line of the file, whether it is
-    // there); a URL list's error is quoted as before.
+    // there), whatever its path looks like; a URL list's error is quoted as before.
     #[test]
     fn flt_004_a_failing_local_list_is_named_without_its_error() {
-        let failing = |name: &str, source: &str, error: &str| ListInfo {
+        let failing = |name: &str, source: &str, local: bool, error: &str| ListInfo {
             name: name.into(),
             kind: "allow".into(),
             enabled: true,
             mode: "enforce".into(),
             source: source.into(),
+            local,
             state: "failed".into(),
             error: Some(error.into()),
             bytes: 0,
@@ -797,9 +798,16 @@ mod tests {
             failing(
                 "family-allow",
                 "/etc/telltale/allow.txt",
+                true,
                 "not a usable list: 0 rules, 3 invalid lines (first: `bad!marker-7f3a`: invalid character in name)",
             ),
-            failing("web", "https://lists.example/hosts.txt", "HTTP 404"),
+            failing(
+                "urlish",
+                "https://lists.example/not-a-download.txt",
+                true,
+                "https://lists.example/not-a-download.txt: marker-9c2e",
+            ),
+            failing("web", "https://lists.example/hosts.txt", false, "HTTP 404"),
         ];
         let ups = [up("quad9", &["default"], "open")];
         let mut l = local(&ups, &[]);
@@ -815,6 +823,9 @@ mod tests {
         let local = summary("family-allow");
         assert!(!local.contains("marker-7f3a"), "{local}");
         assert!(local.contains("local file"), "{local}");
+        let urlish = summary("urlish");
+        assert!(!urlish.contains("marker-9c2e"), "{urlish}");
+        assert!(urlish.contains("local file"), "{urlish}");
         assert!(summary("web").contains("HTTP 404"), "{reasons:?}");
     }
 
@@ -841,6 +852,7 @@ mod tests {
             enabled: true,
             mode: "enforce".into(),
             source: "https://lists.example/hagezi.txt".into(),
+            local: false,
             state: "failed".into(),
             error: Some("HTTP 404".into()),
             bytes: 0,

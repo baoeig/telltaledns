@@ -1874,7 +1874,7 @@ async fn lists(
             l.hits = hits.get(&l.name).copied().unwrap_or(0);
             // REQ: FLT-004, API-002 (ADR-180) — what went wrong reading a local file (a line of
             // it, whether it is there) is an administrator's to see; the node's log has it too.
-            if !admin && l.error.is_some() && list_reads_a_local_file(&l.source) {
+            if !admin && l.error.is_some() && l.local {
                 l.error = Some(LOCAL_LIST_ERROR.to_owned());
             }
         }
@@ -1890,18 +1890,6 @@ async fn lists(
 /// REQ: FLT-004 (ADR-180) — what a caller below admin sees of a failing list read from a local
 /// file.
 const LOCAL_LIST_ERROR: &str = "the list's local file couldn't be used; an administrator sees why here, and the node's log says";
-
-/// REQ: FLT-004 (ADR-180) — whether a list's `source` ([`model::ListInfo`]: a URL, a file path,
-/// or `inline`) is a local file.
-pub fn list_reads_a_local_file(source: &str) -> bool {
-    source != "inline"
-        && !source
-            .get(..8)
-            .is_some_and(|s| s.eq_ignore_ascii_case("https://"))
-        && !source
-            .get(..7)
-            .is_some_and(|s| s.eq_ignore_ascii_case("http://"))
-}
 
 /// Blockable services.
 ///

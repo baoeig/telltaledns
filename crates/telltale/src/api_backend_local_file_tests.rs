@@ -576,9 +576,14 @@ fn serve(body: Vec<u8>) -> String {
 /// REQ: OBS-024 (ADR-180) — a simulation downloads a candidate's lists under this node's rules:
 /// the candidate's `[filter]` settings (link-local addresses allowed, the byte cap, the timeout)
 /// take effect only after a restart, and a list's own `max_bytes` can't go past what this node
-/// allows. For every caller, an administrator included.
-#[tokio::test]
-async fn obs_024_a_simulation_keeps_this_nodes_download_rules() {
+/// allows. For every caller, an administrator included. (It takes the node's one simulation slot
+/// while it fetches.)
+#[test]
+fn obs_024_a_simulation_keeps_this_nodes_download_rules() {
+    holding_the_slot(keeps_this_nodes_download_rules());
+}
+
+async fn keeps_this_nodes_download_rules() {
     let n = Node::new(telltale_config::Config::default());
     // This node: at most 1 KiB per list.
     configure(
@@ -644,4 +649,300 @@ async fn api_002_a_valid_tls_file_in_a_check_shows_only_that_it_builds() {
     {
         assert!(!text.contains(line), "{v}");
     }
+}
+
+/// A plain HTTP server on loopback that records the path of every request and answers it with
+/// `body` once the gate is open.
+struct Catcher {
+    url: String,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+    gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl Catcher {
+    fn new(body: Vec<u8>, open: bool) -> Self {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gate = Arc::new((std::sync::Mutex::new(open), std::sync::Condvar::new()));
+        let (s, g) = (Arc::clone(&seen), Arc::clone(&gate));
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut c) = conn else { continue };
+                let (s, g, body) = (Arc::clone(&s), Arc::clone(&g), body.clone());
+                std::thread::spawn(move || {
+                    let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                    let mut head = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while let Ok(k) = c.read(&mut chunk) {
+                        if k == 0 {
+                            break;
+                        }
+                        head.extend_from_slice(&chunk[..k]);
+                        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let path = String::from_utf8_lossy(&head)
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("")
+                        .to_owned();
+                    s.lock().unwrap().push(path);
+                    let (lock, cv) = &*g;
+                    drop(
+                        cv.wait_timeout_while(
+                            lock.lock().unwrap(),
+                            std::time::Duration::from_secs(20),
+                            |open| !*open,
+                        )
+                        .unwrap(),
+                    );
+                    let _ = c.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    );
+                    let _ = c.write_all(&body);
+                });
+            }
+        });
+        Self { url, seen, gate }
+    }
+
+    fn saw(&self) -> Vec<String> {
+        self.seen.lock().unwrap().clone()
+    }
+
+    fn open(&self) {
+        let (lock, cv) = &*self.gate;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+    }
+}
+
+/// REQ: OBS-024 (ADR-180) — what one simulation fetches is bounded by this node, for every caller:
+/// at most 4 lists by URL or from a file, whose byte caps add up to no more than 4 times this
+/// node's `max_list_bytes`, else refused before any request is made; within that it runs as before;
+/// and the side snapshot is compiled under this node's `compile_memory` and `max_regexes`.
+#[test]
+fn obs_024_a_simulation_fetches_within_this_nodes_budget() {
+    holding_the_slot(async {
+        let n = Node::new(telltale_config::Config::default());
+        let own = format!("{}/own.txt", n.data());
+        std::fs::write(&own, "a.example\n").unwrap();
+        // This node: 1 KiB per list (so 4 KiB for one simulation), a list of its own allowed
+        // 2 KiB, and a list file of its own.
+        configure(
+            &n,
+            toml::from_str(&format!(
+                "[filter]\nmax_list_bytes = \"1KiB\"\ncompile_memory = \"64MiB\"\nmax_regexes = 3\n\
+                 [[list]]\nname = \"big\"\nurl = \"https://lists.example.com/big.txt\"\nmax_bytes = \"2KiB\"\n\
+                 [[list]]\nname = \"own\"\npath = \"{own}\"\nkind = \"allow\"\n"
+            ))
+            .unwrap(),
+        );
+        let server = Catcher::new("a.example\n".repeat(10).into_bytes(), true);
+        let list = |name: &str| serde_json::json!({ "name": name, "url": format!("{}/{name}.txt", server.url) });
+        let mut big = list("big");
+        big["max_bytes"] = "64MiB".into();
+        let own_file =
+            |name: &str| serde_json::json!({ "name": name, "path": own, "kind": "allow" });
+        let by_url: Vec<serde_json::Value> = (1..=5).map(|i| list(&format!("l{i}"))).collect();
+        let over = [
+            (
+                "five lists by URL",
+                serde_json::json!({ "list": by_url }),
+                "at most 4 lists",
+            ),
+            (
+                "three by URL and this node's list file twice",
+                serde_json::json!({ "list": [list("l1"), list("l2"), list("l3"), own_file("f1"), own_file("f2")] }),
+                "at most 4 lists",
+            ),
+            (
+                "this node's 2 KiB list at a new address, and three more",
+                serde_json::json!({ "list": [big, list("l1"), list("l2"), list("l3")] }),
+                "4KiB",
+            ),
+        ];
+        for (who, creds) in [("viewer", &n.viewer), ("admin", &n.admin)] {
+            for (what, candidate, limit) in &over {
+                let (s, v) = simulate(&n, creds, candidate.clone()).await;
+                assert_eq!(server.saw(), Vec::<String>::new(), "{who}, {what}: {v}");
+                assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{who}, {what}: {v}");
+                assert!(
+                    v["detail"].as_str().unwrap_or("").contains(limit),
+                    "{who}, {what}: the limit is named: {v}"
+                );
+            }
+        }
+        // Within it, as before: two lists, then the 2 KiB list and two more (4 KiB).
+        for (what, candidate, fetched) in [
+            (
+                "two lists",
+                serde_json::json!({ "list": [list("l1"), list("l2")] }),
+                2,
+            ),
+            (
+                "4 KiB",
+                serde_json::json!({ "list": [big, list("l1"), list("l2")] }),
+                5,
+            ),
+        ] {
+            let (s, v) = simulate(&n, &n.viewer, candidate).await;
+            assert_eq!(s, StatusCode::OK, "{what}: {v}");
+            assert_eq!(server.saw().len(), fetched, "{what}: {:?}", server.saw());
+        }
+        // The side snapshot is compiled under this node's limits, whatever the candidate says.
+        let running = n.src.config.load_full();
+        let candidate: telltale_config::Config =
+            toml::from_str("[filter]\ncompile_memory = \"1GiB\"\nmax_regexes = 0\n").unwrap();
+        let c = crate::simulate::with_this_nodes_downloads(&running, &candidate);
+        assert_eq!(
+            (c.filter.compile_memory, c.filter.max_regexes),
+            (running.filter.compile_memory, running.filter.max_regexes)
+        );
+    });
+}
+
+/// REQ: OBS-024 (ADR-180) — a dry run's simulation past what one simulation fetches on this node
+/// isn't run (`download_limit`), before anything is fetched; the dry run itself answers as before.
+/// Here a list of this node's own allowed 8 KiB, 8 times its 1 KiB cap.
+#[test]
+fn obs_024_a_dry_run_simulation_past_the_fetch_limit_isnt_run() {
+    holding_the_slot(async {
+        let n = Node::new(telltale_config::Config::default());
+        configure(
+            &n,
+            toml::from_str(
+                "[filter]\nmax_list_bytes = \"1KiB\"\n\
+                 [[list]]\nname = \"big\"\nurl = \"https://lists.example.com/big.txt\"\nmax_bytes = \"8KiB\"\n",
+            )
+            .unwrap(),
+        );
+        let server = Catcher::new(b"a.example\n".to_vec(), true);
+        let body =
+            serde_json::json!({ "url": format!("{}/big.txt", server.url), "max_bytes": "8KiB" });
+        let uri = "/api/v1/lists/big?dryRun=true&simulate=true";
+        let (s, v) = while_busy(&n, "PUT", uri, &n.operator, &body).await;
+        assert_eq!(server.saw(), Vec::<String>::new(), "{v}");
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["applied"], false, "{v}");
+        assert_eq!(v["simulation"]["available"], false, "{v}");
+        assert_eq!(v["simulation"]["reason"], "download_limit", "{v}");
+    });
+}
+
+/// Runs `test` on a runtime of its own while no other test that may take the node's one simulation
+/// slot runs (the slot is a static, and `simulate::tests` need it free).
+fn holding_the_slot(test: impl std::future::Future<Output = ()>) {
+    let _one = crate::simulate::slot_tests();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(test);
+}
+
+/// REQ: OBS-024 (ADR-180) — the node's one simulation at a time covers its downloads too: while
+/// one simulation is fetching a list, another is refused as busy before it fetches anything.
+#[test]
+fn obs_024_one_simulation_at_a_time_includes_its_downloads() {
+    holding_the_slot(one_at_a_time_includes_downloads());
+}
+
+async fn one_at_a_time_includes_downloads() {
+    let n = Node::new(telltale_config::Config::default());
+    let server = Catcher::new(b"a.example\n".to_vec(), false);
+    let candidate = |name: &str| serde_json::json!({ "config": { "list": [{ "name": name, "url": format!("{}/{name}.txt", server.url) }] } });
+    let first = n.send(
+        "POST",
+        "/api/v1/simulate",
+        &n.viewer,
+        Some(candidate("first")),
+    );
+    let second = async {
+        // The first is fetching its list (held at the server).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !server.saw().iter().any(|p| p == "/first.txt") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first simulation never fetched"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            n.send(
+                "POST",
+                "/api/v1/simulate",
+                &n.viewer,
+                Some(candidate("second")),
+            ),
+        )
+        .await;
+        let saw = server.saw();
+        server.open();
+        (r, saw)
+    };
+    let ((s1, v1), (r2, saw)) = tokio::join!(first, second);
+    assert!(
+        !saw.iter().any(|p| p == "/second.txt"),
+        "the second simulation fetched while the first ran: {saw:?}"
+    );
+    let (s2, v2) = r2.expect("the second simulation answered at once");
+    assert_eq!(s2, StatusCode::CONFLICT, "{v2}");
+    assert_eq!(v2["code"], "simulation_busy", "{v2}");
+    assert_eq!(s1, StatusCode::OK, "{v1}");
+}
+
+/// REQ: FLT-004 (ADR-180) — a list is a local file because it has a `path`, whatever that path
+/// looks like: one written `inline` or like a URL still gets the generic reason below admin.
+#[tokio::test]
+async fn flt_004_a_list_file_named_like_a_url_is_still_a_local_file() {
+    use telltale_filter::fetch::{
+        Client, FetchSettings, Fetcher, ListSpec, Outcome, Store, SystemResolver,
+    };
+    let n = Node::new(telltale_config::Config::default());
+    // Relative paths that exist nowhere: reading them fails, and the error names them.
+    let cfg: telltale_config::Config = toml::from_str(
+        "[[list]]\nname = \"plain\"\npath = \"inline\"\n\
+         [[list]]\nname = \"urlish\"\npath = \"https://lists.example.com/not-a-download.txt\"\n",
+    )
+    .unwrap();
+    configure(&n, cfg.clone());
+    let fetcher = Arc::new(Fetcher::new(
+        Store::open(&std::path::Path::new(&n.data()).join("lists")).unwrap(),
+        Client::new(Arc::new(SystemResolver), &[]).unwrap(),
+        FetchSettings::from_config(&cfg),
+    ));
+    for spec in ListSpec::from_config(&cfg) {
+        assert!(matches!(
+            fetcher.refresh_one(&spec).await,
+            Outcome::Failed(_)
+        ));
+    }
+    n.src.lists.store(Some(Arc::new(crate::lists::ListsShared {
+        fetcher,
+        compiled: std::sync::Mutex::new(None),
+    })));
+    let (_, v) = n.send("GET", "/api/v1/lists", &n.viewer, None).await;
+    for name in ["plain", "urlish"] {
+        let e = error_of(&v, name).unwrap_or_default();
+        assert!(
+            e.contains("administrator") && !e.contains("os error"),
+            "{name}: {v}"
+        );
+    }
+    let (_, v) = n.send("GET", "/api/v1/lists", &n.admin, None).await;
+    assert!(
+        error_of(&v, "urlish")
+            .unwrap_or_default()
+            .contains("os error"),
+        "{v}"
+    );
 }

@@ -1717,6 +1717,7 @@ impl Backend for ApiBackend {
                     enabled: l.enabled,
                     mode: label(&l.mode),
                     source,
+                    local: l.url.is_none() && l.path.is_some(),
                     state: state.to_owned(),
                     error: meta.and_then(|m| m.last_error.clone()),
                     bytes: meta.map_or(0, |m| m.bytes),
@@ -4768,6 +4769,51 @@ fn credential_place(d: &telltale_config::AlertDestination, data_dir: &str) -> Re
     Ok(())
 }
 
+/// REQ: UPS-011, API-002 (ADR-180) — an upstream group or a client group written through the API
+/// (`entries`, with the write in them) that names what the merge leaves out because it names a
+/// program or a local socket (a plugin upstream, a forward's plugin server, an upstream group left
+/// out with them) is refused, rather than stored and adjusted.
+fn left_out_guard(
+    kind: ManagedKind,
+    name: &str,
+    file: &telltale_config::Config,
+    entries: &crate::managed::Entries,
+) -> Result<(), Problem> {
+    fn set<'a, T>(stored: &'a [(String, crate::managed::Ovr<T>)], name: &str) -> Option<&'a T> {
+        match stored.iter().find(|(n, _)| n == name) {
+            Some((_, crate::managed::Ovr::Set(v))) => Some(v),
+            _ => None,
+        }
+    }
+    let named: Option<Vec<String>> = match kind {
+        ManagedKind::UpstreamGroup => set(&entries.upstream_groups, name)
+            .map(|g| g.members.iter().map(ToString::to_string).collect()),
+        ManagedKind::Group => set(&entries.groups, name)
+            .and_then(|g| g.upstreams.as_ref())
+            .map(|u| vec![u.to_string()]),
+        _ => None,
+    };
+    let Some(named) = named else {
+        return Ok(());
+    };
+    let out = crate::managed::left_out_names(file, entries);
+    let (field, list, what) = if kind == ManagedKind::UpstreamGroup {
+        ("members", &out.upstreams, "upstream")
+    } else {
+        ("upstreams", &out.groups, "upstream group")
+    };
+    if let Some(n) = named.iter().find(|n| list.contains(*n)) {
+        return Err(Problem::new(
+            Code::InvalidConfig,
+            format!(
+                "`{field}`: {what} `{n}` isn't used: it names a program or a local socket, or has only upstreams that do"
+            ),
+        )
+        .hint("Plugin upstreams (`exec://`, `unix://`) are defined in the config file."));
+    }
+    Ok(())
+}
+
 /// REQ: API-002 (T7.5, ADR-069) — a change to an upstream, upstream group, list, or group: it
 /// may override or hide the files' entry of the same name. `PUT` stores a definition; `DELETE`
 /// removes what the API stored (so the files' entry, if any, is back), or else hides the
@@ -4901,6 +4947,7 @@ fn plan_override(
     {
         credential_place(d, file.node.data_dir.as_str())?;
     }
+    left_out_guard(w.kind, &name, &file, &entries)?;
     let merged = crate::managed::merge(&file, &entries)
         .map_err(|errs| Problem::new(Code::InvalidConfig, errs.join("; ")))?;
     let after = match w.kind {
@@ -5273,9 +5320,15 @@ async fn dry_run_simulation(
     let candidate = Arc::new(candidate.clone());
     // REQ: OBS-024 (ADR-180) — the rule of `POST /api/v1/simulate`, before anything is read:
     // here the plan still answers, and its simulation says it wasn't run.
-    let asked = !opts.auto || src.config.load().simulate.plans_by_default;
+    let running = src.config.load_full();
+    let asked = !opts.auto || running.simulate.plans_by_default;
     if asked && !by_admin && crate::simulate::new_local_name(&baseline, &candidate).is_some() {
         return Ok(Some(crate::simulate::local_name_unavailable()));
+    }
+    // REQ: OBS-024 (ADR-180) — likewise for a change that would fetch more lists than one
+    // simulation may on this node.
+    if asked && crate::simulate::over_fetch_limit(&running, &baseline, &candidate).is_some() {
+        return Ok(Some(crate::simulate::fetch_limit_unavailable()));
     }
     crate::simulate::simulate(src, baseline, candidate, opts).await
 }
