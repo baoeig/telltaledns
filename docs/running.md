@@ -2266,8 +2266,9 @@ it may write only that `update/` folder:
 1. it reads the request (a small regular file written by `telltale`, opened without following a
    link or waiting on it) and removes it;
 2. it refuses anything but a release or edge build **newer** than the one installed and on the
-   node's **channel** (below), a request more than an hour old, and a version that was rolled
-   back or failed on this node in the last 24 hours;
+   node's **channel** (below), a request more than an hour old, and a version whose new build
+   was installed on this node and didn't come up in the last 24 hours (a run that failed in the
+   downloads doesn't count);
 3. it checks that the binary sits where only root can write (owned by root, and neither it nor
    any folder above it writable by a group or others), and that the health check's address in
    its unit is one of this host's;
@@ -2312,8 +2313,11 @@ rolled back; upgrade such a node by hand.
 previous one was put back. That can be the build, but it can also be the node's side: the node's
 own process answers the check, and any local user can occupy the port first. `ctl upgrade` stops
 at it; look at the node (`journalctl -u telltale -u telltale-update`) before you ask again. The
-node refuses the same version for 24 hours (`update_failed_recently`); `sudo telltale self-update
---to <version> --restart` by hand isn't held back.
+node refuses the same version for 24 hours from that run (`update_failed_recently`; `GET` shows
+it as `held`, with until when), and says which run, when, and what failed; `sudo telltale
+self-update --to <version> --restart` by hand isn't held back. A run that failed before anything
+was installed (a network error, the eight-minute download limit, a signature or checksum, an edge
+build moved on) holds nothing back: the next request tries again.
 
 **Turning it on.** The update service is installed and **off**. On each native node:
 ```sh
@@ -2425,8 +2429,9 @@ upgradeHook:
 - **A node down:** the hook fails before asking any node (the pods keep their version) unless
   `skipDown: true`. For the first 90 seconds after the node that answers starts, a native node
   that hasn't connected since isn't listed at all, so a hook run then can pass without it.
-- **A node rolled back:** every sync stops at it for 24 hours (the node refuses that version)
-  unless the pin moves on. Look at the node; upgrade it by hand when it is fixed.
+- **A node rolled back:** every sync stops at it for 24 hours from that run (the node refuses that
+  version, and says until when) unless the pin moves on. A run that failed in the downloads (a
+  GitHub or DNS outage) holds nothing: the next sync tries again. Look at the node; upgrade it by hand when it is fixed.
 
 **What it doesn't do.** It doesn't upgrade containers or Compose installs (pull the new image),
 it doesn't choose a version for you (that's your chart bump, or `--to`), it never downgrades or

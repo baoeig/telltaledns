@@ -90,9 +90,10 @@ pub fn channel_takes(channel: &str, to: &str) -> Result<(), String> {
 /// The hint for [`Code::UpdateChannel`].
 pub const CHANNEL_HINT: &str = "Ask for a release, or move the node to edge builds by hand: on it, as root, telltale self-update --channel edge --restart, then sh install.sh --edge --cluster-updates (which sets its update channel to edge).";
 
-/// REQ: OPS-014 (ADR-182) — how long a node refuses a version whose run there ended
-/// `rolled_back` or `failed` (`update_failed_recently`): a hook or script that asks again after
-/// a failure doesn't install and restart the node over and over.
+/// REQ: OPS-014 (ADR-182) — how long a node refuses a version whose new build was installed
+/// there and didn't come up (`update_failed_recently`), from that run: a hook or script that
+/// asks again doesn't install and restart the node over and over. A run that failed before
+/// anything was installed starts no hold.
 pub const FAILED_RECENTLY_MS: u64 = 24 * 3_600_000;
 
 /// The hint for [`Code::UpdateFailedRecently`].
@@ -169,9 +170,10 @@ pub struct UpdateQuery {
 /// never a change of channel: a node on the stable channel takes only a release
 /// (`update_channel`); one on the edge channel takes both and stays on it. The same version
 /// answers `up_to_date` without a request. One at a time per node: while a request waits for the
-/// update service or an update runs, another gets `update_in_progress`. A version whose run on
-/// the node ended `rolled_back` or `failed` in the last 24 hours is refused
-/// (`update_failed_recently`: install it by hand, or wait). A node in a
+/// update service or an update runs, another gets `update_in_progress`. A version whose new
+/// build was installed on the node and didn't come up in the last 24 hours is refused
+/// (`update_failed_recently`, `held` in the state: install it by hand, or wait); a run that
+/// failed in the downloads holds nothing back. A node in a
 /// container or Kubernetes is upgraded by its image (`update_unsupported`), and a node whose
 /// update service isn't enabled says so (`update_not_enabled`). In a cluster, upgrade replicas
 /// before the primary, one at a time: `telltale ctl upgrade` does this. `id` as for the read.
@@ -184,7 +186,7 @@ pub struct UpdateQuery {
     responses(
         (status = 200, body = NodeUpdate, description = "`state`: `requested` (handed to the update service) or `up_to_date`; with `dryRun`, `would_request` or `up_to_date`."),
         (status = 404, body = Problem, description = "No such node (`node_unknown`)."),
-        (status = 409, body = Problem, description = "The node is upgraded by its image (`update_unsupported`), its update service is off (`update_not_enabled`), the version is older than its own (`update_downgrade`) or on another channel (`update_channel`), an update is already under way there (`update_in_progress`), or the version was rolled back or failed there in the last 24 hours (`update_failed_recently`)."),
+        (status = 409, body = Problem, description = "The node is upgraded by its image (`update_unsupported`), its update service is off (`update_not_enabled`), the version is older than its own (`update_downgrade`) or on another channel (`update_channel`), an update is already under way there (`update_in_progress`), or its build was installed there and didn't come up in the last 24 hours (`update_failed_recently`)."),
         (status = 422, body = Problem, description = "Not a release or edge build version (`update_invalid`)."),
         (status = 503, body = Problem, description = "The node isn't reachable over the cluster channel (`node_unreachable`)."),
     ))]

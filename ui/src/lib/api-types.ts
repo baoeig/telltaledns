@@ -1976,9 +1976,10 @@ export interface paths {
          *     never a change of channel: a node on the stable channel takes only a release
          *     (`update_channel`); one on the edge channel takes both and stays on it. The same version
          *     answers `up_to_date` without a request. One at a time per node: while a request waits for the
-         *     update service or an update runs, another gets `update_in_progress`. A version whose run on
-         *     the node ended `rolled_back` or `failed` in the last 24 hours is refused
-         *     (`update_failed_recently`: install it by hand, or wait). A node in a
+         *     update service or an update runs, another gets `update_in_progress`. A version whose new
+         *     build was installed on the node and didn't come up in the last 24 hours is refused
+         *     (`update_failed_recently`, `held` in the state: install it by hand, or wait); a run that
+         *     failed in the downloads holds nothing back. A node in a
          *     container or Kubernetes is upgraded by its image (`update_unsupported`), and a node whose
          *     update service isn't enabled says so (`update_not_enabled`). In a cluster, upgrade replicas
          *     before the primary, one at a time: `telltale ctl upgrade` does this. `id` as for the read.
@@ -6758,6 +6759,7 @@ export interface components {
             channel?: string | null;
             /** @description Its root update service (`telltale-update.path`) is enabled, so a request is picked up. */
             enabled: boolean;
+            held?: components["schemas"]["NodeUpdateHeld"] | null;
             /**
              * @description `native`, `container`, or `helm`. Only a native node installs a version itself; the others
              *     are upgraded by their image.
@@ -6777,6 +6779,19 @@ export interface components {
              * @example 0.7.0
              */
             version: string;
+        };
+        /**
+         * @description REQ: OPS-014 (ADR-182) — a version a node holds back after a run whose new build was
+         *     installed and didn't come up (`rolled_back`, or `failed` once installed). A run that failed
+         *     before installing anything (a download, a signature, an edge build moved on) holds nothing.
+         */
+        NodeUpdateHeld: {
+            /** @example 0.8.0 */
+            to: string;
+            /** @description Until when (RFC 3339): 24 hours after that run, by the node's own record. */
+            until: string;
+            /** @description Which run, when, what failed, and the ways out (by hand with `self-update --to`, or wait). */
+            why: string;
         };
         /** @description REQ: OPS-014 — a request handed to a node's update service and not picked up yet. */
         NodeUpdatePending: {
@@ -6827,8 +6842,8 @@ export interface components {
              *     look into, see `error`), `unavailable` (an edge build the edge channel no longer serves:
              *     nothing installed; the error names the one it serves), `failed` (not installed, or the
              *     previous binary couldn't be put back), or `refused` (the request was stale, malformed,
-             *     older than the node's version, on another channel, of a version that failed there in the
-             *     last day, or the host wasn't set up for it). REQ: OPS-014 (ADR-182).
+             *     older than the node's version, on another channel, of a version whose build was installed
+             *     there and didn't come up in the last day, or the host wasn't set up for it). REQ: OPS-014 (ADR-182).
              * @example updated
              */
             state: string;
@@ -12486,7 +12501,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The node is upgraded by its image (`update_unsupported`), its update service is off (`update_not_enabled`), the version is older than its own (`update_downgrade`) or on another channel (`update_channel`), an update is already under way there (`update_in_progress`), or the version was rolled back or failed there in the last 24 hours (`update_failed_recently`). */
+            /** @description The node is upgraded by its image (`update_unsupported`), its update service is off (`update_not_enabled`), the version is older than its own (`update_downgrade`) or on another channel (`update_channel`), an update is already under way there (`update_in_progress`), or its build was installed there and didn't come up in the last 24 hours (`update_failed_recently`). */
             409: {
                 headers: {
                     [name: string]: unknown;

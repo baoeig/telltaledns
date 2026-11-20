@@ -106,8 +106,9 @@ pub enum Code {
     /// REQ: OPS-014 (ADR-182) — the node already has a request waiting for its update service,
     /// or an update running (one at a time per node): retry after `Retry-After`.
     UpdateInProgress,
-    /// REQ: OPS-014 (ADR-182) — the node's last run of this version, less than 24 hours ago,
-    /// ended `rolled_back` or `failed`: it isn't asked for again for a day (install it by hand
+    /// REQ: OPS-014 (ADR-182) — this version's new build was installed on the node less than 24
+    /// hours ago and didn't come up (`rolled_back`, or `failed` after the swap; a failure in the
+    /// downloads doesn't count): it isn't asked for again for a day (install it by hand
     /// with `self-update --to`, or wait).
     UpdateFailedRecently,
 }
@@ -205,7 +206,7 @@ impl Code {
             Self::UpdateInvalid => "Invalid version",
             Self::UpdateChannel => "Not on the node's channel",
             Self::UpdateInProgress => "An update is already under way on the node",
-            Self::UpdateFailedRecently => "This version failed on the node in the last day",
+            Self::UpdateFailedRecently => "This version didn't come up on the node in the last day",
         }
     }
 

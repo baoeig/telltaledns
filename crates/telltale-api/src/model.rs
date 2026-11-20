@@ -2508,8 +2508,8 @@ pub struct NodeUpdateRun {
     /// look into, see `error`), `unavailable` (an edge build the edge channel no longer serves:
     /// nothing installed; the error names the one it serves), `failed` (not installed, or the
     /// previous binary couldn't be put back), or `refused` (the request was stale, malformed,
-    /// older than the node's version, on another channel, of a version that failed there in the
-    /// last day, or the host wasn't set up for it). REQ: OPS-014 (ADR-182).
+    /// older than the node's version, on another channel, of a version whose build was installed
+    /// there and didn't come up in the last day, or the host wasn't set up for it). REQ: OPS-014 (ADR-182).
     #[schema(example = "updated")]
     pub state: String,
     /// What went wrong, for `failed`, `rolled_back`, `unavailable` and `refused`.
@@ -2524,6 +2524,20 @@ pub struct NodeUpdateRun {
     pub by: String,
     /// When the state was written (RFC 3339).
     pub at: String,
+}
+
+/// REQ: OPS-014 (ADR-182) — a version a node holds back after a run whose new build was
+/// installed and didn't come up (`rolled_back`, or `failed` once installed). A run that failed
+/// before installing anything (a download, a signature, an edge build moved on) holds nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeUpdateHeld {
+    #[schema(example = "0.8.0")]
+    pub to: String,
+    /// Until when (RFC 3339): 24 hours after that run, by the node's own record.
+    pub until: String,
+    /// Which run, when, what failed, and the ways out (by hand with `self-update --to`, or wait).
+    pub why: String,
 }
 
 /// REQ: OPS-014 (ADR-182) — a node's update state (`GET`), or what it did with a request
@@ -2547,6 +2561,10 @@ pub struct NodeUpdate {
     pub channel: Option<String>,
     /// Its root update service (`telltale-update.path`) is enabled, so a request is picked up.
     pub enabled: bool,
+    /// A version the node refuses for now (`update_failed_recently`): one whose new build was
+    /// installed here and didn't come up, for 24 hours after that run. REQ: OPS-014 (ADR-182).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<NodeUpdateHeld>,
     /// After a `POST`: `requested` (handed to the update service) or `up_to_date` (it already runs
     /// that version). Absent from a `GET`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

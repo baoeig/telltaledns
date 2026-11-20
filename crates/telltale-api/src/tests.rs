@@ -458,6 +458,7 @@ impl Backend for Fake {
                 install: "native".into(),
                 channel: Some("stable".into()),
                 enabled: true,
+                held: None,
                 state,
                 pending: None,
                 last: None,

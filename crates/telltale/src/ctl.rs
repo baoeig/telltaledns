@@ -1271,21 +1271,22 @@ fn preflight(u: &Value, to: &str, now_ms: u64) -> Preflight {
         ));
     }
     let last = &u["last"];
-    let at = || telltale_api::time::parse_time_ms(&s(last, "at"), now_ms).unwrap_or(now_ms);
-    let state = s(last, "state");
-    if state == "installing" && now_ms.saturating_sub(at()) < INSTALLING_MS {
-        return Preflight::Block(format!("an update to {} is running on it", s(last, "to")));
+    if s(last, "state") == "installing" {
+        let at = telltale_api::time::parse_time_ms(&s(last, "at"), now_ms).unwrap_or(now_ms);
+        if now_ms.saturating_sub(at) < INSTALLING_MS {
+            return Preflight::Block(format!("an update to {} is running on it", s(last, "to")));
+        }
     }
-    // REQ: OPS-014 (ADR-182) — the node refuses a version that was rolled back or failed there
-    // in the last day (`update_failed_recently`): stop before any node is asked.
-    if matches!(state.as_str(), "rolled_back" | "failed")
-        && s(last, "to") == to
-        && now_ms.saturating_sub(at()) < telltale_api::update_api::FAILED_RECENTLY_MS
-    {
+    // REQ: OPS-014 (ADR-182) — the node holds this version back (its new build was installed
+    // there and didn't come up, within the last day: `update_failed_recently`), by its own record
+    // and clock: stop before any node is asked. A run that failed before installing anything
+    // holds nothing back, so it doesn't stop the run.
+    let held = &u["held"];
+    if s(held, "to") == to {
         return Preflight::Block(format!(
-            "its last run of {to} ended {state} ({}), so it refuses {to} for 24 hours after that: {}",
-            s(last, "error"),
-            telltale_api::update_api::FAILED_RECENTLY_HINT
+            "it holds {to} back until {}: {}",
+            s(held, "until"),
+            s(held, "why")
         ));
     }
     // REQ: OPS-014 (ADR-182) — said in full: which channel the node follows, what was asked, and
@@ -2205,14 +2206,16 @@ mod tests {
                 ),
                 "is running on it",
             ),
-            // REQ: OPS-014 (ADR-182) — the node refuses a version that was rolled back (or
-            // failed) there in the last 24 hours: the run stops before any node is asked.
+            // REQ: OPS-014 (ADR-182) — the node holds the version back (its build was installed
+            // there and didn't come up, within the day): the run stops before any node is asked,
+            // with the node's own words and time.
             (
                 with(
-                    "last",
-                    json!({"state": "rolled_back", "to": "0.8.0", "at": at(now - 60_000)}),
+                    "held",
+                    json!({"to": "0.8.0", "until": "2026-11-21T10:00:00Z",
+                           "why": "0.8.0 was installed here and didn't come up: run 1a-2b ended rolled_back"}),
                 ),
-                "24 hours",
+                "holds 0.8.0 back until 2026-11-21T10:00:00Z: 0.8.0 was installed here",
             ),
         ] {
             match preflight(&u, "0.8.0", now) {
@@ -2230,10 +2233,11 @@ mod tests {
             json!({"state": "installing", "to": "0.8.0", "at": at(now - INSTALLING_MS - 1)}),
         );
         assert_eq!(preflight(&stale, "0.8.0", now), Preflight::Ready);
-        // A rollback of another version, or one more than a day ago, doesn't hold this one off.
+        // A last run that failed (in the downloads, say) or was rolled back doesn't stop the run
+        // by itself: only what the node says it holds back does, and only for that version.
         for last in [
-            json!({"state": "rolled_back", "to": "0.8.1", "at": at(now - 60_000)}),
-            json!({"state": "failed", "to": "0.8.0", "at": at(now - 25 * 3_600_000)}),
+            json!({"state": "failed", "to": "0.8.0", "at": at(now - 60_000)}),
+            json!({"state": "rolled_back", "to": "0.8.0", "at": at(now - 60_000)}),
         ] {
             assert_eq!(
                 preflight(&with("last", last.clone()), "0.8.0", now),
@@ -2241,6 +2245,8 @@ mod tests {
                 "{last}"
             );
         }
+        let other = with("held", json!({"to": "0.8.1", "until": "x", "why": "y"}));
+        assert_eq!(preflight(&other, "0.8.0", now), Preflight::Ready);
     }
 
     /// A fake API: `versions` per node; a POST "installs" by moving the node to the version

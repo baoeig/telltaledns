@@ -984,30 +984,50 @@ fn ops_014_a_failed_rollback_is_recorded_and_stops() {
     assert!(!served_ok("failed"));
 }
 
-/// REQ: OPS-014 (ADR-182) — a version whose run ended `rolled_back` (or `failed`) isn't asked for
-/// again on that node for 24 hours: the node refuses it (`update_failed_recently`, 409: the same
-/// check answers the API and the cluster RPC), and the update service refuses it too, whoever
-/// wrote the request. Another version may be asked for; a day later the same one again.
+/// REQ: OPS-014 (ADR-182) — a version whose new build was installed and rolled back isn't asked
+/// for again on that node for 24 hours, counted from the run the node recorded (not from any
+/// request): the node refuses it (`update_failed_recently`, 409: the same check answers the API
+/// and the cluster RPC), naming the run, when, what failed, and the two ways out; it shows the
+/// hold in its state (for `ctl`'s pre-flight); and the update service refuses it too, whoever
+/// wrote the request. Another version may be asked for; once the day is over, the same again.
 #[test]
 fn ops_014_a_version_that_failed_is_not_asked_for_again_for_a_day() {
     let d = tempfile::tempdir().unwrap();
     let h = here(d.path(), "native", "0.7.0", true);
-    request(&h, "0.8.0", "hook", NOW).unwrap();
+    let run = request(&h, "0.8.0", "hook", NOW).unwrap().pending.unwrap();
     let mut host = Scripted {
         install: Some(Ok(installed())),
         health: vec![Err("status 503".into()), Ok(())],
         ..Scripted::default()
     };
     serve_request(&h.request_path(), &h.result, "0.7.0", NOW, true, &mut host);
-    assert_eq!(status(&h).last.unwrap().state, "rolled_back");
-    // The run is recorded at the wall clock's time; ask a minute after it.
-    let soon = crate::maintenance::now_ms() + 60_000;
+    let recorded: ResultFile = read_json(&h.result).unwrap();
+    assert_eq!(
+        (recorded.state.as_str(), recorded.installed),
+        ("rolled_back", true)
+    );
+    // The clock is the node's record of that run.
+    let at = recorded.at_ms;
+    let until = rfc3339(at + 24 * 3_600_000);
+    let soon = at + 60_000;
     let e = request(&h, "0.8.0", "hook", soon).unwrap_err();
     assert_eq!(
         (serde_json::to_value(e.code).unwrap(), e.status),
         (serde_json::json!("update_failed_recently"), 409),
         "{e:?}"
     );
+    let (at_text, until_text) = (rfc3339(at), format!("until {until}"));
+    for part in [
+        run.id.as_str(),
+        "rolled_back",
+        at_text.as_str(),
+        "status 503",
+        until_text.as_str(),
+        "telltale self-update --to 0.8.0 --restart",
+        "wait until then",
+    ] {
+        assert!(e.detail.contains(part), "{part}: {}", e.detail);
+    }
     assert!(
         e.hint
             .as_deref()
@@ -1019,11 +1039,16 @@ fn ops_014_a_version_that_failed_is_not_asked_for_again_for_a_day() {
         serde_json::to_value(dry_run(&h, "0.8.0", soon).unwrap_err().code).unwrap(),
         serde_json::json!("update_failed_recently")
     );
+    let held = status(&h).held.unwrap();
+    assert_eq!(
+        (held.to.as_str(), held.until.as_str()),
+        ("0.8.0", until.as_str())
+    );
     // Another version: asked as usual.
     request(&h, "0.8.1", "hook", soon).unwrap();
     std::fs::remove_file(h.request_path()).unwrap();
-    // The update service refuses the failed version, however the request was written, and that
-    // refusal doesn't wipe the memory of the failure.
+    // The update service refuses the held version, however the request was written, and that
+    // refusal doesn't wipe the memory of the run.
     let body = serde_json::json!({"id": "1a-2c", "to": "0.8.0", "by": "x", "requestedMs": soon});
     plant(&h, &body.to_string());
     let asked = Cell::new(false);
@@ -1033,19 +1058,105 @@ fn ops_014_a_version_that_failed_is_not_asked_for_again_for_a_day() {
     });
     assert!(!asked.get(), "nothing is fetched");
     assert_eq!(served, refused());
-    assert!(status(&h).last.unwrap().error.unwrap().contains("24 hours"),);
+    let why = status(&h).last.unwrap().error.unwrap();
+    assert!(why.contains(&format!("until {until}")), "{why}");
+    // Still held a minute before the day is over, counted from the recorded run.
+    let almost = at + 24 * 3_600_000 - 60_000;
     assert_eq!(
-        serde_json::to_value(request(&h, "0.8.0", "hook", soon).unwrap_err().code).unwrap(),
+        serde_json::to_value(request(&h, "0.8.0", "hook", almost).unwrap_err().code).unwrap(),
         serde_json::json!("update_failed_recently")
     );
-    // A day later, the same version again.
-    let later = crate::maintenance::now_ms() + 24 * 3_600_000 + 60_000;
+    // A minute after, the same version again.
+    let later = at + 24 * 3_600_000 + 60_000;
     assert_eq!(
         request(&h, "0.8.0", "hook", later)
             .unwrap()
             .state
             .as_deref(),
         Some("requested")
+    );
+}
+
+/// REQ: OPS-014 (ADR-182) — only a run whose new build was installed and didn't come up holds a
+/// version back. One that failed before anything was installed (a network error, the downloads'
+/// deadline, a signature or checksum), an edge build the channel moved past (`unavailable`), or a
+/// refused request holds nothing: a retry right after is asked for and installed (a passing
+/// outage never blocks a version, and the hook, for a day). A run whose previous binary couldn't
+/// be put back (`failed` after the install) does hold it.
+#[test]
+fn ops_014_a_failure_before_the_install_holds_nothing_back() {
+    for outcome in [
+        Err("https://github.com/x/SHA256SUMS: connect: Network is unreachable".to_owned()),
+        Err("the downloads didn't finish within 480 s: nothing installed".to_owned()),
+        Err("the signature does not verify with the release key: not trusted".to_owned()),
+        Ok(Outcome::Unavailable {
+            serves: "0.8.0-edge.9".into(),
+            commit: "abc1234".into(),
+        }),
+    ] {
+        let d = tempfile::tempdir().unwrap();
+        let h = here(d.path(), "native", "0.8.0-edge.1", true);
+        request(&h, "0.8.0-edge.5", "hook", NOW).unwrap();
+        let mut host = Scripted {
+            install: Some(outcome.clone()),
+            ..Scripted::default()
+        };
+        let current = "0.8.0-edge.1";
+        serve_request(&h.request_path(), &h.result, current, NOW, true, &mut host);
+        let recorded: ResultFile = read_json(&h.result).unwrap();
+        assert!(!recorded.installed, "{outcome:?}");
+        assert!(status(&h).held.is_none(), "{outcome:?}");
+        let soon = recorded.at_ms + 60_000;
+        assert_eq!(
+            request(&h, "0.8.0-edge.5", "hook", soon)
+                .unwrap()
+                .state
+                .as_deref(),
+            Some("requested"),
+            "{outcome:?}"
+        );
+        let mut host = Scripted {
+            install: Some(Ok(installed())),
+            ..Scripted::default()
+        };
+        assert_eq!(
+            serve_request(&h.request_path(), &h.result, current, soon, true, &mut host),
+            Served::Done {
+                state: "updated".into()
+            },
+            "{outcome:?}: the update service takes the retry"
+        );
+    }
+    // A refused request holds nothing either.
+    let d = tempfile::tempdir().unwrap();
+    let h = here(d.path(), "native", "0.7.0", true);
+    plant(&h, "not json");
+    let served = serve(&h.request_path(), &h.result, "0.7.0", NOW, |_| {
+        Err("must not install".to_owned())
+    });
+    assert_eq!(served, refused());
+    assert!(status(&h).held.is_none());
+    // The previous binary couldn't be put back after the install: held.
+    request(&h, "0.8.0", "hook", NOW).unwrap();
+    let mut host = Scripted {
+        install: Some(Ok(installed())),
+        health: vec![Err("status 503".into())],
+        restore_fails: true,
+        ..Scripted::default()
+    };
+    let served = serve_request(&h.request_path(), &h.result, "0.7.0", NOW, true, &mut host);
+    assert_eq!(
+        served,
+        Served::Done {
+            state: "failed".into()
+        }
+    );
+    let recorded: ResultFile = read_json(&h.result).unwrap();
+    assert!(recorded.installed);
+    assert_eq!(status(&h).held.unwrap().to, "0.8.0");
+    assert_eq!(
+        code(request(&h, "0.8.0", "hook", recorded.at_ms + 60_000)),
+        Code::UpdateFailedRecently
     );
 }
 

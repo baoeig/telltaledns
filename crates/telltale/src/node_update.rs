@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use telltale_api::NodeUpdateCall;
-use telltale_api::model::{NodeUpdate, NodeUpdatePending, NodeUpdateRun};
+use telltale_api::model::{NodeUpdate, NodeUpdateHeld, NodeUpdatePending, NodeUpdateRun};
 use telltale_api::problem::{Code, Problem};
 use telltale_api::update_api::{
     CHANNEL_ENV, CHANNEL_HINT, FAILED_RECENTLY_HINT, FAILED_RECENTLY_MS, channel_takes,
@@ -95,29 +95,44 @@ pub(crate) struct ResultFile {
     #[serde(default)]
     pub(crate) by_verified: bool,
     pub(crate) at_ms: u64,
-    /// REQ: OPS-014 (ADR-182) — the latest run that ended `rolled_back` or `failed`, kept through
-    /// the runs after it (a refusal doesn't wipe it): its version isn't asked for again for
-    /// [`FAILED_RECENTLY_MS`].
+    /// The new build was put in place in this run (a run that ended before the swap, in the
+    /// downloads or the checks, leaves the old binary untouched and says `false`).
+    #[serde(default)]
+    pub(crate) installed: bool,
+    /// REQ: OPS-014 (ADR-182) — the latest run whose new build was installed and didn't come up,
+    /// kept through the runs after it (a refusal doesn't wipe it): its version isn't asked for
+    /// again for [`FAILED_RECENTLY_MS`] after that run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_failure: Option<Failure>,
 }
 
-/// A run that ended `rolled_back` or `failed`.
+/// A run whose new build was installed and didn't come up.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Failure {
+    #[serde(default)]
+    pub(crate) id: String,
     pub(crate) to: String,
     pub(crate) state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
     pub(crate) at_ms: u64,
 }
 
 impl ResultFile {
-    /// This run if it ended `rolled_back` or `failed`, else the one it kept.
+    /// REQ: OPS-014 (ADR-182) — this run if its new build was installed and didn't come up
+    /// (`rolled_back`, or `failed` after the swap: the previous binary couldn't be put back),
+    /// else the one it kept. A run that failed before anything was installed (a download, a
+    /// timeout, a signature or checksum, an edge build moved on, a refusal) is none: a passing
+    /// outage never holds a version back.
     fn failure(&self) -> Option<Failure> {
-        if matches!(self.state.as_str(), "rolled_back" | "failed") {
+        let counts = self.state == "rolled_back" || (self.state == "failed" && self.installed);
+        if counts {
             return Some(Failure {
+                id: self.id.clone(),
                 to: self.to.clone(),
                 state: self.state.clone(),
+                error: self.error.clone(),
                 at_ms: self.at_ms,
             });
         }
@@ -125,21 +140,36 @@ impl ResultFile {
     }
 }
 
-/// REQ: OPS-014 (ADR-182) — whether `to` failed on this node in the last day (`last`: the latest
-/// result): why, for a refusal.
-fn failed_recently(last: Option<&ResultFile>, to: &str, now: u64) -> Option<String> {
+/// REQ: OPS-014 (ADR-182) — the version this node holds back now, from its own recorded result
+/// (`last`; never from a request): the run that started the clock, and when the hold ends.
+fn held(last: Option<&ResultFile>, now: u64) -> Option<(Failure, u64)> {
     let f = last?.failure()?;
-    (f.to == to && now.saturating_sub(f.at_ms) < FAILED_RECENTLY_MS).then(|| {
-        format!(
-            "{to} was {} here {} min ago: it isn't asked for again for 24 hours after that",
-            if f.state == "failed" {
-                "tried and failed"
-            } else {
-                "rolled back"
-            },
-            now.saturating_sub(f.at_ms) / 60_000
-        )
-    })
+    let until = f.at_ms.saturating_add(FAILED_RECENTLY_MS);
+    (now < until).then_some((f, until))
+}
+
+/// REQ: OPS-014 (ADR-182) — whether `to` is held back on this node now (`last`: its latest
+/// result): why, which run, when, and the two ways out, for a refusal.
+fn failed_recently(last: Option<&ResultFile>, to: &str, now: u64) -> Option<String> {
+    let (f, until) = held(last, now).filter(|(f, _)| f.to == to)?;
+    Some(held_text(&f, until))
+}
+
+/// What [`failed_recently`] says.
+fn held_text(f: &Failure, until: u64) -> String {
+    let what = f
+        .error
+        .as_deref()
+        .map(|e| e.chars().take(200).collect::<String>())
+        .unwrap_or_default();
+    format!(
+        "{to} was installed here and didn't come up: run {id} ended {state} at {at} ({what}). It isn't asked for again until {until}: install it by hand on the node (as root: telltale self-update --to {to} --restart), or wait until then",
+        to = f.to,
+        id = if f.id.is_empty() { "?" } else { &f.id },
+        state = f.state,
+        at = rfc3339(f.at_ms),
+        until = rfc3339(until),
+    )
 }
 
 /// A request on the cluster channel: the call and when the entry node sent it.
@@ -215,7 +245,15 @@ pub(crate) fn status(h: &Here) -> NodeUpdate {
         by: r.by,
         requested_at: rfc3339(r.requested_ms),
     });
-    let last = read_json::<ResultFile>(&h.result).map(|r| NodeUpdateRun {
+    let result = read_json::<ResultFile>(&h.result);
+    // REQ: OPS-014 (ADR-182) — a version held back after a run whose build didn't come up, so
+    // `ctl`'s pre-flight sees what the node would refuse (the node's clock and record).
+    let held = held(result.as_ref(), now_ms()).map(|(f, until)| NodeUpdateHeld {
+        to: f.to.clone(),
+        until: rfc3339(until),
+        why: held_text(&f, until),
+    });
+    let last = result.map(|r| NodeUpdateRun {
         id: r.id,
         to: r.to,
         from: r.from,
@@ -231,6 +269,7 @@ pub(crate) fn status(h: &Here) -> NodeUpdate {
         install: h.install.clone(),
         channel: Some(h.channel().to_owned()),
         enabled: h.enabled,
+        held,
         state: None,
         pending,
         last,
@@ -292,8 +331,8 @@ pub(crate) fn plan(h: &Here, to: &str, now: u64) -> Result<Option<String>, Probl
             Problem::new(Code::UpdateChannel, format!("{}: {why}", h.node)).hint(CHANNEL_HINT),
         );
     }
-    // REQ: OPS-014 (ADR-182) — a version rolled back or failed here in the last day isn't
-    // installed again from a request (checked again by the update service).
+    // REQ: OPS-014 (ADR-182) — a version whose build was installed here and didn't come up in
+    // the last day isn't installed again from a request (checked again by the update service).
     if let Some(why) = failed_recently(read_json::<ResultFile>(&h.result).as_ref(), &to, now) {
         return Err(
             Problem::new(Code::UpdateFailedRecently, format!("{}: {why}", h.node))
@@ -898,10 +937,17 @@ pub(crate) fn serve_request(
     restart: bool,
     host: &mut impl Host,
 ) -> Served {
-    // The last run's outcome: a failure it keeps (a version refused for a day after it).
+    // The last run's outcome: the run it keeps whose build didn't come up (a version refused for
+    // a day after it).
     let before = read_json::<ResultFile>(result);
     let kept = before.as_ref().and_then(ResultFile::failure);
-    let record = |r: &RequestFile, state: &str, error: Option<String>, health: Option<String>| {
+    // `installed`: the new build was put in place in this run.
+    let record = |r: &RequestFile,
+                  state: &str,
+                  error: Option<String>,
+                  health: Option<String>,
+                  installed: bool| {
+        let counts = state == "rolled_back" || (state == "failed" && installed);
         let out = ResultFile {
             id: r.id.clone(),
             to: r.to.clone(),
@@ -912,12 +958,9 @@ pub(crate) fn serve_request(
             by: r.by.clone(),
             by_verified: false,
             at_ms: now_ms().max(now),
+            installed,
             // This run is the failure to keep when it is one.
-            last_failure: if matches!(state, "rolled_back" | "failed") {
-                None
-            } else {
-                kept.clone()
-            },
+            last_failure: if counts { None } else { kept.clone() },
         };
         if let Some(dir) = result.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -940,7 +983,7 @@ pub(crate) fn serve_request(
         Ok(Some(b)) => b,
         Err(e) => {
             warn!("update: {e}");
-            record(&blank, "refused", Some(e), None);
+            record(&blank, "refused", Some(e), None, false);
             return done("refused");
         }
     };
@@ -949,18 +992,18 @@ pub(crate) fn serve_request(
         Ok(r) => r,
         Err((r, why)) => {
             warn!("update: refused: {why}");
-            record(&r, "refused", Some(why), None);
+            record(&r, "refused", Some(why), None, false);
             return done("refused");
         }
     };
     if version_key(&r.to) == version_key(current) {
-        record(&r, "up_to_date", None, None);
+        record(&r, "up_to_date", None, None, false);
         return done("up_to_date");
     }
     // REQ: OPS-014 (ADR-182) — the host is set up for it, or nothing is fetched.
     if let Err(why) = host.ready() {
         warn!("update: refused: {why}");
-        record(&r, "refused", Some(why), None);
+        record(&r, "refused", Some(why), None, false);
         return done("refused");
     }
     // `by` is the node's word for who asked: the journal says so.
@@ -969,23 +1012,23 @@ pub(crate) fn serve_request(
         "update: installing {} (was {current}), asked by `{}` as written by the node (unverified)",
         r.to, r.by
     );
-    record(&r, "installing", None, None);
+    record(&r, "installing", None, None, false);
     let previous = match host.install(&r.to) {
         Ok(crate::selfupdate::Outcome::Updated { previous }) => previous,
         // REQ: OPS-014 (ADR-182) — an edge build main has since passed: nothing installed.
         Ok(crate::selfupdate::Outcome::Unavailable { serves, commit }) => {
             let e = crate::selfupdate::unavailable_text(&r.to, &serves, &commit);
             warn!("update: {} not installed: {e}", r.to);
-            record(&r, "unavailable", Some(e), None);
+            record(&r, "unavailable", Some(e), None, false);
             return done("unavailable");
         }
         Ok(_) => {
-            record(&r, "up_to_date", None, None);
+            record(&r, "up_to_date", None, None, false);
             return done("up_to_date");
         }
         Err(e) => {
             warn!("update: {} not installed: {e}", r.to);
-            record(&r, "failed", Some(e), None);
+            record(&r, "failed", Some(e), None, false);
             return done("failed");
         }
     };
@@ -999,7 +1042,7 @@ pub(crate) fn serve_request(
             Some("not checked: the node wasn't restarted (no --restart)".to_owned()),
         )
     };
-    record(&r, state, error, health);
+    record(&r, state, error, health, true);
     done(state)
 }
 

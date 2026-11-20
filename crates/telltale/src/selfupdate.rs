@@ -60,7 +60,7 @@ pub(crate) struct Options {
 }
 
 /// What happened.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Outcome {
     UpToDate,
     Available {
