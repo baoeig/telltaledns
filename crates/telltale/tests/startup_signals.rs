@@ -3,16 +3,31 @@
 //! once the node is up: SIGTERM drains and exits cleanly, SIGHUP reloads. Before, the signal's
 //! default action ended the process (review round 3, F2). A stop during a cluster join that can't
 //! finish (a loopback port where nothing listens) ends the join and the node at once, with exit
-//! 0, rather than after the join's two minutes (review round 4, N1). The start-up is made a
-//! little longer with a bootstrap administrator (a password hash). Every failed check prints the
-//! node's log.
+//! 0, rather than after the join's two minutes (review round 4, N1).
+//!
+//! The join holds start-up open for two minutes, so the tests that send a signal during it are
+//! deterministic: they fail on a build without the fix every time. The drain and the reload
+//! themselves can only be seen once start-up ends, and a stop during a join doesn't drain (by
+//! design), so those two still send their signal at DNS's first answer, with a bootstrap
+//! administrator (a password hash) to make the start-up a little longer: guards, not certain to
+//! catch a regression on every run. The tests take turns (one node at a time), a node that exits
+//! early fails its test at once with its exit status, and every failed check prints the node's
+//! log.
 
 #![allow(clippy::expect_used)] // test helpers
 
 use std::net::{TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
+
+/// One node at a time: the tests take turns.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+fn turn() -> MutexGuard<'static, ()> {
+    ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// A UDP port nothing uses now (for DNS).
 fn free_udp_port() -> u16 {
@@ -174,9 +189,15 @@ listen = "127.0.0.1:{api}"
         .stderr(std::fs::File::create(&log).expect("log file"))
         .spawn()
         .expect("start");
-    let node = Node { child, dns, log };
+    let mut node = Node { child, dns, log };
     let started = Instant::now();
     while !answers(node.dns) {
+        let exited = node.child.try_wait().expect("try_wait");
+        assert!(
+            exited.is_none(),
+            "the node exited during start-up: {exited:?}; {}",
+            node.tail()
+        );
         assert!(
             started.elapsed() <= Duration::from_secs(60),
             "never answered; {}",
@@ -187,8 +208,32 @@ listen = "127.0.0.1:{api}"
     node
 }
 
+/// The `[cluster]` lines of a node that joins at a loopback port where nothing listens (the
+/// join retries for two minutes), with its secret file in `dir`.
+fn joining(dir: &Path) -> String {
+    let secret = dir.join("join-secret");
+    std::fs::write(&secret, "a join secret nobody checks").expect("secret");
+    format!(
+        "\n[cluster]\njoin_url = \"https://127.0.0.1:{}\"\nbootstrap_secret_file = \"{}\"\n",
+        free_tcp_port(),
+        secret.display()
+    )
+}
+
+/// [`start`] with a join that can't finish, once the log says the join is retrying.
+fn start_joining(dir: &Path) -> Node {
+    let node = start(dir, &joining(dir));
+    assert!(
+        node.wait_logged("joining failed, retrying", Duration::from_secs(30)),
+        "not joining; {}",
+        node.tail()
+    );
+    node
+}
+
 #[test]
 fn ops_007_a_stop_during_start_up_drains_and_exits_cleanly() {
+    let _turn = turn();
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut node = start(tmp.path(), "");
     node.signal("-TERM");
@@ -215,6 +260,7 @@ fn ops_007_a_stop_during_start_up_drains_and_exits_cleanly() {
 
 #[test]
 fn ops_009_a_reload_during_start_up_reloads() {
+    let _turn = turn();
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut node = start(tmp.path(), "");
     node.signal("-HUP");
@@ -243,23 +289,11 @@ fn ops_009_a_reload_during_start_up_reloads() {
     );
 }
 
-/// A node joining a cluster whose join URL can't answer (a loopback port where nothing
-/// listens: the join retries for two minutes), stopped by `sig` during the join.
+/// A node joining a cluster whose join URL can't answer, stopped by `sig` during the join.
 fn stop_during_a_join(sig: &str) {
+    let _turn = turn();
     let tmp = tempfile::tempdir().expect("tempdir");
-    let secret = tmp.path().join("join-secret");
-    std::fs::write(&secret, "a join secret nobody checks").expect("secret");
-    let extra = format!(
-        "\n[cluster]\njoin_url = \"https://127.0.0.1:{}\"\nbootstrap_secret_file = \"{}\"\n",
-        free_tcp_port(),
-        secret.display()
-    );
-    let mut node = start(tmp.path(), &extra);
-    assert!(
-        node.wait_logged("joining failed, retrying", Duration::from_secs(30)),
-        "not joining; {}",
-        node.tail()
-    );
+    let mut node = start_joining(tmp.path());
     node.signal(sig);
     let sent = Instant::now();
     let code = node.wait_exit(Duration::from_secs(10));
@@ -284,4 +318,32 @@ fn ops_007_a_stop_during_a_cluster_join_ends_the_node() {
 #[test]
 fn ops_007_ctrl_c_during_a_cluster_join_ends_the_node() {
     stop_during_a_join("-INT");
+}
+
+/// REQ: OPS-009 (review round 3, F2) — held open by the join: a SIGHUP during start-up doesn't
+/// end the node (before, its default action did); it is kept for the main loop, which reloads once
+/// the join ends. The node stays up and answering, and a stop still ends it at once.
+#[test]
+fn ops_009_a_reload_during_a_cluster_join_keeps_the_node() {
+    let _turn = turn();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut node = start_joining(tmp.path());
+    node.signal("-HUP");
+    assert!(
+        node.wait_exit(Duration::from_secs(2)).is_none(),
+        "a reload during the join ended the node; {}",
+        node.tail()
+    );
+    assert!(
+        answers_within(node.dns, Duration::from_secs(2)),
+        "answers during the join; {}",
+        node.tail()
+    );
+    node.signal("-TERM");
+    let code = node.wait_exit(Duration::from_secs(10));
+    assert!(
+        code.is_some_and(|c| c.success()),
+        "a stop still ends it: {code:?}; {}",
+        node.tail()
+    );
 }
