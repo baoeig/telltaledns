@@ -15,12 +15,18 @@ const VIEWER = { user: 'viewer1', pass: 'another long password' };
 
 let page: Page;
 const problems: string[] = [];
+// A refusal the running test expects (the server answering a dry run with 4xx), matched when the
+// console message arrives: the message can come after the page shows the refusal, so removing it
+// from `problems` afterwards races. Null (every other test, and outside such a stretch): strict.
+let expectedRefusal: RegExp | null = null;
 
 test.beforeAll(async ({ browser }) => {
   page = await browser.newPage();
   page.on('pageerror', (e) => problems.push(`page error: ${e.message}`));
   page.on('console', (m) => {
-    if (m.type() === 'error' && !/status of 40[13]/.test(m.text())) problems.push(`console: ${m.text()}`);
+    if (m.type() !== 'error' || /status of 40[13]/.test(m.text())) return;
+    if (expectedRefusal?.test(m.text())) return;
+    problems.push(`console: ${m.text()}`);
   });
 });
 
@@ -2031,7 +2037,23 @@ test('t8_6 discovered devices, group settings, and zones', async () => {
 // (no key-file field), saved by the server, never shown back, and the row says it is saved; a new
 // address needs it again, and a pasted key needs an https:// address (both refused by the server
 // and shown); then it's removed. Every address is loopback or a reserved name in a dry run.
+// Each request is awaited by its response before what it shows is checked, so no check passes on
+// what was there before (the field's help text also says "sent only over https"). The two expected
+// 422s are let through as their console messages arrive (`expectedRefusal`) until later requests
+// have been answered and shown: a refusal's console message can come after the page shows it.
 test('api_002 routers are added and changed in the UI', async () => {
+  // A request to this router (PUT as a dry run or not, or DELETE), awaited by its response. An
+  // apply is answered once the change is stored and the configuration reloaded on the node's main
+  // loop; the build VM has been seen to stall for seconds right after the server starts, so each
+  // wait is 30 s, and what the page shows after a response is given CI's 15 s.
+  const routerCall = (method: string, dry: boolean) =>
+    page.waitForResponse(
+      (r) => r.request().method() === method && r.url().includes('/api/v1/routers/udm-e2e') && r.url().includes('dryRun=true') === dry,
+      { timeout: 30_000 },
+    );
+  const answered = async (p: ReturnType<typeof routerCall>, status: number) => expect((await p).status()).toBe(status);
+  const settle = { timeout: 15_000 };
+  const refusal = (text: RegExp) => page.getByRole('alert').filter({ hasText: text });
   await page.setViewportSize({ width: 1280, height: 800 });
   await page.goto('/#/clients?tab=discovered');
   const editor = page.getByTestId('editor-router');
@@ -2041,11 +2063,17 @@ test('api_002 routers are added and changed in the UI', async () => {
   await expect(page.getByLabel('API key file', { exact: true })).toHaveCount(0);
   await page.getByLabel('API key', { exact: true }).fill('e2e-secret-key');
   await page.getByLabel("Don't check the certificate", { exact: true }).check();
+  let call = routerCall('PUT', true);
   await page.getByRole('button', { name: 'Check', exact: true }).click();
-  await expect(page.getByTestId('entry-preview')).not.toContainText('e2e-secret-key');
+  await answered(call, 200);
+  const preview = page.getByTestId('entry-preview');
+  await expect(preview).toBeVisible(settle);
+  await expect(preview).not.toContainText('e2e-secret-key');
+  call = routerCall('PUT', false);
   await page.getByRole('button', { name: 'Apply' }).click();
+  await answered(call, 200);
   const row = editor.getByTestId('entry-row').filter({ hasText: 'udm-e2e' });
-  await expect(row).toContainText('added here');
+  await expect(row).toContainText('added here', settle);
   await expect(row).toContainText('unifi · https://127.0.0.1:1');
   await expect(row.getByTestId('entry-status')).toHaveText('key saved');
 
@@ -2053,25 +2081,40 @@ test('api_002 routers are added and changed in the UI', async () => {
   const key = page.getByLabel('API key', { exact: true });
   await expect(key).toHaveValue('');
   await expect(key).toHaveAttribute('placeholder', 'Saved. Type a new API key to replace it.');
-  // A new address needs the key again (it isn't sent to an endpoint it wasn't entered for).
-  await page.getByLabel('Address', { exact: true }).fill('https://127.0.0.2:1');
-  await page.getByRole('button', { name: 'Check', exact: true }).click();
-  await expect(page.getByText(/enter it again/)).toBeVisible();
-  // A pasted key isn't sent over http:// (a dry run: nothing is contacted).
-  await page.getByLabel('Address', { exact: true }).fill('http://router.example.test');
-  await key.fill('e2e-secret-key-2');
-  await page.getByRole('button', { name: 'Check', exact: true }).click();
-  await expect(page.getByText(/sent only over https/)).toBeVisible();
-  // Those refusals are expected: not a page problem.
-  for (let i = problems.length - 1; i >= 0; i--) if (problems[i].includes('status of 422')) problems.splice(i, 1);
-  await page.getByLabel('Address', { exact: true }).fill('https://127.0.0.2:1');
-  await page.getByRole('button', { name: 'Check', exact: true }).click();
-  await page.getByRole('button', { name: 'Apply' }).click();
-  await expect(row).toContainText('unifi · https://127.0.0.2:1');
-  await expect(row.getByTestId('entry-status')).toHaveText('key saved');
+  expectedRefusal = /status of 422/;
+  try {
+    // A new address needs the key again (it isn't sent to an endpoint it wasn't entered for).
+    await page.getByLabel('Address', { exact: true }).fill('https://127.0.0.2:1');
+    call = routerCall('PUT', true);
+    await page.getByRole('button', { name: 'Check', exact: true }).click();
+    await answered(call, 422);
+    await expect(refusal(/enter it again/)).toBeVisible(settle);
+    // A pasted key isn't sent over http:// (a dry run: nothing is contacted).
+    await page.getByLabel('Address', { exact: true }).fill('http://router.example.test');
+    await key.fill('e2e-secret-key-2');
+    call = routerCall('PUT', true);
+    await page.getByRole('button', { name: 'Check', exact: true }).click();
+    await answered(call, 422);
+    await expect(refusal(/sent only over https/)).toBeVisible(settle);
+    await page.getByLabel('Address', { exact: true }).fill('https://127.0.0.2:1');
+    call = routerCall('PUT', true);
+    await page.getByRole('button', { name: 'Check', exact: true }).click();
+    await answered(call, 200);
+    call = routerCall('PUT', false);
+    await page.getByRole('button', { name: 'Apply' }).click();
+    await answered(call, 200);
+    await expect(row).toContainText('unifi · https://127.0.0.2:1', settle);
+    await expect(row.getByTestId('entry-status')).toHaveText('key saved');
+  } finally {
+    // Requests made after both refusals have been answered and shown, and a page's events come in
+    // order: the refusals' console messages are in.
+    expectedRefusal = null;
+  }
 
+  call = routerCall('DELETE', false);
   await row.getByRole('button', { name: 'Remove' }).click();
-  await expect(row).toHaveCount(0);
+  await answered(call, 200);
+  await expect(row).toHaveCount(0, settle);
 });
 
 // REQ: OBS-010 (T9.6) — the Alerts page: add a destination, send it a test, add a rule that
