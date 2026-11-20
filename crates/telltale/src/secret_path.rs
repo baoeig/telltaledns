@@ -82,6 +82,20 @@ pub(crate) fn in_data_secrets(path: &str, data_dir: &str) -> bool {
     in_data_secrets_with(&FS, path, data_dir)
 }
 
+/// REQ: API-002, T8.2 (ADR-181) — the folders a platform fills with secrets, without the data
+/// directory's: `/run/secrets/` (Docker and Compose) and `/etc/telltale-secrets/` (the Helm chart's
+/// `secretMounts`).
+pub(crate) fn mount_roots() -> Vec<PathBuf> {
+    FIXED_ROOTS.iter().map(PathBuf::from).collect()
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — whether `path` is in one of `roots` (normally
+/// [`mount_roots`]) by [`allowed`]'s rule: normal form, compared by components as written and
+/// with links followed, never under Kubernetes' own `kubernetes.io` folder. Blocking.
+pub(crate) fn in_folders(path: &str, roots: &[PathBuf]) -> bool {
+    written(path).is_some_and(|p| within(&FS, &p, roots))
+}
+
 /// [`in_data_secrets`], asking `look`.
 fn in_data_secrets_with(look: &Look, path: &str, data_dir: &str) -> bool {
     let (Some(p), Some(d)) = (written(path), written(data_dir.trim_end_matches('/'))) else {

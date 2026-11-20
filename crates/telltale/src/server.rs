@@ -1009,6 +1009,7 @@ pub(crate) async fn serve(files: Vec<PathBuf>, cfg: Config) -> io::Result<()> {
         config: ArcSwap::from_pointee(cfg.clone()),
         file_config: ArcSwap::from_pointee(own_files),
         files_unread: std::sync::atomic::AtomicBool::new(files_unread),
+        secret_mounts: crate::secret_path::mount_roots(),
         config_files: files.clone(),
         update: Arc::new(std::sync::Mutex::new(crate::updates::initial(
             cfg.updates.check,

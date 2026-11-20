@@ -91,6 +91,11 @@ struct Node {
 
 impl Node {
     fn new(reload: Reload) -> Self {
+        Self::with(reload, |_, _| {})
+    }
+
+    /// [`Node::new`], with `f` changing the sources first (given the data directory).
+    fn with(reload: Reload, f: impl FnOnce(&Path, &mut Sources)) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut s = crate::http::tests::sources_in(dir.path());
         let mut file = telltale_config::Config::default();
@@ -98,6 +103,10 @@ impl Node {
             telltale_config::SafeString::new(dir.path().to_str().unwrap()).unwrap();
         s.file_config = arc_swap::ArcSwap::from_pointee(file.clone());
         s.config = arc_swap::ArcSwap::from_pointee(file);
+        // The folders a platform fills with secrets (`/run/secrets/`, `/etc/telltale-secrets/`),
+        // here a folder of the test's own.
+        s.secret_mounts = vec![dir.path().join("mount")];
+        f(dir.path(), &mut s);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<bool>>(4);
         s.reload = tx;
         let state =
@@ -593,8 +602,10 @@ async fn api_002_router_key_kept_when_saved_but_not_applied() {
     );
 }
 
-/// REQ: API-002, T8.2 (ADR-181) — F3: a client that goes away after the change is stored doesn't
-/// undo it half way: the key file stays, and the change is still applied.
+/// REQ: API-002, API-006, T8.2 (ADR-181) — F3: a client that goes away after the change is
+/// stored doesn't undo it half way: the key file stays, the change is still applied, audited, and
+/// kept for the Idempotency-Key, so the client's retry gets the first answer rather than a
+/// second change.
 #[tokio::test]
 async fn api_002_router_key_kept_when_the_client_goes_away() {
     let (asked, mut reload_asked) = tokio::sync::mpsc::unbounded_channel();
@@ -603,10 +614,12 @@ async fn api_002_router_key_kept_when_the_client_goes_away() {
         asked,
         go: Arc::clone(&go),
     });
+    let mut creds = n.admin.clone();
+    creds.push(("idempotency-key", marker("retry")));
     let req = Node::request(
         "PUT",
         "/api/v1/routers/udm",
-        &n.admin,
+        &creds,
         Some(&unifi(HERE, "the-key")),
     );
     let app = n.app.clone();
@@ -630,6 +643,73 @@ async fn api_002_router_key_kept_when_the_client_goes_away() {
     assert_eq!(
         std::fs::read_to_string(&f).ok().as_deref().map(str::trim),
         Some("the-key")
+    );
+    // Audited, though nobody waited for the answer.
+    wait_until("the change audited", 10, || {
+        n.auth
+            .state()
+            .audit_page(None, 100, None, None)
+            .unwrap()
+            .iter()
+            .any(|e| e.action == "router.put" && e.target == "udm")
+    })
+    .await;
+    // The retry with the same Idempotency-Key replays the first answer: no second file.
+    go.notify_one();
+    let (s, v) = n
+        .send(
+            "PUT",
+            "/api/v1/routers/udm",
+            &creds,
+            Some(unifi(HERE, "the-key")),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(n.key_file("udm").as_deref(), Some(f.as_str()), "replayed");
+}
+
+/// REQ: API-002, API-006, AGT-003 (ADR-181) — the same for a change of another kind (an
+/// upstream): every change that isn't a dry run runs to its end with its audit entry and its
+/// Idempotency-Key record, whether or not the client waits.
+#[tokio::test]
+async fn api_002_any_change_is_audited_when_the_client_goes_away() {
+    let (asked, mut reload_asked) = tokio::sync::mpsc::unbounded_channel();
+    let go = Arc::new(tokio::sync::Notify::new());
+    let n = Node::new(Reload::Gated {
+        asked,
+        go: Arc::clone(&go),
+    });
+    let mut creds = n.admin.clone();
+    creds.push(("idempotency-key", marker("retry")));
+    let body = serde_json::json!({"url": "udp://192.0.2.53"});
+    let req = Node::request("PUT", "/api/v1/upstreams/up", &creds, Some(&body));
+    let app = n.app.clone();
+    let client = tokio::spawn(async move { app.oneshot(req).await });
+    reload_asked.recv().await.unwrap();
+    client.abort();
+    let _ = client.await;
+    go.notify_one();
+    wait_until("the upstream change audited", 10, || {
+        n.auth
+            .state()
+            .audit_page(None, 100, None, None)
+            .unwrap()
+            .iter()
+            .any(|e| e.action == "upstream.put" && e.target == "up")
+    })
+    .await;
+    // The retry replays the first answer: no second change (a second one would wait for a reload
+    // nobody lets go).
+    let (s, v) = tokio::time::timeout(
+        Duration::from_secs(10),
+        n.send("PUT", "/api/v1/upstreams/up", &creds, Some(body)),
+    )
+    .await
+    .expect("replayed, not made again");
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(
+        reload_asked.try_recv().is_err(),
+        "no second reload asked for"
     );
 }
 
@@ -916,8 +996,11 @@ async fn api_002_orphaned_router_key_files_removed() {
     })
     .await;
     assert!(Path::new(&udm_file).exists(), "udm's key is named");
+    let _ = stop.send(true);
+    let _ = task.await;
     // The routers in effect stop naming udm's file (a replica, after the key was entered again on
-    // the primary), and this node's own stored entry doesn't name it either.
+    // the primary), and this node's own stored entry doesn't name it either: the sweep the task
+    // runs after such a change, called here directly.
     let mut cfg = (*n.src.config.load_full()).clone();
     if let Some(r) = cfg.router.iter_mut().find(|r| r.name.as_str() == "udm") {
         r.api_key_file =
@@ -928,12 +1011,9 @@ async fn api_002_orphaned_router_key_files_removed() {
         .delete_managed(crate::managed::ROUTER, "udm", None)
         .unwrap();
     n.src.config.store(Arc::new(cfg));
-    wait_until("udm's old key removed after the change", 20, || {
-        !Path::new(&udm_file).exists()
-    })
-    .await;
-    let _ = stop.send(true);
-    let _ = task.await;
+    let gone = crate::router_secrets::sweep_now(&n.src).unwrap();
+    assert_eq!(gone.len(), 1, "{gone:?}");
+    assert!(!Path::new(&udm_file).exists());
     assert!(Path::new(&format!("{d}/secrets/mine")).exists());
     assert!(Path::new(&format!("{d}/outside-file")).exists());
 }
@@ -1069,4 +1149,456 @@ async fn api_002_router_definitions_redacted_for_viewers() {
         assert!(of("fw")["definition"]["api_secret_file"].is_string());
         assert_eq!(of("ctl")["definition"]["username"], "telltale-reader");
     }
+}
+
+// ---- Review round 1.
+
+/// The `credentials` status of `name`'s `api_key` in `items`.
+fn key_status(items: &[serde_json::Value], name: &str) -> serde_json::Value {
+    items
+        .iter()
+        .find(|e| e["name"] == name)
+        .map(|e| e["credentials"]["api_key"].clone())
+        .unwrap_or_default()
+}
+
+/// REQ: API-002, T8.2 (ADR-181, ADR-120) — a router the node gets only from the cluster's shared
+/// configuration (a native replica, a primary promoted after a failover), with its key file in a
+/// folder a platform fills with secrets (`/etc/telltale-secrets/`, `/run/secrets/`; here the test's
+/// own), is polled on this node, as before the use-time rule. With its key elsewhere, or through a
+/// link that leaves the folder, it is held, logged once with what to do, and its status says so.
+#[tokio::test]
+async fn api_002_a_shared_router_with_its_key_in_a_secrets_folder_is_polled_on_any_node() {
+    use telltale_cluster::node::Role as NodeRole;
+    let items = shared_router_on(None).await;
+    assert_eq!(key_status(&items, "d-mounted"), "saved");
+    assert_eq!(key_status(&items, "b-etc"), "not_used");
+    // A native replica, and a node promoted to primary (a newer epoch): the same rule, the held
+    // router said at info on the replica and as a warning on the primary.
+    for (role, epoch, level) in [
+        (NodeRole::Replica, 1, tracing::Level::INFO),
+        (NodeRole::Primary, 2, tracing::Level::WARN),
+    ] {
+        let items = shared_router_on(Some((role, epoch, level))).await;
+        assert_eq!(key_status(&items, "d-mounted"), "saved", "{role:?}");
+        assert_eq!(key_status(&items, "b-etc"), "not_used", "{role:?}");
+    }
+}
+
+/// [`api_002_a_shared_router_with_its_key_in_a_secrets_folder_is_polled_on_any_node`] on one
+/// node: standalone, or a cluster member in `role` at `epoch` whose held routers are logged at
+/// `level`. Returns each router's credential status (`name`, `credentials`).
+async fn shared_router_on(
+    member: Option<(telltale_cluster::node::Role, u64, tracing::Level)>,
+) -> Vec<serde_json::Value> {
+    let n = Node::with(Reload::Applies, |dir, s| {
+        if let Some((role, epoch, _)) = member {
+            let id = telltale_cluster::node::Identity::init_with(
+                dir,
+                "home",
+                vec!["https://node.example.test:8443".into()],
+                "home",
+                "api",
+            )
+            .unwrap();
+            let c = telltale_cluster::net::Cluster::new(id, "0.1.0");
+            if role == telltale_cluster::node::Role::Primary {
+                // Promoted: a replica first, then primary at a newer epoch.
+                c.set_role(telltale_cluster::node::Role::Replica, epoch - 1)
+                    .unwrap();
+            }
+            c.set_role(role, epoch).unwrap();
+            s.cluster = Some(c);
+        }
+    });
+    let d = n.data();
+    let fake = console();
+    std::fs::create_dir_all(format!("{d}/mount/unifi")).unwrap();
+    std::fs::create_dir_all(format!("{d}/etc-telltale")).unwrap();
+    std::fs::write(format!("{d}/mount/unifi/key"), "mounted-key").unwrap();
+    std::fs::write(format!("{d}/etc-telltale/key"), "etc-key").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(format!("{d}/etc-telltale/key"), format!("{d}/mount/link")).unwrap();
+    // The node's own files define no router: the routers in effect come from the cluster.
+    let mut cfg = (*n.src.config.load_full()).clone();
+    for (name, site, file) in [
+        ("b-etc", "etc", format!("{d}/etc-telltale/key")),
+        ("c-link", "link", format!("{d}/mount/link")),
+        ("d-mounted", "mounted", format!("{d}/mount/unifi/key")),
+    ] {
+        cfg.router.push(
+            serde_json::from_value(serde_json::json!({
+                "name": name, "type": "unifi", "url": fake.url, "site": site,
+                "api_key_file": file, "offline_days": 0,
+            }))
+            .unwrap(),
+        );
+    }
+    n.src.config.store(Arc::new(cfg));
+    let seen = super::local_access_tests::Seen::default();
+    let _log = tracing::subscriber::set_default(seen.subscriber());
+    let (stop, task) = poll(&n);
+    wait_until("the router with its key in the folder polled", 20, || {
+        fake.sites().iter().any(|s| s == "mounted")
+    })
+    .await;
+    let _ = stop.send(true);
+    let _ = task.await;
+    assert_eq!(fake.key_for("mounted").as_deref(), Some("mounted-key"));
+    assert!(
+        !fake.sites().iter().any(|s| s == "etc" || s == "link"),
+        "held: {:?}",
+        fake.sites()
+    );
+    let held = seen.lines(|l| l.contains("not read on this node") && l.contains("b-etc"));
+    assert_eq!(held.len(), 1, "logged once: {held:?}");
+    assert!(
+        held[0].contains("this node's config file") && held[0].contains("/etc/telltale-secrets/"),
+        "says what to do: {held:?}"
+    );
+    assert_eq!(
+        seen.lines(|l| l.contains("not read on this node") && l.contains("c-link"))
+            .len(),
+        1,
+        "a link out of the folder is held"
+    );
+    if let Some((_, _, level)) = member {
+        let at: Vec<_> = seen
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, l)| l.contains("not read on this node") && l.contains("b-etc"))
+            .map(|(lv, _)| *lv)
+            .collect();
+        assert_eq!(at, vec![level]);
+        // The status as the API reports it, read here (a member's API would ask its primary).
+        let check = crate::router_secrets::UseCheck::load(&n.src);
+        return n
+            .src
+            .config
+            .load()
+            .router
+            .iter()
+            .map(|r| serde_json::json!({"name": r.name.as_str(), "credentials": check.status(r)}))
+            .collect();
+    }
+    n.routers(&n.viewer).await
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — after a failover the router in effect comes from the last
+/// version the cluster published, which is in neither this node's files nor its stored entries.
+/// The UI sends the definition back with the key pasted again: the pasted key replaces whatever
+/// file the body names for it (that path is never read), and goes to a new file here.
+#[tokio::test]
+async fn api_002_a_pasted_key_replaces_a_file_the_planned_router_lacks() {
+    let n = Node::new(Reload::Applies);
+    let d = n.data();
+    let old = format!("{d}/old-primary/secrets/router-udm.api_key.0123456789abcdef");
+    let mut cfg = (*n.src.config.load_full()).clone();
+    cfg.router.push(
+        serde_json::from_value(serde_json::json!({
+            "name": "udm", "type": "unifi", "url": HERE, "api_key_file": old, "offline_days": 0,
+        }))
+        .unwrap(),
+    );
+    n.src.config.store(Arc::new(cfg));
+    let (status, answer) = n
+        .put(
+            "udm",
+            &n.admin,
+            false,
+            serde_json::json!({"type": "unifi", "url": HERE, "api_key_file": old,
+                "api_key": "re-entered", "offline_days": 0}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let saved = n.key_file("udm").unwrap();
+    assert!(
+        saved.starts_with(&format!("{d}/secrets/router-udm.api_key.")),
+        "{saved}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&saved)
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("re-entered")
+    );
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — F3: the router task starts before the state database is open
+/// (`start_http` opens it). The sweep at start then can't see the stored entries; it doesn't count
+/// as done, and runs once the database is open, so a key file a crash left behind is removed.
+#[tokio::test]
+async fn api_002_the_start_sweep_waits_for_the_state_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().to_str().unwrap().to_owned();
+    let mut s = crate::http::tests::sources_in(dir.path());
+    let mut file = telltale_config::Config::default();
+    file.node.data_dir = telltale_config::SafeString::new(&d).unwrap();
+    s.file_config = arc_swap::ArcSwap::from_pointee(file.clone());
+    s.config = arc_swap::ArcSwap::from_pointee(file);
+    let src = Arc::new(s);
+    std::fs::create_dir_all(format!("{d}/secrets")).unwrap();
+    let orphan = format!("{d}/secrets/router-gone.api_key.0123456789abcdef");
+    std::fs::write(&orphan, "k").unwrap();
+    std::fs::write(
+        format!("{d}/secrets/.written"),
+        format!(
+            "{}\n",
+            serde_json::json!({"router": "gone", "field": "api_key", "file": orphan})
+        ),
+    )
+    .unwrap();
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let view = Arc::new(arc_swap::ArcSwap::from_pointee(
+        crate::devices::Leases::new(),
+    ));
+    let first = view.load_full();
+    let task = tokio::spawn(crate::routers::run(
+        Arc::clone(&src),
+        Arc::clone(&view),
+        stopped,
+        false,
+    ));
+    wait_until("the task's first round", 10, || {
+        !Arc::ptr_eq(&first, &view.load_full())
+    })
+    .await;
+    assert!(Path::new(&orphan).exists(), "nothing removed unchecked");
+    let state = Arc::new(telltale_store::state::State::open(&dir.path().join("state.db")).unwrap());
+    let _ = src
+        .auth
+        .set(Arc::new(Auth::new(state, auth::Settings::default())));
+    wait_until("the orphan removed once the database is open", 20, || {
+        !Path::new(&orphan).exists()
+    })
+    .await;
+    let _ = stop.send(true);
+    let _ = task.await;
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — security F1: a pasted key with an unchecked certificate goes
+/// only to an address, not a host name (a local name, forward or upstream, which operators may
+/// add, could change where a name resolves on a node whose resolver is TelltaleDNS). Dry runs.
+#[tokio::test]
+async fn api_002_an_unchecked_certificate_needs_an_address_for_a_pasted_key() {
+    let n = Node::new(Reload::Applies);
+    let insecure = |url: &str| {
+        serde_json::json!({"type": "unifi", "url": url, "api_key": "k",
+            "tls_insecure_skip_verify": true, "offline_days": 0})
+    };
+    for url in ["https://unifi.example.test", "https://unifi.lan:8443/"] {
+        let (s, v) = n.put("udm", &n.admin, true, insecure(url)).await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{url}: {v}");
+        assert!(
+            v["hint"].as_str().unwrap_or("").contains("tls_ca"),
+            "{url}: {v}"
+        );
+    }
+    for url in [
+        "https://192.0.2.1",
+        "https://[2001:db8::1]:8443",
+        "http://127.0.0.1:1",
+    ] {
+        let (s, v) = n.put("udm", &n.admin, true, insecure(url)).await;
+        assert_eq!(s, StatusCode::OK, "{url}: {v}");
+    }
+    let (s, v) = n
+        .put(
+            "udm",
+            &n.admin,
+            true,
+            unifi("https://unifi.example.test", "k"),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "a checked certificate with a name: {v}");
+}
+
+/// Every byte of this node's state database (with its write-ahead log).
+fn state_bytes(n: &Node) -> Vec<u8> {
+    let mut b = Vec::new();
+    for f in ["state.db", "state.db-wal"] {
+        if let Ok(x) = std::fs::read(n.dir.path().join(f)) {
+            b.extend(x);
+        }
+    }
+    b
+}
+
+/// REQ: API-002, AGT-003, T8.2 (ADR-181) — security F5: the request kept for an Idempotency-Key
+/// holds a pasted key only as a keyed hash (with a key of this node's), not a plain one anyone
+/// with `state.db` could test guesses against.
+#[tokio::test]
+async fn api_002_a_pasted_key_is_kept_for_a_retry_only_as_a_keyed_hash() {
+    let n = Node::new(Reload::Applies);
+    let key = marker("pasted");
+    let mut creds = n.admin.clone();
+    creds.push(("idempotency-key", marker("k")));
+    let (s, v) = n
+        .send(
+            "PUT",
+            "/api/v1/routers/udm",
+            &creds,
+            Some(unifi(HERE, &key)),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let plain = blake3::hash(key.as_bytes()).to_hex().to_string();
+    let db = state_bytes(&n);
+    assert_ne!(db.len(), 0, "state.db read");
+    assert!(
+        !db.windows(plain.len()).any(|w| w == plain.as_bytes()),
+        "a plain hash of the key is in state.db"
+    );
+    assert!(!db.windows(key.len()).any(|w| w == key.as_bytes()));
+}
+
+/// REQ: API-002, AGT-003, T8.2 (ADR-181) — an Idempotency-Key replays a router write: the same
+/// key and body get the first answer and no second file; the same key with another pasted key
+/// is another request (409).
+#[tokio::test]
+async fn api_002_a_router_write_replays_for_its_idempotency_key() {
+    let n = Node::new(Reload::Applies);
+    let mut creds = n.admin.clone();
+    creds.push(("idempotency-key", marker("k")));
+    let (s, first) = n
+        .send(
+            "PUT",
+            "/api/v1/routers/udm",
+            &creds,
+            Some(unifi(HERE, "k1")),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{first}");
+    let f = n.key_file("udm").unwrap();
+    let (s, again) = n
+        .send(
+            "PUT",
+            "/api/v1/routers/udm",
+            &creds,
+            Some(unifi(HERE, "k1")),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{again}");
+    assert_eq!(again, first, "the first answer");
+    assert_eq!(n.key_file("udm").as_deref(), Some(f.as_str()));
+    assert_eq!(n.secret_files().len(), 1, "{:?}", n.secret_files());
+    let (s, other) = n
+        .send(
+            "PUT",
+            "/api/v1/routers/udm",
+            &creds,
+            Some(unifi(HERE, "k2")),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{other}");
+    assert_eq!(n.key_file("udm").as_deref(), Some(f.as_str()));
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — security F6: a router's `site` stays in the path of the request
+/// (percent-encoded), never in the host; a body whose `url` holds `{` or `}` is refused.
+#[tokio::test]
+async fn api_002_a_routers_site_stays_in_the_path() {
+    let n = Node::new(Reload::Applies);
+    let d = n.data();
+    let fake = console();
+    std::fs::write(format!("{d}/file-key"), "file-key").unwrap();
+    let mut file = (*n.src.file_config.load_full()).clone();
+    file.router.push(
+        serde_json::from_value(serde_json::json!({
+            "name": "site", "type": "unifi", "url": fake.url, "site": "a/b@c",
+            "api_key_file": format!("{d}/file-key"), "offline_days": 0,
+        }))
+        .unwrap(),
+    );
+    n.src.file_config.store(Arc::new(file));
+    apply(&n.src);
+    let (stop, task) = poll(&n);
+    wait_until("the router polled", 20, || !fake.sites().is_empty()).await;
+    let _ = stop.send(true);
+    let _ = task.await;
+    assert_eq!(fake.sites()[0], "a%2Fb%40c", "{:?}", fake.sites());
+    for url in ["https://{site}.example.test", "https://192.0.2.1/}"] {
+        let (s, v) = n.put("x", &n.admin, true, unifi(url, "k")).await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{url}: {v}");
+    }
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — the sweep keeps a record whose file is a link inside
+/// `secrets/` that leads out, and touches neither the link nor what it leads to.
+#[cfg(unix)]
+#[tokio::test]
+async fn api_002_the_sweep_never_follows_a_link_out() {
+    let n = Node::new(Reload::Applies);
+    let d = n.data();
+    std::fs::create_dir_all(format!("{d}/secrets")).unwrap();
+    std::fs::write(format!("{d}/precious"), "not a key").unwrap();
+    std::os::unix::fs::symlink(format!("{d}/precious"), format!("{d}/secrets/link")).unwrap();
+    std::fs::write(
+        format!("{d}/secrets/.written"),
+        format!(
+            "{}\n",
+            serde_json::json!({"router": "gone", "field": "api_key", "file": format!("{d}/secrets/link")})
+        ),
+    )
+    .unwrap();
+    let gone = crate::router_secrets::sweep_now(&n.src).unwrap();
+    assert!(gone.is_empty(), "{gone:?}");
+    assert!(Path::new(&format!("{d}/secrets/link")).exists());
+    assert!(Path::new(&format!("{d}/precious")).exists());
+}
+
+/// REQ: API-002, T8.2 (ADR-181, ADR-179) — if the config files couldn't be read at start-up,
+/// nothing counts as this node's own: a router whose key is outside the folders is held, while
+/// one with its key in a folder for secrets is still used. A Git commit in use counts as the
+/// node's own.
+#[tokio::test]
+async fn api_002_the_use_rule_without_files_and_with_a_git_commit() {
+    let n = Node::new(Reload::Applies);
+    let d = n.data();
+    std::fs::create_dir_all(format!("{d}/mount")).unwrap();
+    let outside = |name: &str| -> telltale_config::RouterConfig {
+        serde_json::from_value(serde_json::json!({
+            "name": name, "type": "unifi", "url": HERE, "api_key_file": format!("{d}/outside/key"),
+        }))
+        .unwrap()
+    };
+    let mounted: telltale_config::RouterConfig = serde_json::from_value(serde_json::json!({
+        "name": "mounted", "type": "unifi", "url": HERE, "api_key_file": format!("{d}/mount/key"),
+    }))
+    .unwrap();
+    let mut file = (*n.src.file_config.load_full()).clone();
+    file.router.push(outside("own"));
+    n.src.file_config.store(Arc::new(file.clone()));
+    let check = || crate::router_secrets::UseCheck::load(&n.src);
+    assert!(check().refused(&outside("own")).is_none());
+    n.src
+        .files_unread
+        .store(true, std::sync::atomic::Ordering::Release);
+    assert!(check().refused(&outside("own")).is_some(), "files unread");
+    assert!(check().refused(&mounted).is_none(), "a folder for secrets");
+    n.src
+        .files_unread
+        .store(false, std::sync::atomic::Ordering::Release);
+    // The commit in use, on a node that takes the cluster's configuration from Git.
+    file.cluster.git = Some(
+        serde_json::from_value(serde_json::json!({
+            "repo": "https://git.example.test/homelab", "path": "telltale/shared.toml",
+        }))
+        .unwrap(),
+    );
+    n.src.file_config.store(Arc::new(file));
+    let dir = telltale_cluster::node::dir_of(n.dir.path());
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("git-shared.toml"),
+        format!(
+            "[[router]]\nname = \"git\"\ntype = \"unifi\"\nurl = \"{HERE}\"\napi_key_file = \"{d}/outside/key\"\n"
+        ),
+    )
+    .unwrap();
+    assert!(check().refused(&outside("git")).is_none(), "the Git commit");
+    assert!(check().refused(&outside("other")).is_some());
 }

@@ -64,10 +64,10 @@ fn secret(path: Option<&telltale_config::SafeString>) -> Result<Option<String>, 
             .map(|s| s.trim().to_owned())
             .map_err(|e| {
                 // REQ: T8.2 (ADR-181) — after a restore elsewhere or a failover the key isn't
-                // on this node: say what to do, not only that the file is missing.
+                // on this node: say so, and what puts it back for either kind of router.
                 if e.kind() == std::io::ErrorKind::NotFound {
                     format!(
-                        "{}: the key file isn't on this node (key missing: enter it again under Clients → Discovered → Routers, or put the file there)",
+                        "{}: the key file isn't on this node (put the file there; for a router made in the UI, enter the key again on the node that takes configuration changes)",
                         p.as_str()
                     )
                 } else {
@@ -267,6 +267,19 @@ pub(crate) fn opnsense_leases(v: &Value) -> Seen {
         .collect()
 }
 
+/// `s` as one path segment: every byte but the unreserved ones (letters, digits, `-._~`)
+/// percent-encoded.
+fn path_segment(s: &str) -> String {
+    s.bytes().fold(String::new(), |mut out, b| {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            let _ = std::fmt::Write::write_fmt(&mut out, format_args!("%{b:02X}"));
+        }
+        out
+    })
+}
+
 /// How to reach a UniFi Network API once signed in: the path prefix (`/proxy/network` on
 /// UniFi OS consoles) and the header that authenticates (`x-api-key`, or the login cookie).
 struct UnifiSession<'a> {
@@ -285,7 +298,14 @@ impl UnifiSession<'_> {
         client: &telltale_filter::fetch::Client,
         path: &str,
     ) -> Result<Value, String> {
-        let url = format!("{}{}{path}", self.base, self.prefix).replace("{site}", self.site);
+        // REQ: T8.2 (ADR-181) — security F6: the site goes into the path template only, as one
+        // percent-encoded segment, never into the address.
+        let url = format!(
+            "{}{}{}",
+            self.base,
+            self.prefix,
+            path.replace("{site}", &path_segment(self.site))
+        );
         let req = http::Request::get(url.as_str())
             .header(self.auth.0, self.auth.1.as_str())
             .header("accept", "application/json")
@@ -470,9 +490,9 @@ pub(crate) async fn run(
         let routers = routers_now();
         // REQ: API-002, T8.2 (ADR-181) — F5: at start, and after each change of the routers in
         // effect (a write, a reload, a replicated version, a failover), the key files this node
-        // wrote that nothing names any more are removed.
-        if swept_for.as_ref() != Some(&routers) {
-            crate::router_secrets::sweep(&sources).await;
+        // wrote that nothing names any more are removed; one that couldn't run yet (the state
+        // database not open) is tried again at the next check (correctness F3).
+        if swept_for.as_ref() != Some(&routers) && crate::router_secrets::sweep(&sources).await {
             swept_for = Some(routers.clone());
         }
         let same_device = |a: &RouterConfig, b: &RouterConfig| {
@@ -585,6 +605,13 @@ pub(crate) async fn run(
             tokio::select! {
                 _ = stop.changed() => return,
                 () = tokio::time::sleep(CHANGE_CHECK.min(until - tokio::time::Instant::now())) => {}
+            }
+            // A sweep that couldn't run yet is tried again at each check, without a new round of
+            // polls (correctness F3; cheap while the state database isn't open).
+            if swept_for.as_ref() != Some(&read_with)
+                && crate::router_secrets::sweep(&sources).await
+            {
+                swept_for = Some(read_with.clone());
             }
             if routers_now() != read_with {
                 break;

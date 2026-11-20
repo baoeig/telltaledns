@@ -82,12 +82,17 @@ import json, sys
 items = [x for x in json.load(sys.stdin)["items"] if x["name"] == "udm"]
 print(items[0]["definition"].get("api_key_file", "") if items else "")'; }
 
-# Credential files outside secrets/ are refused, pasted or not (the poll would send them).
-for body in "{\"type\":\"unifi\",\"url\":\"http://127.0.0.1:26984\",\"api_key\":\"$KEY\",\"api_key_file\":\"$E/elsewhere\"}" \
-            "{\"type\":\"unifi\",\"url\":\"http://127.0.0.1:26984\",\"api_key_file\":\"$E/telltale.toml\"}"; do
-  code=$(put udm "$body")
-  [ "$code" = 422 ] || fail "a credential file outside secrets/ wasn't refused ($code): $(cat "$E/out")"
-done
+# A credential file named in a body is refused (the poll would send it). With a pasted key, the
+# file the body names is replaced by a new one under secrets/ and never read or written (a dry
+# run here, so nothing is stored yet).
+code=$(put udm "{\"type\":\"unifi\",\"url\":\"http://127.0.0.1:26984\",\"api_key_file\":\"$E/telltale.toml\"}")
+[ "$code" = 422 ] || fail "a credential file outside secrets/ wasn't refused ($code): $(cat "$E/out")"
+code=$(curl -s -o "$E/out" -w '%{http_code}' -X PUT -b "$E/jar" -H "x-csrf-token: $CSRF" -H 'content-type: application/json' \
+  -d "{\"type\":\"unifi\",\"url\":\"http://127.0.0.1:26984\",\"api_key\":\"$KEY\",\"api_key_file\":\"$E/elsewhere\"}" \
+  "$API/api/v1/routers/udm?dryRun=true")
+[ "$code" = 200 ] || fail "a pasted key with a file named: $code $(cat "$E/out")"
+field 'd["after"]["api_key_file"]' < "$E/out" | grep -q "^$E/data/secrets/router-udm.api_key\." \
+  || fail "the named file wasn't replaced by a new one under secrets/: $(cat "$E/out")"
 [ ! -e "$E/elsewhere" ] || fail "the key was written outside secrets/"
 
 # Added with a pasted key: a new file under secrets/, 0600, read without a restart.

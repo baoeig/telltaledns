@@ -4054,10 +4054,10 @@ fn managed_impact(src: &Sources, kind: ManagedKind, name: &str, setting: bool) -
         }
         // REQ: T8.2 (ADR-181)
         (ManagedKind::Router, true) => {
-            "The router is read within 5 seconds; its devices are named once it answers (the log says if it doesn't).".into()
+            "The router is read within 5 seconds, or once a read in progress ends; its devices are named once it answers (the log says if it doesn't).".into()
         }
         (ManagedKind::Router, false) => {
-            "Its devices lose the names it gave them within 5 seconds.".into()
+            "Its devices lose the names it gave them within 5 seconds, or once a read in progress ends.".into()
         }
         // REQ: OBS-038 — decided when a finding is created, so nothing already recorded changes.
         (ManagedKind::AnomalyMute, true) => {
@@ -5381,10 +5381,20 @@ async fn run_managed_write(
                 r?;
                 expect = None;
             }
-            match &body {
+            let r = match &body {
                 Some(b) => state.put_managed(kind, &name, b, None, expect, now, &w.by),
                 None => state.delete_managed(kind, &name, expect),
+            };
+            // REQ: API-002, T8.2 (ADR-181) — F3, security F4: the entry naming the new key
+            // files is stored, so they stay, kept here as the store returns (a runtime shutdown
+            // after this can't remove them), whatever the reload says next. A store that failed
+            // removes them, on this blocking thread.
+            if r.is_ok() {
+                written.keep();
+            } else {
+                drop(written);
             }
+            r
         })
         .await
         .map_err(|e| Problem::internal(format!("request worker failed: {e}")))?
@@ -5394,10 +5404,6 @@ async fn run_managed_write(
         ManagedError::NotFound { .. } => Problem::not_found(e.to_string()),
         ManagedError::State(e) => Problem::internal(e.to_string()),
     })?;
-    // REQ: API-002, T8.2 (ADR-181) — F3: the entry naming the new key files is stored,
-    // so they stay, whatever the reload says next (removing them would leave a stored
-    // entry naming files that are gone).
-    written.keep();
     provenance(&w.by, version);
     let (tx, rx) = tokio::sync::oneshot::channel();
     let applied = src.reload.send(tx).await.is_ok() && rx.await.unwrap_or(false);
@@ -5661,10 +5667,12 @@ fn keep_in_git(
                 let secret = telltale_api::ROUTER_CREDENTIALS
                     .iter()
                     .find(|(_, file_field)| *file_field == k.as_str());
+                // Security F8: one safe folder name, whatever the router's name holds.
                 let v = match secret {
-                    Some((field, _)) => {
-                        serde_json::Value::String(format!("/etc/telltale-secrets/{name}/{field}"))
-                    }
+                    Some((field, _)) => serde_json::Value::String(format!(
+                        "/etc/telltale-secrets/{}/{field}",
+                        crate::router_secrets::slug(name)
+                    )),
                     None => v.clone(),
                 };
                 t.insert(k.clone(), v);
@@ -5970,6 +5978,36 @@ mod keep_in_git_tests {
             Some("/etc/telltale-secrets/fw/api_secret")
         );
         assert!(r.get("password_file").is_none());
+    }
+
+    /// REQ: API-002, T8.2 (ADR-181) — security F8: the Secret folder Keep it in Git names for a
+    /// router is one safe folder name, whatever the router's name holds (`/`, `..`).
+    #[test]
+    fn api_002_keep_in_git_uses_a_safe_folder_name() {
+        let toml_text = keep_in_git(
+            ManagedKind::Router,
+            "a/../b",
+            Some(&serde_json::json!({
+                "type": "unifi", "url": "https://192.168.1.1",
+                "api_key_file": "/var/lib/telltale/secrets/router-a_.._b-0123abcd.api_key.0123456789abcdef",
+            })),
+            None,
+        );
+        let parsed: toml::Table = toml::from_str(&toml_text).unwrap();
+        let f = parsed["router"][0]["api_key_file"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let rest = f.strip_prefix("/etc/telltale-secrets/").unwrap_or_default();
+        let parts: Vec<&str> = rest.split('/').collect();
+        assert_eq!(parts.len(), 2, "{f}");
+        assert!(
+            parts[0]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "{f}"
+        );
+        assert_eq!(parts[1], "api_key", "{f}");
     }
 
     /// REQ: API-002 (T7.5) — the TOML that keeps an API change in Git.
