@@ -5649,6 +5649,28 @@ fn keep_in_git(
             t
         }
         ManagedKind::Rule => after.map(|a| vec![("rule", a.clone())]).unwrap_or_default(),
+        // REQ: API-002, T8.2 (ADR-181) — F8: in Git a router's key is a Secret every pod can
+        // mount (the chart's `secretMounts`), not the file one node saved in its data directory.
+        ManagedKind::Router => {
+            let mut t = serde_json::Map::new();
+            t.insert("name".into(), name.into());
+            for (k, v) in body.as_object().into_iter().flatten() {
+                if k == "name" {
+                    continue;
+                }
+                let secret = telltale_api::ROUTER_CREDENTIALS
+                    .iter()
+                    .find(|(_, file_field)| *file_field == k.as_str());
+                let v = match secret {
+                    Some((field, _)) => {
+                        serde_json::Value::String(format!("/etc/telltale-secrets/{name}/{field}"))
+                    }
+                    None => v.clone(),
+                };
+                t.insert(k.clone(), v);
+            }
+            vec![(section, serde_json::Value::Object(t))]
+        }
         _ => {
             let mut t = body.clone();
             if let Some(o) = t.as_object_mut() {
@@ -5664,6 +5686,9 @@ fn keep_in_git(
         }
     };
     let mut out = String::from(head);
+    if kind == ManagedKind::Router {
+        out.push_str("# Its keys: put each in a Kubernetes Secret mounted with the chart's `secretMounts` (name: the router's), or in a Docker secret under /run/secrets/ (then name that file), and paste nothing in the UI. The files this node saved stay on this node.\n");
+    }
     for (sec, t) in tables {
         let mut root = toml::Table::new();
         let Ok(toml::Value::Table(table)) = toml::Value::try_from(&t) else {
@@ -5913,6 +5938,39 @@ fn bad_maps(b: &mut TimeBucket, bad: &telltale_telemetry::agg::Bad, ups: &[Strin
 #[cfg(test)]
 mod keep_in_git_tests {
     use super::*;
+
+    /// REQ: API-002, T8.2 (ADR-181) — F8: "Keep it in Git" for a router names each key as a file
+    /// of a Kubernetes Secret mounted with the chart's `secretMounts`
+    /// (`/etc/telltale-secrets/<router>/<credential>`), not the file one node saved under its
+    /// data directory; it says so, and the rest of the router is as written.
+    #[test]
+    fn api_002_keep_in_git_names_a_secret_mount_for_a_router_key() {
+        let toml_text = keep_in_git(
+            ManagedKind::Router,
+            "fw",
+            Some(&serde_json::json!({
+                "type": "opnsense", "url": "https://opnsense.lan",
+                "api_key_file": "/var/lib/telltale/secrets/router-fw.api_key.0123456789abcdef",
+                "api_secret_file": "/var/lib/telltale/secrets/router-fw.api_secret.fedcba9876543210",
+            })),
+            None,
+        );
+        assert!(!toml_text.contains("/var/lib/telltale"), "{toml_text}");
+        assert!(toml_text.contains("secretMounts"), "{toml_text}");
+        let parsed: toml::Table = toml::from_str(&toml_text).unwrap();
+        let r = &parsed["router"][0];
+        assert_eq!(r["name"].as_str(), Some("fw"));
+        assert_eq!(r["url"].as_str(), Some("https://opnsense.lan"));
+        assert_eq!(
+            r["api_key_file"].as_str(),
+            Some("/etc/telltale-secrets/fw/api_key")
+        );
+        assert_eq!(
+            r["api_secret_file"].as_str(),
+            Some("/etc/telltale-secrets/fw/api_secret")
+        );
+        assert!(r.get("password_file").is_none());
+    }
 
     /// REQ: API-002 (T7.5) — the TOML that keeps an API change in Git.
     #[test]
