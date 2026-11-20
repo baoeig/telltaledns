@@ -274,14 +274,23 @@ async fn ops_014_an_edge_build_installs_only_while_it_is_the_newest() {
     let dir = tempfile::tempdir().unwrap();
     let exe = old_binary(dir.path());
     let base = serve(pinned_release("releases-edge.json")).await;
-    let err = update(
+    let out = update(
         &pinned_options(base.clone(), "9.9.9-edge.6"),
         &exe,
         ASSET,
         &key,
     )
     .await
-    .unwrap_err();
+    .unwrap();
+    // REQ: OPS-014 (ADR-182) — its own outcome, so the update service can say `unavailable`.
+    assert_eq!(
+        out,
+        Outcome::Unavailable {
+            serves: "9.9.9-edge.7".into(),
+            commit: "abc1234".into()
+        }
+    );
+    let err = unavailable_text("9.9.9-edge.6", "9.9.9-edge.7", "abc1234");
     assert!(
         err.contains("now serves 9.9.9-edge.7") && err.contains("only the newest edge build"),
         "{err}"

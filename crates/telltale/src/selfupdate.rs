@@ -55,8 +55,18 @@ pub(crate) struct Options {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
     UpToDate,
-    Available { sha256: String },
-    Updated { previous: PathBuf },
+    Available {
+        sha256: String,
+    },
+    Updated {
+        previous: PathBuf,
+    },
+    /// REQ: OPS-014 (ADR-182) — the edge build asked for (`--to`) isn't served any more: the edge
+    /// channel now serves `serves` (commit `commit`). Nothing was installed.
+    Unavailable {
+        serves: String,
+        commit: String,
+    },
 }
 
 /// This build's release asset name.
@@ -83,7 +93,7 @@ fn base_url(o: &Options) -> String {
 }
 
 /// REQ: OPS-014 — the signed index of the release at `base` must name `to` and list `want` for
-/// `asset`.
+/// `asset`. `Ok(Some((serves, commit)))`: `to` is an edge build the edge channel has moved past.
 fn check_pinned(
     key: &str,
     index: &[u8],
@@ -91,7 +101,7 @@ fn check_pinned(
     to: &str,
     asset: &str,
     want: &str,
-) -> Result<(), String> {
+) -> Result<Option<(String, String)>, String> {
     let ix = crate::updates::verified(key, index, sig)?;
     // REQ: OPS-014 (ADR-182) — the index is of the version's own channel (an edge build's is the
     // edge channel's, a release's the stable one's): a request never moves a stable node to edge.
@@ -107,25 +117,28 @@ fn check_pinned(
         ));
     }
     if ix.version != to {
-        return Err(if telltale_api::update_api::is_edge(to) {
-            format!(
-                "the edge channel now serves {} (commit {}), not {to}: only the newest edge build can be downloaded. Ask for {} instead, or wait for the release",
-                ix.version, ix.commit, ix.version
-            )
-        } else {
-            format!(
-                "the index of release v{to} names {}: not trusted",
-                ix.version
-            )
-        });
+        if telltale_api::update_api::is_edge(to) {
+            return Ok(Some((ix.version, ix.commit)));
+        }
+        return Err(format!(
+            "the index of release v{to} names {}: not trusted",
+            ix.version
+        ));
     }
     match ix.assets.values().find(|a| a.name == asset) {
         None => Err(format!("{to} has no {asset}")),
         Some(a) if !a.sha256.eq_ignore_ascii_case(want) => Err(format!(
             "{asset}: the release index and SHA256SUMS disagree: not installed"
         )),
-        Some(_) => Ok(()),
+        Some(_) => Ok(None),
     }
+}
+
+/// REQ: OPS-014 (ADR-182) — what [`Outcome::Unavailable`] says.
+pub(crate) fn unavailable_text(to: &str, serves: &str, commit: &str) -> String {
+    format!(
+        "the edge channel now serves {serves} (commit {commit}), not {to}: only the newest edge build can be downloaded. Ask for {serves} instead, or wait for the release"
+    )
 }
 
 fn in_container() -> bool {
@@ -200,7 +213,9 @@ pub(crate) async fn update(
     if let Some(to) = &o.to {
         let index = fetch(&client, &format!("{base}/releases.json"), MAX_SUMS).await?;
         let isig = fetch(&client, &format!("{base}/releases.json.minisig"), MAX_SUMS).await?;
-        check_pinned(key, &index, &isig, to, asset, &want)?;
+        if let Some((serves, commit)) = check_pinned(key, &index, &isig, to, asset, &want)? {
+            return Ok(Outcome::Unavailable { serves, commit });
+        }
     }
     let current = std::fs::read(exe).map_err(|e| format!("cannot read {}: {e}", exe.display()))?;
     if sha256_hex(&current) == want {

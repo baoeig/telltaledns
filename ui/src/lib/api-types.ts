@@ -1957,9 +1957,10 @@ export interface paths {
          * A node's version and update state.
          * @description The version it runs, how it was installed, whether its root update service
          *     (`telltale-update.path`) is enabled, a request it hasn't picked up yet, and the service's
-         *     latest run (`installing`, `updated`, `up_to_date`, `rolled_back`, `failed`, or `refused`, with
-         *     the error): after a restart the new build must come up healthy, or the previous one is put
-         *     back (`rolled_back`). `id` is `local` (the node answering) or a cluster node's ID, site, or pod
+         *     latest run (`installing`, `updated`, `up_to_date`, `rolled_back`, `unavailable`, `failed`, or
+         *     `refused`, with the error): after a restart the new build must come up healthy, or the
+         *     previous one is put back (`rolled_back`); an edge build the channel no longer serves is
+         *     `unavailable`. `id` is `local` (the node answering) or a cluster node's ID, site, or pod
          *     name: the read goes
          *     to that node over the cluster channel.
          */
@@ -6791,7 +6792,7 @@ export interface components {
             /** @description When the state was written (RFC 3339). */
             at: string;
             by: string;
-            /** @description What went wrong, for `failed`, `rolled_back` and `refused`. */
+            /** @description What went wrong, for `failed`, `rolled_back`, `unavailable` and `refused`. */
             error?: string | null;
             /**
              * @description The version the node ran when the run started.
@@ -6803,9 +6804,10 @@ export interface components {
             /**
              * @description `installing` (also while the restarted node is checked), `updated` (installed, restarted,
              *     and healthy), `up_to_date`, `rolled_back` (the new build wasn't healthy after the restart:
-             *     the previous binary is back and running), `failed` (not installed, or rolled back and
-             *     still not healthy), or `refused` (the request was stale, malformed, older than the node's
-             *     version, or on another channel). REQ: OPS-014 (ADR-182).
+             *     the previous binary is back and running), `unavailable` (an edge build the edge channel no
+             *     longer serves: nothing installed; the error names the one it serves), `failed` (not
+             *     installed, or rolled back and still not healthy), or `refused` (the request was stale,
+             *     malformed, older than the node's version, or on another channel). REQ: OPS-014 (ADR-182).
              * @example updated
              */
             state: string;

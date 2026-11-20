@@ -104,6 +104,18 @@ pub const SCOPES: &[(&str, &str)] = &[
 /// What an agent token gets when none are named: read-only, without the query log.
 pub const DEFAULT_SCOPES: &[&str] = &["analytics:read", "config:read"];
 
+/// REQ: OPS-014, AGT-008 (ADR-182) — scopes an agent API token may hold but an OAuth access
+/// token for MCP may not: they are neither advertised (`scopes_supported`) nor taken from an
+/// identity provider's token. `cluster:upgrade` makes a root service install a build on the
+/// native nodes; it is for a token an admin made for that job (the chart's upgrade hook), not
+/// for an assistant signed in through a provider.
+pub const NOT_FOR_OAUTH: &[&str] = &["cluster:upgrade"];
+
+/// REQ: AGT-008 (ADR-182) — whether an OAuth access token for MCP may carry `scope`.
+pub fn oauth_scope(scope: &str) -> bool {
+    !NOT_FOR_OAUTH.contains(&scope)
+}
+
 /// The role a scope needs from the token's owner (a token never exceeds its owner).
 fn scope_role(scope: &str) -> Role {
     if scope == "cluster:admin" || scope == "cluster:upgrade" {

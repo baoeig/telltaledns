@@ -561,15 +561,16 @@ pub(crate) fn handle(
 pub(crate) enum Served {
     /// No request file.
     Nothing,
-    /// The state recorded (`refused`, `up_to_date`, `updated`, `rolled_back`, `failed`).
+    /// The state recorded (`refused`, `up_to_date`, `updated`, `rolled_back`, `unavailable`,
+    /// `failed`).
     Done { state: String },
 }
 
 /// REQ: OPS-014 (ADR-182) — whether a run ends well for systemd: a refusal is the service doing
 /// its job (recorded, exit 0, so refusals don't fail the unit); an install that failed or was
-/// rolled back is a failure.
+/// rolled back, or that couldn't be fetched (`unavailable`), is a failure.
 pub(crate) fn served_ok(state: &str) -> bool {
-    !matches!(state, "failed" | "rolled_back")
+    !matches!(state, "failed" | "rolled_back" | "unavailable")
 }
 
 /// REQ: OPS-014 (ADR-182) — what the update service does on its host, beyond reading the request
@@ -800,6 +801,13 @@ pub(crate) fn serve_request(
     record(&r, "installing", None);
     let previous = match host.install(&r.to) {
         Ok(crate::selfupdate::Outcome::Updated { previous }) => previous,
+        // REQ: OPS-014 (ADR-182) — an edge build main has since passed: nothing installed.
+        Ok(crate::selfupdate::Outcome::Unavailable { serves, commit }) => {
+            let e = crate::selfupdate::unavailable_text(&r.to, &serves, &commit);
+            warn!("update: {} not installed: {e}", r.to);
+            record(&r, "unavailable", Some(e));
+            return done("unavailable");
+        }
         Ok(_) => {
             record(&r, "up_to_date", None);
             return done("up_to_date");
@@ -810,45 +818,49 @@ pub(crate) fn serve_request(
             return done("failed");
         }
     };
-    if !restart {
+    let (state, error) = if restart {
+        restart_and_check(&r.to, current, &previous, host)
+    } else {
         info!("update: installed {}; restart the node to run it", r.to);
-        record(&r, "updated", None);
-        return done("updated");
-    }
-    // REQ: OPS-014 (ADR-182) — the health gate: the new build must come up healthy.
-    info!("update: installed {}; restarting the node", r.to);
-    let Err(why) = host.restart().and_then(|()| host.healthy()) else {
-        info!("update: {} is running and healthy", r.to);
-        record(&r, "updated", None);
-        return done("updated");
+        ("updated", None)
     };
-    warn!(
-        "update: {} isn't healthy after the restart ({why}): putting {current} back",
-        r.to
-    );
-    // One rollback, no loop: the previous binary, one more restart, one more check.
+    record(&r, state, error);
+    done(state)
+}
+
+/// REQ: OPS-014 (ADR-182) — the health gate after an install: restarts the node, and if it isn't
+/// healthy puts `previous` back, restarts once more and checks again (one rollback, no loop). The
+/// state to record (`updated`, `rolled_back`, `failed`) and why.
+fn restart_and_check(
+    to: &str,
+    current: &str,
+    previous: &Path,
+    host: &mut impl Host,
+) -> (&'static str, Option<String>) {
+    info!("update: installed {to}; restarting the node");
+    let Err(why) = host.restart().and_then(|()| host.healthy()) else {
+        info!("update: {to} is running and healthy");
+        return ("updated", None);
+    };
+    warn!("update: {to} isn't healthy after the restart ({why}): putting {current} back");
     match host
-        .restore(&previous)
+        .restore(previous)
         .and_then(|()| host.restart())
         .and_then(|()| host.healthy())
     {
         Ok(()) => {
             let e = format!(
-                "{} wasn't healthy after the restart ({why}); {current} is back and running",
-                r.to
+                "{to} wasn't healthy after the restart ({why}); {current} is back and running"
             );
             warn!("update: rolled back: {e}");
-            record(&r, "rolled_back", Some(e));
-            done("rolled_back")
+            ("rolled_back", Some(e))
         }
         Err(back) => {
             let e = format!(
-                "{} wasn't healthy after the restart ({why}), and putting {current} back didn't bring the node back either ({back})",
-                r.to
+                "{to} wasn't healthy after the restart ({why}), and putting {current} back didn't bring the node back either ({back})"
             );
             warn!("update: {e}");
-            record(&r, "failed", Some(e));
-            done("failed")
+            ("failed", Some(e))
         }
     }
 }

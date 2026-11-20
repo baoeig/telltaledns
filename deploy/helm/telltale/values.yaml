@@ -289,21 +289,31 @@ grafanaDashboard:
 # sync. A node that fails stops the upgrade, and the pods keep their version. Each node needs
 # its update service on (install.sh --cluster-updates, or systemctl enable --now
 # telltale-update.path). An edge image's build can be installed on the nodes only while it is
-# the newest on the edge channel. Nodes on an older version without this feature are upgraded
-# by hand once (telltale self-update --restart).
+# the newest on the edge channel (see whenUnavailable). Nodes on an older version without this
+# feature are upgraded by hand once (telltale self-update --restart). Helm waits for a hook only
+# `helm upgrade --timeout` (5m by default): give it at least activeDeadlineSeconds
+# (`--timeout 30m`). docs/running.md "Upgrading from the cluster" has the Argo CD notes.
 upgradeHook:
   enabled: false
   # A Secret with an agent token (Settings → API tokens → for an AI agent, made by an admin)
-  # that has the scopes analytics:read and cluster:upgrade.
+  # that has the scopes analytics:read and cluster:upgrade. Make it with an expiry
+  # (expires_in_days) and rotate it; the Secret must exist before the sync that runs the hook
+  # (under Argo CD a PreSync hook runs before the app's own resources).
   tokenSecret:
     name: ""
     key: token
-  # The API to ask. Default: this release's API Service (plain HTTP inside the cluster).
+  # The API to ask. Default: this release's API Service, over plain HTTP inside the cluster; set
+  # an https:// URL when the API serves TLS ([api] tls).
   url: ""
   # How long each node may take to install the version and come back in sync.
   timeout: 10m
-  # Leave nodes that are down out instead of failing the upgrade.
+  # Leave nodes that are down, or that can't take a request now, out instead of failing.
   skipDown: false
+  # When a native node can't fetch the image's edge build any more (main has published a newer
+  # one): `fail` keeps the sync blocked until the pin moves to the newest edge build or a
+  # release; `skip` leaves that node on its version with a loud log line and goes on (the
+  # replicas-first order is lost for that node in that run).
+  whenUnavailable: fail
   # The whole hook's limit, for every node together.
   activeDeadlineSeconds: 1800
   resources:

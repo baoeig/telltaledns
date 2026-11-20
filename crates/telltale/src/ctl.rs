@@ -282,6 +282,11 @@ pub(crate) struct UpgradeArgs {
     /// an update is already running, a channel they don't follow), out instead of stopping.
     #[arg(long)]
     pub(crate) skip_down: bool,
+    /// When a node reports the version can't be fetched any more (an edge build main has since
+    /// passed): leave that node on its version, say so loudly, and go on, instead of stopping.
+    /// The replicas-first order is then not kept for that node in this run.
+    #[arg(long)]
+    pub(crate) skip_unavailable: bool,
     /// Succeed when nothing answers at `--url` (a first install: no cluster to upgrade yet).
     #[arg(long)]
     pub(crate) skip_if_unreachable: bool,
@@ -1411,7 +1416,7 @@ async fn upgrade(api: &Api, a: UpgradeArgs) -> Result<Value, String> {
     let mut done = Vec::new();
     let mut skipped = skipped;
     let timeout = std::time::Duration::from_secs(u64::from(a.timeout));
-    for st in &plan.steps {
+    'nodes: for st in &plan.steps {
         let path = format!("nodes/{}/update", path_segment(&st.id));
         eprintln!(
             "{}: asking it to install {to} (it runs {})",
@@ -1445,6 +1450,28 @@ async fn upgrade(api: &Api, a: UpgradeArgs) -> Result<Value, String> {
                 let last = &u["last"];
                 if !id.is_empty() && s(last, "id") == id {
                     match s(last, "state").as_str() {
+                        // REQ: OPS-014 (ADR-182) — the build can't be fetched any more: with
+                        // --skip-unavailable the node keeps its version and the run goes on.
+                        "unavailable" if a.skip_unavailable => {
+                            eprintln!(
+                                "WARNING: {}: {}. Left on {} (--skip-unavailable): the order isn't kept for it in this run, so the chart's pods may now run a newer build than this native node.",
+                                st.label,
+                                s(last, "error"),
+                                st.from
+                            );
+                            skipped.push(json!({"node": st.label, "reason": format!(
+                                "{to} can't be fetched any more (--skip-unavailable): {}",
+                                s(last, "error")
+                            )}));
+                            continue 'nodes;
+                        }
+                        "unavailable" => {
+                            return Err(format!(
+                                "{}: {to} can't be fetched any more: {} (--skip-unavailable, or the chart's upgradeHook.whenUnavailable: skip, leaves such a node on its version and goes on)",
+                                st.label,
+                                s(last, "error")
+                            ));
+                        }
                         // REQ: OPS-014 (ADR-182) — a rollback is a failure: the run stops.
                         "failed" | "refused" | "rolled_back" => {
                             return Err(format!(
@@ -2050,6 +2077,7 @@ mod tests {
         calls: std::sync::Mutex<Vec<String>>,
         fail: Vec<String>,
         disabled: Vec<String>,
+        unavailable: Vec<String>,
     }
 
     async fn fake_api(f: Arc<FakeCluster>) -> String {
@@ -2083,9 +2111,12 @@ mod tests {
         };
         let status = move |State(f): State<Arc<FakeCluster>>, P(id): P<String>| async move {
             f.calls.lock().unwrap().push(format!("GET {id}"));
-            let failed = f.fail.contains(&id) && f.asked.lock().unwrap().contains(&id);
-            let last = if failed {
+            let asked = f.asked.lock().unwrap().contains(&id);
+            let last = if f.fail.contains(&id) && asked {
                 json!({"id": "r-1", "state": "failed", "error": "checksum mismatch"})
+            } else if f.unavailable.contains(&id) && asked {
+                json!({"id": "r-1", "state": "unavailable",
+                       "error": "the edge channel now serves 0.8.0-edge.9 (commit abc1234), not 0.8.0-edge.5"})
             } else {
                 Value::Null
             };
@@ -2107,7 +2138,7 @@ mod tests {
                 .unwrap()
                 .to_owned();
             f.asked.lock().unwrap().push(id.clone());
-            if !f.fail.contains(&id) {
+            if !f.fail.contains(&id) && !f.unavailable.contains(&id) {
                 for (n, v) in f.versions.lock().unwrap().iter_mut() {
                     if *n == id {
                         v.clone_from(&to);
@@ -2133,6 +2164,7 @@ mod tests {
             nodes: Vec::new(),
             timeout: 30,
             skip_down: false,
+            skip_unavailable: false,
             skip_if_unreachable: false,
             dry_run: false,
         }
@@ -2150,7 +2182,75 @@ mod tests {
             calls: std::sync::Mutex::default(),
             fail: fail.iter().map(|n| (*n).to_owned()).collect(),
             disabled: Vec::new(),
+            unavailable: Vec::new(),
         })
+    }
+
+    /// REQ: OPS-014 (ADR-182) — a node behind a pinned edge build that can't be fetched any more
+    /// (main has published a newer one): without --skip-unavailable the run stops there and the
+    /// nodes after it aren't asked (the hook fails, the sync stays blocked); with it the node is
+    /// left on its version, said loudly, and the run goes on.
+    #[tokio::test]
+    async fn ops_014_ctl_upgrade_and_an_edge_build_no_longer_served() {
+        let edge = |skip: bool| {
+            let mut a = args("0.8.0-edge.5");
+            a.skip_unavailable = skip;
+            a
+        };
+        let unserved = || {
+            let mut f = Arc::into_inner(fake(&["c0", "dns-01", "dns-02"], &[])).unwrap();
+            for (_, v) in f.versions.get_mut().unwrap().iter_mut() {
+                *v = "0.8.0-edge.1".into();
+            }
+            f.unavailable = vec!["dns-01".into()];
+            Arc::new(f)
+        };
+        let f = unserved();
+        let base = fake_api(Arc::clone(&f)).await;
+        let e = run(&base, None, "t", CtlCommand::Upgrade(edge(false)), false)
+            .await
+            .unwrap_err();
+        assert!(
+            e.contains("dns-01") && e.contains("can't be fetched any more") && e.contains("skip"),
+            "{e}"
+        );
+        assert_eq!(
+            *f.asked.lock().unwrap(),
+            vec!["dns-01"],
+            "dns-02 isn't asked"
+        );
+        let f = unserved();
+        let base = fake_api(Arc::clone(&f)).await;
+        let out = run(&base, None, "t", CtlCommand::Upgrade(edge(true)), false)
+            .await
+            .unwrap();
+        assert_eq!(*f.asked.lock().unwrap(), vec!["dns-01", "dns-02"]);
+        assert!(
+            out.contains("can't be fetched any more (--skip-unavailable)")
+                && out.contains("Upgraded to 0.8.0-edge.5:"),
+            "{out}"
+        );
+    }
+
+    /// REQ: OPS-014 (ADR-182) — with every native node already on the version (a sync after the
+    /// bump, or any later one) no request is sent at all: no node is read for its update state,
+    /// none is asked, nothing is downloaded.
+    #[tokio::test]
+    async fn ops_014_nodes_on_the_version_are_not_asked() {
+        let f = fake(&["c0", "dns-01", "dns-02"], &[]);
+        for (_, v) in f.versions.lock().unwrap().iter_mut() {
+            *v = "0.8.0".into();
+        }
+        let base = fake_api(Arc::clone(&f)).await;
+        let out = run(&base, None, "t", CtlCommand::Upgrade(args("0.8.0")), false)
+            .await
+            .unwrap();
+        assert!(
+            f.calls.lock().unwrap().is_empty(),
+            "{:?}",
+            f.calls.lock().unwrap()
+        );
+        assert!(out.contains("No node needed 0.8.0."), "{out}");
     }
 
     /// REQ: OPS-014 (ADR-182) — pre-flight: every planned node is read before any is asked, and

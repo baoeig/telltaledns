@@ -933,6 +933,45 @@ fn ops_014_a_failed_rollback_is_recorded_and_stops() {
     assert!(!served_ok("failed"));
 }
 
+/// REQ: OPS-014 (ADR-182) — an edge build main has since passed can't be fetched: the update
+/// service records `unavailable`, with the build the channel serves (so `ctl upgrade` can tell it
+/// from a failure), installs nothing and doesn't restart the node; systemd sees a failed run.
+#[test]
+fn ops_014_an_edge_build_no_longer_served_is_unavailable() {
+    let d = tempfile::tempdir().unwrap();
+    let h = here(d.path(), "native", "0.8.0-edge.1", true);
+    request(&h, "0.8.0-edge.5", "hook", NOW).unwrap();
+    let mut host = Scripted {
+        install: Some(Ok(Outcome::Unavailable {
+            serves: "0.8.0-edge.9".into(),
+            commit: "abc1234".into(),
+        })),
+        ..Scripted::default()
+    };
+    let served = serve_request(
+        &h.request_path(),
+        &h.result,
+        "0.8.0-edge.1",
+        NOW,
+        true,
+        &mut host,
+    );
+    assert_eq!(
+        served,
+        Served::Done {
+            state: "unavailable".into()
+        }
+    );
+    assert_eq!(host.calls, ["install 0.8.0-edge.5"], "nothing restarted");
+    let last = status(&h).last.unwrap();
+    assert_eq!(last.state, "unavailable");
+    assert!(
+        last.error.unwrap().contains("now serves 0.8.0-edge.9"),
+        "the build the channel serves"
+    );
+    assert!(!served_ok("unavailable"));
+}
+
 #[test]
 fn ops_014_a_version_picks_its_channel() {
     assert_eq!(channel_for("0.8.0"), crate::selfupdate::Channel::Stable);

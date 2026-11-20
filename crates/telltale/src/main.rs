@@ -1371,6 +1371,14 @@ fn run_self_update(
                  Install it with: telltale self-update{again} --restart"
             )
         }
+        Ok(selfupdate::Outcome::Unavailable { serves, commit }) => {
+            let to = opts.to.as_deref().unwrap_or_default();
+            eprintln!(
+                "error: {}",
+                selfupdate::unavailable_text(to, &serves, &commit)
+            );
+            return ExitCode::FAILURE;
+        }
         Ok(selfupdate::Outcome::Updated { previous }) => {
             let mut m = format!(
                 "Updated. The previous binary is kept at {}.",

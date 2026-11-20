@@ -103,9 +103,10 @@ pub(crate) fn admin_routes(backend: Shared, auth: Arc<Auth>) -> Router {
 ///
 /// The version it runs, how it was installed, whether its root update service
 /// (`telltale-update.path`) is enabled, a request it hasn't picked up yet, and the service's
-/// latest run (`installing`, `updated`, `up_to_date`, `rolled_back`, `failed`, or `refused`, with
-/// the error): after a restart the new build must come up healthy, or the previous one is put
-/// back (`rolled_back`). `id` is `local` (the node answering) or a cluster node's ID, site, or pod
+/// latest run (`installing`, `updated`, `up_to_date`, `rolled_back`, `unavailable`, `failed`, or
+/// `refused`, with the error): after a restart the new build must come up healthy, or the
+/// previous one is put back (`rolled_back`); an edge build the channel no longer serves is
+/// `unavailable`. `id` is `local` (the node answering) or a cluster node's ID, site, or pod
 /// name: the read goes
 /// to that node over the cluster channel.
 #[utoipa::path(get, path = "/api/v1/nodes/{id}/update", tag = "system",

@@ -436,6 +436,14 @@
         "skipDown": {
           "type": "boolean"
         },
+        "whenUnavailable": {
+          "type": "string",
+          "description": "REQ: OPS-014 (ADR-182) — a native node that can no longer fetch the image's edge build: fail (keep the sync blocked) or skip (leave it, loudly).",
+          "enum": [
+            "fail",
+            "skip"
+          ]
+        },
         "activeDeadlineSeconds": {
           "type": "integer",
           "minimum": 60

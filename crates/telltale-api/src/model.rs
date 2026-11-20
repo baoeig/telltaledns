@@ -2504,12 +2504,13 @@ pub struct NodeUpdateRun {
     pub from: String,
     /// `installing` (also while the restarted node is checked), `updated` (installed, restarted,
     /// and healthy), `up_to_date`, `rolled_back` (the new build wasn't healthy after the restart:
-    /// the previous binary is back and running), `failed` (not installed, or rolled back and
-    /// still not healthy), or `refused` (the request was stale, malformed, older than the node's
-    /// version, or on another channel). REQ: OPS-014 (ADR-182).
+    /// the previous binary is back and running), `unavailable` (an edge build the edge channel no
+    /// longer serves: nothing installed; the error names the one it serves), `failed` (not
+    /// installed, or rolled back and still not healthy), or `refused` (the request was stale,
+    /// malformed, older than the node's version, or on another channel). REQ: OPS-014 (ADR-182).
     #[schema(example = "updated")]
     pub state: String,
-    /// What went wrong, for `failed`, `rolled_back` and `refused`.
+    /// What went wrong, for `failed`, `rolled_back`, `unavailable` and `refused`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub by: String,

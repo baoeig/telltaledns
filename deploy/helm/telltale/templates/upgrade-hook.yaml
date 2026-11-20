@@ -4,7 +4,8 @@ REQ: OPS-014, CLU-010 (ADR-182) — before the chart's pods roll, upgrade the cl
 `telltale ctl upgrade --to-self`, against the running controller's API. A node that fails stops
 the upgrade, so the pods keep their version. Helm runs it before an upgrade; Argo CD as a
 PreSync hook on every sync (nothing to do when every node already runs the version, and nothing
-answering yet on a first install).
+answering yet on a first install). With `whenUnavailable: skip`, a node that can't fetch the
+image's edge build any more is left on its version (loudly) instead of failing the hook.
 */}}
 {{- $h := .Values.upgradeHook }}
 {{- if $h.enabled }}
@@ -63,6 +64,9 @@ spec:
             - {{ $h.timeout | quote }}
             {{- if $h.skipDown }}
             - --skip-down
+            {{- end }}
+            {{- if eq ($h.whenUnavailable | default "fail") "skip" }}
+            - --skip-unavailable
             {{- end }}
           env:
             - name: TELLTALE_TOKEN
