@@ -6,6 +6,7 @@ import { createHmac } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { query } from './dns';
+import { plainHttpPage } from '../../src/lib/plainHttp';
 import { FrameHub, Loop, PANEL_MIN, Particles, Ticker, chooseLayout, dotBudget, lerpBoxes, motionAllowed, parseEvery, parseLayout, parsePanels, screenClass, screenClassStable, type Box } from '../../src/lib/wall';
 
 test.describe.configure({ mode: 'serial' });
@@ -2059,6 +2060,8 @@ test('api_002 routers are added and changed in the UI', async () => {
   const editor = page.getByTestId('editor-router');
   await editor.getByRole('button', { name: 'Add router' }).click();
   await page.getByLabel('Name', { exact: true }).fill('udm-e2e');
+  // This page is on 127.0.0.1: no plain-HTTP warning.
+  await expect(page.getByTestId('editor-notice')).toHaveCount(0);
   await page.getByLabel('Address', { exact: true }).fill('https://127.0.0.1:1');
   await expect(page.getByLabel('API key file', { exact: true })).toHaveCount(0);
   await page.getByLabel('API key', { exact: true }).fill('e2e-secret-key');
@@ -2100,6 +2103,10 @@ test('api_002 routers are added and changed in the UI', async () => {
     call = routerCall('PUT', true);
     await page.getByRole('button', { name: 'Check', exact: true }).click();
     await answered(call, 200);
+    // The editor sends the pasted key, never the key file the entry names (the server keeps it).
+    const sent = (await call).request().postDataJSON() as Record<string, unknown>;
+    expect(sent.api_key).toBe('e2e-secret-key-2');
+    expect(Object.keys(sent).filter((k) => k.endsWith('_file'))).toEqual([]);
     call = routerCall('PUT', false);
     await page.getByRole('button', { name: 'Apply' }).click();
     await answered(call, 200);
@@ -2115,6 +2122,24 @@ test('api_002 routers are added and changed in the UI', async () => {
   await row.getByRole('button', { name: 'Remove' }).click();
   await answered(call, 200);
   await expect(row).toHaveCount(0, settle);
+});
+
+// REQ: API-002, T8.2 (ADR-181) — the Routers editor warns on a plain-HTTP page opened from another
+// machine (a pasted key then crosses the network unencrypted), not over https or on this machine.
+test('api_002 the plain-HTTP notice is for a page reached over the network', () => {
+  const cases: [string, string, boolean][] = [
+    ['http:', '192.168.1.5', true],
+    ['http:', 'telltale.lan', true],
+    ['http:', '127.0.0.1', false],
+    ['http:', '127.1.2.3', false],
+    ['http:', 'localhost', false],
+    ['http:', '[::1]', false],
+    ['http:', '127.0.0.1.example.test', true],
+    ['https:', '192.168.1.5', false],
+  ];
+  for (const [protocol, hostname, shown] of cases) {
+    expect(plainHttpPage({ protocol, hostname }), `${protocol}//${hostname}`).toBe(shown);
+  }
 });
 
 // REQ: OBS-010 (T9.6) — the Alerts page: add a destination, send it a test, add a rule that

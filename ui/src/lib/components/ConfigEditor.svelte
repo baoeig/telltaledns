@@ -55,6 +55,8 @@
     role,
     note,
     status,
+    omit = [],
+    notice = null,
   }: {
     kind: 'upstream' | 'upstream_group' | 'list' | 'group' | 'alert_destination' | 'alert_rule' | 'schedule' | 'ratelimit' | 'exclusions' | 'simulate' | 'rollout' | 'router';
     path: 'upstreams' | 'upstream-groups' | 'lists' | 'groups' | 'alerts/destinations' | 'alerts/rules' | 'schedules' | 'ratelimit' | 'exclusions' | 'simulate-settings' | 'cluster/rollout-settings' | 'routers';
@@ -76,6 +78,11 @@
     note?: (values: Record<string, unknown>) => string;
     /** A badge on a row from what the server says of the entry (T8.2, ADR-181: "key saved"). */
     status?: (e: S['ConfigEntry']) => { text: string; cls: string } | null;
+    /** Keys of an entry the body never sends back (T8.2, ADR-181: a router's key files; the
+     *  server keeps them, or replaces them with a pasted value's new file). */
+    omit?: string[];
+    /** A warning at the top of the form (T8.2, ADR-181: a page opened over plain HTTP). */
+    notice?: string | null;
   } = $props();
   let formOut = $state<{ ok: boolean; text: string } | null>(null);
   async function runFormAction() {
@@ -147,6 +154,7 @@
   function body(): Record<string, unknown> {
     const v = { ...editing!.values };
     delete v.name;
+    for (const k of omit) delete v[k];
     for (const f of fields) if (f.fromText) v[f.key] = f.fromText(texts[f.key] ?? '');
     for (const f of fields) {
       const x = v[f.key];
@@ -175,6 +183,9 @@
     try {
       result = await api.putEntry(path, editing.name.trim(), body(), false);
       preview = null;
+      // T8.2 (ADR-181) — a pasted value is sent once: not kept in the page once it's saved
+      // (the form can stay open to show what to keep in Git).
+      for (const f of fields) if (f.type === 'secret') delete editing.values[f.key];
       await load();
       onchanged?.();
       if (!result.keepInGit) editing = null;
@@ -260,6 +271,7 @@
       <button onclick={() => (editing = null)}>Done</button>
     {:else}
       <form class="form" onsubmit={check}>
+        {#if notice}<p class="notice warn small" role="note" data-testid="editor-notice">{notice}</p>{/if}
         <label>
           Name
           <input class="mono" bind:value={editing.name} required readonly={!editing.isNew} aria-label="Name" />
