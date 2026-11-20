@@ -25,7 +25,15 @@ pub(crate) const RELEASE_KEY: &str = "RWQSVukPYI4mZximvuqnLSiH56cyTwz6uEWQEFyWDh
 const RELEASES: &str = "https://github.com/paimonsoror/telltaledns/releases";
 const MAX_SUMS: u64 = 64 * 1024;
 const MAX_BINARY: u64 = 128 * 1024 * 1024;
-const TIMEOUT: Duration = Duration::from_secs(300);
+/// REQ: OPS-014 (ADR-182) — one deadline for all the downloads of an update (the checksums,
+/// their signature, the signed index and the binary): past it nothing is installed. Part of the
+/// root update service's time budget (`node_update::run_budget_secs`).
+pub(crate) const FETCH_DEADLINE: Duration = Duration::from_secs(480);
+/// How long the new binary's test run (`--version`) may take before it is killed and refused.
+pub(crate) const VERSION_WAIT: Duration = Duration::from_secs(10);
+/// How long `systemctl restart telltale` is waited for. The restart itself goes on if it takes
+/// longer; the health check after it then decides.
+pub(crate) const RESTART_WAIT: Duration = Duration::from_secs(30);
 
 /// Which releases to follow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -183,13 +191,44 @@ pub(crate) fn systemctl() -> &'static str {
     }
 }
 
-/// `systemctl restart telltale`.
+/// REQ: OPS-014 (ADR-182) — runs `cmd` (its output discarded) and waits for it at most `limit`:
+/// past that it is killed (for the restart, only `systemctl` itself: the restart goes on).
+pub(crate) fn run_bounded(
+    cmd: &mut std::process::Command,
+    limit: Duration,
+) -> Result<std::process::ExitStatus, String> {
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if started.elapsed() < limit => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("didn't finish within {} s", limit.as_secs()));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// `systemctl restart telltale`, waited for at most [`RESTART_WAIT`].
 pub(crate) fn restart_node() -> Result<(), String> {
-    let status = std::process::Command::new(systemctl())
-        .args(["restart", "telltale"])
-        .env_clear()
-        .status()
-        .map_err(|e| format!("`systemctl restart telltale` failed: {e}"))?;
+    let status = run_bounded(
+        std::process::Command::new(systemctl())
+            .args(["restart", "telltale"])
+            .env_clear(),
+        RESTART_WAIT,
+    )
+    .map_err(|e| format!("`systemctl restart telltale`: {e}"))?;
     if status.success() {
         Ok(())
     } else {
@@ -204,15 +243,32 @@ pub(crate) async fn update(
     asset: &str,
     key: &str,
 ) -> Result<Outcome, String> {
+    update_within(o, exe, asset, key, FETCH_DEADLINE).await
+}
+
+/// [`update`], with every download done within `fetch_for` of the start (nothing is installed
+/// past it: the old binary stays).
+pub(crate) async fn update_within(
+    o: &Options,
+    exe: &Path,
+    asset: &str,
+    key: &str,
+    fetch_for: Duration,
+) -> Result<Outcome, String> {
+    let deadline = tokio::time::Instant::now() + fetch_for;
     let base = base_url(o);
     let client = Client::new(Arc::new(SystemResolver), &[])?;
-    let sums = fetch(&client, &format!("{base}/SHA256SUMS"), MAX_SUMS).await?;
-    let sig = fetch(&client, &format!("{base}/SHA256SUMS.minisig"), MAX_SUMS).await?;
+    let get = |url: String, max: u64| {
+        let client = &client;
+        async move { fetch(client, &url, max, deadline, fetch_for).await }
+    };
+    let sums = get(format!("{base}/SHA256SUMS"), MAX_SUMS).await?;
+    let sig = get(format!("{base}/SHA256SUMS.minisig"), MAX_SUMS).await?;
     verify_signature(key, &sums, &sig)?;
     let want = expected_sha256(&sums, asset)?;
     if let Some(to) = &o.to {
-        let index = fetch(&client, &format!("{base}/releases.json"), MAX_SUMS).await?;
-        let isig = fetch(&client, &format!("{base}/releases.json.minisig"), MAX_SUMS).await?;
+        let index = get(format!("{base}/releases.json"), MAX_SUMS).await?;
+        let isig = get(format!("{base}/releases.json.minisig"), MAX_SUMS).await?;
         if let Some((serves, commit)) = check_pinned(key, &index, &isig, to, asset, &want)? {
             return Ok(Outcome::Unavailable { serves, commit });
         }
@@ -224,7 +280,7 @@ pub(crate) async fn update(
     if o.check {
         return Ok(Outcome::Available { sha256: want });
     }
-    let new = fetch(&client, &format!("{base}/{asset}"), MAX_BINARY).await?;
+    let new = get(format!("{base}/{asset}"), MAX_BINARY).await?;
     if sha256_hex(&new) != want {
         return Err(format!("{asset}: checksum mismatch, not installed"));
     }
@@ -232,9 +288,18 @@ pub(crate) async fn update(
     Ok(Outcome::Updated { previous })
 }
 
-async fn fetch(client: &Client, url: &str, max: u64) -> Result<Vec<u8>, String> {
-    match tokio::time::timeout(TIMEOUT, client.get(url, &Conditional::default(), max)).await {
-        Err(_) => Err(format!("{url}: timed out")),
+async fn fetch(
+    client: &Client,
+    url: &str,
+    max: u64,
+    deadline: tokio::time::Instant,
+    fetch_for: Duration,
+) -> Result<Vec<u8>, String> {
+    match tokio::time::timeout_at(deadline, client.get(url, &Conditional::default(), max)).await {
+        Err(_) => Err(format!(
+            "{url}: the downloads didn't finish within {} s: nothing installed",
+            fetch_for.as_secs()
+        )),
         Ok(Err(e)) => Err(format!("{url}: {}", e.message)),
         Ok(Ok(Response::Body { data, .. })) => Ok(data),
         Ok(Ok(Response::NotModified)) => Err(format!("{url}: unexpected 304")),
@@ -290,11 +355,13 @@ fn install(exe: &Path, new: &[u8]) -> Result<PathBuf, String> {
         f.sync_all().map_err(|e| err("cannot sync", e))?;
     }
     set_executable(&staged).map_err(|e| err("cannot chmod", e))?;
-    // A binary that can't even print its version (wrong arch, truncated) never goes live.
-    let ok = std::process::Command::new(&staged)
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success());
+    // A binary that can't even print its version (wrong arch, truncated), or hangs at it, never
+    // goes live.
+    let ok = run_bounded(
+        std::process::Command::new(&staged).arg("--version"),
+        VERSION_WAIT,
+    )
+    .is_ok_and(|s| s.success());
     if !ok {
         let _ = std::fs::remove_file(&staged);
         return Err("the downloaded binary doesn't run on this system: not installed".into());

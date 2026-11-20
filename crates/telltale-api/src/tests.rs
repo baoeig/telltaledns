@@ -456,6 +456,7 @@ impl Backend for Fake {
                 node: node.to_owned(),
                 version: "0.7.0".into(),
                 install: "native".into(),
+                channel: Some("stable".into()),
                 enabled: true,
                 state,
                 pending: None,

@@ -133,6 +133,13 @@ UPD=/var/lib/telltale/update RESULT=/var/lib/telltale-update/result.json
 if systemctl is-enabled --quiet telltale-update.path; then fail "telltale-update.path is on by default"; fi
 grep -qx "PathExists=$UPD/request.json" "$UPATH" || { fail "the path unit watches $(grep PathExists "$UPATH")"; }
 grep -qx "ReadWritePaths=/usr/local/bin -$UPD" "$USVC" || { fail "the service writes $(grep ReadWritePaths "$USVC")"; }
+# REQ: OPS-014 (ADR-182) — the channel (in both units) and the health check's address (from the
+# config's [api] listen, 0.0.0.0:8053: asked at loopback), written by install.sh.
+grep -qx 'Environment=TELLTALE_UPDATE_CHANNEL=stable' "$USVC" \
+  && grep -qx 'Environment=TELLTALE_UPDATE_CHANNEL=stable' /etc/systemd/system/telltale.service \
+  || { fail "the update channel isn't in the units: $(grep -h CHANNEL "$USVC" /etc/systemd/system/telltale.service)"; }
+grep -qx 'Environment=TELLTALE_UPDATE_HEALTH_URL=http://127.0.0.1:8053/readyz?startup=1' "$USVC" \
+  || { fail "the health URL: $(grep HEALTH_URL "$USVC")"; }
 systemd-analyze verify "$UPATH" "$USVC" || { fail "systemd-analyze verify"; }
 echo "telltale-update.service: $(systemd-analyze security telltale-update.service --no-pager | tail -1)"
 # The sandbox as the service gets it (a drop-in with another command, removed afterwards).
@@ -143,7 +150,7 @@ cat > /etc/systemd/system/telltale-update.service.d/e2e.conf <<EOF
 ExecStart=
 ExecStart=/bin/sh -c 'touch /usr/local/bin/.tt-e2e && rm /usr/local/bin/.tt-e2e && touch $UPD/.tt-e2e && rm $UPD/.tt-e2e && ! touch /var/lib/telltale/.tt-e2e 2>/dev/null && ! touch /etc/.tt-e2e 2>/dev/null'
 ExecStart=/usr/bin/systemctl restart telltale
-ExecStart=/bin/sh -c 'for i in \$\$(seq 1 40); do /usr/local/bin/telltale health --url "http://127.0.0.1:8053/readyz?startup=1" && exit 0; sleep 0.5; done; exit 1'
+ExecStart=/bin/sh -c 'for i in \$\$(seq 1 40); do /usr/local/bin/telltale health --url "\${TELLTALE_UPDATE_HEALTH_URL}" && exit 0; sleep 0.5; done; exit 1'
 EOF
 sudo -u telltale mkdir -p -m 0750 "$UPD"
 systemctl daemon-reload
@@ -168,6 +175,12 @@ settled() { # the service has run and stopped; the path unit is still on
   systemctl is-active --quiet telltale-update.path || { fail "the path unit stopped after a refusal"; }
 }
 rm -f "$RESULT"
+# A local build refuses every request before anything is fetched: the binary under test must be
+# one, or this request would start a real download.
+case " $(/usr/local/bin/telltale --version) " in
+  *" dev "*) ;;
+  *) fail "the binary under test isn't a local (dev) build: $(/usr/local/bin/telltale --version)" ;;
+esac
 ask "{\"id\":\"1a-2b\",\"to\":\"9.9.9\",\"by\":\"e2e\",\"requestedMs\":$(( $(date +%s) * 1000 ))}"
 outcome '"id": "1a-2b"' || { fail "no outcome recorded for the request"; }
 result="$(sudo -u telltale cat "$RESULT" 2>&1)" || { fail "the node can't read the outcome: $result"; }
@@ -181,6 +194,15 @@ sudo -u telltale mkfifo "$UPD/request.json"
 outcome 'regular file' || { fail "a FIFO at the request wasn't refused"; }
 [ ! -e "$UPD/request.json" ] || { fail "the FIFO was left behind"; }
 settled
+systemctl disable --now telltale-update.path
+# REQ: OPS-014 (ADR-182) — install.sh --cluster-updates turns it on only once the node answers
+# where the health check will ask, and says where that is.
+out="$(sh "$HERE/install.sh" --disable-resolved-stub --cluster-updates 2>&1)" \
+  || { echo "$out" | tail -20; fail "install.sh --cluster-updates"; }
+grep -q 'health check after each update asks http://127.0.0.1:8053/readyz?startup=1, which answers now' <<<"$out" \
+  || { echo "$out" | tail -10; fail "install.sh --cluster-updates didn't say where the health check asks"; }
+grep -q 'Update channel: stable' <<<"$out" || { echo "$out" | tail -10; fail "install.sh didn't say the update channel"; }
+systemctl is-enabled --quiet telltale-update.path || { fail "--cluster-updates left the path unit off"; }
 systemctl disable --now telltale-update.path
 
 # REQ: OPS-001 (T7.6) — the guided setup on a fresh machine: answers on stdin, the first admin

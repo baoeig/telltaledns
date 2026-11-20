@@ -106,6 +106,10 @@ pub enum Code {
     /// REQ: OPS-014 (ADR-182) — the node already has a request waiting for its update service,
     /// or an update running (one at a time per node): retry after `Retry-After`.
     UpdateInProgress,
+    /// REQ: OPS-014 (ADR-182) — the node's last run of this version, less than 24 hours ago,
+    /// ended `rolled_back` or `failed`: it isn't asked for again for a day (install it by hand
+    /// with `self-update --to`, or wait).
+    UpdateFailedRecently,
 }
 
 impl Code {
@@ -153,6 +157,7 @@ impl Code {
             Self::UpdateInvalid => "https://telltaledns.dev/problems/update_invalid",
             Self::UpdateChannel => "https://telltaledns.dev/problems/update_channel",
             Self::UpdateInProgress => "https://telltaledns.dev/problems/update_in_progress",
+            Self::UpdateFailedRecently => "https://telltaledns.dev/problems/update_failed_recently",
         }
     }
 
@@ -200,6 +205,7 @@ impl Code {
             Self::UpdateInvalid => "Invalid version",
             Self::UpdateChannel => "Not on the node's channel",
             Self::UpdateInProgress => "An update is already under way on the node",
+            Self::UpdateFailedRecently => "This version failed on the node in the last day",
         }
     }
 
@@ -227,7 +233,8 @@ impl Code {
             | Self::UpdateNotEnabled
             | Self::UpdateDowngrade
             | Self::UpdateChannel
-            | Self::UpdateInProgress => StatusCode::CONFLICT,
+            | Self::UpdateInProgress
+            | Self::UpdateFailedRecently => StatusCode::CONFLICT,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::VersionConflict => StatusCode::PRECONDITION_FAILED,
             Self::InvalidConfig

@@ -1399,16 +1399,56 @@ fn run_self_update(
 }
 
 /// REQ: OPS-014 (ADR-182) — the root update service on this host: the signed self-update, the
-/// node's restart, its health, and putting the previous binary back.
+/// node's restart, its health, and putting the previous binary back. Its settings come from its
+/// own root-owned unit (written by `install.sh`), never from the request.
 struct RootHost {
     /// The installed binary (this one), resolved before anything is replaced.
     exe: Option<PathBuf>,
+    /// The channel set for the node (`TELLTALE_UPDATE_CHANNEL`).
+    channel: Option<String>,
+    /// Where the health gate asks (`TELLTALE_UPDATE_HEALTH_URL`), or why the run is refused.
+    gate: Result<node_update::HealthGate, String>,
 }
 
-/// How long the update service waits for the restarted node to be healthy.
-const HEALTH_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+impl RootHost {
+    /// This process, as the unit started it.
+    fn from_env() -> Self {
+        let var = |name: &str| match std::env::var(name) {
+            Ok(v) => Some(v),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => Some("\u{fffd}".to_owned()),
+        };
+        Self {
+            exe: std::env::current_exe().and_then(std::fs::canonicalize).ok(),
+            channel: var(telltale_api::update_api::CHANNEL_ENV),
+            gate: node_update::health_gate(
+                var(node_update::HEALTH_URL_ENV).as_deref(),
+                node_update::is_this_host,
+            ),
+        }
+    }
+
+    /// The installed binary, which must sit where root alone can write.
+    fn checked_exe(&self) -> Result<&Path, String> {
+        let exe = self
+            .exe
+            .as_deref()
+            .ok_or("the installed binary's path isn't known")?;
+        node_update::root_owned(exe, 0, Path::new("/"))?;
+        Ok(exe)
+    }
+}
 
 impl node_update::Host for RootHost {
+    fn channel(&self) -> Option<String> {
+        self.channel.clone()
+    }
+
+    fn ready(&mut self) -> Result<(), String> {
+        self.checked_exe()?;
+        self.gate.as_ref().map(|_| ()).map_err(Clone::clone)
+    }
+
     fn install(&mut self, to: &str) -> Result<selfupdate::Outcome, String> {
         selfupdate::run(&selfupdate::Options {
             channel: node_update::channel_for(to),
@@ -1425,20 +1465,24 @@ impl node_update::Host for RootHost {
     }
 
     /// The node's own health check (`telltale health`), on its readiness for a start
-    /// (`/readyz?startup=1`: maintenance doesn't count), passing twice in a row, 2 s apart,
-    /// within [`HEALTH_WAIT`].
-    fn healthy(&mut self) -> Result<(), String> {
-        let url = "http://127.0.0.1:8053/readyz?startup=1";
+    /// (`/readyz?startup=1`: maintenance doesn't count) at the address the unit names, passing
+    /// twice in a row, 2 s apart, within [`node_update::HEALTH_WAIT`].
+    fn healthy(&mut self) -> Result<String, String> {
+        let url = match &self.gate {
+            Ok(node_update::HealthGate::Check(url)) => url.clone(),
+            Ok(node_update::HealthGate::Skip(why)) => return Ok((*why).to_owned()),
+            Err(e) => return Err(e.clone()),
+        };
         let started = std::time::Instant::now();
         let mut passed = 0;
         let mut last = String::from("no answer yet");
-        while started.elapsed() < HEALTH_WAIT {
+        while started.elapsed() < node_update::HEALTH_WAIT {
             std::thread::sleep(std::time::Duration::from_secs(2));
-            match health(url) {
+            match health(&url) {
                 Ok(()) => {
                     passed += 1;
                     if passed >= 2 {
-                        return Ok(());
+                        return Ok(format!("checked at {url}"));
                     }
                 }
                 Err(e) => {
@@ -1449,24 +1493,23 @@ impl node_update::Host for RootHost {
         }
         Err(format!(
             "not healthy within {} s ({url}: {last})",
-            HEALTH_WAIT.as_secs()
+            node_update::HEALTH_WAIT.as_secs()
         ))
     }
 
     fn restore(&mut self, previous: &Path) -> Result<(), String> {
-        let exe = self
-            .exe
-            .as_ref()
-            .ok_or("the installed binary's path isn't known")?;
-        std::fs::rename(previous, exe)
+        let exe = self.checked_exe()?.to_path_buf();
+        std::fs::rename(previous, &exe)
             .map_err(|e| format!("can't put {} back: {e}", previous.display()))?;
         // A build that doesn't start makes systemd restart it (`Restart=on-failure`) until the
         // unit hits its start limit, which would refuse the restart onto the previous binary:
         // clear it first (nothing to clear is fine).
-        let _ = std::process::Command::new(selfupdate::systemctl())
-            .args(["reset-failed", "telltale"])
-            .env_clear()
-            .status();
+        let _ = selfupdate::run_bounded(
+            std::process::Command::new(selfupdate::systemctl())
+                .args(["reset-failed", "telltale"])
+                .env_clear(),
+            node_update::RESET_WAIT,
+        );
         Ok(())
     }
 }
@@ -1474,9 +1517,7 @@ impl node_update::Host for RootHost {
 /// REQ: OPS-014 (ADR-182) — `telltale self-update --request`: the root update service's run.
 fn run_update_request(request: &Path, result: &Path, restart: bool) -> ExitCode {
     // Resolved now: once the new binary is in place, this process's own path names it.
-    let mut host = RootHost {
-        exe: std::env::current_exe().and_then(std::fs::canonicalize).ok(),
-    };
+    let mut host = RootHost::from_env();
     let served = node_update::serve_request(
         request,
         result,

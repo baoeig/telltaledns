@@ -2503,16 +2503,24 @@ pub struct NodeUpdateRun {
     #[schema(example = "0.7.0")]
     pub from: String,
     /// `installing` (also while the restarted node is checked), `updated` (installed, restarted,
-    /// and healthy), `up_to_date`, `rolled_back` (the new build wasn't healthy after the restart:
-    /// the previous binary is back and running), `unavailable` (an edge build the edge channel no
-    /// longer serves: nothing installed; the error names the one it serves), `failed` (not
-    /// installed, or rolled back and still not healthy), or `refused` (the request was stale,
-    /// malformed, older than the node's version, or on another channel). REQ: OPS-014 (ADR-182).
+    /// and healthy, or not checked: see `health`), `up_to_date`, `rolled_back` (the new build
+    /// wasn't healthy after the restart: the previous binary is back in place; an incident to
+    /// look into, see `error`), `unavailable` (an edge build the edge channel no longer serves:
+    /// nothing installed; the error names the one it serves), `failed` (not installed, or the
+    /// previous binary couldn't be put back), or `refused` (the request was stale, malformed,
+    /// older than the node's version, on another channel, of a version that failed there in the
+    /// last day, or the host wasn't set up for it). REQ: OPS-014 (ADR-182).
     #[schema(example = "updated")]
     pub state: String,
     /// What went wrong, for `failed`, `rolled_back`, `unavailable` and `refused`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// For `updated`: how the new build's health was checked (`checked at <url>`), or why it
+    /// wasn't (`not checked: the API is off`). REQ: OPS-014 (ADR-182).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<String>,
+    /// Who asked, as the node wrote it in the request: the update service can't check it
+    /// (unverified).
     pub by: String,
     /// When the state was written (RFC 3339).
     pub at: String,
@@ -2531,6 +2539,12 @@ pub struct NodeUpdate {
     /// `native`, `container`, or `helm`. Only a native node installs a version itself; the others
     /// are upgraded by their image.
     pub install: String,
+    /// The channel it follows, `edge` or `stable`: as `install.sh` set it (`--edge`), or, on an
+    /// install from before that, its version's. A stable node takes only releases; an edge node
+    /// edge builds and releases, and stays on edge. Absent from an older node. REQ: OPS-014
+    /// (ADR-182).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
     /// Its root update service (`telltale-update.path`) is enabled, so a request is picked up.
     pub enabled: bool,
     /// After a `POST`: `requested` (handed to the update service) or `up_to_date` (it already runs

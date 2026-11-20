@@ -2873,9 +2873,9 @@ mod ephemeral_tests {
     }
 
     /// REQ: OPS-014, CLU-009 (ADR-182, ADR-058) — the `update` RPC: an ephemeral member (a
-    /// resolver pod) and a peer the registry doesn't list may read a node's update state, never
-    /// ask it to install a version, as for maintenance, rollouts, removals, simulations and
-    /// drills. A member the registry lists gets the node's own answer.
+    /// resolver pod) and a peer the registry doesn't list get nothing from it, neither a request
+    /// nor a read of the node's update state (which names who asked and the errors), as for
+    /// maintenance. A member the registry lists gets the node's own answer.
     #[tokio::test]
     async fn ops_014_an_ephemeral_member_cannot_ask_for_an_update() {
         use telltale_cluster::node::{Identity, NodeRecord};
@@ -2924,17 +2924,16 @@ mod ephemeral_tests {
             .expect_err("an ephemeral or unlisted peer can't ask for an update");
             assert!(e.contains("ephemeral member"), "{peer}: {e}");
             assert!(!written(), "{peer}: nothing is written");
-            // The read stays open to it.
-            assert!(
-                handler(
-                    peer.into(),
-                    crate::node_update::KIND.into(),
-                    body(status.clone())
-                )
-                .await
-                .is_ok(),
-                "{peer}: a read is answered"
-            );
+            // Nor a read: it names admins and errors, and nothing legitimate asks through such a
+            // peer (`ctl` and the API go through full members).
+            let e = handler(
+                peer.into(),
+                crate::node_update::KIND.into(),
+                body(status.clone()),
+            )
+            .await
+            .expect_err("an ephemeral or unlisted peer can't read the update state");
+            assert!(e.contains("ephemeral member"), "{peer}: {e}");
         }
         // A member the registry lists gets this node's answer (a test build is a local build, so
         // a problem that says so, not a refusal of the sender).

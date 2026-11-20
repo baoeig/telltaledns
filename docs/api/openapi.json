@@ -5423,7 +5423,7 @@
           "system"
         ],
         "summary": "A node's version and update state.",
-        "description": "The version it runs, how it was installed, whether its root update service\n(`telltale-update.path`) is enabled, a request it hasn't picked up yet, and the service's\nlatest run (`installing`, `updated`, `up_to_date`, `rolled_back`, `unavailable`, `failed`, or\n`refused`, with the error): after a restart the new build must come up healthy, or the\nprevious one is put back (`rolled_back`); an edge build the channel no longer serves is\n`unavailable`. `id` is `local` (the node answering) or a cluster node's ID, site, or pod\nname: the read goes\nto that node over the cluster channel.",
+        "description": "The version it runs, how it was installed, the channel it follows, whether its root update\nservice (`telltale-update.path`) is enabled, a request it hasn't picked up yet, and the\nservice's latest run (`installing`, `updated`, `up_to_date`, `rolled_back`, `unavailable`,\n`failed`, or `refused`, with the error and how the new build's health was checked): after a\nrestart the new build must come up healthy, or the previous one is put back (`rolled_back`,\nan incident to look into); an edge build the channel no longer serves is `unavailable`. `id`\nis `local` (the node answering) or a cluster node's ID, site, or pod name: the read goes to\nthat node over the cluster channel.",
         "operationId": "node_update_status",
         "parameters": [
           {
@@ -5474,7 +5474,7 @@
           "system"
         ],
         "summary": "Install a version on a node.",
-        "description": "A native node (installed with `install.sh`) hands the request to its root update service,\nwhich verifies the release's signature and checksum, installs the binary, and restarts the\nnode; `GET` on the same path shows how it went. The version is a release (`0.8.0`) or an edge\nbuild (`0.8.0-edge.393`); an edge build can be installed only while it is the newest on the\nedge channel. Never older than the node's version (`update_downgrade`: downgrade by hand), and\nnever a change of channel: a node on releases takes only a release (`update_channel`). The\nsame version answers `up_to_date` without a request. One at a time per node: while a request\nwaits for the update service or an update runs, another gets `update_in_progress`. A node in a\ncontainer or Kubernetes is upgraded by its image (`update_unsupported`), and a node whose\nupdate service isn't enabled says so (`update_not_enabled`). In a cluster, upgrade replicas\nbefore the primary, one at a time: `telltale ctl upgrade` does this. `id` as for the read.\n`?dryRun=true` makes every check and writes nothing. It changes no configuration, so a\nGitOps-managed cluster takes it too. Needs the admin role (agents: the `cluster:upgrade`\nscope); audit-logged as `node.update.request`.",
+        "description": "A native node (installed with `install.sh`) hands the request to its root update service,\nwhich verifies the release's signature and checksum, installs the binary, and restarts the\nnode; `GET` on the same path shows how it went. The version is a release (`0.8.0`) or an edge\nbuild (`0.8.0-edge.393`); an edge build can be installed only while it is the newest on the\nedge channel. Never older than the node's version (`update_downgrade`: downgrade by hand), and\nnever a change of channel: a node on the stable channel takes only a release\n(`update_channel`); one on the edge channel takes both and stays on it. The same version\nanswers `up_to_date` without a request. One at a time per node: while a request waits for the\nupdate service or an update runs, another gets `update_in_progress`. A version whose run on\nthe node ended `rolled_back` or `failed` in the last 24 hours is refused\n(`update_failed_recently`: install it by hand, or wait). A node in a\ncontainer or Kubernetes is upgraded by its image (`update_unsupported`), and a node whose\nupdate service isn't enabled says so (`update_not_enabled`). In a cluster, upgrade replicas\nbefore the primary, one at a time: `telltale ctl upgrade` does this. `id` as for the read.\n`?dryRun=true` makes every check and writes nothing. It changes no configuration, so a\nGitOps-managed cluster takes it too. Needs the admin role (agents: the `cluster:upgrade`\nscope); audit-logged as `node.update.request`.",
         "operationId": "node_update_request",
         "parameters": [
           {
@@ -5528,7 +5528,7 @@
             }
           },
           "409": {
-            "description": "The node is upgraded by its image (`update_unsupported`), its update service is off (`update_not_enabled`), the version is older than its own (`update_downgrade`) or on another channel (`update_channel`), or an update is already under way there (`update_in_progress`).",
+            "description": "The node is upgraded by its image (`update_unsupported`), its update service is off (`update_not_enabled`), the version is older than its own (`update_downgrade`) or on another channel (`update_channel`), an update is already under way there (`update_in_progress`), or the version was rolled back or failed there in the last 24 hours (`update_failed_recently`).",
             "content": {
               "application/json": {
                 "schema": {
@@ -12327,7 +12327,8 @@
           "update_downgrade",
           "update_invalid",
           "update_channel",
-          "update_in_progress"
+          "update_in_progress",
+          "update_failed_recently"
         ]
       },
       "ConfigChange": {
@@ -18353,6 +18354,13 @@
           "enabled"
         ],
         "properties": {
+          "channel": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The channel it follows, `edge` or `stable`: as `install.sh` set it (`--edge`), or, on an\ninstall from before that, its version's. A stable node takes only releases; an edge node\nedge builds and releases, and stays on edge. Absent from an older node. REQ: OPS-014\n(ADR-182)."
+          },
           "enabled": {
             "type": "boolean",
             "description": "Its root update service (`telltale-update.path`) is enabled, so a request is picked up."
@@ -18460,7 +18468,8 @@
             "description": "When the state was written (RFC 3339)."
           },
           "by": {
-            "type": "string"
+            "type": "string",
+            "description": "Who asked, as the node wrote it in the request: the update service can't check it\n(unverified)."
           },
           "error": {
             "type": [
@@ -18474,13 +18483,20 @@
             "description": "The version the node ran when the run started.",
             "example": "0.7.0"
           },
+          "health": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For `updated`: how the new build's health was checked (`checked at <url>`), or why it\nwasn't (`not checked: the API is off`). REQ: OPS-014 (ADR-182)."
+          },
           "id": {
             "type": "string",
             "description": "The request it answers."
           },
           "state": {
             "type": "string",
-            "description": "`installing` (also while the restarted node is checked), `updated` (installed, restarted,\nand healthy), `up_to_date`, `rolled_back` (the new build wasn't healthy after the restart:\nthe previous binary is back and running), `unavailable` (an edge build the edge channel no\nlonger serves: nothing installed; the error names the one it serves), `failed` (not\ninstalled, or rolled back and still not healthy), or `refused` (the request was stale,\nmalformed, older than the node's version, or on another channel). REQ: OPS-014 (ADR-182).",
+            "description": "`installing` (also while the restarted node is checked), `updated` (installed, restarted,\nand healthy, or not checked: see `health`), `up_to_date`, `rolled_back` (the new build\nwasn't healthy after the restart: the previous binary is back in place; an incident to\nlook into, see `error`), `unavailable` (an edge build the edge channel no longer serves:\nnothing installed; the error names the one it serves), `failed` (not installed, or the\nprevious binary couldn't be put back), or `refused` (the request was stale, malformed,\nolder than the node's version, on another channel, of a version that failed there in the\nlast day, or the host wasn't set up for it). REQ: OPS-014 (ADR-182).",
             "example": "updated"
           },
           "to": {

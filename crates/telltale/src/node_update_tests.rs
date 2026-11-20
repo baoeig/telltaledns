@@ -14,6 +14,7 @@ fn here(dir: &Path, install: &str, version: &str, enabled: bool) -> Here {
         version: version.into(),
         install: install.into(),
         enabled,
+        channel: None,
         data_dir: dir.to_path_buf(),
         result: dir.join("service").join("result.json"),
     }
@@ -34,8 +35,8 @@ impl Host for Installs<'_> {
     fn restart(&mut self) -> Result<(), String> {
         Ok(())
     }
-    fn healthy(&mut self) -> Result<(), String> {
-        Ok(())
+    fn healthy(&mut self) -> Result<String, String> {
+        Ok("checked at the test's address".into())
     }
     fn restore(&mut self, _: &Path) -> Result<(), String> {
         Ok(())
@@ -388,8 +389,8 @@ fn refused() -> Served {
 
 /// Makes a FIFO at `p`, in this process: a child process (`mkfifo`) forked while another test
 /// writes a binary it is about to run (the pinned self-update tests) can make that `exec` fail
-/// with "Text file busy".
-#[cfg(unix)]
+/// with "Text file busy". (`mknodat` is Linux's in rustix.)
+#[cfg(target_os = "linux")]
 fn mkfifo(p: &Path) {
     use rustix::fs::{CWD, FileType, Mode};
     rustix::fs::mknodat(CWD, p, FileType::Fifo, Mode::from_raw_mode(0o600), 0)
@@ -414,7 +415,7 @@ fn serve_bounded(h: &Here, current: &'static str) -> Served {
 /// REQ: OPS-014 (ADR-182) — a link to a FIFO at the request is refused without the update
 /// service blocking on it (the open never follows a link and never waits for a writer); the
 /// link goes, the FIFO it named stays, and the result says only that it wasn't a request.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn ops_014_a_link_to_a_fifo_is_refused_without_blocking() {
     let d = tempfile::tempdir().unwrap();
@@ -439,7 +440,7 @@ fn ops_014_a_link_to_a_fifo_is_refused_without_blocking() {
 /// (so the path unit isn't started again for it), with the same one error. A directory with
 /// something in it can't be removed without root reaching into the node's files: it is refused
 /// each time (the path unit's start limit then stops it: ADR-182, the feature switched off).
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn ops_014_a_fifo_or_directory_at_the_request_is_refused_and_removed() {
     let d = tempfile::tempdir().unwrap();
@@ -534,9 +535,9 @@ fn ops_014_a_request_never_moves_a_stable_node_to_edge() {
         "{e:?}"
     );
     assert!(
-        e.hint
-            .as_deref()
-            .is_some_and(|h| h.contains("by hand with self-update")),
+        e.hint.as_deref().is_some_and(|h| h
+            .contains("telltale self-update --channel edge --restart")
+            && h.contains("install.sh --edge --cluster-updates")),
         "{e:?}"
     );
     assert!(!stable.request_path().exists(), "nothing is written");
@@ -654,7 +655,27 @@ fn ops_014_the_units_watch_and_write_only_the_request_folder() {
     ] {
         assert_eq!(lines(svc, key), [want], "{key}");
     }
-    assert!(lines(svc, "User").is_empty() && lines(svc, "Environment").len() == 2);
+    // REQ: OPS-014 (ADR-182) — the channel and the health check's address are the unit's (as
+    // install.sh writes them: deploy/systemd/update-units-test.sh), never the request's.
+    assert_eq!(lines(svc, "User"), [] as [&str; 0]);
+    assert_eq!(
+        lines(svc, "Environment"),
+        [
+            "TELLTALE_INSTALL=native",
+            "TELLTALE_LOG=info",
+            "TELLTALE_UPDATE_CHANNEL=stable",
+            "TELLTALE_UPDATE_HEALTH_URL=http://127.0.0.1:8053/readyz?startup=1",
+        ]
+    );
+    assert_eq!(
+        format!("{HEALTH_URL_ENV}={DEFAULT_HEALTH_URL}"),
+        lines(svc, "Environment")[3]
+    );
+    let node = include_str!("../../../deploy/systemd/telltale.service");
+    assert!(
+        lines(node, "Environment").contains(&"TELLTALE_UPDATE_CHANNEL=stable"),
+        "the node's unit names its channel too"
+    );
     // `systemctl` is never looked up through PATH (the service may write /usr/local/bin).
     for (file, src) in [
         ("main.rs", include_str!("main.rs")),
@@ -707,9 +728,9 @@ fn ops_014_a_second_request_waits_for_the_first() {
         to: "0.8.1".into(),
         from: "0.7.0".into(),
         state: "installing".into(),
-        error: None,
         by: "bob".into(),
         at_ms,
+        ..ResultFile::default()
     };
     std::fs::create_dir_all(h.result.parent().unwrap()).unwrap();
     std::fs::write(&h.result, serde_json::to_vec(&installing(later)).unwrap()).unwrap();
@@ -765,16 +786,25 @@ fn ops_014_a_dry_run_writes_nothing() {
 }
 
 /// A host whose steps are scripted: the install's outcome, each health check's answer in turn,
-/// and whether the previous binary can be put back. `calls` has every step, in order.
+/// whether the previous binary can be put back, the channel set for the node, and whether the
+/// host is set up for an update (`not_ready`: why not). `calls` has every step, in order.
 #[derive(Default)]
 struct Scripted {
     install: Option<Result<Outcome, String>>,
     health: Vec<Result<(), String>>,
     restore_fails: bool,
+    channel: Option<String>,
+    not_ready: Option<String>,
     calls: Vec<String>,
 }
 
 impl Host for Scripted {
+    fn channel(&self) -> Option<String> {
+        self.channel.clone()
+    }
+    fn ready(&mut self) -> Result<(), String> {
+        self.not_ready.clone().map_or(Ok(()), Err)
+    }
     fn install(&mut self, to: &str) -> Result<Outcome, String> {
         self.calls.push(format!("install {to}"));
         self.install
@@ -785,12 +815,14 @@ impl Host for Scripted {
         self.calls.push("restart".into());
         Ok(())
     }
-    fn healthy(&mut self) -> Result<(), String> {
+    fn healthy(&mut self) -> Result<String, String> {
         self.calls.push("healthy".into());
         if self.health.is_empty() {
-            Ok(())
+            Ok("checked at the test's address".into())
         } else {
-            self.health.remove(0)
+            self.health
+                .remove(0)
+                .map(|()| "checked at the test's address".into())
         }
     }
     fn restore(&mut self, previous: &Path) -> Result<(), String> {
@@ -853,7 +885,10 @@ fn ops_014_a_build_that_does_not_come_up_is_rolled_back() {
         "{why}"
     );
     assert!(!served_ok("rolled_back"), "systemd sees a failed run");
-    // Healthy at once: updated, nothing put back.
+    // Healthy at once (another node: this one refuses 0.8.0 for a day now): updated, nothing
+    // put back, and how its health was checked is recorded.
+    let d = tempfile::tempdir().unwrap();
+    let h = here(d.path(), "native", "0.7.0", true);
     request(&h, "0.8.0", "alice", NOW).unwrap();
     let mut host = Scripted {
         install: Some(Ok(installed())),
@@ -867,14 +902,19 @@ fn ops_014_a_build_that_does_not_come_up_is_rolled_back() {
         }
     );
     assert_eq!(host.calls, ["install 0.8.0", "restart", "healthy"]);
+    assert_eq!(
+        status(&h).last.unwrap().health.as_deref(),
+        Some("checked at the test's address")
+    );
     assert!(served_ok("updated") && served_ok("refused"));
 }
 
-/// REQ: OPS-014 (ADR-182) — one attempt only: if the rolled-back node isn't healthy either, or
-/// the previous binary can't be put back, the run records `failed` with both reasons and stops
-/// (no second rollback, no loop, no restart onto a binary that isn't there).
+/// REQ: OPS-014 (ADR-182) — the previous build is back and restarted, but its check fails too:
+/// then the check may be what's wrong (an address the node doesn't answer on), and the previous
+/// build is in place, so the run is `rolled_back` with a note saying so, not `failed` ("didn't
+/// bring the node back"). One attempt, no loop.
 #[test]
-fn ops_014_a_failed_rollback_is_recorded_and_stops() {
+fn ops_014_a_rollback_whose_check_fails_too_is_recorded_as_rolled_back() {
     let d = tempfile::tempdir().unwrap();
     let h = here(d.path(), "native", "0.7.0", true);
     request(&h, "0.8.0", "alice", NOW).unwrap();
@@ -887,7 +927,7 @@ fn ops_014_a_failed_rollback_is_recorded_and_stops() {
     assert_eq!(
         served,
         Served::Done {
-            state: "failed".into()
+            state: "rolled_back".into()
         }
     );
     assert_eq!(
@@ -903,10 +943,21 @@ fn ops_014_a_failed_rollback_is_recorded_and_stops() {
     );
     let why = status(&h).last.unwrap().error.unwrap();
     assert!(
-        why.contains("status 503") && why.contains("connection refused"),
+        why.contains("status 503")
+            && why.contains("connection refused")
+            && why.contains("0.7.0 is back in place"),
         "{why}"
     );
-    // The previous binary can't be put back: failed, with no restart after it.
+    assert!(!why.contains("didn't bring the node back"), "{why}");
+}
+
+/// REQ: OPS-014 (ADR-182) — one attempt only: if the previous binary can't be put back, the run
+/// records `failed` with both reasons and stops (no second rollback, no loop, no restart onto a
+/// binary that isn't there).
+#[test]
+fn ops_014_a_failed_rollback_is_recorded_and_stops() {
+    let d = tempfile::tempdir().unwrap();
+    let h = here(d.path(), "native", "0.7.0", true);
     request(&h, "0.8.0", "alice", NOW).unwrap();
     let mut host = Scripted {
         install: Some(Ok(installed())),
@@ -931,6 +982,71 @@ fn ops_014_a_failed_rollback_is_recorded_and_stops() {
         ]
     );
     assert!(!served_ok("failed"));
+}
+
+/// REQ: OPS-014 (ADR-182) — a version whose run ended `rolled_back` (or `failed`) isn't asked for
+/// again on that node for 24 hours: the node refuses it (`update_failed_recently`, 409: the same
+/// check answers the API and the cluster RPC), and the update service refuses it too, whoever
+/// wrote the request. Another version may be asked for; a day later the same one again.
+#[test]
+fn ops_014_a_version_that_failed_is_not_asked_for_again_for_a_day() {
+    let d = tempfile::tempdir().unwrap();
+    let h = here(d.path(), "native", "0.7.0", true);
+    request(&h, "0.8.0", "hook", NOW).unwrap();
+    let mut host = Scripted {
+        install: Some(Ok(installed())),
+        health: vec![Err("status 503".into()), Ok(())],
+        ..Scripted::default()
+    };
+    serve_request(&h.request_path(), &h.result, "0.7.0", NOW, true, &mut host);
+    assert_eq!(status(&h).last.unwrap().state, "rolled_back");
+    // The run is recorded at the wall clock's time; ask a minute after it.
+    let soon = crate::maintenance::now_ms() + 60_000;
+    let e = request(&h, "0.8.0", "hook", soon).unwrap_err();
+    assert_eq!(
+        (serde_json::to_value(e.code).unwrap(), e.status),
+        (serde_json::json!("update_failed_recently"), 409),
+        "{e:?}"
+    );
+    assert!(
+        e.hint
+            .as_deref()
+            .is_some_and(|h| h.contains("self-update --to")),
+        "{e:?}"
+    );
+    assert!(!h.request_path().exists(), "nothing is written");
+    assert_eq!(
+        serde_json::to_value(dry_run(&h, "0.8.0", soon).unwrap_err().code).unwrap(),
+        serde_json::json!("update_failed_recently")
+    );
+    // Another version: asked as usual.
+    request(&h, "0.8.1", "hook", soon).unwrap();
+    std::fs::remove_file(h.request_path()).unwrap();
+    // The update service refuses the failed version, however the request was written, and that
+    // refusal doesn't wipe the memory of the failure.
+    let body = serde_json::json!({"id": "1a-2c", "to": "0.8.0", "by": "x", "requestedMs": soon});
+    plant(&h, &body.to_string());
+    let asked = Cell::new(false);
+    let served = serve(&h.request_path(), &h.result, "0.7.0", soon, |_| {
+        asked.set(true);
+        Err("not here".to_owned())
+    });
+    assert!(!asked.get(), "nothing is fetched");
+    assert_eq!(served, refused());
+    assert!(status(&h).last.unwrap().error.unwrap().contains("24 hours"),);
+    assert_eq!(
+        serde_json::to_value(request(&h, "0.8.0", "hook", soon).unwrap_err().code).unwrap(),
+        serde_json::json!("update_failed_recently")
+    );
+    // A day later, the same version again.
+    let later = crate::maintenance::now_ms() + 24 * 3_600_000 + 60_000;
+    assert_eq!(
+        request(&h, "0.8.0", "hook", later)
+            .unwrap()
+            .state
+            .as_deref(),
+        Some("requested")
+    );
 }
 
 /// REQ: OPS-014 (ADR-182) — an edge build main has since passed can't be fetched: the update
@@ -970,6 +1086,326 @@ fn ops_014_an_edge_build_no_longer_served_is_unavailable() {
         "the build the channel serves"
     );
     assert!(!served_ok("unavailable"));
+}
+
+/// REQ: OPS-014 (ADR-182) — the channel is the one set for the node (`TELLTALE_UPDATE_CHANNEL`,
+/// from `install.sh --edge`), not its version's: an edge node that took a release stays on edge
+/// and takes the next edge build, at the node (the API and the cluster RPC) and at the update
+/// service; a node set to stable refuses an edge build at both, whatever its version; with the
+/// variable absent (an older install) the version's channel is used, as before.
+#[test]
+fn ops_014_an_edge_node_that_took_a_release_stays_on_edge() {
+    let d = tempfile::tempdir().unwrap();
+    let mut h = here(d.path(), "native", "0.8.0", true);
+    h.channel = Some("edge".into());
+    assert_eq!(status(&h).channel.as_deref(), Some("edge"));
+    assert_eq!(
+        request(&h, "0.8.1-edge.3", "hook", NOW)
+            .unwrap()
+            .state
+            .as_deref(),
+        Some("requested")
+    );
+    let mut host = Scripted {
+        install: Some(Ok(installed())),
+        channel: Some("edge".into()),
+        ..Scripted::default()
+    };
+    let served = serve_request(&h.request_path(), &h.result, "0.8.0", NOW, true, &mut host);
+    assert_eq!(
+        served,
+        Served::Done {
+            state: "updated".into()
+        }
+    );
+    assert_eq!(host.calls[0], "install 0.8.1-edge.3");
+    // Set to stable: an edge build is refused at the node and at the update service.
+    let d = tempfile::tempdir().unwrap();
+    let mut h = here(d.path(), "native", "0.8.0-edge.5", true);
+    h.channel = Some("stable".into());
+    assert_eq!(status(&h).channel.as_deref(), Some("stable"));
+    assert_eq!(
+        code(request(&h, "0.8.0-edge.9", "hook", NOW)),
+        Code::UpdateChannel
+    );
+    let body =
+        serde_json::json!({"id": "1a-2b", "to": "0.8.0-edge.9", "by": "x", "requestedMs": NOW});
+    plant(&h, &body.to_string());
+    let mut host = Scripted {
+        install: Some(Err("must not install".into())),
+        channel: Some("stable".into()),
+        ..Scripted::default()
+    };
+    let served = serve_request(
+        &h.request_path(),
+        &h.result,
+        "0.8.0-edge.5",
+        NOW,
+        true,
+        &mut host,
+    );
+    assert_eq!(served, refused());
+    assert!(host.calls.is_empty(), "nothing is fetched");
+    assert!(
+        status(&h)
+            .last
+            .unwrap()
+            .error
+            .unwrap()
+            .contains("stable channel")
+    );
+    // Not set (an older install): the version's channel.
+    let d = tempfile::tempdir().unwrap();
+    let h = here(d.path(), "native", "0.8.0", true);
+    assert_eq!(status(&h).channel.as_deref(), Some("stable"));
+    assert_eq!(
+        code(request(&h, "0.8.1-edge.1", "hook", NOW)),
+        Code::UpdateChannel
+    );
+    let h = here(d.path(), "native", "0.8.0-edge.1", true);
+    assert_eq!(status(&h).channel.as_deref(), Some("edge"));
+}
+
+/// REQ: OPS-014 (ADR-182) — the answer to a request carries the request as written, even when
+/// the update service has taken the file already (`ctl upgrade` follows its id); and a peer's
+/// `by` keeps its "(unverified)" marker however long the name it sent.
+#[test]
+fn ops_014_the_answer_names_the_request_written_and_marks_a_peers_by() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = here(dir.path(), "native", "0.7.0", true);
+    let written = RequestFile {
+        id: "19a-0badcafe".into(),
+        to: "0.8.0".into(),
+        by: "alice".into(),
+        requested_ms: NOW,
+    };
+    // No file at all (taken at once): the answer still names it.
+    let answer = requested(&h, &written);
+    let pending = answer.pending.unwrap();
+    assert_eq!(
+        (pending.id.as_str(), pending.to.as_str()),
+        ("19a-0badcafe", "0.8.0")
+    );
+    assert_eq!(answer.state.as_deref(), Some("requested"));
+    let long = "m".repeat(500);
+    let by = peer_by(&long, &"n".repeat(300));
+    assert!(by.ends_with(" (unverified)"), "{by}");
+    assert!(by.chars().count() <= MAX_BY_STORED, "{}", by.len());
+    let asked = request(&h, "0.8.0", &by, NOW).unwrap().pending.unwrap();
+    assert!(asked.by.ends_with("(unverified)"), "{}", asked.by);
+    // The update service takes such a `by`.
+    let mut host = Scripted {
+        install: Some(Ok(installed())),
+        ..Scripted::default()
+    };
+    let served = serve_request(&h.request_path(), &h.result, "0.7.0", NOW, true, &mut host);
+    assert_eq!(
+        served,
+        Served::Done {
+            state: "updated".into()
+        }
+    );
+    let last = status(&h).last.unwrap();
+    assert!(last.by.ends_with("(unverified)"));
+    // result.json says `by` is the node's word for it.
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&h.result).unwrap()).unwrap();
+    assert_eq!(raw["byVerified"], serde_json::json!(false));
+}
+
+/// REQ: OPS-014, AGT-002 (ADR-182) — a dry run never removes anything: not even a request older
+/// than the update service would take (a real request replaces it).
+#[test]
+fn ops_014_a_dry_run_leaves_a_dead_request_in_place() {
+    let d = tempfile::tempdir().unwrap();
+    let h = here(d.path(), "native", "0.7.0", true);
+    request(&h, "0.8.0", "alice", NOW).unwrap();
+    let later = NOW + STALE_REQUEST_MS + 1;
+    assert_eq!(
+        dry_run(&h, "0.8.1", later).unwrap().state.as_deref(),
+        Some("would_request")
+    );
+    assert!(h.request_path().exists(), "the dry run left it");
+    request(&h, "0.8.1", "bob", later).unwrap();
+}
+
+/// REQ: OPS-014 (ADR-182) — a host that isn't set up for an update (an install location root
+/// doesn't own alone, a health address it may not use) refuses the run before anything is
+/// fetched, and says why; the node isn't restarted.
+#[test]
+fn ops_014_a_host_not_set_up_for_it_refuses_before_fetching() {
+    let d = tempfile::tempdir().unwrap();
+    let h = here(d.path(), "native", "0.7.0", true);
+    request(&h, "0.8.0", "alice", NOW).unwrap();
+    let mut host = Scripted {
+        install: Some(Err("must not install".into())),
+        not_ready: Some(
+            "install location is not root-owned: /home/pi/bin belongs to uid 1000".into(),
+        ),
+        ..Scripted::default()
+    };
+    let served = serve_request(&h.request_path(), &h.result, "0.7.0", NOW, true, &mut host);
+    assert_eq!(served, refused());
+    assert!(host.calls.is_empty(), "{:?}", host.calls);
+    assert!(
+        status(&h)
+            .last
+            .unwrap()
+            .error
+            .unwrap()
+            .starts_with("install location is not root-owned")
+    );
+}
+
+/// A host whose unit says the API is off (no health check), for the install `0`.
+struct Off(Option<Install<'static>>);
+
+impl Host for Off {
+    fn install(&mut self, to: &str) -> Result<Outcome, String> {
+        self.0.take().map_or_else(|| Err("twice".into()), |f| f(to))
+    }
+    fn restart(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    fn healthy(&mut self) -> Result<String, String> {
+        match health_gate(Some(""), |_| false) {
+            Ok(HealthGate::Skip(why)) => Ok(why.to_owned()),
+            other => Err(format!("{other:?}")),
+        }
+    }
+    fn restore(&mut self, _: &Path) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// REQ: OPS-014 (ADR-182) — the health gate's address comes from the unit only: unset is the
+/// old default (an older unit), empty is no check (the API is off: `updated` says so), and a
+/// value must be a plain `http://` URL of `/readyz` at an IP address and port of this host.
+#[test]
+fn ops_014_the_health_gate_takes_only_a_plain_address_of_this_host() {
+    let here_ip = |ip: std::net::IpAddr| ip == std::net::IpAddr::from([192, 168, 3, 2]);
+    assert_eq!(
+        health_gate(None, here_ip),
+        Ok(HealthGate::Check(DEFAULT_HEALTH_URL.into()))
+    );
+    assert_eq!(
+        health_gate(Some(""), here_ip),
+        Ok(HealthGate::Skip("not checked: the API is off"))
+    );
+    for ok in [
+        "http://127.0.0.1:8053/readyz?startup=1",
+        "http://127.0.0.1:9443/readyz",
+        "http://[::1]:8053/readyz?startup=1",
+        "http://192.168.3.2:8053/readyz?startup=1",
+    ] {
+        assert_eq!(
+            health_gate(Some(ok), here_ip),
+            Ok(HealthGate::Check(ok.into())),
+            "{ok}"
+        );
+    }
+    for (bad, why) in [
+        ("https://127.0.0.1:8053/readyz", "plain http://"),
+        ("http://localhost:8053/readyz", "IP address and port"),
+        ("http://user@127.0.0.1:8053/readyz", "IP address and port"),
+        ("http://127.0.0.1/readyz", "IP address and port"),
+        ("http://127.0.0.1:8053/metrics", "/readyz"),
+        ("http://127.0.0.1:8053/readyz?x=1", "/readyz"),
+        ("http://0.0.0.0:8053/readyz", "address one can ask"),
+        ("http://10.9.9.9:8053/readyz", "of this host"),
+        ("http://192.0.2.1:8053/readyz?startup=1", "of this host"),
+    ] {
+        let e = health_gate(Some(bad), here_ip).unwrap_err();
+        assert!(e.contains(why) && e.contains(HEALTH_URL_ENV), "{bad}: {e}");
+    }
+    // The real check: loopback is this host's; a documentation address isn't (no packet sent).
+    assert!(is_this_host(std::net::IpAddr::from([127, 0, 0, 1])));
+    assert!(!is_this_host(std::net::IpAddr::from([192, 0, 2, 1])));
+    // The API off: `updated`, with the reason as its health.
+    let d = tempfile::tempdir().unwrap();
+    let h = here(d.path(), "native", "0.7.0", true);
+    request(&h, "0.8.0", "alice", NOW).unwrap();
+    let served = serve_request(
+        &h.request_path(),
+        &h.result,
+        "0.7.0",
+        NOW,
+        true,
+        &mut Off(Some(Box::new(|_| Ok(installed())))),
+    );
+    assert_eq!(
+        served,
+        Served::Done {
+            state: "updated".into()
+        }
+    );
+    assert_eq!(
+        status(&h).last.unwrap().health.as_deref(),
+        Some("not checked: the API is off")
+    );
+}
+
+/// REQ: OPS-014 (ADR-182) — root runs and renames binaries only where root alone can write: the
+/// binary and every folder above it owned by root and not writable by group or others (here
+/// with this user standing in for root, in a folder of its own).
+#[cfg(unix)]
+#[test]
+fn ops_014_the_install_location_must_be_roots_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let top = d.path().canonicalize().unwrap();
+    let bin = top.join("usr").join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let exe = bin.join("telltale");
+    std::fs::write(&exe, "x").unwrap();
+    let mode = |p: &Path, m: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m));
+    for p in [&top, &top.join("usr"), &bin] {
+        mode(p, 0o755).unwrap();
+    }
+    mode(&exe, 0o755).unwrap();
+    let me = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&exe).unwrap().uid()
+    };
+    assert_eq!(root_owned(&exe, me, &top), Ok(()));
+    // Another owner.
+    let e = root_owned(&exe, me + 1, &top).unwrap_err();
+    assert!(e.starts_with("install location is not root-owned"), "{e}");
+    // A folder its group may write, or a binary anyone may.
+    mode(&bin, 0o775).unwrap();
+    let e = root_owned(&exe, me, &top).unwrap_err();
+    assert!(e.contains(&bin.display().to_string()), "{e}");
+    mode(&bin, 0o755).unwrap();
+    mode(&exe, 0o757).unwrap();
+    assert!(root_owned(&exe, me, &top).is_err());
+    mode(&exe, 0o755).unwrap();
+    // Any folder on the way that anyone may write. (The walk stops at `top`, so the world-writable
+    // temporary folder above it isn't looked at; in production `top` is `/`.)
+    mode(&top.join("usr"), 0o777).unwrap();
+    assert!(root_owned(&exe, me, &top).is_err());
+}
+
+/// REQ: OPS-014 (ADR-182) — the whole run (one deadline for the downloads, the test run, the
+/// restart and health window, and a rollback's reset, restart and window) fits in the unit's
+/// `TimeoutStartSec=` with a minute to spare, so systemd never kills it between the install and
+/// its check (which would leave the new build unchecked and the run `installing`).
+#[test]
+fn ops_014_the_run_fits_in_the_units_time_limit() {
+    let svc = include_str!("../../../deploy/systemd/telltale-update.service");
+    let limit: u64 = svc
+        .lines()
+        .find_map(|l| l.strip_prefix("TimeoutStartSec="))
+        .and_then(|v| v.trim().parse().ok())
+        .expect("TimeoutStartSec");
+    assert_eq!(HEALTH_WAIT.as_secs(), 120);
+    assert_eq!(crate::selfupdate::FETCH_DEADLINE.as_secs(), 480);
+    assert!(
+        run_budget_secs() + 60 <= limit,
+        "the run may take {} s, the unit allows {limit} s",
+        run_budget_secs()
+    );
+    // The node's lock on a run that says `installing` is the unit's limit.
+    assert_eq!(RUNNING_MS / 1000, limit);
 }
 
 #[test]

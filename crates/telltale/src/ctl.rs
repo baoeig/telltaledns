@@ -278,8 +278,10 @@ pub(crate) struct UpgradeArgs {
     /// `10m`, or seconds.
     #[arg(long, value_parser = parse_duration, default_value = "10m")]
     pub(crate) timeout: u32,
-    /// Leave nodes that are down, or that can't take a request now (their update service is off,
-    /// an update is already running, a channel they don't follow), out instead of stopping.
+    /// Leave nodes that are down out instead of stopping. A node that is up but can't take the
+    /// request (its update service is off, an update is running there, it follows another
+    /// channel, it refuses the version for a day after a rollback) still stops the run: that is
+    /// set up wrong, not down.
     #[arg(long)]
     pub(crate) skip_down: bool,
     /// When a node reports the version can't be fetched any more (an edge build main has since
@@ -293,6 +295,10 @@ pub(crate) struct UpgradeArgs {
     /// Say which nodes would be upgraded, in which order, without asking any.
     #[arg(long)]
     pub(crate) dry_run: bool,
+    /// Why, for the audit log (sent with each request as `X-Telltale-Reason`, which an agent
+    /// token must send). Default: `telltale ctl upgrade --to <version>`.
+    #[arg(long)]
+    pub(crate) reason: Option<String>,
 }
 
 /// REQ: CLU-013 — `telltale ctl rollout`.
@@ -367,9 +373,22 @@ struct Api {
     client: telltale_filter::fetch::Client,
     base: String,
     token: String,
+    /// REQ: AGT-003, OPS-014 — why, sent as `X-Telltale-Reason` with every change: the audit log
+    /// keeps it, and an agent token's change without one is refused (400).
+    reason: Option<String>,
 }
 
 impl Api {
+    /// The same connection, saying `reason` with every change.
+    fn with_reason(&self, reason: String) -> Self {
+        Self {
+            client: self.client.clone(),
+            base: self.base.clone(),
+            token: self.token.clone(),
+            reason: Some(reason),
+        }
+    }
+
     fn url(&self, path: &str) -> String {
         let p = path.trim_start_matches('/');
         let p = p.strip_prefix("api/v1/").unwrap_or(p);
@@ -408,11 +427,15 @@ impl Api {
         body: Option<&Value>,
     ) -> Result<Result<Value, (http::StatusCode, Value)>, String> {
         let url = self.url(path);
+        let changes = method != http::Method::GET;
         let mut req = http::Request::builder()
             .method(method)
             .uri(url.as_str())
             .header("authorization", format!("Bearer {}", self.token))
             .header("accept", "application/json");
+        if let Some(r) = self.reason.as_deref().filter(|_| changes) {
+            req = req.header(telltale_api::auth::routes::REASON, r);
+        }
         let bytes = match body {
             Some(b) => {
                 req = req.header("content-type", "application/json");
@@ -553,6 +576,7 @@ pub(crate) async fn run(
         client: client(ca)?,
         base: base.to_owned(),
         token: token.to_owned(),
+        reason: None,
     };
     let pretty = |v: &Value| serde_json::to_string_pretty(v).unwrap_or_default();
     // Raw calls print JSON whatever --json says.
@@ -1247,20 +1271,116 @@ fn preflight(u: &Value, to: &str, now_ms: u64) -> Preflight {
         ));
     }
     let last = &u["last"];
-    if s(last, "state") == "installing" {
-        let at = telltale_api::time::parse_time_ms(&s(last, "at"), now_ms).unwrap_or(now_ms);
-        if now_ms.saturating_sub(at) < INSTALLING_MS {
-            return Preflight::Block(format!("an update to {} is running on it", s(last, "to")));
-        }
+    let at = || telltale_api::time::parse_time_ms(&s(last, "at"), now_ms).unwrap_or(now_ms);
+    let state = s(last, "state");
+    if state == "installing" && now_ms.saturating_sub(at()) < INSTALLING_MS {
+        return Preflight::Block(format!("an update to {} is running on it", s(last, "to")));
     }
-    if let Err(why) = telltale_api::update_api::same_channel(&s(u, "version"), to) {
-        return Preflight::Block(why);
+    // REQ: OPS-014 (ADR-182) — the node refuses a version that was rolled back or failed there
+    // in the last day (`update_failed_recently`): stop before any node is asked.
+    if matches!(state.as_str(), "rolled_back" | "failed")
+        && s(last, "to") == to
+        && now_ms.saturating_sub(at()) < telltale_api::update_api::FAILED_RECENTLY_MS
+    {
+        return Preflight::Block(format!(
+            "its last run of {to} ended {state} ({}), so it refuses {to} for 24 hours after that: {}",
+            s(last, "error"),
+            telltale_api::update_api::FAILED_RECENTLY_HINT
+        ));
+    }
+    // REQ: OPS-014 (ADR-182) — said in full: which channel the node follows, what was asked, and
+    // how to change it (a node set up wrong, never mistaken for one that is down).
+    let channel = telltale_api::update_api::node_channel(u["channel"].as_str(), &s(u, "version"));
+    if let Err(why) = telltale_api::update_api::channel_takes(channel, to) {
+        return Preflight::Block(format!(
+            "CHANNEL: it runs {} and {why} ({})",
+            s(u, "version"),
+            telltale_api::update_api::CHANNEL_HINT
+        ));
     }
     Preflight::Ready
 }
 
 /// The hint for an entry node that answers a bare 404 for the update route: it is older.
-const OLDER_ENTRY: &str = "the node at --url doesn't have updates from the cluster (it runs an older version): upgrade it by hand first (telltale self-update --restart), or point --url at a node that does";
+const OLDER_ENTRY: &str = "the node at --url doesn't have updates from the cluster (it runs an older version): upgrade it by hand first (as root on it: telltale self-update --restart, or with --channel edge for a node on edge builds), or point --url at a node that does";
+
+/// REQ: OPS-014 (ADR-182) — `--skip-if-unreachable` skips only a first install: the API's name
+/// doesn't exist yet (`no_such_name`: the chart's Service isn't there), or every address of it
+/// refused the connection (nothing listens yet). Anything else (a lookup that failed another way,
+/// a timeout, packets dropped, an address that answers, so the failure was TLS or HTTP) is no
+/// first install. What it found, or `None`.
+fn first_install(
+    no_such_name: bool,
+    connects: &[Result<(), std::io::ErrorKind>],
+) -> Option<&'static str> {
+    if no_such_name {
+        return Some("its name doesn't resolve");
+    }
+    (!connects.is_empty()
+        && connects
+            .iter()
+            .all(|c| *c == Err(std::io::ErrorKind::ConnectionRefused)))
+    .then_some("nothing listens at its address")
+}
+
+/// A name lookup that failed because the name doesn't exist (glibc: "Name or service not known";
+/// musl, the image's: "Name does not resolve"), not because the lookup itself failed.
+fn no_such_name(e: &std::io::Error) -> bool {
+    let m = e.to_string();
+    [
+        "Name or service not known",
+        "Name does not resolve",
+        "No address associated with hostname",
+    ]
+    .iter()
+    .any(|n| m.contains(n))
+}
+
+/// For [`first_install`]: whether the host of `base` has no such name, and else what a TCP
+/// connection to each of its addresses did (bounded: 10 s for the lookup, 5 s per address).
+async fn look_at(base: &str) -> (bool, Vec<Result<(), std::io::ErrorKind>>) {
+    use std::time::Duration;
+    let Ok(uri) = base.parse::<http::Uri>() else {
+        return (false, Vec::new());
+    };
+    let Some(host) = uri.host() else {
+        return (false, Vec::new());
+    };
+    let name = host.trim_start_matches('[').trim_end_matches(']');
+    let port = uri
+        .port_u16()
+        .unwrap_or(if uri.scheme_str() == Some("https") {
+            443
+        } else {
+            80
+        });
+    let addrs: Vec<std::net::SocketAddr> = match name.parse::<std::net::IpAddr>() {
+        Ok(ip) => vec![std::net::SocketAddr::new(ip, port)],
+        Err(_) => match tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::net::lookup_host((name, port)),
+        )
+        .await
+        {
+            Ok(Ok(a)) => a.collect(),
+            Ok(Err(e)) => return (no_such_name(&e), Vec::new()),
+            Err(_) => return (false, Vec::new()),
+        },
+    };
+    let mut out = Vec::new();
+    for a in addrs {
+        out.push(
+            match tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(a))
+                .await
+            {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(e)) => Err(e.kind()),
+                Err(_) => Err(std::io::ErrorKind::TimedOut),
+            },
+        );
+    }
+    (false, out)
+}
 
 /// A problem answer as one line: its detail and hint (an older node's bare 404 gets a hint).
 fn problem_line(status: http::StatusCode, p: &Value) -> String {
@@ -1303,22 +1423,36 @@ async fn upgrade(api: &Api, a: UpgradeArgs) -> Result<Value, String> {
             p.detail
         }
     })?;
+    // REQ: OPS-014, AGT-003 — every request says why (an agent token's change must).
+    let api = &api.with_reason(
+        a.reason
+            .clone()
+            .unwrap_or_else(|| format!("telltale ctl upgrade --to {to}")),
+    );
     let view = match api.call_raw(http::Method::GET, "cluster", None).await {
         Ok(Ok(v)) => v,
         Ok(Err((status, v))) => {
             return Err(format!("GET /cluster: HTTP {status}: {}", s(&v, "detail")));
         }
         Err(e) if a.skip_if_unreachable => {
-            // REQ: OPS-014 (ADR-182) — loud: on a first install nothing answers yet, but on an
-            // upgrade this lets the chart's pods roll before the native nodes.
+            // REQ: OPS-014 (ADR-182) — only a first install is skipped: the API's name doesn't
+            // resolve yet, or nothing listens at its address. A timeout, a TLS failure, or packets
+            // a policy drops fail the run (they hide an upgrade's order, not a first install).
+            let (no_name, connects) = look_at(&api.base).await;
+            let Some(what) = first_install(no_name, &connects) else {
+                return Err(format!(
+                    "{e} (--skip-if-unreachable skips only a first install, where the API's name doesn't resolve or nothing listens at its address yet; this is something else)"
+                ));
+            };
+            // Loud: on an upgrade this lets the chart's pods roll before the native nodes.
             eprintln!(
-                "WARNING: nothing answered at the API ({e}), so no node was asked to upgrade \
-                 (--skip-if-unreachable). Expected on a first install; on an upgrade the chart's \
-                 pods now roll before the native nodes: check the API Service and run `telltale \
-                 ctl upgrade --to {to}` by hand."
+                "WARNING: nothing answered at the API ({what}: {e}), so no node was asked to \
+                 upgrade (--skip-if-unreachable). Expected on a first install; on an upgrade the \
+                 chart's pods now roll before the native nodes: check the API Service and run \
+                 `telltale ctl upgrade --to {to}` by hand."
             );
             return Ok(
-                json!({"to": to, "upgraded": [], "skipped": [], "note": format!("nothing to upgrade yet: {e}")}),
+                json!({"to": to, "upgraded": [], "skipped": [], "note": format!("nothing to upgrade yet ({what}): {e}")}),
             );
         }
         Err(e) => return Err(e),
@@ -1376,10 +1510,13 @@ async fn upgrade(api: &Api, a: UpgradeArgs) -> Result<Value, String> {
         }
     }
     plan.steps = ready;
-    if !blocked.is_empty() && !a.skip_down && !a.dry_run {
+    // REQ: OPS-014 (ADR-182) — a node that is up but can't take the request is set up wrong (its
+    // update service off, another channel, a run under way, a version it refuses for a day): it
+    // stops the run, with --skip-down too (that skips only nodes that are down).
+    if !blocked.is_empty() && !a.dry_run {
         let list: Vec<String> = blocked.iter().map(|(n, w)| format!("{n}: {w}")).collect();
         return Err(format!(
-            "nothing was asked: {} can't take the upgrade now ({}); fix {} or pass --skip-down",
+            "nothing was asked: {} can't take the upgrade now ({}); fix {} first (--skip-down skips only nodes that are down)",
             if blocked.len() == 1 {
                 "a node"
             } else {
@@ -1388,11 +1525,6 @@ async fn upgrade(api: &Api, a: UpgradeArgs) -> Result<Value, String> {
             list.join("; "),
             if blocked.len() == 1 { "it" } else { "them" }
         ));
-    }
-    if a.skip_down {
-        for (n, why) in std::mem::take(&mut blocked) {
-            plan.skipped.push((n, format!("{why} (--skip-down)")));
-        }
     }
     let skipped: Vec<Value> = plan
         .skipped
@@ -1442,14 +1574,31 @@ async fn upgrade(api: &Api, a: UpgradeArgs) -> Result<Value, String> {
             continue;
         }
         let id = r["pending"]["id"].as_str().unwrap_or_default().to_owned();
+        if id.is_empty() {
+            return Err(format!(
+                "{}: the node didn't say which request it wrote, so its outcome can't be followed: ask it again, or upgrade it by hand",
+                st.label
+            ));
+        }
+        // REQ: OPS-014 (ADR-182) — done only once the update service has recorded `updated` for
+        // this request (after its health gate) and the cluster view shows the node on the
+        // version, ready and in sync: a rollback inside the gate stops the run.
+        let mut updated = false;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let waited = started.elapsed();
             // The node restarts (and with it, for the primary, the API): failures are expected.
             if let Ok(u) = api.get(&path).await {
                 let last = &u["last"];
-                if !id.is_empty() && s(last, "id") == id {
+                if s(last, "id") == id {
                     match s(last, "state").as_str() {
+                        "updated" => updated = true,
+                        "up_to_date" => {
+                            skipped.push(
+                                json!({"node": st.label, "reason": format!("already on {to}")}),
+                            );
+                            continue 'nodes;
+                        }
                         // REQ: OPS-014 (ADR-182) — the build can't be fetched any more: with
                         // --skip-unavailable the node keeps its version and the run goes on.
                         "unavailable" if a.skip_unavailable => {
@@ -1492,15 +1641,16 @@ async fn upgrade(api: &Api, a: UpgradeArgs) -> Result<Value, String> {
                     ));
                 }
             }
-            let caught_up = if st.id == "local" {
-                api.get("system/info")
-                    .await
-                    .is_ok_and(|i| s(&i, "version") == to)
-            } else {
-                api.get("cluster")
-                    .await
-                    .is_ok_and(|v| upgraded(&v, &st.id, &to))
-            };
+            let caught_up = updated
+                && if st.id == "local" {
+                    api.get("system/info")
+                        .await
+                        .is_ok_and(|i| s(&i, "version") == to)
+                } else {
+                    api.get("cluster")
+                        .await
+                        .is_ok_and(|v| upgraded(&v, &st.id, &to))
+                };
             if caught_up {
                 let secs = started.elapsed().as_secs();
                 eprintln!("{}: on {to}, ready and in sync ({secs} s)", st.label);
@@ -1509,8 +1659,13 @@ async fn upgrade(api: &Api, a: UpgradeArgs) -> Result<Value, String> {
             }
             if waited > timeout {
                 return Err(format!(
-                    "{}: not back on {to}, ready and in sync after {} s: the nodes after it were not upgraded",
+                    "{}: {} after {} s: the nodes after it were not upgraded",
                     st.label,
+                    if updated {
+                        format!("not back on {to}, ready and in sync")
+                    } else {
+                        format!("its update service hasn't recorded {to} as installed and healthy")
+                    },
                     timeout.as_secs()
                 ));
             }
@@ -1934,6 +2089,7 @@ mod tests {
             .unwrap(),
             base: "http://127.0.0.1:8053/".into(),
             token: String::new(),
+            reason: None,
         };
         assert_eq!(api.url("lists"), "http://127.0.0.1:8053/api/v1/lists");
         assert_eq!(
@@ -2049,6 +2205,15 @@ mod tests {
                 ),
                 "is running on it",
             ),
+            // REQ: OPS-014 (ADR-182) — the node refuses a version that was rolled back (or
+            // failed) there in the last 24 hours: the run stops before any node is asked.
+            (
+                with(
+                    "last",
+                    json!({"state": "rolled_back", "to": "0.8.0", "at": at(now - 60_000)}),
+                ),
+                "24 hours",
+            ),
         ] {
             match preflight(&u, "0.8.0", now) {
                 Preflight::Block(w) => assert!(w.contains(why), "{w}"),
@@ -2065,11 +2230,25 @@ mod tests {
             json!({"state": "installing", "to": "0.8.0", "at": at(now - INSTALLING_MS - 1)}),
         );
         assert_eq!(preflight(&stale, "0.8.0", now), Preflight::Ready);
+        // A rollback of another version, or one more than a day ago, doesn't hold this one off.
+        for last in [
+            json!({"state": "rolled_back", "to": "0.8.1", "at": at(now - 60_000)}),
+            json!({"state": "failed", "to": "0.8.0", "at": at(now - 25 * 3_600_000)}),
+        ] {
+            assert_eq!(
+                preflight(&with("last", last.clone()), "0.8.0", now),
+                Preflight::Ready,
+                "{last}"
+            );
+        }
     }
 
     /// A fake API: `versions` per node; a POST "installs" by moving the node to the version
-    /// (or fails it when the node is in `fail`). A node in `disabled` has its update service
-    /// off. `calls` has every request to a node's update route, in order.
+    /// and its update service then says `updated` (or fails it when the node is in `fail`). A
+    /// node in `disabled` has its update service off; one in `down` is down in the cluster view.
+    /// A node in `rolled_back` shows the new version, up and ready, at once (the view before the
+    /// health gate is done), says `installing` at the first read and `rolled_back` after it.
+    /// `calls` has every request to a node's update route, in order.
     #[derive(Default)]
     struct FakeCluster {
         versions: std::sync::Mutex<Vec<(String, String)>>,
@@ -2078,13 +2257,17 @@ mod tests {
         fail: Vec<String>,
         disabled: Vec<String>,
         unavailable: Vec<String>,
+        rolled_back: Vec<String>,
+        down: Vec<String>,
     }
 
+    #[allow(clippy::too_many_lines)] // one fake API: its three routes and their answers
     async fn fake_api(f: Arc<FakeCluster>) -> String {
         use axum::extract::{Path as P, State};
         use axum::routing::get;
         let reply = |v: Value| {
             (
+                http::StatusCode::OK,
                 [(http::header::CONTENT_TYPE, "application/json")],
                 v.to_string(),
             )
@@ -2102,7 +2285,7 @@ mod tests {
                         id,
                         if id == "c0" { "primary" } else { "replica" },
                         v,
-                        true,
+                        !f.down.contains(id),
                         pod,
                     )
                 })
@@ -2112,11 +2295,29 @@ mod tests {
         let status = move |State(f): State<Arc<FakeCluster>>, P(id): P<String>| async move {
             f.calls.lock().unwrap().push(format!("GET {id}"));
             let asked = f.asked.lock().unwrap().contains(&id);
+            // Reads of this node since it was asked (this one included).
+            let reads = {
+                let calls = f.calls.lock().unwrap();
+                let (post, get) = (format!("POST {id}"), format!("GET {id}"));
+                calls
+                    .iter()
+                    .rposition(|c| *c == post)
+                    .map_or(0, |i| calls[i..].iter().filter(|c| **c == get).count())
+            };
             let last = if f.fail.contains(&id) && asked {
                 json!({"id": "r-1", "state": "failed", "error": "checksum mismatch"})
             } else if f.unavailable.contains(&id) && asked {
                 json!({"id": "r-1", "state": "unavailable",
                        "error": "the edge channel now serves 0.8.0-edge.9 (commit abc1234), not 0.8.0-edge.5"})
+            } else if f.rolled_back.contains(&id) && asked {
+                if reads <= 1 {
+                    json!({"id": "r-1", "state": "installing"})
+                } else {
+                    json!({"id": "r-1", "state": "rolled_back",
+                           "error": "0.8.0 wasn't healthy after the restart (status 503); 0.7.0 is back and running"})
+                }
+            } else if asked {
+                json!({"id": "r-1", "state": "updated"})
             } else {
                 Value::Null
             };
@@ -2131,8 +2332,24 @@ mod tests {
             reply(json!({"node": id, "version": version, "install": "native",
                          "enabled": !f.disabled.contains(&id), "last": last}))
         };
-        let post = move |State(f): State<Arc<FakeCluster>>, P(id): P<String>, body: String| async move {
+        let post = move |State(f): State<Arc<FakeCluster>>,
+                         P(id): P<String>,
+                         headers: http::HeaderMap,
+                         body: String| async move {
             f.calls.lock().unwrap().push(format!("POST {id}"));
+            // REQ: OPS-014, AGT-003 — as the API answers an agent token's change that doesn't
+            // say why (the chart's hook holds one): 400, nothing asked.
+            if headers
+                .get("x-telltale-reason")
+                .is_none_or(|r| r.as_bytes().trim_ascii().is_empty())
+            {
+                return (
+                    http::StatusCode::BAD_REQUEST,
+                    [(http::header::CONTENT_TYPE, "application/problem+json")],
+                    json!({"code": "invalid", "detail": "agents must say why they change something"})
+                        .to_string(),
+                );
+            }
             let to = serde_json::from_str::<Value>(&body).unwrap()["to"]
                 .as_str()
                 .unwrap()
@@ -2167,6 +2384,7 @@ mod tests {
             skip_unavailable: false,
             skip_if_unreachable: false,
             dry_run: false,
+            reason: None,
         }
     }
 
@@ -2181,9 +2399,179 @@ mod tests {
             asked: std::sync::Mutex::default(),
             calls: std::sync::Mutex::default(),
             fail: fail.iter().map(|n| (*n).to_owned()).collect(),
-            disabled: Vec::new(),
-            unavailable: Vec::new(),
+            ..FakeCluster::default()
         })
+    }
+
+    /// REQ: OPS-014, AGT-003 (ADR-182) — `ctl upgrade` with an agent token (as the chart's hook
+    /// runs it: `analytics:read` and `cluster:upgrade`) against the real API router: its reads
+    /// pass (the cluster, the node's info and update state: here the node has no update service,
+    /// so the pre-flight stops the run), a dry run works, and its request says why, so it isn't
+    /// refused as an agent's change without a reason (400). The audit keeps the reason.
+    #[tokio::test]
+    async fn ops_014_ctl_upgrade_works_with_an_agent_token() {
+        use telltale_api::auth::{self, Auth, Role};
+        let dir = tempfile::tempdir().unwrap();
+        let mut sources = crate::http::tests::sources_in(dir.path());
+        let mut file = telltale_config::Config::default();
+        file.node.data_dir =
+            telltale_config::SafeString::new(dir.path().to_str().unwrap()).unwrap();
+        sources.file_config = arc_swap::ArcSwap::from_pointee(file.clone());
+        sources.config = arc_swap::ArcSwap::from_pointee(file);
+        let state =
+            Arc::new(telltale_store::state::State::open(&dir.path().join("state.db")).unwrap());
+        let auth = Arc::new(Auth::new(state, auth::Settings::default()));
+        let src = Arc::new(sources);
+        let _ = src.auth.set(Arc::clone(&auth));
+        let now = crate::maintenance::now_ms() / 1000;
+        let root = auth
+            .create_user("root", "correct horse battery", Role::Admin, false, now)
+            .unwrap();
+        let (id, secret) = (auth::crypto::random_id(), auth::crypto::random_secret());
+        auth.state()
+            .create_token(
+                &id,
+                root.id,
+                "hook",
+                &auth::crypto::secret_hash(&secret),
+                "admin",
+                None,
+                now,
+            )
+            .unwrap();
+        auth.state()
+            .set_token_agent(&id, "analytics:read cluster:upgrade", None, None)
+            .unwrap();
+        let token = format!("tt_{id}_{secret}");
+        let app = telltale_api::router(
+            Arc::new(crate::api_backend::ApiBackend {
+                src: Arc::clone(&src),
+            }),
+            Arc::clone(&auth),
+        );
+        let addr = crate::http::serve("127.0.0.1:0".parse().unwrap(), app, std::future::pending())
+            .await
+            .unwrap();
+        let base = format!("http://{addr}");
+        // The reads: the run gets to the pre-flight, which finds the update service off.
+        let e = run(
+            &base,
+            None,
+            &token,
+            CtlCommand::Upgrade(args("0.8.1")),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            e.contains("nothing was asked") && e.contains("update service is off"),
+            "{e}"
+        );
+        let mut dry = args("0.8.1");
+        dry.dry_run = true;
+        let out = run(&base, None, &token, CtlCommand::Upgrade(dry), false)
+            .await
+            .unwrap();
+        assert!(out.contains("update service is off"), "{out}");
+        // The request: with the reason the upgrade sends, the node answers (a local build here:
+        // `update_unsupported`); without one, the API refuses the agent's change.
+        let api = Api {
+            client: client(None).unwrap(),
+            base: base.clone(),
+            token: token.clone(),
+            reason: None,
+        };
+        let body = json!({"to": "0.8.1"});
+        let (status, p) = api
+            .call_raw(http::Method::POST, "nodes/local/update", Some(&body))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{p}");
+        assert!(s(&p, "detail").contains("say why"), "{p}");
+        let api = api.with_reason("telltale ctl upgrade --to 0.8.1".into());
+        let (status, p) = api
+            .call_raw(http::Method::POST, "nodes/local/update", Some(&body))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            (status, s(&p, "code").as_str()),
+            (http::StatusCode::CONFLICT, "update_unsupported"),
+            "{p}"
+        );
+        let audit = auth.state().audit_page(None, 100, None, None).unwrap();
+        assert!(
+            audit.iter().any(|e| e.action == "node.update.refused"
+                && e.reason.as_deref() == Some("telltale ctl upgrade --to 0.8.1")),
+            "{audit:?}"
+        );
+    }
+
+    /// REQ: OPS-014 (ADR-182) — `--skip-if-unreachable` skips only a first install: a name that
+    /// doesn't exist, or every address refusing the connection. A lookup that failed another way,
+    /// a timeout, or an address that answers (the failure was TLS or HTTP) is no first install.
+    #[test]
+    fn ops_014_only_a_first_install_is_skipped() {
+        use std::io::ErrorKind::{ConnectionRefused, TimedOut};
+        assert!(first_install(true, &[]).is_some());
+        assert!(first_install(false, &[Err(ConnectionRefused)]).is_some());
+        assert!(first_install(false, &[Err(ConnectionRefused), Err(ConnectionRefused)]).is_some());
+        assert!(
+            first_install(false, &[]).is_none(),
+            "a lookup that failed otherwise"
+        );
+        assert!(
+            first_install(false, &[Err(TimedOut)]).is_none(),
+            "a timeout or a drop"
+        );
+        assert!(first_install(false, &[Err(ConnectionRefused), Err(TimedOut)]).is_none());
+        assert!(
+            first_install(false, &[Ok(())]).is_none(),
+            "it answers: TLS or HTTP failed"
+        );
+        for (m, nx) in [
+            (
+                "failed to lookup address information: Name or service not known",
+                true,
+            ),
+            (
+                "failed to lookup address information: Name does not resolve",
+                true,
+            ),
+            (
+                "failed to lookup address information: Temporary failure in name resolution",
+                false,
+            ),
+            ("failed to lookup address information: Try again", false),
+        ] {
+            assert_eq!(no_such_name(&std::io::Error::other(m)), nx, "{m}");
+        }
+    }
+
+    /// REQ: OPS-014 (ADR-182) — a node is done only once its update service has recorded
+    /// `updated` for this request, not as soon as the cluster view shows it on the version and
+    /// ready: the health gate runs after that, and a rollback inside it stops the run before the
+    /// next node is asked.
+    #[tokio::test]
+    async fn ops_014_ctl_waits_for_updated_and_stops_at_a_late_rollback() {
+        let f = Arc::new(FakeCluster {
+            rolled_back: vec!["dns-01".into()],
+            ..Arc::into_inner(fake(&["c0", "dns-01", "dns-02"], &[])).unwrap()
+        });
+        let base = fake_api(Arc::clone(&f)).await;
+        let e = run(&base, None, "t", CtlCommand::Upgrade(args("0.8.0")), false)
+            .await
+            .unwrap_err();
+        assert!(
+            e.contains("dns-01") && e.contains("rolled_back") && e.contains("status 503"),
+            "{e}"
+        );
+        assert_eq!(
+            *f.asked.lock().unwrap(),
+            vec!["dns-01"],
+            "dns-02 is never asked"
+        );
     }
 
     /// REQ: OPS-014 (ADR-182) — a node behind a pinned edge build that can't be fetched any more
@@ -2255,7 +2643,8 @@ mod tests {
 
     /// REQ: OPS-014 (ADR-182) — pre-flight: every planned node is read before any is asked, and
     /// one that can't take the request (here its update service is off) stops the run with
-    /// nothing asked, the error naming it; `--skip-down` leaves it out and goes on.
+    /// nothing asked, the error naming it, with `--skip-down` too: that skips only nodes that
+    /// are down, and a node set up wrong isn't one. A node that is down is left out with it.
     #[tokio::test]
     async fn ops_014_a_node_that_cant_take_the_upgrade_stops_the_run_before_any_is_asked() {
         let f = Arc::new(FakeCluster {
@@ -2276,17 +2665,31 @@ mod tests {
             vec!["GET dns-01", "GET dns-02"],
             "only the pre-flight reads"
         );
-        // --skip-down: dns-02 is left out, dns-01 is upgraded.
-        let mut a = args("0.8.0");
-        a.skip_down = true;
-        let out = run(&base, None, "t", CtlCommand::Upgrade(a), false)
+        // --skip-down doesn't skip it: its update service is off, it isn't down.
+        let skip_down = || {
+            let mut a = args("0.8.0");
+            a.skip_down = true;
+            a
+        };
+        let e = run(&base, None, "t", CtlCommand::Upgrade(skip_down()), false)
+            .await
+            .unwrap_err();
+        assert!(
+            e.contains("nothing was asked") && e.contains("dns-02") && e.contains("off"),
+            "{e}"
+        );
+        assert!(f.asked.lock().unwrap().is_empty(), "no node was asked");
+        // A node that is down: --skip-down leaves it out, and dns-01 is upgraded.
+        let f = Arc::new(FakeCluster {
+            down: vec!["dns-02".into()],
+            ..Arc::into_inner(fake(&["c0", "dns-01", "dns-02"], &[])).unwrap()
+        });
+        let base = fake_api(Arc::clone(&f)).await;
+        let out = run(&base, None, "t", CtlCommand::Upgrade(skip_down()), false)
             .await
             .unwrap();
         assert_eq!(*f.asked.lock().unwrap(), vec!["dns-01"]);
-        assert!(
-            out.contains("dns-02 (dns-02): its update service is off"),
-            "{out}"
-        );
+        assert!(out.contains("dns-02 (dns-02): down (--skip-down)"), "{out}");
     }
 
     /// REQ: OPS-014 — `ctl upgrade` asks one node at a time, waits for each to be back on the

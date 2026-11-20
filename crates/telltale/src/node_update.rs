@@ -29,7 +29,10 @@ use serde::{Deserialize, Serialize};
 use telltale_api::NodeUpdateCall;
 use telltale_api::model::{NodeUpdate, NodeUpdatePending, NodeUpdateRun};
 use telltale_api::problem::{Code, Problem};
-use telltale_api::update_api::{CHANNEL_HINT, check_version, is_edge, same_channel, version_key};
+use telltale_api::update_api::{
+    CHANNEL_ENV, CHANNEL_HINT, FAILED_RECENTLY_HINT, FAILED_RECENTLY_MS, channel_takes,
+    check_version, is_edge, node_channel, version_key,
+};
 use telltale_cluster::net::Cluster;
 use tracing::{info, warn};
 
@@ -53,8 +56,13 @@ const STALE_RPC_MS: u64 = 30_000;
 const STALE_REQUEST_MS: u64 = 3_600_000;
 /// The largest request file the update service reads.
 const MAX_REQUEST: u64 = 4096;
-/// The longest `by` kept.
+/// The longest asker's name taken (a user's, or the one a peer sends), before a peer's
+/// " via <node> (unverified)" is added to it.
 const MAX_BY: usize = 200;
+/// The longest node label added after " via ".
+const MAX_VIA: usize = 96;
+/// The longest `by` a request holds: [`MAX_BY`] with a peer's marker after it.
+const MAX_BY_STORED: usize = MAX_BY + MAX_VIA + 20;
 
 /// `<data_dir>/update/request.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,18 +75,71 @@ pub(crate) struct RequestFile {
 }
 
 /// [`RESULT_PATH`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ResultFile {
     pub(crate) id: String,
     pub(crate) to: String,
     pub(crate) from: String,
-    /// `installing`, `updated`, `up_to_date`, `failed`, or `refused`.
+    /// `installing`, `updated`, `up_to_date`, `rolled_back`, `unavailable`, `failed`, or
+    /// `refused`.
     pub(crate) state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) error: Option<String>,
+    /// For `updated`: how the new build's health was checked, or why it wasn't.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) health: Option<String>,
+    /// As the node wrote it in the request (the update service can't check who asked).
     pub(crate) by: String,
+    /// Always `false`: `by` is the node's word for it, unverified.
+    #[serde(default)]
+    pub(crate) by_verified: bool,
     pub(crate) at_ms: u64,
+    /// REQ: OPS-014 (ADR-182) — the latest run that ended `rolled_back` or `failed`, kept through
+    /// the runs after it (a refusal doesn't wipe it): its version isn't asked for again for
+    /// [`FAILED_RECENTLY_MS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_failure: Option<Failure>,
+}
+
+/// A run that ended `rolled_back` or `failed`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Failure {
+    pub(crate) to: String,
+    pub(crate) state: String,
+    pub(crate) at_ms: u64,
+}
+
+impl ResultFile {
+    /// This run if it ended `rolled_back` or `failed`, else the one it kept.
+    fn failure(&self) -> Option<Failure> {
+        if matches!(self.state.as_str(), "rolled_back" | "failed") {
+            return Some(Failure {
+                to: self.to.clone(),
+                state: self.state.clone(),
+                at_ms: self.at_ms,
+            });
+        }
+        self.last_failure.clone()
+    }
+}
+
+/// REQ: OPS-014 (ADR-182) — whether `to` failed on this node in the last day (`last`: the latest
+/// result): why, for a refusal.
+fn failed_recently(last: Option<&ResultFile>, to: &str, now: u64) -> Option<String> {
+    let f = last?.failure()?;
+    (f.to == to && now.saturating_sub(f.at_ms) < FAILED_RECENTLY_MS).then(|| {
+        format!(
+            "{to} was {} here {} min ago: it isn't asked for again for 24 hours after that",
+            if f.state == "failed" {
+                "tried and failed"
+            } else {
+                "rolled back"
+            },
+            now.saturating_sub(f.at_ms) / 60_000
+        )
+    })
 }
 
 /// A request on the cluster channel: the call and when the entry node sent it.
@@ -106,6 +167,9 @@ pub(crate) struct Here {
     pub(crate) install: String,
     /// The update service is enabled.
     pub(crate) enabled: bool,
+    /// REQ: OPS-014 (ADR-182) — the channel set for this node ([`CHANNEL_ENV`] in its unit,
+    /// written by `install.sh`); `None` on an install from before it (its version's, then).
+    pub(crate) channel: Option<String>,
     pub(crate) data_dir: PathBuf,
     pub(crate) result: PathBuf,
 }
@@ -118,6 +182,7 @@ impl Here {
             version: crate::build_info::VERSION.to_owned(),
             install: crate::build_info::install_type().to_owned(),
             enabled: Path::new(ENABLED_LINK).exists(),
+            channel: std::env::var(CHANNEL_ENV).ok(),
             data_dir: PathBuf::from(src.config.load().node.data_dir.as_str()),
             result: PathBuf::from(RESULT_PATH),
         }
@@ -126,6 +191,12 @@ impl Here {
     /// REQ: OPS-014 (ADR-182) — `<data_dir>/update/request.json`, where the units look.
     pub(crate) fn request_path(&self) -> PathBuf {
         self.data_dir.join(REQUEST_DIR).join(REQUEST_FILE)
+    }
+
+    /// REQ: OPS-014 (ADR-182) — the channel this node follows: the one set for it, or its
+    /// version's.
+    fn channel(&self) -> &'static str {
+        node_channel(self.channel.as_deref(), &self.version)
     }
 }
 
@@ -150,6 +221,7 @@ pub(crate) fn status(h: &Here) -> NodeUpdate {
         from: r.from,
         state: r.state,
         error: r.error,
+        health: r.health,
         by: r.by,
         at: rfc3339(r.at_ms),
     });
@@ -157,6 +229,7 @@ pub(crate) fn status(h: &Here) -> NodeUpdate {
         node: h.node.clone(),
         version: h.version.clone(),
         install: h.install.clone(),
+        channel: Some(h.channel().to_owned()),
         enabled: h.enabled,
         state: None,
         pending,
@@ -164,9 +237,9 @@ pub(crate) fn status(h: &Here) -> NodeUpdate {
     }
 }
 
-/// REQ: OPS-014 — whether this node can take `to`, and if so the request to hand over (`None`:
-/// it already runs `to`).
-pub(crate) fn plan(h: &Here, to: &str) -> Result<Option<String>, Problem> {
+/// REQ: OPS-014 — whether this node can take `to` now (`now`: for a version that failed here in
+/// the last day), and if so the request to hand over (`None`: it already runs `to`).
+pub(crate) fn plan(h: &Here, to: &str, now: u64) -> Result<Option<String>, Problem> {
     let to = check_version(to)?;
     if h.install != "native" {
         let (what, hint) = if h.install == "helm" {
@@ -212,10 +285,19 @@ pub(crate) fn plan(h: &Here, to: &str) -> Result<Option<String>, Problem> {
         )));
     }
     // REQ: OPS-014 (ADR-182) — never a channel change: checked here (for the API on this node
-    // and for the cluster RPC alike) and again by the update service.
-    if let Err(why) = same_channel(&h.version, &to) {
+    // and for the cluster RPC alike) and again by the update service, against the channel set
+    // for the node (an edge node that took a release stays on edge).
+    if let Err(why) = channel_takes(h.channel(), &to) {
         return Err(
             Problem::new(Code::UpdateChannel, format!("{}: {why}", h.node)).hint(CHANNEL_HINT),
+        );
+    }
+    // REQ: OPS-014 (ADR-182) — a version rolled back or failed here in the last day isn't
+    // installed again from a request (checked again by the update service).
+    if let Some(why) = failed_recently(read_json::<ResultFile>(&h.result).as_ref(), &to, now) {
+        return Err(
+            Problem::new(Code::UpdateFailedRecently, format!("{}: {why}", h.node))
+                .hint(FAILED_RECENTLY_HINT),
         );
     }
     if !h.enabled {
@@ -223,25 +305,25 @@ pub(crate) fn plan(h: &Here, to: &str) -> Result<Option<String>, Problem> {
             Code::UpdateNotEnabled,
             format!("{}'s update service is off, so nothing would install {to}", h.node),
         )
-        .hint("On the node, as root: systemctl enable --now telltale-update.path (install.sh adds it; re-run install.sh to add it to an older install)."));
+        .hint("On the node, as root: systemctl enable --now telltale-update.path (install.sh --cluster-updates adds and enables it; on a node on edge builds, give it --edge too)."));
     }
     Ok(Some(to))
 }
 
 /// REQ: OPS-014 — hands `to` to this node's update service (or answers that it runs it).
 pub(crate) fn request(h: &Here, to: &str, by: &str, now: u64) -> Result<NodeUpdate, Problem> {
-    let Some(to) = plan(h, to)? else {
+    let Some(to) = plan(h, to, now)? else {
         let mut s = status(h);
         s.state = Some("up_to_date".into());
         return Ok(s);
     };
-    if let Some(busy) = in_progress(h, now) {
+    if let Some(busy) = in_progress(h, now, true) {
         return Err(busy);
     }
     let r = RequestFile {
         id: format!("{now:x}-{:08x}", rand::random::<u32>()),
         to: to.clone(),
-        by: by.chars().take(MAX_BY).collect(),
+        by: by.chars().take(MAX_BY_STORED).collect(),
         requested_ms: now,
     };
     // REQ: OPS-014 (ADR-182) — the request's own folder (0750, this node's user's), the only
@@ -259,20 +341,41 @@ pub(crate) fn request(h: &Here, to: &str, by: &str, now: u64) -> Result<NodeUpda
         }
     }
     info!(to = %to, by = %r.by, "update: requested {to} (the update service installs it and restarts this node)");
+    Ok(requested(h, &r))
+}
+
+/// REQ: OPS-014 (ADR-182) — the answer to a request: `pending` is the request as written (its
+/// id is what `ctl upgrade` follows), never read back from the file, which the update service
+/// may have taken already.
+pub(crate) fn requested(h: &Here, r: &RequestFile) -> NodeUpdate {
     let mut s = status(h);
+    s.pending = Some(NodeUpdatePending {
+        id: r.id.clone(),
+        to: r.to.clone(),
+        by: r.by.clone(),
+        requested_at: rfc3339(r.requested_ms),
+    });
     s.state = Some("requested".into());
-    Ok(s)
+    s
+}
+
+/// REQ: OPS-014 (ADR-182) — what a peer's request says asked: the user it names (cut to
+/// [`MAX_BY`]) and the node it came through, marked as unverified (the marker always fits).
+pub(crate) fn peer_by(by: &str, via: &str) -> String {
+    let by: String = by.chars().take(MAX_BY).collect();
+    let via: String = via.chars().take(MAX_VIA).collect();
+    format!("{by} via {via} (unverified)")
 }
 
 /// REQ: OPS-014, AGT-002 (ADR-182) — every check [`request`] makes, and what it would do
-/// (`would_request`, or `up_to_date`), with nothing written.
+/// (`would_request`, or `up_to_date`), with nothing written or removed.
 pub(crate) fn dry_run(h: &Here, to: &str, now: u64) -> Result<NodeUpdate, Problem> {
     let mut s = status(h);
-    if plan(h, to)?.is_none() {
+    if plan(h, to, now)?.is_none() {
         s.state = Some("up_to_date".into());
         return Ok(s);
     }
-    if let Some(busy) = in_progress(h, now) {
+    if let Some(busy) = in_progress(h, now, false) {
         return Err(busy);
     }
     s.state = Some("would_request".into());
@@ -294,8 +397,9 @@ fn busy_waiting(h: &Here) -> Problem {
 
 /// REQ: OPS-014 (ADR-182) — one at a time per node: a request waiting for the update service, or
 /// a run that says `installing` and isn't older than [`RUNNING_MS`], holds a new one off. A
-/// request older than the update service would take (an hour) is dead, and is replaced.
-fn in_progress(h: &Here, now: u64) -> Option<Problem> {
+/// request older than the update service would take (an hour) is dead: with `clear` it is
+/// removed (a request replaces it), never by a dry run.
+fn in_progress(h: &Here, now: u64, clear: bool) -> Option<Problem> {
     let path = h.request_path();
     if let Ok(meta) = std::fs::symlink_metadata(&path) {
         let at = read_json::<RequestFile>(&path)
@@ -309,7 +413,7 @@ fn in_progress(h: &Here, now: u64) -> Option<Problem> {
             return Some(busy_waiting(h));
         }
         // Dead: the update service would refuse it. Only a file of ours is removed here.
-        if meta.file_type().is_file() {
+        if clear && meta.file_type().is_file() {
             let _ = std::fs::remove_file(&path);
         }
     }
@@ -474,7 +578,7 @@ pub(crate) async fn send(
             },
         )
         .hint(if older {
-            "Upgrade it by hand this once (as root: telltale self-update --restart), then enable telltale-update.path."
+            "Upgrade it by hand this once, on its own channel (as root: telltale self-update --restart for releases, telltale self-update --channel edge --restart for edge builds), then add the update service: sh install.sh --cluster-updates (with --edge on an edge node)."
         } else {
             "The node installs the version itself, so it must be up. Check the Cluster page."
         })
@@ -490,8 +594,9 @@ pub(crate) async fn send(
 }
 
 /// REQ: OPS-014 (ADR-182) — a peer's call for this node: applied and, for a request, audited
-/// here with the entry node. `ephemeral`: the peer is an ephemeral member or one the registry
-/// doesn't list (`federated::rpc_handler`), which may read but never ask for an install.
+/// here with the entry node (refused ones too). `ephemeral`: the peer is an ephemeral member or
+/// one the registry doesn't list (`federated::rpc_handler`), which gets nothing, not even a read
+/// (the state names who asked and the errors), as for maintenance.
 pub(crate) fn handle(
     src: &crate::http::Sources,
     cluster: &Cluster,
@@ -501,15 +606,6 @@ pub(crate) fn handle(
 ) -> Result<Vec<u8>, String> {
     let Envelope { call, sent_ms } =
         serde_json::from_slice(body).map_err(|e| format!("bad update request: {e}"))?;
-    // REQ: OPS-014, CLU-009 (ADR-182, ADR-058) — as for maintenance, rollouts, removals,
-    // simulations and drills: an ephemeral member serves no UI, so no user is behind a request
-    // from it (nor from a peer the registry doesn't list).
-    if ephemeral && !matches!(call, NodeUpdateCall::Status) {
-        return Err("an ephemeral member can't change this node's state".into());
-    }
-    if now_ms() > sent_ms.saturating_add(STALE_RPC_MS) {
-        return Err("the request is too old; the node that sent it gave up on it".into());
-    }
     let via = cluster
         .members()
         .into_iter()
@@ -517,13 +613,41 @@ pub(crate) fn handle(
         .map(|m| if m.pod.is_empty() { m.site } else { m.pod })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| peer.to_owned());
+    let actor = || telltale_api::auth::Actor {
+        name: format!("node {via}"),
+        kind: "cluster",
+        remote: Some(format!("node {peer}")),
+        reason: None,
+    };
+    // A request refused before it reaches the node's checks is audited too.
+    let refuse = |why: &str| -> Result<Vec<u8>, String> {
+        if let (NodeUpdateCall::Request { to, by }, Some(auth)) = (&call, src.auth.get()) {
+            auth.record(
+                &actor(),
+                "node.update.refused",
+                &crate::maintenance::label(src),
+                &serde_json::json!({ "to": to, "reason": why, "by": by, "byVerified": false }),
+            );
+        }
+        Err(why.to_owned())
+    };
+    // REQ: OPS-014, CLU-009 (ADR-182, ADR-058) — as for maintenance: an ephemeral member serves
+    // no UI, so no user is behind a call from it (nor from a peer the registry doesn't list).
+    if ephemeral {
+        return refuse(
+            "an ephemeral member, or a peer the registry doesn't list, can't read or change this node's update state",
+        );
+    }
+    if now_ms() > sent_ms.saturating_add(STALE_RPC_MS) {
+        return refuse("the request is too old; the node that sent it gave up on it");
+    }
     // Only the sender (`via`, its stream's certificate) is checked here; the user is the
     // entry node's word for it, so the audit names the node and keeps the user as unverified.
     let (call, said) = match call {
         NodeUpdateCall::Request { to, by } => (
             NodeUpdateCall::Request {
                 to,
-                by: format!("{by} via {via} (unverified)"),
+                by: peer_by(&by, &via),
             },
             Some(by),
         ),
@@ -536,12 +660,7 @@ pub(crate) fn handle(
     };
     let r = apply_here(src, call);
     if let (Some(said), Some(auth)) = (said, src.auth.get()) {
-        let actor = telltale_api::auth::Actor {
-            name: format!("node {via}"),
-            kind: "cluster",
-            remote: Some(format!("node {peer}")),
-            reason: None,
-        };
+        let actor = actor();
         match &r {
             Ok(res) => auth.record(
                 &actor,
@@ -583,12 +702,25 @@ pub(crate) fn served_ok(state: &str) -> bool {
 /// REQ: OPS-014 (ADR-182) — what the update service does on its host, beyond reading the request
 /// and recording the result: injected, so every step and its order can be tested.
 pub(crate) trait Host {
+    /// REQ: OPS-014 (ADR-182) — the channel set for the node and this service
+    /// (`TELLTALE_UPDATE_CHANNEL` in the unit): `None` where it isn't set (the installed
+    /// version's channel, then).
+    fn channel(&self) -> Option<String> {
+        None
+    }
+    /// REQ: OPS-014 (ADR-182) — what must hold on the host before anything is fetched: the
+    /// install location is root's alone, and the health check's address is one it may use.
+    /// `Err` says what doesn't (the run is refused, nothing changed).
+    fn ready(&mut self) -> Result<(), String> {
+        Ok(())
+    }
     /// Installs `to` (the signed, pinned self-update in production).
     fn install(&mut self, to: &str) -> Result<crate::selfupdate::Outcome, String>;
-    /// Restarts the node (`systemctl restart telltale`).
+    /// Restarts the node (`systemctl restart telltale`), bounded.
     fn restart(&mut self) -> Result<(), String>;
-    /// Waits, bounded, for the restarted node to be healthy; `Err` says how it wasn't.
-    fn healthy(&mut self) -> Result<(), String>;
+    /// Waits, bounded, for the restarted node to be healthy: how it was checked (or why it
+    /// wasn't); `Err` says how it wasn't healthy.
+    fn healthy(&mut self) -> Result<String, String>;
     /// Puts `previous` (the binary the install kept) back in place.
     fn restore(&mut self, previous: &Path) -> Result<(), String>;
 }
@@ -681,10 +813,13 @@ fn take_request(_: &Path) -> Result<Option<Vec<u8>>, String> {
     Err(NOT_A_REQUEST.to_owned())
 }
 
-/// Checks a request the update service read, against the version installed now.
+/// Checks a request the update service read, against the version installed now, the node's
+/// channel, and its last run (`last`).
 fn check_request(
     body: &[u8],
     current: &str,
+    channel: &str,
+    last: Option<&ResultFile>,
     now: u64,
 ) -> Result<RequestFile, (RequestFile, String)> {
     let r: RequestFile = serde_json::from_slice(body).map_err(|_| {
@@ -705,7 +840,7 @@ fn check_request(
     if !id_ok {
         return bad("the request's id is malformed".into());
     }
-    if r.by.chars().count() > MAX_BY || r.by.chars().any(char::is_control) {
+    if r.by.chars().count() > MAX_BY_STORED || r.by.chars().any(char::is_control) {
         return bad("the request's `by` is malformed".into());
     }
     if r.requested_ms.saturating_add(STALE_REQUEST_MS) < now
@@ -738,7 +873,12 @@ fn check_request(
             r.to
         ));
     }
-    if let Err(why) = same_channel(current, &r.to) {
+    // REQ: OPS-014 (ADR-182) — the channel set for the node, not its version's: a stable node
+    // takes only a release, an edge node both (and stays on edge).
+    if let Err(why) = channel_takes(channel, &r.to) {
+        return bad(why);
+    }
+    if let Some(why) = failed_recently(last, &r.to, now) {
         return bad(why);
     }
     Ok(r)
@@ -747,8 +887,9 @@ fn check_request(
 /// REQ: OPS-014 (ADR-182) — the update service's run: reads and removes the request at
 /// `request`, checks it, records `installing` and then the outcome in `result`, and installs with
 /// `host`. With `restart`, it then restarts the node and waits for it to be healthy; if it isn't,
-/// it puts the previous binary back and restarts once more (one attempt: `rolled_back`, or
-/// `failed` if that isn't healthy either). `current` is the installed version.
+/// it puts the previous binary back and restarts once more (one attempt: `rolled_back`, whether
+/// or not that one's check passes; `failed` if the previous binary can't be put back). `current`
+/// is the installed version.
 pub(crate) fn serve_request(
     request: &Path,
     result: &Path,
@@ -757,15 +898,26 @@ pub(crate) fn serve_request(
     restart: bool,
     host: &mut impl Host,
 ) -> Served {
-    let record = |r: &RequestFile, state: &str, error: Option<String>| {
+    // The last run's outcome: a failure it keeps (a version refused for a day after it).
+    let before = read_json::<ResultFile>(result);
+    let kept = before.as_ref().and_then(ResultFile::failure);
+    let record = |r: &RequestFile, state: &str, error: Option<String>, health: Option<String>| {
         let out = ResultFile {
             id: r.id.clone(),
             to: r.to.clone(),
             from: current.to_owned(),
             state: state.to_owned(),
             error,
+            health,
             by: r.by.clone(),
+            by_verified: false,
             at_ms: now_ms().max(now),
+            // This run is the failure to keep when it is one.
+            last_failure: if matches!(state, "rolled_back" | "failed") {
+                None
+            } else {
+                kept.clone()
+            },
         };
         if let Some(dir) = result.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -788,88 +940,107 @@ pub(crate) fn serve_request(
         Ok(Some(b)) => b,
         Err(e) => {
             warn!("update: {e}");
-            record(&blank, "refused", Some(e));
+            record(&blank, "refused", Some(e), None);
             return done("refused");
         }
     };
-    let r = match check_request(&body, current, now) {
+    let channel = node_channel(host.channel().as_deref(), current);
+    let r = match check_request(&body, current, channel, before.as_ref(), now) {
         Ok(r) => r,
         Err((r, why)) => {
             warn!("update: refused: {why}");
-            record(&r, "refused", Some(why));
+            record(&r, "refused", Some(why), None);
             return done("refused");
         }
     };
     if version_key(&r.to) == version_key(current) {
-        record(&r, "up_to_date", None);
+        record(&r, "up_to_date", None, None);
         return done("up_to_date");
     }
-    info!(to = %r.to, by = %r.by, "update: installing {} (was {current})", r.to);
-    record(&r, "installing", None);
+    // REQ: OPS-014 (ADR-182) — the host is set up for it, or nothing is fetched.
+    if let Err(why) = host.ready() {
+        warn!("update: refused: {why}");
+        record(&r, "refused", Some(why), None);
+        return done("refused");
+    }
+    // `by` is the node's word for who asked: the journal says so.
+    info!(
+        to = %r.to, by_unverified = %r.by,
+        "update: installing {} (was {current}), asked by `{}` as written by the node (unverified)",
+        r.to, r.by
+    );
+    record(&r, "installing", None, None);
     let previous = match host.install(&r.to) {
         Ok(crate::selfupdate::Outcome::Updated { previous }) => previous,
         // REQ: OPS-014 (ADR-182) — an edge build main has since passed: nothing installed.
         Ok(crate::selfupdate::Outcome::Unavailable { serves, commit }) => {
             let e = crate::selfupdate::unavailable_text(&r.to, &serves, &commit);
             warn!("update: {} not installed: {e}", r.to);
-            record(&r, "unavailable", Some(e));
+            record(&r, "unavailable", Some(e), None);
             return done("unavailable");
         }
         Ok(_) => {
-            record(&r, "up_to_date", None);
+            record(&r, "up_to_date", None, None);
             return done("up_to_date");
         }
         Err(e) => {
             warn!("update: {} not installed: {e}", r.to);
-            record(&r, "failed", Some(e));
+            record(&r, "failed", Some(e), None);
             return done("failed");
         }
     };
-    let (state, error) = if restart {
+    let (state, error, health) = if restart {
         restart_and_check(&r.to, current, &previous, host)
     } else {
         info!("update: installed {}; restart the node to run it", r.to);
-        ("updated", None)
+        (
+            "updated",
+            None,
+            Some("not checked: the node wasn't restarted (no --restart)".to_owned()),
+        )
     };
-    record(&r, state, error);
+    record(&r, state, error, health);
     done(state)
 }
 
 /// REQ: OPS-014 (ADR-182) — the health gate after an install: restarts the node, and if it isn't
 /// healthy puts `previous` back, restarts once more and checks again (one rollback, no loop). The
-/// state to record (`updated`, `rolled_back`, `failed`) and why.
+/// state to record (`updated`, `rolled_back`, `failed`), why, and how the health was checked.
+/// Once the previous binary is back in place the run is `rolled_back` whatever its own check
+/// says (that check failing too points at the check, and says so); `failed` only when it can't
+/// be put back.
 fn restart_and_check(
     to: &str,
     current: &str,
     previous: &Path,
     host: &mut impl Host,
-) -> (&'static str, Option<String>) {
+) -> (&'static str, Option<String>, Option<String>) {
     info!("update: installed {to}; restarting the node");
-    let Err(why) = host.restart().and_then(|()| host.healthy()) else {
-        info!("update: {to} is running and healthy");
-        return ("updated", None);
+    let why = match host.restart().and_then(|()| host.healthy()) {
+        Ok(how) => {
+            info!("update: {to} is running and healthy ({how})");
+            return ("updated", None, Some(how));
+        }
+        Err(why) => why,
     };
     warn!("update: {to} isn't healthy after the restart ({why}): putting {current} back");
-    match host
-        .restore(previous)
-        .and_then(|()| host.restart())
-        .and_then(|()| host.healthy())
-    {
-        Ok(()) => {
-            let e = format!(
-                "{to} wasn't healthy after the restart ({why}); {current} is back and running"
-            );
-            warn!("update: rolled back: {e}");
-            ("rolled_back", Some(e))
-        }
-        Err(back) => {
-            let e = format!(
-                "{to} wasn't healthy after the restart ({why}), and putting {current} back didn't bring the node back either ({back})"
-            );
-            warn!("update: {e}");
-            ("failed", Some(e))
-        }
+    if let Err(e) = host.restore(previous) {
+        let e = format!(
+            "{to} wasn't healthy after the restart ({why}), and {current} couldn't be put back ({e}): put a binary back by hand and restart telltale"
+        );
+        warn!("update: {e}");
+        return ("failed", Some(e), None);
     }
+    let e = match host.restart().and_then(|()| host.healthy()) {
+        Ok(_) => {
+            format!("{to} wasn't healthy after the restart ({why}); {current} is back and running")
+        }
+        Err(back) => format!(
+            "{to} wasn't healthy after the restart ({why}); {current} is back in place, but its own check failed too ({back}): the check may be what's wrong (TELLTALE_UPDATE_HEALTH_URL in telltale-update.service, or [access] allowed_networks leaving out this host), so look at the node"
+        ),
+    };
+    warn!("update: rolled back: {e}");
+    ("rolled_back", Some(e), None)
 }
 
 fn done(state: &str) -> Served {
@@ -884,6 +1055,143 @@ pub(crate) fn channel_for(to: &str) -> crate::selfupdate::Channel {
         crate::selfupdate::Channel::Edge
     } else {
         crate::selfupdate::Channel::Stable
+    }
+}
+
+/// REQ: OPS-014 (ADR-182) — the variable of `telltale-update.service` that says where the health
+/// gate asks: `install.sh` writes it from the node's `[api]` (empty when the API is off). The
+/// request never names one.
+pub(crate) const HEALTH_URL_ENV: &str = "TELLTALE_UPDATE_HEALTH_URL";
+/// Where the gate asks when the unit doesn't say (one `install.sh` wrote before the variable).
+pub(crate) const DEFAULT_HEALTH_URL: &str = "http://127.0.0.1:8053/readyz?startup=1";
+/// REQ: OPS-014 (ADR-182) — how long the restarted node has to pass the health check twice in a
+/// row (2 s apart). A node that takes longer to come up (very large lists on an SD card) is
+/// rolled back: the window is part of the run's time budget ([`run_budget_secs`]).
+pub(crate) const HEALTH_WAIT: Duration = Duration::from_secs(120);
+/// How far past [`HEALTH_WAIT`] a check started inside it can end: the 2 s pause and one GET's
+/// connect, write and read limits (3 s each). (Only the time budget below counts it.)
+#[cfg(test)]
+pub(crate) const HEALTH_SLACK: Duration = Duration::from_secs(11);
+/// How long `systemctl reset-failed telltale` may take before a rollback's restart.
+pub(crate) const RESET_WAIT: Duration = Duration::from_secs(10);
+
+/// REQ: OPS-014 (ADR-182) — the longest the update service's run can take, in seconds: the
+/// downloads (one deadline for them all), the new binary's test run, the restart and the health
+/// window, and for a rollback the reset, a second restart and window. `TimeoutStartSec=` of
+/// `telltale-update.service` must be above it with room to spare, so systemd never kills a run
+/// between the install and its check (`ops_014_the_run_fits_in_the_units_time_limit`).
+#[cfg(test)]
+pub(crate) const fn run_budget_secs() -> u64 {
+    let gate =
+        crate::selfupdate::RESTART_WAIT.as_secs() + HEALTH_WAIT.as_secs() + HEALTH_SLACK.as_secs();
+    crate::selfupdate::FETCH_DEADLINE.as_secs()
+        + crate::selfupdate::VERSION_WAIT.as_secs()
+        + gate
+        + RESET_WAIT.as_secs()
+        + gate
+}
+
+/// Where the health gate asks, or why it doesn't.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HealthGate {
+    /// GET this URL until it answers 200 twice in a row.
+    Check(String),
+    /// No check (the run records `updated` with this as `health`).
+    Skip(&'static str),
+}
+
+/// REQ: OPS-014 (ADR-182) — the health gate from the unit's [`HEALTH_URL_ENV`] (`set`: its value,
+/// `None` when the unit has none): unset is [`DEFAULT_HEALTH_URL`] (an older unit); empty is no
+/// check (the API is off, so nothing answers); anything else must be a plain `http://` URL of
+/// `/readyz` (or `/readyz?startup=1`) at an IP address of this host (`is_here`: loopback always
+/// is), with a port. No name (no lookup), no user, no other path: `Err` says why, and the run is
+/// refused before anything is fetched.
+pub(crate) fn health_gate(
+    set: Option<&str>,
+    is_here: impl Fn(std::net::IpAddr) -> bool,
+) -> Result<HealthGate, String> {
+    let Some(url) = set else {
+        return Ok(HealthGate::Check(DEFAULT_HEALTH_URL.to_owned()));
+    };
+    if url.is_empty() {
+        return Ok(HealthGate::Skip("not checked: the API is off"));
+    }
+    let bad = |why: &str| {
+        Err(format!(
+            "{HEALTH_URL_ENV} in telltale-update.service (`{}`) {why}: re-run install.sh to write it again",
+            url.chars().take(80).collect::<String>().escape_debug()
+        ))
+    };
+    let Some(rest) = url.strip_prefix("http://") else {
+        return bad("isn't a plain http:// URL");
+    };
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    if !matches!(path, "readyz" | "readyz?startup=1") {
+        return bad("doesn't ask /readyz");
+    }
+    let Ok(addr) = authority.parse::<std::net::SocketAddr>() else {
+        return bad("doesn't name an IP address and port");
+    };
+    let ip = addr.ip();
+    if addr.port() == 0 || ip.is_unspecified() || ip.is_multicast() {
+        return bad("doesn't name an address one can ask");
+    }
+    if !ip.is_loopback() && !is_here(ip) {
+        return bad("isn't an address of this host");
+    }
+    Ok(HealthGate::Check(url.to_owned()))
+}
+
+/// Whether `ip` is an address of this host: a socket can be bound to it (no packet is sent).
+pub(crate) fn is_this_host(ip: std::net::IpAddr) -> bool {
+    std::net::UdpSocket::bind((ip, 0)).is_ok()
+}
+
+/// REQ: OPS-014 (ADR-182) — root runs and renames binaries only where root alone can write: the
+/// installed binary `exe` and every folder above it, up to and including `top` (`/` in
+/// production), must be owned by `uid` (0) and not writable by their group or others. Checked
+/// before the new binary is test-run and before the previous one is put back. `Err` is the
+/// refusal.
+pub(crate) fn root_owned(exe: &Path, uid: u32, top: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        for p in exe.ancestors() {
+            let m = std::fs::symlink_metadata(p)
+                .map_err(|e| format!("install location is not root-owned: {}: {e}", p.display()))?;
+            if m.uid() != uid {
+                return Err(format!(
+                    "install location is not root-owned: {} belongs to uid {}",
+                    p.display(),
+                    m.uid()
+                ));
+            }
+            if m.mode() & 0o022 != 0 {
+                return Err(format!(
+                    "install location is not root-owned: {} can be written by its group or others",
+                    p.display()
+                ));
+            }
+            if m.file_type().is_symlink() {
+                return Err(format!(
+                    "install location is not root-owned: {} is a link",
+                    p.display()
+                ));
+            }
+            if p == top {
+                return Ok(());
+            }
+        }
+        Err(format!(
+            "install location is not root-owned: {} isn't under {}",
+            exe.display(),
+            top.display()
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (exe, uid, top);
+        Err("install location is not root-owned: not a Unix system".into())
     }
 }
 

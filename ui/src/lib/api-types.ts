@@ -1955,14 +1955,14 @@ export interface paths {
         };
         /**
          * A node's version and update state.
-         * @description The version it runs, how it was installed, whether its root update service
-         *     (`telltale-update.path`) is enabled, a request it hasn't picked up yet, and the service's
-         *     latest run (`installing`, `updated`, `up_to_date`, `rolled_back`, `unavailable`, `failed`, or
-         *     `refused`, with the error): after a restart the new build must come up healthy, or the
-         *     previous one is put back (`rolled_back`); an edge build the channel no longer serves is
-         *     `unavailable`. `id` is `local` (the node answering) or a cluster node's ID, site, or pod
-         *     name: the read goes
-         *     to that node over the cluster channel.
+         * @description The version it runs, how it was installed, the channel it follows, whether its root update
+         *     service (`telltale-update.path`) is enabled, a request it hasn't picked up yet, and the
+         *     service's latest run (`installing`, `updated`, `up_to_date`, `rolled_back`, `unavailable`,
+         *     `failed`, or `refused`, with the error and how the new build's health was checked): after a
+         *     restart the new build must come up healthy, or the previous one is put back (`rolled_back`,
+         *     an incident to look into); an edge build the channel no longer serves is `unavailable`. `id`
+         *     is `local` (the node answering) or a cluster node's ID, site, or pod name: the read goes to
+         *     that node over the cluster channel.
          */
         get: operations["node_update_status"];
         put?: never;
@@ -1973,9 +1973,12 @@ export interface paths {
          *     node; `GET` on the same path shows how it went. The version is a release (`0.8.0`) or an edge
          *     build (`0.8.0-edge.393`); an edge build can be installed only while it is the newest on the
          *     edge channel. Never older than the node's version (`update_downgrade`: downgrade by hand), and
-         *     never a change of channel: a node on releases takes only a release (`update_channel`). The
-         *     same version answers `up_to_date` without a request. One at a time per node: while a request
-         *     waits for the update service or an update runs, another gets `update_in_progress`. A node in a
+         *     never a change of channel: a node on the stable channel takes only a release
+         *     (`update_channel`); one on the edge channel takes both and stays on it. The same version
+         *     answers `up_to_date` without a request. One at a time per node: while a request waits for the
+         *     update service or an update runs, another gets `update_in_progress`. A version whose run on
+         *     the node ended `rolled_back` or `failed` in the last 24 hours is refused
+         *     (`update_failed_recently`: install it by hand, or wait). A node in a
          *     container or Kubernetes is upgraded by its image (`update_unsupported`), and a node whose
          *     update service isn't enabled says so (`update_not_enabled`). In a cluster, upgrade replicas
          *     before the primary, one at a time: `telltale ctl upgrade` does this. `id` as for the read.
@@ -4351,7 +4354,7 @@ export interface components {
          * @description Stable error codes.
          * @enum {string}
          */
-        Code: "invalid_parameter" | "not_found" | "unsupported_scope" | "unavailable" | "internal" | "unauthorized" | "totp_required" | "forbidden" | "csrf_rejected" | "conflict" | "version_conflict" | "invalid_config" | "rate_limited" | "gitops_managed" | "maintenance_too_long" | "maintenance_invalid" | "node_unreachable" | "node_unknown" | "simulation_busy" | "simulation_window" | "cluster_pinned" | "no_rollout" | "version_unknown" | "version_blobs_missing" | "annotation_text" | "annotation_time" | "method_not_allowed" | "heatmap_window" | "privacy_level" | "kubernetes_disabled" | "drill_refused" | "drill_active" | "drill_targets" | "node_is_primary" | "node_is_up" | "change_in_progress" | "update_unsupported" | "update_not_enabled" | "update_downgrade" | "update_invalid" | "update_channel" | "update_in_progress";
+        Code: "invalid_parameter" | "not_found" | "unsupported_scope" | "unavailable" | "internal" | "unauthorized" | "totp_required" | "forbidden" | "csrf_rejected" | "conflict" | "version_conflict" | "invalid_config" | "rate_limited" | "gitops_managed" | "maintenance_too_long" | "maintenance_invalid" | "node_unreachable" | "node_unknown" | "simulation_busy" | "simulation_window" | "cluster_pinned" | "no_rollout" | "version_unknown" | "version_blobs_missing" | "annotation_text" | "annotation_time" | "method_not_allowed" | "heatmap_window" | "privacy_level" | "kubernetes_disabled" | "drill_refused" | "drill_active" | "drill_targets" | "node_is_primary" | "node_is_up" | "change_in_progress" | "update_unsupported" | "update_not_enabled" | "update_downgrade" | "update_invalid" | "update_channel" | "update_in_progress" | "update_failed_recently";
         /** @description What a change to local names or forwarded domains did (or would do, with `dryRun`). */
         ConfigChange: {
             /** @description The entry after (absent after a delete). */
@@ -6746,6 +6749,13 @@ export interface components {
          *     (`POST`).
          */
         NodeUpdate: {
+            /**
+             * @description The channel it follows, `edge` or `stable`: as `install.sh` set it (`--edge`), or, on an
+             *     install from before that, its version's. A stable node takes only releases; an edge node
+             *     edge builds and releases, and stays on edge. Absent from an older node. REQ: OPS-014
+             *     (ADR-182).
+             */
+            channel?: string | null;
             /** @description Its root update service (`telltale-update.path`) is enabled, so a request is picked up. */
             enabled: boolean;
             /**
@@ -6791,6 +6801,10 @@ export interface components {
         NodeUpdateRun: {
             /** @description When the state was written (RFC 3339). */
             at: string;
+            /**
+             * @description Who asked, as the node wrote it in the request: the update service can't check it
+             *     (unverified).
+             */
             by: string;
             /** @description What went wrong, for `failed`, `rolled_back`, `unavailable` and `refused`. */
             error?: string | null;
@@ -6799,15 +6813,22 @@ export interface components {
              * @example 0.7.0
              */
             from: string;
+            /**
+             * @description For `updated`: how the new build's health was checked (`checked at <url>`), or why it
+             *     wasn't (`not checked: the API is off`). REQ: OPS-014 (ADR-182).
+             */
+            health?: string | null;
             /** @description The request it answers. */
             id: string;
             /**
              * @description `installing` (also while the restarted node is checked), `updated` (installed, restarted,
-             *     and healthy), `up_to_date`, `rolled_back` (the new build wasn't healthy after the restart:
-             *     the previous binary is back and running), `unavailable` (an edge build the edge channel no
-             *     longer serves: nothing installed; the error names the one it serves), `failed` (not
-             *     installed, or rolled back and still not healthy), or `refused` (the request was stale,
-             *     malformed, older than the node's version, or on another channel). REQ: OPS-014 (ADR-182).
+             *     and healthy, or not checked: see `health`), `up_to_date`, `rolled_back` (the new build
+             *     wasn't healthy after the restart: the previous binary is back in place; an incident to
+             *     look into, see `error`), `unavailable` (an edge build the edge channel no longer serves:
+             *     nothing installed; the error names the one it serves), `failed` (not installed, or the
+             *     previous binary couldn't be put back), or `refused` (the request was stale, malformed,
+             *     older than the node's version, on another channel, of a version that failed there in the
+             *     last day, or the host wasn't set up for it). REQ: OPS-014 (ADR-182).
              * @example updated
              */
             state: string;
@@ -12465,7 +12486,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The node is upgraded by its image (`update_unsupported`), its update service is off (`update_not_enabled`), the version is older than its own (`update_downgrade`) or on another channel (`update_channel`), or an update is already under way there (`update_in_progress`). */
+            /** @description The node is upgraded by its image (`update_unsupported`), its update service is off (`update_not_enabled`), the version is older than its own (`update_downgrade`) or on another channel (`update_channel`), an update is already under way there (`update_in_progress`), or the version was rolled back or failed there in the last 24 hours (`update_failed_recently`). */
             409: {
                 headers: {
                     [name: string]: unknown;

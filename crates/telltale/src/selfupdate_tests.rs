@@ -18,6 +18,11 @@ fn fixture(name: &str) -> Vec<u8> {
 
 /// Serves `files` (path → body) over plain HTTP; everything else is 404.
 async fn serve(files: Vec<(&'static str, Vec<u8>)>) -> String {
+    serve_stalling(files, "").await
+}
+
+/// [`serve`], except that a request for `stall` is never answered.
+async fn serve_stalling(files: Vec<(&'static str, Vec<u8>)>, stall: &'static str) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -31,6 +36,10 @@ async fn serve(files: Vec<(&'static str, Vec<u8>)>) -> String {
                 let n = s.read(&mut buf).await.unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]);
                 let path = req.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                if path == stall {
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                    return;
+                }
                 let (status, body) = files
                     .iter()
                     .find(|(p, _)| *p == path)
@@ -127,6 +136,34 @@ async fn ops_004_update_check_and_swap() {
         .await
         .unwrap();
     assert_eq!(out, Outcome::UpToDate);
+}
+
+/// REQ: OPS-014 (ADR-182) — one deadline for all the downloads of an update: a download that
+/// stalls past it fails the update, and the installed binary stays as it was (nothing staged,
+/// nothing set aside), so the root update service records `failed` with the old build in place.
+#[cfg(unix)]
+#[tokio::test]
+async fn ops_014_downloads_that_take_too_long_install_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = old_binary(dir.path());
+    let base = serve_stalling(release(), "/r/telltale-x86_64-linux").await;
+    let e = update_within(
+        &options(base, false),
+        &exe,
+        ASSET,
+        TEST_KEY,
+        std::time::Duration::from_secs(2),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        e.contains("didn't finish within 2 s") && e.contains("nothing installed"),
+        "{e}"
+    );
+    assert_eq!(std::fs::read(&exe).unwrap(), b"#!/bin/sh\necho old\n");
+    assert!(!dir.path().join(".telltale.new").exists());
+    assert!(!dir.path().join("telltale.old").exists());
+    assert_eq!(FETCH_DEADLINE.as_secs(), 480);
 }
 
 #[cfg(unix)]

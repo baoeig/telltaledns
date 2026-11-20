@@ -57,20 +57,46 @@ pub fn is_edge(v: &str) -> bool {
     v.contains("-edge.")
 }
 
-/// REQ: OPS-014 (ADR-182) — a request never changes a node's channel: a node that runs a release
-/// takes only a release; one on the edge channel takes an edge build or a release (newer, as
-/// every request). `Err` is why not, for `current` running and `to` asked.
-pub fn same_channel(current: &str, to: &str) -> Result<(), String> {
-    if is_edge(to) && !is_edge(current) {
+/// REQ: OPS-014 (ADR-182) — the environment variable that names a native node's update channel,
+/// `edge` or `stable`: `install.sh` writes it into the node's unit and its update service's
+/// (from `--edge`, or from the version it installed), so taking a release doesn't turn an edge
+/// node into a stable one.
+pub const CHANNEL_ENV: &str = "TELLTALE_UPDATE_CHANNEL";
+
+/// REQ: OPS-014 (ADR-182) — a node's update channel: `edge` or `stable` as set for it
+/// ([`CHANNEL_ENV`]); where it isn't set (an install from before it), the channel of the
+/// version it runs.
+pub fn node_channel(set: Option<&str>, version: &str) -> &'static str {
+    match set {
+        Some("edge") => "edge",
+        Some("stable") => "stable",
+        _ if is_edge(version) => "edge",
+        _ => "stable",
+    }
+}
+
+/// REQ: OPS-014 (ADR-182) — a request never moves a node onto another channel: a node on the
+/// stable channel takes only a release; one on the edge channel an edge build or a release
+/// (newer, as every request), and stays on edge. `Err` is why not.
+pub fn channel_takes(channel: &str, to: &str) -> Result<(), String> {
+    if is_edge(to) && channel != "edge" {
         return Err(format!(
-            "this node runs {current}, on the stable channel: a request never moves it to an edge build ({to})"
+            "{to} is an edge build and this node follows the stable channel: a request never moves a node onto edge builds"
         ));
     }
     Ok(())
 }
 
 /// The hint for [`Code::UpdateChannel`].
-pub const CHANNEL_HINT: &str = "Ask for a release, or install an edge build by hand with self-update on that node (as root: telltale self-update --channel edge --restart).";
+pub const CHANNEL_HINT: &str = "Ask for a release, or move the node to edge builds by hand: on it, as root, telltale self-update --channel edge --restart, then sh install.sh --edge --cluster-updates (which sets its update channel to edge).";
+
+/// REQ: OPS-014 (ADR-182) — how long a node refuses a version whose run there ended
+/// `rolled_back` or `failed` (`update_failed_recently`): a hook or script that asks again after
+/// a failure doesn't install and restart the node over and over.
+pub const FAILED_RECENTLY_MS: u64 = 24 * 3_600_000;
+
+/// The hint for [`Code::UpdateFailedRecently`].
+pub const FAILED_RECENTLY_HINT: &str = "Install it by hand with self-update --to on the node (as root: telltale self-update --to <version> --restart), or wait.";
 
 /// A version the cluster may ask a node to install: a release or an edge build.
 pub fn check_version(to: &str) -> Result<String, Problem> {
@@ -101,14 +127,14 @@ pub(crate) fn admin_routes(backend: Shared, auth: Arc<Auth>) -> Router {
 
 /// A node's version and update state.
 ///
-/// The version it runs, how it was installed, whether its root update service
-/// (`telltale-update.path`) is enabled, a request it hasn't picked up yet, and the service's
-/// latest run (`installing`, `updated`, `up_to_date`, `rolled_back`, `unavailable`, `failed`, or
-/// `refused`, with the error): after a restart the new build must come up healthy, or the
-/// previous one is put back (`rolled_back`); an edge build the channel no longer serves is
-/// `unavailable`. `id` is `local` (the node answering) or a cluster node's ID, site, or pod
-/// name: the read goes
-/// to that node over the cluster channel.
+/// The version it runs, how it was installed, the channel it follows, whether its root update
+/// service (`telltale-update.path`) is enabled, a request it hasn't picked up yet, and the
+/// service's latest run (`installing`, `updated`, `up_to_date`, `rolled_back`, `unavailable`,
+/// `failed`, or `refused`, with the error and how the new build's health was checked): after a
+/// restart the new build must come up healthy, or the previous one is put back (`rolled_back`,
+/// an incident to look into); an edge build the channel no longer serves is `unavailable`. `id`
+/// is `local` (the node answering) or a cluster node's ID, site, or pod name: the read goes to
+/// that node over the cluster channel.
 #[utoipa::path(get, path = "/api/v1/nodes/{id}/update", tag = "system",
     params(("id" = String, Path, description = "`local`, or a node's ID, site, or pod name.")),
     responses(
@@ -140,9 +166,12 @@ pub struct UpdateQuery {
 /// node; `GET` on the same path shows how it went. The version is a release (`0.8.0`) or an edge
 /// build (`0.8.0-edge.393`); an edge build can be installed only while it is the newest on the
 /// edge channel. Never older than the node's version (`update_downgrade`: downgrade by hand), and
-/// never a change of channel: a node on releases takes only a release (`update_channel`). The
-/// same version answers `up_to_date` without a request. One at a time per node: while a request
-/// waits for the update service or an update runs, another gets `update_in_progress`. A node in a
+/// never a change of channel: a node on the stable channel takes only a release
+/// (`update_channel`); one on the edge channel takes both and stays on it. The same version
+/// answers `up_to_date` without a request. One at a time per node: while a request waits for the
+/// update service or an update runs, another gets `update_in_progress`. A version whose run on
+/// the node ended `rolled_back` or `failed` in the last 24 hours is refused
+/// (`update_failed_recently`: install it by hand, or wait). A node in a
 /// container or Kubernetes is upgraded by its image (`update_unsupported`), and a node whose
 /// update service isn't enabled says so (`update_not_enabled`). In a cluster, upgrade replicas
 /// before the primary, one at a time: `telltale ctl upgrade` does this. `id` as for the read.
@@ -155,7 +184,7 @@ pub struct UpdateQuery {
     responses(
         (status = 200, body = NodeUpdate, description = "`state`: `requested` (handed to the update service) or `up_to_date`; with `dryRun`, `would_request` or `up_to_date`."),
         (status = 404, body = Problem, description = "No such node (`node_unknown`)."),
-        (status = 409, body = Problem, description = "The node is upgraded by its image (`update_unsupported`), its update service is off (`update_not_enabled`), the version is older than its own (`update_downgrade`) or on another channel (`update_channel`), or an update is already under way there (`update_in_progress`)."),
+        (status = 409, body = Problem, description = "The node is upgraded by its image (`update_unsupported`), its update service is off (`update_not_enabled`), the version is older than its own (`update_downgrade`) or on another channel (`update_channel`), an update is already under way there (`update_in_progress`), or the version was rolled back or failed there in the last 24 hours (`update_failed_recently`)."),
         (status = 422, body = Problem, description = "Not a release or edge build version (`update_invalid`)."),
         (status = 503, body = Problem, description = "The node isn't reachable over the cluster channel (`node_unreachable`)."),
     ))]
@@ -260,5 +289,22 @@ mod tests {
         assert!(k("0.7.0") < k("0.8.0-edge.1"));
         assert!(k("0.8.0-edge.9") < k("0.8.0-edge.10"));
         assert!(is_edge("0.8.0-edge.393") && !is_edge("0.8.0"));
+    }
+
+    // REQ: OPS-014 (ADR-182) — the channel a node follows is the one set for it, whatever its
+    // version says (an edge node that took a release stays on edge); without one (an older
+    // install), its version's. A stable node takes only releases; an edge node both.
+    #[test]
+    fn ops_014_a_node_keeps_the_channel_set_for_it() {
+        assert_eq!(node_channel(Some("edge"), "0.8.0"), "edge");
+        assert_eq!(node_channel(Some("stable"), "0.8.0-edge.4"), "stable");
+        assert_eq!(node_channel(None, "0.8.0-edge.4"), "edge");
+        assert_eq!(node_channel(None, "0.8.0"), "stable");
+        assert_eq!(node_channel(Some("beta"), "0.8.0"), "stable");
+        assert!(channel_takes("edge", "0.9.0-edge.1").is_ok());
+        assert!(channel_takes("edge", "0.9.0").is_ok());
+        assert!(channel_takes("stable", "0.9.0").is_ok());
+        let e = channel_takes("stable", "0.9.0-edge.1").unwrap_err();
+        assert!(e.contains("stable channel"), "{e}");
     }
 }
