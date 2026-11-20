@@ -392,7 +392,18 @@
         <!-- REQ: FLT-005 (T6.12) — act on it: a quick rule for this device or its group. -->
         <section class="card quick-card">
           <h2>Make a quick rule<HelpButton id="quick-rules" /></h2>
-          <QuickRuleForm domain={why.name} device={why.clientName ?? why.client} group={why.group ?? ''} />
+          <!-- REQ: FLT-005, FLT-017 (issue #73) — what a rule can name: the configured device the address is
+               recognized as, else the address. The log's name for it (a router's, mDNS) is a label, not
+               the value. A pod's `device` is its workload's name, which no rule can name: its group is
+               the scope. -->
+          <QuickRuleForm
+            domain={why.name}
+            device={explained.client.workload ? why.client : (explained.client.device ?? why.client)}
+            address={why.client}
+            seenAs={why.clientName ?? ''}
+            workload={explained.client.workload?.name ?? ''}
+            group={why.group ?? ''}
+          />
         </section>
       {/if}
       <!-- REQ: DNS-006 (T6.13) — what the cache holds for this name, and flushing it. -->
