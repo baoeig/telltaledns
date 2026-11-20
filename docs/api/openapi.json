@@ -18334,7 +18334,7 @@
       },
       "NodeUpdate": {
         "type": "object",
-        "description": "REQ: OPS-014 (ADR-177) — a node's update state (`GET`), or what it did with a request\n(`POST`).",
+        "description": "REQ: OPS-014 (ADR-182) — a node's update state (`GET`), or what it did with a request\n(`POST`).",
         "required": [
           "node",
           "version",
@@ -18419,7 +18419,7 @@
       },
       "NodeUpdateRequest": {
         "type": "object",
-        "description": "REQ: OPS-014 (ADR-177) — `POST /api/v1/nodes/{id}/update`: install this version on the node.",
+        "description": "REQ: OPS-014 (ADR-182) — `POST /api/v1/nodes/{id}/update`: install this version on the node.",
         "required": [
           "to"
         ],

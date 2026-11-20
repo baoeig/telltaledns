@@ -1,4 +1,4 @@
-# TelltaleDNS: install the versions the cluster asks for (REQ: OPS-014, ADR-177). Installed by
+# TelltaleDNS: install the versions the cluster asks for (REQ: OPS-014, ADR-182). Installed by
 # deploy/systemd/install.sh and off until enabled:
 #   sudo systemctl enable --now telltale-update.path     (or install.sh --cluster-updates)
 # The node writes /var/lib/telltale/update-request.json when an admin (or `telltale ctl upgrade`,

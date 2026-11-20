@@ -117,7 +117,7 @@ sh "$HERE/install.sh" --disable-resolved-stub >/dev/null
 grep -q "# local edit" /etc/telltale/telltale.toml || { fail "config overwritten"; }
 systemctl is-active --quiet telltale
 
-# REQ: OPS-014 (ADR-177) — the update service: installed and off; once on, it picks up a request
+# REQ: OPS-014 (ADR-182) — the update service: installed and off; once on, it picks up a request
 # the telltale user writes, removes it, refuses this build (a local build never installs from a
 # request), records the outcome where the node can read it, and leaves the node running.
 echo "== the update service picks a request up"

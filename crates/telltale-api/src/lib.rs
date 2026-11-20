@@ -615,7 +615,7 @@ pub trait Backend: Send + Sync + 'static {
             ))
         })
     }
-    /// REQ: OPS-014 (ADR-177) — asks `node` (`local`, or a cluster node's ID, site, or pod name)
+    /// REQ: OPS-014 (ADR-182) — asks `node` (`local`, or a cluster node's ID, site, or pod name)
     /// to install a version, or reads its update state. A native node hands the request to its
     /// root update service; it's the node's own business, so a cluster sends it to that node.
     fn node_update(

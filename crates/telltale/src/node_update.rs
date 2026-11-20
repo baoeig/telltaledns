@@ -1,4 +1,4 @@
-//! Updates driven from the cluster (REQ: OPS-014, CLU-010; ADR-177): an admin, or
+//! Updates driven from the cluster (REQ: OPS-014, CLU-010; ADR-182): an admin, or
 //! `telltale ctl upgrade`, asks a native node to install a version, and the node's root update
 //! service installs it.
 //!

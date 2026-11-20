@@ -6736,7 +6736,7 @@ export interface components {
             upstreamFailPct: (number | null)[];
         };
         /**
-         * @description REQ: OPS-014 (ADR-177) — a node's update state (`GET`), or what it did with a request
+         * @description REQ: OPS-014 (ADR-182) — a node's update state (`GET`), or what it did with a request
          *     (`POST`).
          */
         NodeUpdate: {
@@ -6772,7 +6772,7 @@ export interface components {
             /** @example 0.8.0 */
             to: string;
         };
-        /** @description REQ: OPS-014 (ADR-177) — `POST /api/v1/nodes/{id}/update`: install this version on the node. */
+        /** @description REQ: OPS-014 (ADR-182) — `POST /api/v1/nodes/{id}/update`: install this version on the node. */
         NodeUpdateRequest: {
             /**
              * @description A release (`0.8.0`) or an edge build (`0.8.0-edge.393`), never older than the version the

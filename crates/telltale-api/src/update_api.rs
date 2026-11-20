@@ -1,4 +1,4 @@
-//! REQ: OPS-014, AGT-004 (ADR-177) — updates driven from the cluster: ask a native node to
+//! REQ: OPS-014, AGT-004 (ADR-182) — updates driven from the cluster: ask a native node to
 //! install a version, and read where it stands. The node only writes a request into its data
 //! directory; its root update service (`telltale-update.path`, off until enabled) verifies the
 //! release signature, installs it, and restarts the node, so the node itself never needs root

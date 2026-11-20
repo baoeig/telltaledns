@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# REQ: OPS-014 (ADR-177) — the chart's upgrade hook: off by default; on, a pre-upgrade Job that
+# REQ: OPS-014 (ADR-182) — the chart's upgrade hook: off by default; on, a pre-upgrade Job that
 # runs `ctl upgrade --to-self` from the same image as the controller, with the token from the
 # named Secret; it refuses to render without one; and a NetworkPolicy that limits the API lets
 # the hook in.

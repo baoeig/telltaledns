@@ -2468,7 +2468,7 @@ pub struct MaintenanceRequest {
     pub handover: Option<bool>,
 }
 
-/// REQ: OPS-014 (ADR-177) — `POST /api/v1/nodes/{id}/update`: install this version on the node.
+/// REQ: OPS-014 (ADR-182) — `POST /api/v1/nodes/{id}/update`: install this version on the node.
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NodeUpdateRequest {
@@ -2514,7 +2514,7 @@ pub struct NodeUpdateRun {
     pub at: String,
 }
 
-/// REQ: OPS-014 (ADR-177) — a node's update state (`GET`), or what it did with a request
+/// REQ: OPS-014 (ADR-182) — a node's update state (`GET`), or what it did with a request
 /// (`POST`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]

@@ -282,7 +282,7 @@ grafanaDashboard:
     grafana_dashboard: "1"
   annotations: {}
 
-# REQ: OPS-014 (ADR-177) — upgrade the cluster's native nodes (installed with install.sh, outside
+# REQ: OPS-014 (ADR-182) — upgrade the cluster's native nodes (installed with install.sh, outside
 # Kubernetes) before this chart rolls its own pods. A pre-upgrade hook Job (Argo CD: PreSync)
 # runs `telltale ctl upgrade --to-self` from the new image: it asks each native node in turn,
 # replicas first, to install the image's version, and waits until it is back, ready, and in

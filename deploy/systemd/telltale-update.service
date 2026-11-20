@@ -1,4 +1,4 @@
-# TelltaleDNS: install a version the cluster asked for (REQ: OPS-014, ADR-177). Started by
+# TelltaleDNS: install a version the cluster asked for (REQ: OPS-014, ADR-182). Started by
 # telltale-update.path; installed by deploy/systemd/install.sh.
 #
 # It runs as root because it replaces the binary and restarts the service, which the sandboxed

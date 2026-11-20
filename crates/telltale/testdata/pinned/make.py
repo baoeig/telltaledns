@@ -1,4 +1,4 @@
-"""Pinned self-update fixtures (REQ: OPS-014, ADR-177; not a real release): `release-binary`
+"""Pinned self-update fixtures (REQ: OPS-014, ADR-182; not a real release): `release-binary`
 listed in `SHA256SUMS`, and signed release indexes that name a release (`releases.json`, 9.9.9),
 an edge build (`releases-edge.json`, 9.9.9-edge.7), and a release whose index lists another
 SHA-256 than `SHA256SUMS` (`releases-mismatch.json`), all signed by a throwaway minisign key

@@ -2042,7 +2042,7 @@ impl Backend for Federated {
             }
         }
     }
-    // REQ: OPS-014 (ADR-177) — installing a version is the node's own business, like
+    // REQ: OPS-014 (ADR-182) — installing a version is the node's own business, like
     // maintenance: a request (or a read) for another node goes to that node.
     fn node_update(
         &self,

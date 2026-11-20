@@ -1,5 +1,5 @@
 {{- /*
-REQ: OPS-014, CLU-010 (ADR-177) — before the chart's pods roll, upgrade the cluster's native nodes
+REQ: OPS-014, CLU-010 (ADR-182) — before the chart's pods roll, upgrade the cluster's native nodes
 (outside Kubernetes) to this image's version, one at a time, replicas first: the image's own
 `telltale ctl upgrade --to-self`, against the running controller's API. A node that fails stops
 the upgrade, so the pods keep their version. Helm runs it before an upgrade; Argo CD as a

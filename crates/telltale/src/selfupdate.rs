@@ -8,7 +8,7 @@
 //! rename (the previous binary stays next to it as `telltale.old`). Containers are refused:
 //! they update by pulling a new image.
 //!
-//! REQ: OPS-014 (ADR-177) — `--to <version>` installs that version only: a release from its own
+//! REQ: OPS-014 (ADR-182) — `--to <version>` installs that version only: a release from its own
 //! release page, or an edge build while it is the newest on the edge channel (edge binaries are
 //! replaced on every build). The release's signed `releases.json` must name that version and
 //! list the same SHA-256 as `SHA256SUMS`, so a version is never installed under another's name.

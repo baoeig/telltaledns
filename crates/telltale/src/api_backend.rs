@@ -2344,7 +2344,7 @@ impl Backend for ApiBackend {
         crate::maintenance::local_backend_call(Arc::clone(&self.src), node, w)
     }
 
-    // REQ: OPS-014 (ADR-177) — this node's own update state and requests (in a cluster, the
+    // REQ: OPS-014 (ADR-182) — this node's own update state and requests (in a cluster, the
     // federated backend sends calls for other nodes to them).
     fn node_update(
         &self,
