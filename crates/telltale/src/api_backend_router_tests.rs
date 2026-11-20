@@ -103,9 +103,8 @@ impl Node {
             telltale_config::SafeString::new(dir.path().to_str().unwrap()).unwrap();
         s.file_config = arc_swap::ArcSwap::from_pointee(file.clone());
         s.config = arc_swap::ArcSwap::from_pointee(file);
-        // The folders a platform fills with secrets (`/run/secrets/`, `/etc/telltale-secrets/`),
-        // here a folder of the test's own.
-        s.secret_mounts = vec![dir.path().join("mount")];
+        // The folders a platform fills with secrets (`/run/secrets/`, `/etc/telltale-secrets/`)
+        // have a stand-in in test builds: `<data_dir>/mount` (`secret_path::mount_roots_for`).
         f(dir.path(), &mut s);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<bool>>(4);
         s.reload = tx;
@@ -1671,18 +1670,14 @@ async fn api_002_a_retry_while_the_first_change_runs_is_not_made_twice() {
     assert_eq!(rows, 1, "one audit row");
 }
 
-/// REQ: API-002, T8.2 (ADR-181) — correctness R5(a): a write that reaches the backend without the
-/// API's handler (a write a replica forwarded, on the primary) runs to its end in the backend's
-/// own task too: the caller goes away after the store, and the key file stays and the change is
-/// applied.
+/// REQ: API-002, T8.2 (ADR-181) — correctness R5(a), review round 3 (F1): a write that reaches
+/// the backend without the API's handler (a write a replica forwarded, on the primary) runs to its
+/// end in the backend's own task: another change holds the configuration lock, the write waits
+/// for it, and its caller goes away meanwhile. Once the lock is free the write is planned,
+/// stored and applied (without that task, nothing would be).
 #[tokio::test]
 async fn api_002_a_backend_write_whose_caller_goes_away_runs_to_its_end() {
-    let (asked, mut reload_asked) = tokio::sync::mpsc::unbounded_channel();
-    let go = Arc::new(tokio::sync::Notify::new());
-    let n = Node::new(Reload::Gated {
-        asked,
-        go: Arc::clone(&go),
-    });
+    let n = Node::new(Reload::Applies);
     let backend = ApiBackend {
         src: Arc::clone(&n.src),
     };
@@ -1696,13 +1691,18 @@ async fn api_002_a_backend_write_whose_caller_goes_away_runs_to_its_end() {
         simulate: None,
         by_admin: true,
     };
+    let held = n.src.config_writes.lock().await;
     let caller = tokio::spawn(backend.write_managed(w));
-    reload_asked.recv().await.unwrap();
+    // The write starts and waits for the lock.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        n.key_file("udm").is_none(),
+        "nothing stored while the lock is held"
+    );
     caller.abort();
     let _ = caller.await;
-    let f = n.key_file("udm").expect("the entry is stored");
-    go.notify_one();
-    wait_until("the change applied", 10, || {
+    drop(held);
+    wait_until("the change stored and applied", 10, || {
         n.src
             .config
             .load()
@@ -1711,6 +1711,7 @@ async fn api_002_a_backend_write_whose_caller_goes_away_runs_to_its_end() {
             .any(|r| r.name.as_str() == "udm")
     })
     .await;
+    let f = n.key_file("udm").expect("the entry is stored");
     assert_eq!(
         std::fs::read_to_string(&f).ok().as_deref().map(str::trim),
         Some("the-key")
@@ -1743,81 +1744,188 @@ async fn api_002_the_router_task_sweeps_after_the_routers_change() {
     let _ = task.await;
 }
 
-/// REQ: API-002, T8.2 (ADR-181) — security N4, correctness R2: the folder rule doesn't let a
-/// stored override keep sending a mounted key to an endpoint this node's own files no longer
-/// give that router. The override kept the file router's mounted key and address; the file then
-/// moved the router: the override is held (as in round 1), and its console is never asked.
+/// A UniFi router `name` at `url` whose key is the file `key`.
+fn mounted_router(name: &str, url: &str, key: &str) -> telltale_config::RouterConfig {
+    serde_json::from_value(serde_json::json!({
+        "name": name, "type": "unifi", "url": url, "site": "default",
+        "api_key_file": key, "offline_days": 0,
+    }))
+    .unwrap()
+}
+
+/// The routers a replica would get from this node's configuration in effect (its shared part).
+fn shared_routers(n: &Node) -> Vec<serde_json::Value> {
+    telltale_config::shared::shared_part(&n.src.config.load())["router"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// An administrator's override of router `name` at `url` that keeps the mounted `key` (allowed:
+/// the files' router's own file at the same endpoint) and reads every minute.
+async fn override_keeping(n: &Node, name: &str, url: &str, key: &str) {
+    let (s, v) = n
+        .put(
+            name,
+            &n.admin,
+            false,
+            serde_json::json!({"type": "unifi", "url": url, "site": "default",
+                "api_key_file": key, "interval_secs": 60, "offline_days": 0}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — review round 3 (security S1, correctness R9): an override made
+/// through the API that names a mounted key is in the configuration in effect, and in what the
+/// node publishes, only while the files' router of that name names the same file at the same
+/// address. Once the files move the router, the merge leaves the override out (the files' router
+/// is in effect, and the shared part a replica takes has only it); once they remove it, neither
+/// is there. Each left-out entry is a warning, once.
 #[tokio::test]
-async fn api_002_a_stored_override_keeps_no_mounted_key_for_a_moved_router() {
+async fn api_002_a_stale_override_with_a_mounted_key_is_left_out_of_the_shared_configuration() {
+    let n = Node::new(Reload::Applies);
+    let d = n.data();
+    std::fs::create_dir_all(format!("{d}/mount/udm")).unwrap();
+    let key = format!("{d}/mount/udm/key");
+    std::fs::write(&key, "mounted-key").unwrap();
+    let mut file = (*n.src.file_config.load_full()).clone();
+    file.router = vec![mounted_router("udm", HERE, &key)];
+    n.src.file_config.store(Arc::new(file.clone()));
+    apply(&n.src);
+    override_keeping(&n, "udm", HERE, &key).await;
+    let in_effect = || -> Vec<(String, u32)> {
+        n.src
+            .config
+            .load()
+            .router
+            .iter()
+            .map(|r| (r.url.to_string(), r.interval_secs))
+            .collect()
+    };
+    // The override matches the files: kept, and published.
+    assert_eq!(in_effect(), vec![(HERE.to_owned(), 60)]);
+    assert_eq!(shared_routers(&n)[0]["interval_secs"], 60);
+    // The files move the router.
+    file.router = vec![mounted_router("udm", ELSEWHERE, &key)];
+    n.src.file_config.store(Arc::new(file.clone()));
+    apply(&n.src);
+    assert_eq!(
+        in_effect(),
+        vec![(ELSEWHERE.to_owned(), 300)],
+        "the files' router"
+    );
+    let shared = shared_routers(&n);
+    assert_eq!(shared.len(), 1, "{shared:?}");
+    assert_eq!(shared[0]["url"], ELSEWHERE, "{shared:?}");
+    // A replica built from it has only the files' router.
+    let replica = telltale_config::shared::with_shared(
+        &telltale_config::Config::default(),
+        &telltale_config::shared::shared_part(&n.src.config.load()),
+    )
+    .unwrap();
+    assert!(
+        replica.router.iter().all(|r| r.url.as_str() == ELSEWHERE),
+        "{:?}",
+        replica.router
+    );
+    // The node that applies the stored entries says why, once.
+    let seen = super::local_access_tests::Seen::default();
+    {
+        let _log = tracing::subscriber::set_default(seen.subscriber());
+        let _ = crate::managed::effective(&file);
+        let _ = crate::managed::effective(&file);
+    }
+    let said = seen.lines(|l| l.contains("router `udm` made through the API isn't used"));
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(said[0].contains("DELETE /api/v1/routers/udm"), "{said:?}");
+    // The files remove the router: the override isn't there either.
+    file.router.clear();
+    n.src.file_config.store(Arc::new(file));
+    apply(&n.src);
+    assert_eq!(in_effect(), Vec::<(String, u32)>::new());
+    assert_eq!(shared_routers(&n), Vec::<serde_json::Value>::new());
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — review round 3 (security S1, correctness R9): an override that
+/// kept the files' mounted key and address is read while they match; once the files remove the
+/// router, the override is left out and its console is never asked again, on this node or (from
+/// the shared part) any other.
+#[tokio::test]
+async fn api_002_an_override_of_a_removed_files_router_is_held() {
     let n = Node::new(Reload::Applies);
     let d = n.data();
     let fake = console();
     std::fs::create_dir_all(format!("{d}/mount/udm")).unwrap();
     let key = format!("{d}/mount/udm/key");
     std::fs::write(&key, "mounted-key").unwrap();
-    let file_router = |url: &str| -> telltale_config::RouterConfig {
-        serde_json::from_value(serde_json::json!({
-            "name": "udm", "type": "unifi", "url": url, "site": "default",
-            "api_key_file": key, "offline_days": 0,
-        }))
-        .unwrap()
-    };
     let mut file = (*n.src.file_config.load_full()).clone();
-    file.router.push(file_router(&fake.url));
+    file.router = vec![mounted_router("udm", &fake.url, &key)];
     n.src.file_config.store(Arc::new(file.clone()));
     apply(&n.src);
-    // An administrator's override keeps the file's key and address (allowed), and changes the
-    // interval.
-    let (s, v) = n
-        .put(
-            "udm",
-            &n.admin,
-            false,
-            serde_json::json!({"type": "unifi", "url": fake.url, "site": "default",
-                "api_key_file": key, "interval_secs": 60, "offline_days": 0}),
-        )
-        .await;
-    assert_eq!(s, StatusCode::OK, "{v}");
-    // The file moves the router; the override still says the old address.
-    file.router = vec![file_router(ELSEWHERE)];
-    n.src.file_config.store(Arc::new(file));
-    apply(&n.src);
-    let in_effect = n
-        .src
-        .config
-        .load()
-        .router
-        .iter()
-        .find(|r| r.name.as_str() == "udm")
-        .cloned()
-        .unwrap();
-    assert_eq!(
-        in_effect.url.as_str(),
-        fake.url,
-        "the override is in effect"
-    );
-    assert!(
-        crate::router_secrets::UseCheck::load(&n.src)
-            .refused(&in_effect)
-            .is_some(),
-        "the override's mounted key is held"
-    );
-    let seen = super::local_access_tests::Seen::default();
-    let _log = tracing::subscriber::set_default(seen.subscriber());
+    override_keeping(&n, "udm", &fake.url, &key).await;
     let (stop, task) = poll(&n);
-    wait_until("the held router logged", 20, || {
-        !seen
-            .lines(|l| l.contains("not read on this node") && l.contains("udm"))
-            .is_empty()
+    wait_until("the override read while the files match", 20, || {
+        !fake.sites().is_empty()
     })
     .await;
     let _ = stop.send(true);
     let _ = task.await;
-    assert!(
-        fake.sites().is_empty(),
-        "the console was asked: {:?}",
-        fake.sites()
-    );
+    assert_eq!(fake.key_for("default").as_deref(), Some("mounted-key"));
+    // The files remove the router; the stored override stays.
+    file.router.clear();
+    n.src.file_config.store(Arc::new(file));
+    apply(&n.src);
+    assert!(n.key_file("udm").is_some(), "the entry is still stored");
+    assert!(n.src.config.load().router.is_empty(), "left out");
+    fake.asked.lock().unwrap().clear();
+    let (stop, task) = poll(&n);
+    // A round reads every router in effect at once: two seconds is plenty.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let _ = stop.send(true);
+    let _ = task.await;
+    assert!(fake.sites().is_empty(), "asked: {:?}", fake.sites());
+}
+
+/// REQ: API-002, T8.2 (ADR-181, CLU-006) — review round 3 (correctness R9): a native replica
+/// whose own config file still holds an older copy of the primary's `[[router]]` (CLU-006: the
+/// section is ignored) polls the router the primary shares, with its key in a folder for
+/// secrets, as before round 2. A pinned controller whose files changed since the pin is the same
+/// case.
+#[tokio::test]
+async fn api_002_a_replica_with_a_stale_own_copy_still_polls_a_folder_key() {
+    let n = Node::with(Reload::Applies, |dir, s| {
+        let id = telltale_cluster::node::Identity::init_with(
+            dir,
+            "home",
+            vec!["https://node.example.test:8443".into()],
+            "home",
+            "api",
+        )
+        .unwrap();
+        let c = telltale_cluster::net::Cluster::new(id, "0.1.0");
+        c.set_role(telltale_cluster::node::Role::Replica, 1)
+            .unwrap();
+        s.cluster = Some(c);
+    });
+    let d = n.data();
+    let fake = console();
+    std::fs::create_dir_all(format!("{d}/mount/udm")).unwrap();
+    let key = format!("{d}/mount/udm/key");
+    std::fs::write(&key, "mounted-key").unwrap();
+    // Its own file: the copy from before the primary moved the router.
+    let mut own = (*n.src.file_config.load_full()).clone();
+    own.router = vec![mounted_router("udm", ELSEWHERE, &key)];
+    n.src.file_config.store(Arc::new(own));
+    // In effect: the primary's router, from the shared configuration.
+    let mut cfg = (*n.src.config.load_full()).clone();
+    cfg.router = vec![mounted_router("udm", &fake.url, &key)];
+    n.src.config.store(Arc::new(cfg));
+    let (stop, task) = poll(&n);
+    wait_until("the shared router polled", 20, || !fake.sites().is_empty()).await;
+    let _ = stop.send(true);
+    let _ = task.await;
+    assert_eq!(fake.key_for("default").as_deref(), Some("mounted-key"));
 }
 
 /// REQ: API-002, T8.2 (ADR-181) — correctness R4: a router write that leaves its key out (nothing
@@ -1867,6 +1975,43 @@ async fn api_002_a_missing_mounted_key_says_put_the_file_there() {
     let items = n.routers(&n.viewer).await;
     assert_eq!(key_status(&items, "mounted"), "file_missing", "{items:?}");
     assert_eq!(key_status(&items, "pasted"), "missing", "{items:?}");
+}
+
+/// REQ: API-002, AGT-003, T8.2 (ADR-181) — review round 3 (S7, F5): the sweep also removes the
+/// `.request-key.<16 hex>.tmp` files a crash during the first start left behind, once old, and
+/// never the request key itself nor a fresh one.
+#[cfg(unix)]
+#[tokio::test]
+async fn api_002_the_sweep_removes_old_temporary_request_key_files() {
+    let n = Node::new(Reload::Applies);
+    let d = n.data();
+    let dir = format!("{d}/secrets");
+    std::fs::create_dir_all(&dir).unwrap();
+    let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+    for (name, aged) in [
+        (".request-key.0123456789abcdef.tmp", true),
+        (".request-key.fedcba9876543210.tmp", false),
+        (".request-key", true),
+        (".request-key.0123456789ABCDEF.tmp", true),
+    ] {
+        let f = std::fs::File::create(format!("{dir}/{name}")).unwrap();
+        if aged {
+            f.set_modified(old).unwrap();
+        }
+    }
+    crate::router_secrets::sweep_now(&n.src).unwrap();
+    let left = |name: &str| Path::new(&format!("{dir}/{name}")).exists();
+    assert!(
+        !left(".request-key.0123456789abcdef.tmp"),
+        "an old one is removed"
+    );
+    for kept in [
+        ".request-key.fedcba9876543210.tmp",
+        ".request-key",
+        ".request-key.0123456789ABCDEF.tmp",
+    ] {
+        assert!(left(kept), "{kept} kept");
+    }
 }
 
 /// REQ: API-002, T8.2 (ADR-181) — security N7: the sweep removes `.written.<16 hex>.tmp` files a

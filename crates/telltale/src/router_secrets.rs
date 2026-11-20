@@ -113,6 +113,30 @@ fn random_hex() -> Option<String> {
     }))
 }
 
+/// REQ: API-002, T8.2 (ADR-181) — review round 3 (security S1, correctness R9): the key-file
+/// field of `r`, an entry made through the API, that names a file in a folder a platform fills
+/// with secrets (`roots`) which `files` (the config files' routers, as the merge sees them)
+/// don't give a router of that name for that credential at the same endpoint; `None` when every
+/// such file is vouched for. A router the files don't define vouches for nothing. A key pasted in
+/// the UI (in `<data_dir>/secrets/`) is never asked about here: `.written` vouches for it.
+pub(crate) fn unvouched_mounted_key(
+    files: &[RouterConfig],
+    r: &RouterConfig,
+    roots: &[PathBuf],
+) -> Option<&'static str> {
+    let at = Endpoint::of(r);
+    files_of(r)
+        .find(|(_, file_field, file)| {
+            crate::secret_path::in_folders(file, roots)
+                && !files.iter().any(|f| {
+                    f.name == r.name
+                        && file_of(f, file_field) == Some(*file)
+                        && Endpoint::of(f) == at
+                })
+        })
+        .map(|(_, file_field, _)| file_field)
+}
+
 /// REQ: API-002, T8.2 (ADR-181) — review round 2, correctness R4: the configuration's errors for
 /// a router write, with "a key file is missing" said as what to paste, by the names the editor
 /// and the API body use (`api_key`, `api_secret`, `password`), not the configuration's `*_file`
@@ -797,9 +821,11 @@ pub(crate) async fn sweep(src: &Arc<Sources>) -> bool {
 const RECORD_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Whether `name` is `.written.<16 lowercase hex digits>.tmp`, the temporary file
-/// `write_records` makes.
+/// `write_records` makes, or (review round 3, S7) `.request-key.<16 lowercase hex digits>.tmp`,
+/// the one the request key is made in at start-up.
 fn is_record_temp(name: &str) -> bool {
     name.strip_prefix(".written.")
+        .or_else(|| name.strip_prefix(".request-key."))
         .and_then(|r| r.strip_suffix(".tmp"))
         .is_some_and(|tag| {
             tag.len() == 16
@@ -810,9 +836,9 @@ fn is_record_temp(name: &str) -> bool {
 }
 
 /// REQ: API-002, T8.2 (ADR-181) — review round 2, security N7: removes the temporary files of
-/// `.written` a crash left in `dir` (they hold paths only) once they are [`RECORD_TEMP_AGE`]
-/// old: only files of exactly that name, only regular files (a link is neither followed nor
-/// removed), each logged.
+/// `.written` (and of the request key) a crash left in `dir` (they hold paths, or an unused key,
+/// only) once they are [`RECORD_TEMP_AGE`] old: only files of exactly those names, only regular
+/// files (a link is neither followed nor removed), each logged.
 fn remove_old_record_temps(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -859,8 +885,8 @@ pub(crate) struct UseCheck {
     /// What `.written` records; `None` when it couldn't be read, so nothing counts as written
     /// (fails closed).
     written: Option<Vec<Record>>,
-    /// The folders a platform fills with secrets (`Sources::secret_mounts`): a key file there is
-    /// used for a router whichever node's configuration names it.
+    /// The folders a platform fills with secrets (`secret_path::mount_roots_for`): a key file
+    /// there is used for a router whichever node's configuration names it.
     mounts: Vec<PathBuf>,
 }
 
@@ -884,11 +910,12 @@ impl UseCheck {
             own
         };
         let written = read_records(&data_dir).ok();
+        let mounts = crate::secret_path::mount_roots_for(&data_dir);
         Self {
             data_dir,
             own,
             written,
-            mounts: src.secret_mounts.clone(),
+            mounts,
         }
     }
 
@@ -909,13 +936,13 @@ impl UseCheck {
         }
         // REQ: API-002, T8.2 (ADR-181, ADR-120) — owner decision (review round 1): a key file in
         // a folder a platform fills with secrets (`/run/secrets/`, `/etc/telltale-secrets/`, links
-        // followed by `secret_path`'s rule) is used for a router this node's own files don't
-        // define: one from the cluster's shared configuration, on a replica or a promoted
-        // primary. Review round 2 (security N4, correctness R2): when its own files do define
-        // the router, the check above is the one: a stored override isn't sent a mounted key for
-        // an endpoint the files no longer give it.
-        if !self.own_defines(r.name.as_str()) && crate::secret_path::in_folders(file, &self.mounts)
-        {
+        // followed by `secret_path`'s rule) is used on any node, whatever this node's own files
+        // say: a replica with a stale copy of the primary's `[[router]]` (CLU-006: ignored) and a
+        // pinned controller keep polling. Review round 3 (correctness R9, security S1): a stored
+        // override naming such a file for an endpoint the files don't give the router is left
+        // out where the API's entries are merged ([`unvouched_mounted_key`]), so no node's
+        // configuration in effect carries it.
+        if crate::secret_path::in_folders(file, &self.mounts) {
             return true;
         }
         // Saved here, through the API, for this router, credential and endpoint.

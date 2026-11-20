@@ -65,10 +65,6 @@ pub(crate) struct Sources {
     /// the running configuration instead, until a reload reads them: nothing in it counts as this
     /// node's own when alert destinations' credential files are checked.
     pub(crate) files_unread: std::sync::atomic::AtomicBool,
-    /// REQ: API-002, T8.2 (ADR-181) — the folders a platform fills with secrets (Docker's
-    /// `/run/secrets/`, the Helm chart's `/etc/telltale-secrets/`): a router's key file there is
-    /// used whichever node's configuration names it. Tests point them at a temporary folder.
-    pub(crate) secret_mounts: Vec<std::path::PathBuf>,
     /// The config files' paths, for backups (ADR-063).
     pub(crate) config_files: Vec<std::path::PathBuf>,
     /// Update status from the signed release index (ADR-046).

@@ -31,11 +31,16 @@ const EXCLUDED: &[&str] = &[
 ];
 
 /// REQ: OBS-010, API-002 (ADR-179, ADR-181) — review round 2, security N6: what the routers
-/// feature keeps in `<data_dir>/secrets/` (a router's pasted key, the list of them and its
-/// temporary files, the request key), by the first name under that folder. An alert destination
-/// never names one, so even an administrator can't send a router's key to an alert's address.
+/// feature keeps in `<data_dir>/secrets/` (a router's key pasted in the UI, the list of them and
+/// its temporary files, the request key), by the first name under that folder. An alert
+/// destination never names one, so even an administrator can't send a key pasted in the UI to an
+/// alert's address. A key a platform mounts (`/run/secrets/`, `/etc/telltale-secrets/`) is a
+/// different case: an administrator may still name one for an alert destination, as ADR-179 has
+/// it. Compared without regard to ASCII case (review round 3, S3: on a case-insensitive mount,
+/// `ROUTER-x` opens `router-x`).
 fn feature_file(first: &std::ffi::OsStr) -> bool {
     first.to_str().is_some_and(|n| {
+        let n = n.to_ascii_lowercase();
         n.starts_with("router-") || n.starts_with(".written") || n.starts_with(".request-key")
     })
 }
@@ -126,6 +131,23 @@ pub(crate) fn in_data_secrets(path: &str, data_dir: &str) -> bool {
 /// `secretMounts`).
 pub(crate) fn mount_roots() -> Vec<PathBuf> {
     FIXED_ROOTS.iter().map(PathBuf::from).collect()
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — [`mount_roots`] for a node whose data directory is `data_dir`:
+/// the one list the use-time rule and the merge of the API's entries both ask. In test builds
+/// only, `<data_dir>/mount` stands in for them too, so a test can put a mounted key there.
+pub(crate) fn mount_roots_for(data_dir: &str) -> Vec<PathBuf> {
+    #[cfg(test)]
+    {
+        let mut v = mount_roots();
+        v.push(Path::new(data_dir).join("mount"));
+        v
+    }
+    #[cfg(not(test))]
+    {
+        let _ = data_dir;
+        mount_roots()
+    }
 }
 
 /// REQ: API-002, T8.2 (ADR-181) — whether `path` is in one of `roots` (normally
@@ -421,6 +443,25 @@ mod tests {
             &p("router-udm.api_key.0123456789abcdef"),
             &data
         ));
+    }
+
+    /// REQ: OBS-010, API-002 (ADR-179, ADR-181) — review round 3, security S3: the feature's
+    /// files are recognised whatever the ASCII case of the name (a case-insensitive mount opens
+    /// `ROUTER-x` as `router-x`); an ordinary file of any case is still allowed.
+    #[test]
+    fn obs_010_feature_files_are_refused_in_any_case() {
+        let data = "/var/lib/telltale-test-data";
+        let p = |s: &str| format!("{data}/secrets/{s}");
+        for bad in [
+            "ROUTER-udm.api_key.0123456789abcdef",
+            "Router-udm",
+            ".Request-Key",
+            ".WRITTEN",
+            ".Written.0123456789abcdef.tmp",
+        ] {
+            assert!(!allowed(&p(bad), data), "{bad}");
+        }
+        assert!(allowed(&p("NTFY-Token"), data));
     }
 
     /// REQ: API-002, T8.2 (ADR-181) — a router key the API wrote is in the data directory's
