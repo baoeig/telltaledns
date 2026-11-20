@@ -473,6 +473,31 @@ pub(crate) fn new_local_name(current: &Config, candidate: &Config) -> Option<Str
     None
 }
 
+/// REQ: OBS-024 (ADR-180) — `candidate` as this node fetches its lists for a simulation: with this
+/// node's `[filter]` link-local switch, byte cap and timeout (a candidate's take effect only after
+/// a restart: `[filter]` needs one), and each list's own `max_bytes` no larger than this node
+/// allows for that list now (the byte cap, or the list's own cap in effect if that is larger).
+/// For every caller: what this node may reach and how much it downloads is its own setting.
+pub(crate) fn with_this_nodes_downloads(running: &Config, candidate: &Config) -> Config {
+    let mut c = candidate.clone();
+    let f = &running.filter;
+    c.filter.allow_link_local_urls = f.allow_link_local_urls;
+    c.filter.max_list_bytes = f.max_list_bytes;
+    c.filter.fetch_timeout_secs = f.fetch_timeout_secs;
+    for l in &mut c.list {
+        let allowed = running
+            .list
+            .iter()
+            .find(|r| r.name == l.name)
+            .and_then(|r| r.max_bytes)
+            .map_or(f.max_list_bytes, |m| m.max(f.max_list_bytes));
+        if l.max_bytes.is_some_and(|m| m > allowed) {
+            l.max_bytes = Some(allowed);
+        }
+    }
+    c
+}
+
 /// REQ: OBS-024 (ADR-180) — `POST /api/v1/simulate`'s refusal of a [`new_local_name`]: the same
 /// whatever is, or isn't, at the path.
 pub(crate) fn local_name_refused(field: &str) -> Problem {
@@ -1551,6 +1576,9 @@ pub(crate) async fn simulate(
     if opts.auto && !running.simulate.plans_by_default {
         return Ok(None);
     }
+    // REQ: OBS-024 (ADR-180) — the candidate's lists are fetched under this node's rules, and the
+    // peers get it that way too.
+    let candidate = Arc::new(with_this_nodes_downloads(&running, &candidate));
     let unavailable_counted = |reason: &str| {
         stats().unavailable.fetch_add(1, Ordering::Relaxed);
         Ok(Some(unavailable(reason)))
@@ -1662,7 +1690,7 @@ pub(crate) async fn handle(
             })
         };
         let current = merge(&req.current)?;
-        let mut candidate = merge(&req.candidate)?;
+        let candidate = merge(&req.candidate)?;
         // REQ: OBS-024 (T10.7) — a peer says what to simulate, not what this node reads or
         // reaches: a list file must be one this node's configuration already names, downloads
         // follow this node's link-local setting, and the window and limits are this node's.
@@ -1676,9 +1704,10 @@ pub(crate) async fn handle(
                 l.name.as_str()
             )));
         }
-        candidate.filter.allow_link_local_urls = current.filter.allow_link_local_urls;
-        let (current, candidate) = (Arc::new(current), Arc::new(candidate));
         let running = src.config.load();
+        // REQ: OBS-024 (ADR-180) — and the byte caps and the timeout are this node's too.
+        let candidate = with_this_nodes_downloads(&running, &candidate);
+        let (current, candidate) = (Arc::new(current), Arc::new(candidate));
         let mut window = req.window;
         window.max_rows = window.max_rows.min(running.simulate.max_rows);
         window.max_secs = window.max_secs.min(running.simulate.max_secs);

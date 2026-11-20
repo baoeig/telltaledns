@@ -690,3 +690,278 @@ async fn ups_011_a_stored_plugin_upstream_can_still_be_removed() {
         .collect();
     assert_eq!(members_of(&groups, "default"), ["quad9", "consul"]);
 }
+
+/// A node whose config files define `quad9` and `cloudflare`, the `default` group, and a client
+/// group `iot` that sends to `default`, with a device, a list and a quick rule made the ordinary
+/// way through the API.
+async fn node_with_api_entries() -> Node {
+    let file: telltale_config::Config = toml::from_str(
+        r#"
+        [[upstream]]
+        name = "quad9"
+        url = "udp://9.9.9.9"
+        [[upstream]]
+        name = "cloudflare"
+        url = "udp://1.1.1.1"
+        [[upstream_group]]
+        name = "default"
+        members = ["quad9"]
+        [[group]]
+        name = "iot"
+        upstreams = "default"
+        "#,
+    )
+    .unwrap();
+    let n = Node::new(file);
+    for (path, body) in [
+        (
+            "/api/v1/clients/tv",
+            serde_json::json!({ "match": ["192.168.1.20"] }),
+        ),
+        (
+            "/api/v1/lists/manual",
+            serde_json::json!({ "rules": ["||ads.example^"] }),
+        ),
+        (
+            "/api/v1/rules/r-1",
+            serde_json::json!({ "action": "block", "domain": "tracker.example" }),
+        ),
+    ] {
+        let (s, v) = n.put(path, &n.admin, false, body).await;
+        assert_eq!(s, StatusCode::OK, "{path}: {v}");
+    }
+    n.store(
+        crate::managed::UPSTREAM,
+        "magic",
+        &serde_json::json!({ "name": "magic", "url": format!("unix://{NO_SOCKET}") }),
+    );
+    n
+}
+
+/// The running configuration `effective` builds for `n`, with the warnings and errors it logged.
+fn effective_of(n: &Node) -> (telltale_config::Config, Seen) {
+    let file = n.src.file_config.load_full();
+    let seen = Seen::default();
+    let cfg =
+        tracing::subscriber::with_default(seen.subscriber(), || crate::managed::effective(&file));
+    (cfg, seen)
+}
+
+/// The API's device, list and quick rule are in effect, and nothing made the node fall back to
+/// the config files alone.
+fn assert_api_entries_kept(cfg: &telltale_config::Config, seen: &Seen) {
+    assert!(
+        cfg.client.iter().any(|c| c.name.as_str() == "tv"),
+        "the device: {:?}",
+        seen.lines(|_| true)
+    );
+    assert!(cfg.list.iter().any(|l| l.name.as_str() == "manual"));
+    assert!(
+        cfg.rule
+            .iter()
+            .any(|r| r.domain.as_str() == "tracker.example")
+    );
+    let fell_back = seen.lines(|l| l.contains("using the config files only"));
+    assert!(fell_back.is_empty(), "{fell_back:?}");
+}
+
+/// REQ: UPS-011, API-002 (ADR-180) — an upstream group made through the API whose only members
+/// are left out is left out too (an override of the files' group gives the files' back), so the
+/// merged configuration stays valid and every other entry made through the API stays in effect;
+/// each is named in a warning.
+#[tokio::test]
+async fn ups_011_a_group_emptied_by_a_left_out_plugin_keeps_the_other_api_entries() {
+    let n = node_with_api_entries().await;
+    n.store(
+        crate::managed::UPSTREAM_GROUP,
+        "plugins",
+        &serde_json::json!({ "name": "plugins", "members": ["magic"] }),
+    );
+    n.store(
+        crate::managed::UPSTREAM_GROUP,
+        "default",
+        &serde_json::json!({ "name": "default", "members": ["magic"] }),
+    );
+    let (cfg, seen) = effective_of(&n);
+    assert_api_entries_kept(&cfg, &seen);
+    assert!(
+        cfg.upstream_group
+            .iter()
+            .all(|g| g.name.as_str() != "plugins"),
+        "{:?}",
+        cfg.upstream_group
+    );
+    assert_eq!(
+        members_of(&cfg.upstream_group, "default"),
+        ["quad9"],
+        "the files' group is back"
+    );
+    let warned = seen.warnings();
+    for name in ["`plugins`", "`default`", "`magic`"] {
+        assert_eq!(
+            warned.iter().filter(|w| w.contains(name)).count(),
+            1,
+            "one warning naming {name}: {warned:?}"
+        );
+    }
+}
+
+/// REQ: UPS-011, API-002 (ADR-180) — a `parallel` upstream group made through the API that loses
+/// a left-out member asks as many at once as it still has, or, with one left, uses `failover`;
+/// the merge stays valid.
+#[tokio::test]
+async fn ups_011_a_parallel_group_keeps_working_without_a_left_out_member() {
+    let n = node_with_api_entries().await;
+    for (name, members, fanout) in [
+        ("race2", vec!["quad9", "magic"], 2),
+        ("race3", vec!["quad9", "cloudflare", "magic"], 3),
+    ] {
+        n.store(
+            crate::managed::UPSTREAM_GROUP,
+            name,
+            &serde_json::json!({
+                "name": name, "members": members, "strategy": "parallel", "parallel_fanout": fanout,
+            }),
+        );
+    }
+    let (cfg, seen) = effective_of(&n);
+    assert_api_entries_kept(&cfg, &seen);
+    let group = |name: &str| {
+        cfg.upstream_group
+            .iter()
+            .find(|g| g.name.as_str() == name)
+            .cloned()
+            .unwrap()
+    };
+    let race2 = group("race2");
+    assert_eq!(members_of(&cfg.upstream_group, "race2"), ["quad9"]);
+    assert_eq!(race2.strategy, telltale_config::Strategy::Failover);
+    let race3 = group("race3");
+    assert_eq!(
+        members_of(&cfg.upstream_group, "race3"),
+        ["quad9", "cloudflare"]
+    );
+    assert_eq!(
+        (race3.strategy, race3.parallel_fanout),
+        (telltale_config::Strategy::Parallel, 2)
+    );
+    let warned = seen.warnings();
+    for name in ["`race2`", "`race3`"] {
+        assert_eq!(
+            warned.iter().filter(|w| w.contains(name)).count(),
+            1,
+            "{name}: {warned:?}"
+        );
+    }
+}
+
+/// REQ: UPS-011, API-002 (ADR-180) — a client group made through the API that sends its queries to
+/// an upstream group that is left out (one emptied by a left-out plugin, or a forward left out as a
+/// whole) goes back to the default (an override of a config-file group, to the files' choice); its
+/// other settings stay, and the merge stays valid.
+#[tokio::test]
+async fn ups_011_a_client_group_naming_a_left_out_group_keeps_working() {
+    let n = node_with_api_entries().await;
+    n.store(
+        crate::managed::UPSTREAM_GROUP,
+        "plugins",
+        &serde_json::json!({ "name": "plugins", "members": ["magic"] }),
+    );
+    n.store(
+        crate::managed::FORWARD,
+        "corp.example",
+        &serde_json::json!({ "servers": [format!("exec://{NO_PROGRAM}")] }),
+    );
+    for (name, upstreams) in [
+        ("kids", "plugins"),
+        ("iot", "plugins"),
+        ("office", "forward:corp.example"),
+    ] {
+        n.store(
+            crate::managed::GROUP,
+            name,
+            &serde_json::json!({ "name": name, "upstreams": upstreams, "block_ttl": 60 }),
+        );
+    }
+    let (cfg, seen) = effective_of(&n);
+    assert_api_entries_kept(&cfg, &seen);
+    let group = |name: &str| {
+        cfg.group
+            .iter()
+            .find(|g| g.name.as_str() == name)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(group("kids").upstreams, None);
+    assert_eq!(group("office").upstreams, None);
+    let iot = group("iot");
+    assert_eq!(
+        iot.upstreams.as_deref(),
+        Some("default"),
+        "the files' choice"
+    );
+    assert_eq!(iot.block_ttl, 60, "its other settings stay the API's");
+    let warned = seen.warnings();
+    for name in ["`kids`", "`iot`", "`office`"] {
+        assert_eq!(
+            warned.iter().filter(|w| w.contains(name)).count(),
+            1,
+            "{name}: {warned:?}"
+        );
+    }
+}
+
+/// REQ: UPS-011 (ADR-180) — a forwarded domain made through the API keeps the servers that aren't
+/// plugins (only those are left out); one with none left is left out, and its warning says where
+/// its names go instead.
+#[tokio::test]
+async fn ups_011_a_forward_keeps_its_servers_that_arent_plugins() {
+    let n = node_with_api_entries().await;
+    n.store(
+        crate::managed::FORWARD,
+        "corp.example",
+        &serde_json::json!({ "servers": ["192.0.2.53", format!("exec://{NO_PROGRAM}"), "tls://192.0.2.54"] }),
+    );
+    n.store(
+        crate::managed::FORWARD,
+        "lab.example",
+        &serde_json::json!({ "servers": [format!("unix://{NO_SOCKET}")] }),
+    );
+    let (cfg, seen) = effective_of(&n);
+    assert_api_entries_kept(&cfg, &seen);
+    let route = |d: &str| {
+        cfg.route
+            .iter()
+            .find(|r| r.match_suffix.iter().any(|s| s.as_str() == d))
+            .cloned()
+    };
+    let corp = route("corp.example").expect("the forward stays");
+    let urls: Vec<String> = cfg
+        .upstream_group
+        .iter()
+        .find(|g| g.name == corp.upstream_group)
+        .unwrap()
+        .members
+        .iter()
+        .filter_map(|m| cfg.upstream.iter().find(|u| u.name == *m))
+        .map(|u| u.url.to_string())
+        .collect();
+    assert_eq!(urls, ["udp://192.0.2.53", "tls://192.0.2.54"]);
+    assert!(route("lab.example").is_none(), "no server left");
+    let warned = seen.warnings();
+    let corp: Vec<&String> = warned
+        .iter()
+        .filter(|w| w.contains("`corp.example`"))
+        .collect();
+    assert_eq!(corp.len(), 1, "{warned:?}");
+    assert!(corp[0].contains("keeps"), "{corp:?}");
+    let lab: Vec<&String> = warned
+        .iter()
+        .filter(|w| w.contains("`lab.example`"))
+        .collect();
+    assert_eq!(lab.len(), 1, "{warned:?}");
+    assert!(
+        lab[0].contains("`default`"),
+        "says where its names go: {lab:?}"
+    );
+}

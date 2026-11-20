@@ -335,67 +335,200 @@ pub(crate) fn plugin_field(url: &str, has_args: bool) -> Option<&'static str> {
     }
 }
 
-/// REQ: UPS-011 (ADR-180) — an entry made through the API that the merge leaves out: an upstream
-/// or a forwarded domain that names a program or a local socket. Plugin upstreams are defined in
-/// the config file; such an entry was stored by an older version, restored from a backup, or
-/// written into `state.db` by hand. It isn't deleted.
+/// REQ: UPS-011 (ADR-180) — something the merge changed in the entries made through the API
+/// because some of them name a program or a local socket: such an upstream, or such a server of a
+/// forwarded domain, is left out (plugin upstreams are defined in the config file; it was stored
+/// by an older version, restored from a backup, or written into `state.db` by hand, and isn't
+/// deleted), and what named it is adjusted so the merged configuration stays valid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LeftOut {
-    /// `upstream` or `forward`.
-    pub(crate) kind: &'static str,
+    /// The entry's name.
     pub(crate) name: String,
+    /// What happened to it, as the warning says it.
+    pub(crate) what: String,
 }
 
-/// The entries the merge leaves out (see [`LeftOut`]).
-pub(crate) fn plugin_entries(e: &Entries) -> Vec<LeftOut> {
-    let upstreams = e.upstreams.iter().filter_map(|(n, o)| match o {
-        Ovr::Set(u) if is_plugin_url(u.url.as_str()) => Some(LeftOut {
-            kind: "upstream",
-            name: n.clone(),
-        }),
-        _ => None,
-    });
-    let forwards = e
-        .forwards
+/// How an upstream group is chosen when the merge leaves out the one an entry named.
+fn default_route(file: &Config) -> &'static str {
+    if file
+        .upstream_group
         .iter()
-        .filter(|(_, f)| f.servers.iter().any(|s| is_plugin_url(&server_url(s))))
-        .map(|(d, _)| LeftOut {
-            kind: "forward",
-            name: d.clone(),
-        });
-    upstreams.chain(forwards).collect()
+        .any(|g| g.name.as_str() == "default")
+    {
+        "the `default` upstream group"
+    } else {
+        "the `default` upstream group, if there is one"
+    }
 }
 
-/// `e` without the entries [`plugin_entries`] names (`None`: there are none). An upstream left
-/// out is also taken out of the upstream groups made through the API, unless the files define an
-/// upstream of that name: their entry is then the one in effect.
-fn without_plugins(file: &Config, e: &Entries) -> Option<Entries> {
-    let left = plugin_entries(e);
-    if left.is_empty() {
+/// `e` without what names a program or a local socket, and what that changed (`None`: nothing
+/// does). Only these references to an upstream or an upstream group exist (`validate.rs`): a
+/// group's members, a client group's `upstreams`, and a route's group, and routes made through the
+/// API are the forwards' own. So, made through the API:
+/// - a plugin upstream is left out, and taken out of the upstream groups that name it, unless the
+///   files define an upstream of that name (theirs is then the one in effect);
+/// - a forwarded domain keeps its other servers; with none left it is left out, and its names go
+///   where they would without it;
+/// - an upstream group left with no member is left out (an override of the files' group gives
+///   theirs back); a `parallel` one left with fewer members than it races races them all, or with
+///   one uses `failover`;
+/// - a client group that sent its queries to a group left out uses the files' choice when it
+///   overrides a files' group, else the default.
+///
+/// The merged configuration then validates whenever it did with the plugin entries in it.
+fn without_plugins(file: &Config, e: &Entries) -> Option<(Entries, Vec<LeftOut>)> {
+    let plugin_server = |s: &String| is_plugin_url(&server_url(s));
+    let any = e
+        .upstreams
+        .iter()
+        .any(|(_, o)| matches!(o, Ovr::Set(u) if is_plugin_url(u.url.as_str())))
+        || e.forwards
+            .iter()
+            .any(|(_, f)| f.servers.iter().any(plugin_server));
+    if !any {
         return None;
     }
-    let gone: Vec<&str> = left
-        .iter()
-        .filter(|l| l.kind == "upstream")
-        .map(|l| l.name.as_str())
-        .filter(|n| !file.upstream.iter().any(|u| u.name.as_str() == *n))
-        .collect();
     let mut e = e.clone();
-    e.upstreams
-        .retain(|(_, o)| !matches!(o, Ovr::Set(u) if is_plugin_url(u.url.as_str())));
-    e.forwards
-        .retain(|(_, f)| !f.servers.iter().any(|s| is_plugin_url(&server_url(s))));
-    for (_, g) in &mut e.upstream_groups {
-        if let Ovr::Set(g) = g {
-            g.members.retain(|m| !gone.contains(&m.as_str()));
+    let mut notes = Vec::new();
+    let mut gone = Vec::new();
+    e.upstreams.retain(|(n, o)| {
+        let left = matches!(o, Ovr::Set(u) if is_plugin_url(u.url.as_str()));
+        if left {
+            notes.push(LeftOut {
+                name: n.clone(),
+                what: format!(
+                    "upstream `{n}` made through the API isn't used: it names a program or a local socket (`exec://`, `unix://`), and plugin upstreams are defined in the config file; define it there, or remove this one (DELETE /api/v1/upstreams/{n})"
+                ),
+            });
+            if !file.upstream.iter().any(|u| u.name.as_str() == n) {
+                gone.push(n.clone());
+            }
         }
+        !left
+    });
+    let mut removed = forwards_without_plugins(file, &mut e, &mut notes);
+    upstream_groups_without(file, &mut e, &gone, &mut removed, &mut notes);
+    for (n, o) in &mut e.groups {
+        let Ovr::Set(g) = o else { continue };
+        let Some(u) = g
+            .upstreams
+            .clone()
+            .filter(|u| removed.contains(&u.to_string()))
+        else {
+            continue;
+        };
+        g.upstreams = file
+            .group
+            .iter()
+            .find(|f| f.name.as_str() == n)
+            .and_then(|f| f.upstreams.clone());
+        let now = g.upstreams.as_ref().map_or_else(
+            || default_route(file).to_owned(),
+            |f| format!("the config files' choice, `{f}`"),
+        );
+        notes.push(LeftOut {
+            name: n.clone(),
+            what: format!(
+                "client group `{n}` made through the API sent its queries to upstream group `{u}`, which isn't used (it named only upstreams that are left out); it uses {now} instead"
+            ),
+        });
     }
-    Some(e)
+    Some((e, notes))
 }
 
-/// REQ: UPS-011 (ADR-180) — one warning per entry the merge leaves out, when it starts being left
-/// out: a configuration that is built again with the same ones logs nothing (per data directory,
-/// so each node in a test process keeps its own).
+/// The forwards' plugin servers left out; returns the upstream groups of forwards left out whole.
+fn forwards_without_plugins(
+    file: &Config,
+    e: &mut Entries,
+    notes: &mut Vec<LeftOut>,
+) -> Vec<String> {
+    let mut removed = Vec::new();
+    e.forwards.retain_mut(|(d, f)| {
+        let before = f.servers.len();
+        f.servers.retain(|s| !is_plugin_url(&server_url(s)));
+        let left = before - f.servers.len();
+        if left == 0 {
+            return true;
+        }
+        if f.servers.is_empty() {
+            notes.push(LeftOut {
+                name: d.clone(),
+                what: format!(
+                    "forwarded domain `{d}` made through the API isn't used: its servers name a program or a local socket (`exec://`, `unix://`), and plugin upstreams are defined in the config file; names under it go to {} or a route that matches them; define it in the config file, or remove this one (DELETE /api/v1/forwards/{d})",
+                    default_route(file)
+                ),
+            });
+            removed.push(forward_group(d));
+            false
+        } else {
+            notes.push(LeftOut {
+                name: d.clone(),
+                what: format!(
+                    "forwarded domain `{d}` made through the API: {left} of its servers name a program or a local socket and aren't used (plugin upstreams are defined in the config file); it keeps the other {}",
+                    f.servers.len()
+                ),
+            });
+            true
+        }
+    });
+    removed
+}
+
+/// The upstream groups made through the API without the upstreams in `gone`; the ones left empty
+/// are left out (their names go to `removed` unless the files define a group of that name).
+fn upstream_groups_without(
+    file: &Config,
+    e: &mut Entries,
+    gone: &[String],
+    removed: &mut Vec<String>,
+    notes: &mut Vec<LeftOut>,
+) {
+    e.upstream_groups.retain_mut(|(n, o)| {
+        let Ovr::Set(g) = o else { return true };
+        let had = g.members.len();
+        g.members.retain(|m| !gone.iter().any(|x| x == m.as_str()));
+        let left = g.members.len();
+        if left == had {
+            return true;
+        }
+        if left == 0 {
+            let instead = if file.upstream_group.iter().any(|f| f.name.as_str() == n) {
+                format!("the config files' `{n}` is the one in effect")
+            } else {
+                removed.push(n.clone());
+                "what sent queries to it uses another group".to_owned()
+            };
+            notes.push(LeftOut {
+                name: n.clone(),
+                what: format!(
+                    "upstream group `{n}` made through the API isn't used: every member names a program or a local socket and is left out; {instead}"
+                ),
+            });
+            return false;
+        }
+        if g.strategy == telltale_config::Strategy::Parallel && usize::from(g.parallel_fanout) > left
+        {
+            let now = if left >= 2 {
+                g.parallel_fanout = u8::try_from(left).unwrap_or(u8::MAX);
+                format!("asks its {left} members at once")
+            } else {
+                g.strategy = telltale_config::Strategy::Failover;
+                "uses `failover` with its one member".to_owned()
+            };
+            notes.push(LeftOut {
+                name: n.clone(),
+                what: format!(
+                    "upstream group `{n}` made through the API lost members that are left out (they name a program or a local socket); it now {now}"
+                ),
+            });
+        }
+        true
+    });
+}
+
+/// REQ: UPS-011 (ADR-180) — one warning per change the merge makes for plugin entries, when it
+/// starts: a configuration that is built again with the same ones logs nothing (per data
+/// directory, so each node in a test process keeps its own).
 fn warn_left_out(file: &Config, left: &[LeftOut]) {
     static LAST: std::sync::Mutex<std::collections::BTreeMap<String, Vec<LeftOut>>> =
         std::sync::Mutex::new(std::collections::BTreeMap::new());
@@ -405,15 +538,7 @@ fn warn_left_out(file: &Config, left: &[LeftOut]) {
     let key = file.node.data_dir.to_string();
     let before = last.get(&key).cloned().unwrap_or_default();
     for l in left.iter().filter(|l| !before.contains(l)) {
-        let (what, route) = if l.kind == "forward" {
-            ("forwarded domain", "forwards")
-        } else {
-            ("upstream", "upstreams")
-        };
-        warn!(
-            "{what} `{}` made through the API isn't used: it names a program or a local socket (`exec://`, `unix://`), and plugin upstreams are defined in the config file; define it there, or remove this one (DELETE /api/v1/{route}/{})",
-            l.name, l.name
-        );
+        warn!("{}", l.what);
     }
     if left.is_empty() {
         last.remove(&key);
@@ -444,10 +569,10 @@ fn apply_one_of(cfg: &mut Config, e: &Entries) {
 
 /// `file` plus the entries (names the files already use are skipped), if the result validates
 /// (including record values); otherwise `Err` with the reasons. Entries that name a program or a
-/// local socket are left out (REQ: UPS-011, ADR-180; [`plugin_entries`]).
+/// local socket are left out (REQ: UPS-011, ADR-180; [`without_plugins`]).
 pub(crate) fn merge(file: &Config, e: &Entries) -> Result<Config, Vec<String>> {
     let kept = without_plugins(file, e);
-    let e = kept.as_ref().unwrap_or(e);
+    let e = kept.as_ref().map_or(e, |(k, _)| k);
     let mut cfg = file.clone();
     // ADR-069 — upstreams, upstream groups, lists, and groups made through the API override
     // or hide the files' entries of the same name (before forwards add their own).
@@ -613,7 +738,12 @@ pub(crate) fn effective(file: &Config) -> Config {
     };
     let stored = entries(&state);
     // REQ: UPS-011 (ADR-180) — what the merge leaves out, logged once.
-    warn_left_out(file, &plugin_entries(&stored));
+    warn_left_out(
+        file,
+        &without_plugins(file, &stored)
+            .map(|(_, notes)| notes)
+            .unwrap_or_default(),
+    );
     match merge(file, &stored) {
         Ok(c) => c,
         Err(errs) => {

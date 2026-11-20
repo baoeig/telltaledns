@@ -1874,7 +1874,7 @@ async fn lists(
             l.hits = hits.get(&l.name).copied().unwrap_or(0);
             // REQ: FLT-004, API-002 (ADR-180) — what went wrong reading a local file (a line of
             // it, whether it is there) is an administrator's to see; the node's log has it too.
-            if !admin && l.error.is_some() && from_local_file(&l.source) {
+            if !admin && l.error.is_some() && list_reads_a_local_file(&l.source) {
                 l.error = Some(LOCAL_LIST_ERROR.to_owned());
             }
         }
@@ -1891,8 +1891,9 @@ async fn lists(
 /// file.
 const LOCAL_LIST_ERROR: &str = "the list's local file couldn't be used; an administrator sees why here, and the node's log says";
 
-/// Whether a list's `source` (URL, file path, or `inline`) is a local file.
-fn from_local_file(source: &str) -> bool {
+/// REQ: FLT-004 (ADR-180) — whether a list's `source` ([`model::ListInfo`]: a URL, a file path,
+/// or `inline`) is a local file.
+pub fn list_reads_a_local_file(source: &str) -> bool {
     source != "inline"
         && !source
             .get(..8)
