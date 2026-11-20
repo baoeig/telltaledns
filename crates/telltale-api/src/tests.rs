@@ -292,6 +292,7 @@ impl Backend for Fake {
             enabled: true,
             mode: "enforce".into(),
             source: "inline".into(),
+            local: false,
             state: "ok".into(),
             error: None,
             bytes: 0,

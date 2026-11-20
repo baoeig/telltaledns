@@ -965,3 +965,148 @@ async fn ups_011_a_forward_keeps_its_servers_that_arent_plugins() {
         "says where its names go: {lab:?}"
     );
 }
+
+/// The URLs of upstream group `name`'s members in `cfg`.
+fn member_urls(cfg: &telltale_config::Config, name: &str) -> Vec<String> {
+    members_of(&cfg.upstream_group, name)
+        .iter()
+        .filter_map(|m| cfg.upstream.iter().find(|u| u.name.as_str() == m))
+        .map(|u| u.url.to_string())
+        .collect()
+}
+
+/// REQ: UPS-011, API-002 (ADR-180) — a forwarded domain's servers keep their upstream names
+/// (`forward:<domain>#<n>`, by place) when a plugin server among them is left out, so an upstream
+/// group made through the API that names one still means the same server; the names the left-out
+/// servers had are taken out of such groups, as any left-out upstream is. The merge stays valid.
+#[tokio::test]
+async fn ups_011_a_forwards_servers_keep_their_names_when_a_plugin_is_left_out() {
+    let n = node_with_api_entries().await;
+    n.store(
+        crate::managed::FORWARD,
+        "corp.example",
+        &serde_json::json!({ "servers": [format!("exec://{NO_PROGRAM}"), "192.0.2.53", "tls://192.0.2.54"] }),
+    );
+    n.store(
+        crate::managed::FORWARD,
+        "lab.example",
+        &serde_json::json!({ "servers": [format!("unix://{NO_SOCKET}")] }),
+    );
+    for (name, members) in [
+        (
+            "corp",
+            vec!["forward:corp.example#2", "forward:corp.example#1", "quad9"],
+        ),
+        ("corp-tls", vec!["forward:corp.example#3"]),
+        ("lab", vec!["forward:lab.example#1", "cloudflare"]),
+    ] {
+        n.store(
+            crate::managed::UPSTREAM_GROUP,
+            name,
+            &serde_json::json!({ "name": name, "members": members }),
+        );
+    }
+    let (cfg, seen) = effective_of(&n);
+    assert_api_entries_kept(&cfg, &seen);
+    assert_eq!(
+        member_urls(&cfg, "forward:corp.example"),
+        ["udp://192.0.2.53", "tls://192.0.2.54"]
+    );
+    assert_eq!(
+        members_of(&cfg.upstream_group, "corp"),
+        ["forward:corp.example#2", "quad9"],
+        "the plugin server's name is taken out"
+    );
+    assert_eq!(
+        member_urls(&cfg, "corp"),
+        ["udp://192.0.2.53", "udp://9.9.9.9"]
+    );
+    assert_eq!(member_urls(&cfg, "corp-tls"), ["tls://192.0.2.54"]);
+    assert_eq!(member_urls(&cfg, "lab"), ["udp://1.1.1.1"]);
+}
+
+/// REQ: UPS-011, API-002 (ADR-180) — a write that names what the merge leaves out (an upstream
+/// that names a program or a socket, a forward's plugin server, or an upstream group left out with
+/// them) is refused with a 422 that names it and says where plugin upstreams are defined, dry run
+/// or not, instead of being stored and adjusted. A write that names what is in effect is not.
+#[tokio::test]
+async fn ups_011_a_write_naming_a_left_out_entry_is_refused() {
+    let n = node_with_api_entries().await;
+    n.store(
+        crate::managed::UPSTREAM_GROUP,
+        "plugins",
+        &serde_json::json!({ "name": "plugins", "members": ["magic"] }),
+    );
+    n.store(
+        crate::managed::FORWARD,
+        "corp.example",
+        &serde_json::json!({ "servers": [format!("exec://{NO_PROGRAM}"), "192.0.2.53"] }),
+    );
+    n.store(
+        crate::managed::FORWARD,
+        "lab.example",
+        &serde_json::json!({ "servers": [format!("unix://{NO_SOCKET}")] }),
+    );
+    let refused = [
+        (
+            "/api/v1/upstream-groups/g",
+            serde_json::json!({ "members": ["magic"] }),
+            "magic",
+        ),
+        (
+            "/api/v1/upstream-groups/g",
+            serde_json::json!({ "members": ["quad9", "forward:corp.example#1"] }),
+            "forward:corp.example#1",
+        ),
+        (
+            "/api/v1/groups/kids",
+            serde_json::json!({ "upstreams": "plugins" }),
+            "plugins",
+        ),
+        (
+            "/api/v1/groups/iot",
+            serde_json::json!({ "upstreams": "forward:lab.example" }),
+            "forward:lab.example",
+        ),
+    ];
+    for (who, creds) in [("operator", &n.operator), ("admin", &n.admin)] {
+        for (path, body, name) in &refused {
+            for dry in [true, false] {
+                let (s, v) = n.put(path, creds, dry, body.clone()).await;
+                assert_eq!(
+                    s,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "{who}, {path}, dry={dry}: {v}"
+                );
+                assert!(
+                    v["detail"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains(&format!("`{name}`")),
+                    "{who}, {path}: names it: {v}"
+                );
+                assert!(
+                    v["hint"].as_str().unwrap_or("").contains("config file"),
+                    "{who}, {path}: {v}"
+                );
+            }
+        }
+    }
+    let stored = crate::managed::entries(n.auth.state());
+    assert!(stored.upstream_groups.iter().all(|(k, _)| k != "g"));
+    assert!(stored.groups.iter().all(|(k, _)| k != "kids"));
+    for (path, body) in [
+        (
+            "/api/v1/upstream-groups/g",
+            serde_json::json!({ "members": ["quad9", "forward:corp.example#2"] }),
+        ),
+        (
+            "/api/v1/groups/kids",
+            serde_json::json!({ "upstreams": "forward:corp.example" }),
+        ),
+    ] {
+        let (s, v) = n.put(path, &n.operator, false, body).await;
+        assert_eq!(s, StatusCode::OK, "{path}: {v}");
+        assert!(!v["after"].is_null(), "{path}: in effect: {v}");
+    }
+}

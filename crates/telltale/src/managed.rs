@@ -361,14 +361,44 @@ fn default_route(file: &Config) -> &'static str {
     }
 }
 
+/// REQ: UPS-011, API-002 (ADR-180) — the names of what the merge leaves out of the entries made
+/// through the API because they name a program or a local socket: upstreams (a forward's server is
+/// the upstream `forward:<domain>#<n>`) and upstream groups. A write that names one is refused.
+#[derive(Debug, Default)]
+pub(crate) struct LeftOutNames {
+    pub(crate) upstreams: Vec<String>,
+    pub(crate) groups: Vec<String>,
+}
+
+/// REQ: UPS-011, API-002 (ADR-180) — what [`merge`] leaves out of `e`, by name.
+pub(crate) fn left_out_names(file: &Config, e: &Entries) -> LeftOutNames {
+    without_plugins(file, e)
+        .map(|k| k.names)
+        .unwrap_or_default()
+}
+
+/// What [`without_plugins`] keeps, what it changed, and the names it left out.
+struct Kept {
+    entries: Entries,
+    notes: Vec<LeftOut>,
+    names: LeftOutNames,
+}
+
+/// The upstream a forwarded domain's server becomes: numbered by its place among the domain's
+/// servers, so a server keeps its name when another one is left out.
+fn forward_server_name(group: &str, i: usize) -> String {
+    format!("{group}#{}", i + 1)
+}
+
 /// `e` without what names a program or a local socket, and what that changed (`None`: nothing
 /// does). Only these references to an upstream or an upstream group exist (`validate.rs`): a
 /// group's members, a client group's `upstreams`, and a route's group, and routes made through the
 /// API are the forwards' own. So, made through the API:
 /// - a plugin upstream is left out, and taken out of the upstream groups that name it, unless the
 ///   files define an upstream of that name (theirs is then the one in effect);
-/// - a forwarded domain keeps its other servers; with none left it is left out, and its names go
-///   where they would without it;
+/// - a forwarded domain keeps its other servers, under the names they had; the upstreams its
+///   plugin servers were are taken out of the upstream groups that name them; with none left it is
+///   left out, and its names go where they would without it;
 /// - an upstream group left with no member is left out (an override of the files' group gives
 ///   theirs back); a `parallel` one left with fewer members than it races races them all, or with
 ///   one uses `failover`;
@@ -376,7 +406,7 @@ fn default_route(file: &Config) -> &'static str {
 ///   overrides a files' group, else the default.
 ///
 /// The merged configuration then validates whenever it did with the plugin entries in it.
-fn without_plugins(file: &Config, e: &Entries) -> Option<(Entries, Vec<LeftOut>)> {
+fn without_plugins(file: &Config, e: &Entries) -> Option<Kept> {
     let plugin_server = |s: &String| is_plugin_url(&server_url(s));
     let any = e
         .upstreams
@@ -406,7 +436,7 @@ fn without_plugins(file: &Config, e: &Entries) -> Option<(Entries, Vec<LeftOut>)
         }
         !left
     });
-    let mut removed = forwards_without_plugins(file, &mut e, &mut notes);
+    let mut removed = forwards_without_plugins(file, &mut e, &mut gone, &mut notes);
     upstream_groups_without(file, &mut e, &gone, &mut removed, &mut notes);
     for (n, o) in &mut e.groups {
         let Ovr::Set(g) = o else { continue };
@@ -433,24 +463,58 @@ fn without_plugins(file: &Config, e: &Entries) -> Option<(Entries, Vec<LeftOut>)
             ),
         });
     }
-    Some((e, notes))
+    Some(Kept {
+        entries: e,
+        notes,
+        names: LeftOutNames {
+            upstreams: gone,
+            groups: removed,
+        },
+    })
 }
 
-/// The forwards' plugin servers left out; returns the upstream groups of forwards left out whole.
+/// The forwards' plugin servers left out: the upstreams they were go to `gone` (unless the files
+/// define one of that name); the other servers keep their names ([`forward_upstreams`] skips
+/// plugin servers). Returns the upstream groups of forwards left out whole.
 fn forwards_without_plugins(
     file: &Config,
     e: &mut Entries,
+    gone: &mut Vec<String>,
     notes: &mut Vec<LeftOut>,
 ) -> Vec<String> {
     let mut removed = Vec::new();
     e.forwards.retain_mut(|(d, f)| {
-        let before = f.servers.len();
-        f.servers.retain(|s| !is_plugin_url(&server_url(s)));
-        let left = before - f.servers.len();
+        let group = forward_group(d);
+        let plugins: Vec<usize> = f
+            .servers
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| is_plugin_url(&server_url(s)))
+            .map(|(i, _)| i)
+            .collect();
+        let left = plugins.len();
         if left == 0 {
             return true;
         }
-        if f.servers.is_empty() {
+        let kept = f.servers.len() - left;
+        // A stub zone's servers are one upstream together: it goes when none is left.
+        let names = if f.stub && kept == 0 {
+            vec![stub_upstream_name(&group)]
+        } else if f.stub {
+            f.servers.retain(|s| !is_plugin_url(&server_url(s)));
+            Vec::new()
+        } else {
+            plugins
+                .iter()
+                .map(|&i| forward_server_name(&group, i))
+                .collect()
+        };
+        gone.extend(
+            names
+                .into_iter()
+                .filter(|n| !file.upstream.iter().any(|u| u.name.as_str() == n)),
+        );
+        if kept == 0 {
             notes.push(LeftOut {
                 name: d.clone(),
                 what: format!(
@@ -458,14 +522,13 @@ fn forwards_without_plugins(
                     default_route(file)
                 ),
             });
-            removed.push(forward_group(d));
+            removed.push(group);
             false
         } else {
             notes.push(LeftOut {
                 name: d.clone(),
                 what: format!(
-                    "forwarded domain `{d}` made through the API: {left} of its servers name a program or a local socket and aren't used (plugin upstreams are defined in the config file); it keeps the other {}",
-                    f.servers.len()
+                    "forwarded domain `{d}` made through the API: {left} of its servers name a program or a local socket and aren't used (plugin upstreams are defined in the config file); it keeps the other {kept}"
                 ),
             });
             true
@@ -572,7 +635,7 @@ fn apply_one_of(cfg: &mut Config, e: &Entries) {
 /// local socket are left out (REQ: UPS-011, ADR-180; [`without_plugins`]).
 pub(crate) fn merge(file: &Config, e: &Entries) -> Result<Config, Vec<String>> {
     let kept = without_plugins(file, e);
-    let e = kept.as_ref().map_or(e, |(k, _)| k);
+    let e = kept.as_ref().map_or(e, |k| &k.entries);
     let mut cfg = file.clone();
     // ADR-069 — upstreams, upstream groups, lists, and groups made through the API override
     // or hide the files' entries of the same name (before forwards add their own).
@@ -680,7 +743,12 @@ fn forward_upstreams(
         return members;
     }
     for (i, s) in f.servers.iter().enumerate() {
-        let name = format!("{group}#{}", i + 1);
+        // REQ: UPS-011 (ADR-180) — a server that names a program or a local socket is left out
+        // ([`without_plugins`]); the others keep the names their places give them.
+        if is_plugin_url(&server_url(s)) {
+            continue;
+        }
+        let name = forward_server_name(group, i);
         match (safe(&name), safe(&server_url(s))) {
             (Ok(n), Ok(url)) => match new_upstream(n.clone(), url) {
                 Some(u) => {
@@ -741,7 +809,7 @@ pub(crate) fn effective(file: &Config) -> Config {
     warn_left_out(
         file,
         &without_plugins(file, &stored)
-            .map(|(_, notes)| notes)
+            .map(|k| k.notes)
             .unwrap_or_default(),
     );
     match merge(file, &stored) {
