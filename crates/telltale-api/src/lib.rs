@@ -855,8 +855,9 @@ pub struct ManagedWrite {
     pub simulate: Option<SimulateOpts>,
     /// REQ: OBS-010, API-002 (ADR-179) — the caller is an administrator: an admin's own sign-in,
     /// HTTP Basic, or API token, not an agent token. Only an administrator adds or changes an
-    /// alert destination that names a credential file. Writes the server makes itself, and a
-    /// forwarded write that doesn't say (from an older node), are not an administrator's.
+    /// alert destination that names a credential file, or writes a router (ADR-181). Writes the
+    /// server makes itself, and a forwarded write that doesn't say (from an older node), are not
+    /// an administrator's.
     pub by_admin: bool,
 }
 

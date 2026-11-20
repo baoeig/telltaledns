@@ -4760,6 +4760,22 @@ fn credential_guard(w: &ManagedWrite, current: Option<&serde_json::Value>) -> Re
     .hint("Setting or changing a credential file needs an administrator. A destination without one, or deleting this one, needs only the operator role."))
 }
 
+/// REQ: API-002, T8.2 (ADR-181, as ADR-179) — a router is added, changed or removed only by an
+/// administrator: an admin's own sign-in or admin API token (`by_admin`), never an agent token. A
+/// router holds credentials and says where they're sent, so every write is one, a delete and a
+/// change that keeps the key included. Checked first, before anything in the body is looked at,
+/// for dry runs and for writes forwarded from another node alike.
+fn router_guard(w: &ManagedWrite) -> Result<(), Problem> {
+    if w.kind != ManagedKind::Router || w.by_admin {
+        return Ok(());
+    }
+    Err(Problem::new(
+        Code::Forbidden,
+        "a router is added, changed or removed only by an administrator",
+    )
+    .hint("Routers hold credentials and say where they're sent: use an administrator's own sign-in or an admin API token (agent tokens can't)."))
+}
+
 /// REQ: OBS-010, API-002 (ADR-179) — a credential file an alert destination made through the API
 /// names is in a folder meant for secrets ([`crate::secret_path`]): otherwise a 422 that names the
 /// field and the folders. The message is the same whatever is, or isn't, at that path. Blocking
@@ -4845,6 +4861,9 @@ fn plan_override(
     let file = src.file_config.load_full();
     let mut entries = crate::managed::entries(state);
     let before_cfg = crate::managed::merge(&file, &entries).unwrap_or_else(|_| (*file).clone());
+    // REQ: API-002, T8.2 (ADR-181) — routers are an administrator's (checked again here, where
+    // every write is planned; `do_write_managed` checks before a body's keys are looked at).
+    router_guard(w)?;
     // REQ: OBS-010, API-002 (ADR-179) — before anything else about the body is checked, so
     // whoever is refused learns nothing more.
     if w.kind == ManagedKind::AlertDestination {
@@ -5227,6 +5246,9 @@ impl ApiBackend {
             // the next write looks (two writes planned on the same snapshot could each be
             // valid and together not: the reload would then fall back to the files alone).
             let one_at_a_time = src.config_writes.lock().await;
+            // REQ: API-002, T8.2 (ADR-181) — routers are an administrator's: refused before the
+            // body's keys are looked at.
+            router_guard(&w)?;
             // REQ: T8.2 (ADR-181) — a router's secrets, swapped for their files' paths.
             let secrets = crate::router_secrets::prepare(&src, &mut w)?;
             let state = src
@@ -6399,3 +6421,8 @@ mod local_access_tests;
 #[cfg(test)]
 #[path = "api_backend_local_file_tests.rs"]
 mod local_file_tests;
+
+// REQ: API-002, T8.2 (ADR-181) — routers made through the API, and their pasted keys.
+#[cfg(test)]
+#[path = "api_backend_router_tests.rs"]
+mod router_tests;
