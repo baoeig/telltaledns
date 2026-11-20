@@ -3,14 +3,17 @@
 //! A router body may carry `api_key`, `api_secret`, or `password`. Each pasted value is written
 //! to a new file under `<data_dir>/secrets/` (0600, in a 0700 directory, created exclusively,
 //! so nothing is ever overwritten) and only that file's path is stored, listed, audited, or
-//! returned. The rules, from the review of the first version:
-//! - **Files only from `secrets/`.** A credential file the API names must be under
-//!   `<data_dir>/secrets/`: the poll sends the file's content to the router's address, so an
-//!   arbitrary path would let a writer send any file the process can read to any host. A file
+//! returned. The rules, from the reviews:
+//! - **Paste only.** A body never names a key file: the poll sends a file's content to the
+//!   router's address, so a named file would let a writer send another router's key, or any
+//!   file the process can read, to an address of their choosing. The one exception is the file
+//!   the router already has, at the same endpoint, sent back unchanged (the UI does). A file
 //!   elsewhere (a Docker or Kubernetes secret) is set in `telltale.toml`.
 //! - **A new address needs the key again.** When the type, address, site, or TLS settings
 //!   change, a credential that would be reused (the same file as now) is refused: the key
 //!   was entered for the old endpoint and isn't sent to a new one without being typed again.
+//! - **Over https.** A pasted key goes to a router reached over `https://`, or at a loopback
+//!   address.
 //! - **Written as new files, switched to after the change applies.** A failed or conflicting
 //!   change removes what it wrote; the key in use is never replaced in place.
 //! - **Only what the API wrote is removed.** `secrets/.written` lists the files the API
@@ -88,30 +91,54 @@ fn new_secret_file(data_dir: &str, name: &str, field: &str) -> PathBuf {
     secrets_dir(data_dir).join(format!("router-{slug}.{field}.{tag}"))
 }
 
-/// A credential file path from a router body: a relative one is under the data directory; it
-/// must end up under `<data_dir>/secrets/`, without `..`.
-fn api_file(data_dir: &str, field: &str, v: &str) -> Result<PathBuf, Problem> {
-    let p = Path::new(v.trim());
-    let dir = secrets_dir(data_dir);
-    let full = if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        Path::new(data_dir).join(p)
-    };
-    if p.components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-        || !full.starts_with(&dir)
-        || full == dir
-    {
-        return Err(Problem::new(
+/// The hint of every refusal that asks for the key: the body carries the key, never a path.
+const PASTE: &str = "Paste the key; the node saves it. A key file elsewhere (a Docker or Kubernetes secret) is named in telltale.toml.";
+
+/// REQ: API-002, T8.2 (ADR-181) — F2: a body named a key file other than the router's own.
+fn paste_only(field: &str, file_field: &str) -> Problem {
+    Problem::new(
+        Code::InvalidConfig,
+        format!(
+            "`{file_field}`: a router set through the UI or the API names no key file but the one it has; paste the {field} instead"
+        ),
+    )
+    .hint(PASTE)
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — a pasted key is sent only over `https://`, or to a loopback
+/// address: over `http://` it can be read on the way, and anyone who can change where the name
+/// resolves (a local name, on a node whose own resolver is TelltaleDNS) can choose where it
+/// goes. `localhost` counts as a name. A URL that is neither is left to the validation.
+fn https_only(o: &serde_json::Map<String, serde_json::Value>) -> Result<(), Problem> {
+    let url = o
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match url.strip_prefix("http://") {
+        Some(rest) if !loopback(rest) => Err(Problem::new(
             Code::InvalidConfig,
-            format!(
-                "`{field}`: from the UI or the API, a credential file must be in {} (paste the value, or put the file there); a file elsewhere is set in telltale.toml",
-                dir.display()
-            ),
-        ));
+            "`url`: a pasted key is sent only over https:// (or to a loopback address); over http:// it could be read or redirected on the way",
+        )
+        .hint("Use the router's https:// address. A console with a self-signed certificate: save it as tls_ca, with tls_server_name (see the routers section of the guide).")),
+        _ => Ok(()),
     }
-    Ok(full)
+}
+
+/// Whether the authority at the start of `rest` (what follows `http://`) is a loopback address,
+/// written as one (`127.0.0.1`, `[::1]`, with or without a port).
+fn loopback(rest: &str) -> bool {
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains('@') {
+        return false;
+    }
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+    };
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Whether the body sends credentials somewhere other than `current` does: another type,
@@ -153,19 +180,29 @@ pub(crate) struct Prepared {
     old: Vec<PathBuf>,
 }
 
-/// REQ: T8.2 (ADR-181) — prepares a router write (nothing for other kinds): each pasted secret
-/// is swapped for a new file's path in the body, credential files are checked, and a
-/// credential the body leaves out keeps the current file unless the endpoint changed.
-pub(crate) fn prepare(src: &Sources, w: &mut ManagedWrite) -> Result<Prepared, Problem> {
+/// REQ: T8.2, API-002 (ADR-181) — prepares a router write (nothing for other kinds): each pasted
+/// secret is swapped for a new file's path in the body, a key file the body names is refused
+/// unless it's the router's own at the same endpoint, and a credential the body leaves out keeps
+/// the current file unless the endpoint changed. "The router's own" is the router as the write
+/// is planned against: the config files plus the API's entries (`state`), as `plan_override`
+/// sees them. Blocking (it reads `state.db`).
+pub(crate) fn prepare(
+    src: &Sources,
+    state: &telltale_store::state::State,
+    w: &mut ManagedWrite,
+) -> Result<Prepared, Problem> {
     if w.kind != ManagedKind::Router {
         return Ok(Prepared::default());
     }
-    let cfg = src.config.load();
-    let data_dir = cfg.node.data_dir.to_string();
-    let current = cfg.router.iter().find(|r| r.name.as_str() == w.name);
+    let file = src.file_config.load_full();
+    let before = crate::managed::merge(&file, &crate::managed::entries(state))
+        .unwrap_or_else(|_| (*file).clone());
+    let data_dir = file.node.data_dir.to_string();
+    let name = w.name.trim().to_owned();
+    let current = before.router.iter().find(|r| r.name.as_str() == name);
     let old = current.map(|c| files_of(c).collect()).unwrap_or_default();
     let writes = match w.body.as_mut() {
-        Some(b) => prepare_body(&data_dir, &w.name, current, b)?,
+        Some(b) => prepare_body(&data_dir, &name, current, b)?,
         None => Vec::new(),
     };
     Ok(Prepared {
@@ -199,60 +236,45 @@ pub(crate) fn prepare_body(
                 ));
             }
         };
-        let named = match o.get(file_field) {
-            Some(Value::String(v)) if !v.trim().is_empty() => {
-                Some(api_file(data_dir, file_field, v)?)
-            }
-            _ => None,
-        };
-        let now = current
-            .and_then(|c| file_of(c, file_field))
-            .map(PathBuf::from);
-        let file = match (secret, named) {
-            // A pasted value: a new file (the one named, if it's new; else a fresh name).
-            (Some(v), named) => {
-                let f = named
-                    .filter(|n| Some(n) != now.as_ref())
-                    .unwrap_or_else(|| new_secret_file(data_dir, name, field));
-                if f.exists() {
-                    return Err(Problem::new(
-                        Code::InvalidConfig,
-                        format!(
-                            "`{file_field}`: {} already exists; a pasted {field} goes to a new file (leave the path empty for one)",
-                            f.display()
-                        ),
-                    ));
-                }
-                out.push((f.clone(), v));
-                Some(f)
-            }
-            (None, Some(f)) => Some(f),
-            (None, None) => now.clone(),
-        };
-        // ADR-181 (review) — a key isn't sent to an endpoint it wasn't entered for.
-        if moved
-            && file.is_some()
-            && file == now
-            && !out.iter().any(|(f, _)| Some(f) == file.as_ref())
-        {
-            return Err(Problem::new(
-                Code::InvalidConfig,
-                format!(
-                    "`{field}`: enter it again: the type, address, site, or TLS settings changed, and the saved {field} isn't sent to a new endpoint"
-                ),
-            ));
+        let now = current.and_then(|c| file_of(c, file_field));
+        // REQ: API-002 (ADR-181) — F2, paste only: the one file a body may name is the router's
+        // own, sent back unchanged (it is kept, or replaced by a pasted value below).
+        match o.get(file_field) {
+            None | Some(Value::Null) => {}
+            Some(Value::String(v)) if v.trim().is_empty() || Some(v.as_str()) == now => {}
+            Some(_) => return Err(paste_only(field, file_field)),
         }
+        let file = match secret {
+            // A pasted value: a new file, never one that exists (created exclusively).
+            Some(v) => {
+                let f = new_secret_file(data_dir, name, field);
+                let path = f.to_string_lossy().into_owned();
+                out.push((f, v));
+                Some(path)
+            }
+            // ADR-181 (review) — a key isn't sent to an endpoint it wasn't entered for.
+            None if moved && now.is_some() => {
+                return Err(Problem::new(
+                    Code::InvalidConfig,
+                    format!(
+                        "`{field}`: enter it again: the type, address, site, or TLS settings changed, and the saved {field} isn't sent to a new endpoint"
+                    ),
+                )
+                .hint(PASTE));
+            }
+            None => now.map(str::to_owned),
+        };
         match file {
             Some(f) => {
-                o.insert(
-                    file_field.into(),
-                    Value::String(f.to_string_lossy().into_owned()),
-                );
+                o.insert(file_field.into(), Value::String(f));
             }
             None => {
                 o.remove(file_field);
             }
         }
+    }
+    if !out.is_empty() {
+        https_only(o)?;
     }
     Ok(out)
 }
@@ -389,11 +411,11 @@ mod tests {
         d
     }
 
-    /// REQ: T8.2 (ADR-181) — a pasted key goes to a new file under secrets/ (a fresh name, or
-    /// a new one the body names); relative paths are under the data directory; a credential
-    /// left out keeps the current file.
+    /// REQ: API-002, T8.2 (ADR-181) — a pasted key goes to a new file under secrets/, with a
+    /// fresh name; the router's own file sent back unchanged, or left out, keeps it (same
+    /// endpoint); a pasted key replaces it with a new file.
     #[test]
-    fn t8_2_router_secrets_become_new_files() {
+    fn api_002_pasted_router_secrets_become_new_files() {
         let mut b =
             serde_json::json!({"type": "unifi", "url": "https://192.168.1.1", "api_key": " k1 "});
         let w = prepare_body("/data", "udm", None, &mut b).unwrap();
@@ -405,38 +427,104 @@ mod tests {
         assert!(b.get("api_key").is_none());
 
         let mut b = serde_json::json!({"type": "opnsense", "url": "https://fw", "api_key": "k",
-            "api_key_file": "secrets/fw-key", "api_secret_file": "/data/secrets/opn-secret"});
+            "api_secret": "s"});
         let w = prepare_body("/data", "fw", None, &mut b).unwrap();
-        assert_eq!(w, vec![("/data/secrets/fw-key".into(), "k".to_owned())]);
-        assert_eq!(b["api_secret_file"], "/data/secrets/opn-secret");
+        assert_eq!(w.len(), 2);
+        assert!(
+            b["api_secret_file"]
+                .as_str()
+                .unwrap()
+                .starts_with("/data/secrets/router-fw.api_secret."),
+            "{b}"
+        );
 
-        // Left out: the current file stays (same endpoint).
+        // Left out, or sent back unchanged: the current file stays (same endpoint).
         let current = router(serde_json::json!({"name": "udm", "type": "unifi",
             "url": "https://192.168.1.1", "api_key_file": "/data/secrets/router-udm.api_key.1"}));
-        let mut b = serde_json::json!({"type": "unifi", "url": "https://192.168.1.1", "api_key": "", "interval_secs": 60});
-        assert_eq!(
-            prepare_body("/data", "udm", Some(&current), &mut b).unwrap(),
-            Vec::new()
-        );
-        assert_eq!(b["api_key_file"], "/data/secrets/router-udm.api_key.1");
+        for mut b in [
+            serde_json::json!({"type": "unifi", "url": "https://192.168.1.1", "api_key": "", "interval_secs": 60}),
+            serde_json::json!({"type": "unifi", "url": "https://192.168.1.1", "interval_secs": 60,
+                "api_key_file": "/data/secrets/router-udm.api_key.1"}),
+        ] {
+            assert_eq!(
+                prepare_body("/data", "udm", Some(&current), &mut b).unwrap(),
+                Vec::new()
+            );
+            assert_eq!(b["api_key_file"], "/data/secrets/router-udm.api_key.1");
+        }
+        // A pasted key with the own file sent back: a new file.
+        let mut b = serde_json::json!({"type": "unifi", "url": "https://192.168.1.1", "api_key": "k2",
+            "api_key_file": "/data/secrets/router-udm.api_key.1"});
+        let w = prepare_body("/data", "udm", Some(&current), &mut b).unwrap();
+        assert_eq!(w.len(), 1);
+        assert_ne!(b["api_key_file"], "/data/secrets/router-udm.api_key.1");
     }
 
-    /// REQ: T8.2 (ADR-181, review) — credential files outside secrets/ are refused (the poll
-    /// would send their content), and so is reusing a saved key for a new endpoint.
+    /// REQ: API-002, T8.2 (ADR-181) — F2: a body names no key file but the router's own: any
+    /// other path (absolute, relative, `..`, the folder itself, another file in it) is refused
+    /// with a hint to paste the key, pasted value or not; so is a non-string value, and reusing
+    /// a saved key for a new endpoint. A pasted key goes only over https:// or to a loopback
+    /// address.
     #[test]
-    fn t8_2_router_secrets_refused() {
-        for bad in [
-            serde_json::json!({"api_key_file": "/etc/passwd"}),
-            serde_json::json!({"password_file": "/etc/shadow"}),
-            serde_json::json!({"api_key": "k", "api_key_file": "secrets/../telltale.toml"}),
-            serde_json::json!({"api_key_file": "secrets"}),
-            serde_json::json!({"api_key": 5}),
-        ] {
-            let mut b = bad;
-            assert!(prepare_body("/data", "udm", None, &mut b).is_err(), "{b}");
-        }
+    fn api_002_router_bodies_name_no_key_file() {
         let current = router(serde_json::json!({"name": "udm", "type": "unifi",
             "url": "https://192.168.1.1", "api_key_file": "/data/secrets/k"}));
+        for (bad, named) in [
+            (serde_json::json!({"api_key_file": "/etc/passwd"}), true),
+            (serde_json::json!({"password_file": "/etc/shadow"}), true),
+            (
+                serde_json::json!({"api_key": "k", "api_key_file": "secrets/../telltale.toml"}),
+                true,
+            ),
+            (serde_json::json!({"api_key_file": "secrets"}), true),
+            (
+                serde_json::json!({"api_key_file": "/data/secrets/other"}),
+                true,
+            ),
+            (
+                serde_json::json!({"api_secret_file": "/data/secrets/k"}),
+                true,
+            ),
+            (serde_json::json!({"api_key_file": 5}), true),
+            (serde_json::json!({"api_key": 5}), false),
+        ] {
+            for cur in [None, Some(&current)] {
+                let mut b = bad.clone();
+                b["type"] = "unifi".into();
+                b["url"] = "https://192.168.1.1".into();
+                let e = prepare_body("/data", "udm", cur, &mut b).unwrap_err();
+                if named {
+                    assert!(
+                        e.hint.as_deref().unwrap_or("").contains("Paste the key"),
+                        "{bad}: {e:?}"
+                    );
+                }
+            }
+        }
+        for url in [
+            "http://192.168.1.1",
+            "HTTP://unifi.lan:8443/x",
+            "http://localhost",
+            "http://a@127.0.0.1",
+        ] {
+            let mut b = serde_json::json!({"type": "unifi", "url": url, "api_key": "k"});
+            let e = prepare_body("/data", "udm", None, &mut b).unwrap_err();
+            assert!(e.detail.contains("https://"), "{url}: {e:?}");
+        }
+        for url in [
+            "https://192.168.1.1",
+            "http://127.0.0.1:8443",
+            "http://127.9.9.9/",
+            "http://[::1]:80",
+        ] {
+            let mut b = serde_json::json!({"type": "unifi", "url": url, "api_key": "k"});
+            assert!(prepare_body("/data", "udm", None, &mut b).is_ok(), "{url}");
+        }
+        // Without a pasted key, the scheme is the validation's (a config-file router is unchanged).
+        let mut b =
+            serde_json::json!({"type": "unifi", "url": "http://192.168.1.1", "username": "u"});
+        assert!(prepare_body("/data", "udm", None, &mut b).is_ok());
+        // A new endpoint with the saved key: enter it again.
         for moved in [
             serde_json::json!({"type": "unifi", "url": "https://203.0.113.9"}),
             serde_json::json!({"type": "unifi", "url": "https://203.0.113.9", "api_key_file": "/data/secrets/k"}),

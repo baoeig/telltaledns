@@ -985,20 +985,23 @@ pub(crate) const ROUTER_SECRETS: [&str; 3] = ["api_key", "api_secret", "password
 /// console: `{"type": "unifi", "url": "https://192.168.1.1", "api_key": "…",
 /// "tls_insecure_skip_verify": true}`. The UniFi API key, the OPNsense key and secret, or a
 /// UniFi password are sent as `api_key`, `api_secret`, and `password`: TelltaleDNS writes
-/// each to a new file only it can read under `<data_dir>/secrets/` and stores that file's
-/// path; the value is never stored, logged, or returned (ADR-181). Credential files named
-/// here (`api_key_file`, …) must be under `<data_dir>/secrets/` too. Leave a credential out to
-/// keep the current one, unless the type, address, site, or TLS settings change: then it must
-/// be entered again. Admins only (agents: `config:write:routers`, which `config:write:*`
-/// doesn't include). The routers are read again within seconds; a router the config files
-/// define is overridden until this one is deleted.
+/// each to a new file only it can read under `<data_dir>/secrets/` on this node and stores that
+/// file's path; the value is never stored, logged, or returned (ADR-181). A pasted key goes only
+/// to an `https://` address (or a loopback one). The body names no key file (`api_key_file`, …)
+/// but the router's own, sent back unchanged at the same address: paste the key instead (a file
+/// elsewhere, such as a Docker or Kubernetes secret, is named in the config file). Leave a
+/// credential out to keep the current one, unless the type, address, site, or TLS settings
+/// change: then it must be entered again. Admins only: an administrator's own sign-in or an admin
+/// API token; agent tokens can't. The routers are read again within seconds; a router the config
+/// files define is overridden until this one is deleted.
 #[utoipa::path(put, path = "/api/v1/routers/{name}", tag = "config",
     params(("name" = String, Path, description = "The name."), DryRun),
     request_body = Object,
     responses(
         (status = 200, body = ConfigChange, description = "Applied (or, with dryRun, what would change)."),
+        (status = 403, body = Problem, description = "Not an administrator (agent tokens never are)."),
         (status = 412, body = Problem, description = "The configuration changed since the If-Match version: re-read it and retry."),
-        (status = 422, body = Problem, description = "A field is wrong (the URL, missing credentials), or the configuration wouldn't be valid."),
+        (status = 422, body = Problem, description = "A field is wrong (the URL, missing credentials, a key file named, a pasted key for an http:// address, the key not entered again for a new address), or the configuration wouldn't be valid."),
     ))]
 pub(crate) async fn put_router(
     State((backend, auth)): State<Ctx>,
@@ -1044,10 +1047,12 @@ pub(crate) async fn put_router(
 ///
 /// Its devices lose the names it gave them at the next read. A router the config files define
 /// is hidden until the files' entry is brought back (DELETE again, or Revert to the file).
+/// Admins only, as for `PUT`.
 #[utoipa::path(delete, path = "/api/v1/routers/{name}", tag = "config",
     params(("name" = String, Path, description = "The name."), DryRun),
     responses(
         (status = 200, body = ConfigChange, description = "The result."),
+        (status = 403, body = Problem, description = "Not an administrator (agent tokens never are)."),
         (status = 404, body = Problem, description = "No entry by that name."),
     ))]
 pub(crate) async fn delete_router(

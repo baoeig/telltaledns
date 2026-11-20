@@ -218,6 +218,16 @@ impl Node {
             })
     }
 
+    /// The key file the stored entry for `name` names.
+    fn key_file(&self, name: &str) -> Option<String> {
+        self.stored(name)
+            .and_then(|r| r.api_key_file.map(|f| f.to_string()))
+    }
+
+    fn data(&self) -> String {
+        self.dir.path().to_str().unwrap().to_owned()
+    }
+
     /// Every file under `<data_dir>/secrets/` but the API's own list.
     fn secret_files(&self) -> Vec<String> {
         let dir = self.dir.path().join("secrets");
@@ -238,6 +248,14 @@ impl Node {
 fn unifi(url: &str, key: &str) -> serde_json::Value {
     serde_json::json!({ "type": "unifi", "url": url, "api_key": key, "offline_days": 0 })
 }
+
+fn marker(tag: &str) -> String {
+    format!("{tag}-{}", auth::crypto::random_id())
+}
+
+/// Loopback addresses nothing listens on (no test here polls a router).
+const HERE: &str = "http://127.0.0.1:1";
+const ELSEWHERE: &str = "http://127.0.0.2:1";
 
 // ---- T1: who may write a router.
 
@@ -353,4 +371,141 @@ async fn api_002_a_forwarded_router_write_needs_an_admin() {
     .await;
     let a = serde_json::to_value(a).unwrap();
     assert_eq!(a["ok"]["applied"], true, "{a}");
+}
+
+// ---- T2: a body carries a key, never a path.
+
+/// REQ: API-002, T8.2 (ADR-181) — F2: a router can't name another router's key file (here with
+/// another address) and so have the node send that key there. Refused with 422 and a hint to
+/// paste the key, dry run or not; nothing is stored.
+#[tokio::test]
+async fn api_002_router_cannot_name_another_routers_key() {
+    let n = Node::new(Reload::Applies);
+    let (s, v) = n
+        .put("udm", &n.admin, false, unifi(HERE, &marker("udm-key")))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let udm_file = n.key_file("udm").unwrap();
+    for dry in [true, false] {
+        let (s, v) = n
+            .put(
+                "evil",
+                &n.admin,
+                dry,
+                serde_json::json!({"type": "unifi", "url": ELSEWHERE, "api_key_file": udm_file, "offline_days": 0}),
+            )
+            .await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "dry={dry}: {v}");
+        assert!(
+            v["hint"].as_str().unwrap_or("").contains("Paste the key"),
+            "{v}"
+        );
+    }
+    assert!(n.stored("evil").is_none(), "nothing was stored");
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — every key-file field in an API body is refused unless it is the
+/// file the router already has and its endpoint is unchanged: `..`, a path outside the data
+/// directory, a relative path, a link inside `secrets/`, a file someone put in `secrets/`, and
+/// another router's file, for each of `api_key_file`, `api_secret_file` and `password_file`; and
+/// the router's own file with a new address. Keeping the router's own file at the same address,
+/// or leaving it out, is fine.
+#[tokio::test]
+async fn api_002_router_credential_paths_are_refused() {
+    let n = Node::new(Reload::Applies);
+    let d = n.data();
+    let (s, v) = n
+        .put("udm", &n.admin, false, unifi(HERE, &marker("udm-key")))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = n
+        .put("nas", &n.admin, false, unifi(HERE, &marker("nas-key")))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let udm_file = n.key_file("udm").unwrap();
+    let other_routers_file = n.key_file("nas").unwrap();
+    std::fs::write(format!("{d}/secrets/mine"), "someone's file").unwrap();
+    let mut paths = vec![
+        format!("{d}/secrets/../state.db"),
+        "/etc/passwd".to_owned(),
+        "secrets/mine".to_owned(),
+        format!("{d}/secrets/mine"),
+        other_routers_file.clone(),
+    ];
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&other_routers_file, format!("{d}/secrets/link")).unwrap();
+        paths.push(format!("{d}/secrets/link"));
+    }
+    let bodies = |p: &str| {
+        [
+            serde_json::json!({"type": "unifi", "url": HERE, "api_key_file": p, "offline_days": 0}),
+            serde_json::json!({"type": "opnsense", "url": HERE, "api_key": "k", "api_secret_file": p}),
+            serde_json::json!({"type": "unifi", "url": HERE, "username": "telltale", "password_file": p, "offline_days": 0}),
+        ]
+    };
+    for p in &paths {
+        for b in bodies(p) {
+            for name in ["udm", "fresh"] {
+                let (s, v) = n.put(name, &n.admin, true, b.clone()).await;
+                assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{name} {b}: {v}");
+                assert!(
+                    v["hint"].as_str().unwrap_or("").contains("Paste the key"),
+                    "{name} {b}: {v}"
+                );
+            }
+        }
+    }
+    // The router's own file, at a new address.
+    let (s, v) = n
+        .put(
+            "udm",
+            &n.admin,
+            true,
+            serde_json::json!({"type": "unifi", "url": ELSEWHERE, "api_key_file": udm_file, "offline_days": 0}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    // Its own file at the same address, or none named: kept.
+    for b in [
+        serde_json::json!({"type": "unifi", "url": HERE, "api_key_file": udm_file, "offline_days": 0, "interval_secs": 60}),
+        serde_json::json!({"type": "unifi", "url": HERE, "offline_days": 0, "interval_secs": 90}),
+    ] {
+        let (s, v) = n.put("udm", &n.admin, false, b.clone()).await;
+        assert_eq!(s, StatusCode::OK, "{b}: {v}");
+        assert_eq!(n.key_file("udm").as_deref(), Some(udm_file.as_str()));
+    }
+    assert!(n.stored("fresh").is_none());
+}
+
+// ---- T7 (a): a pasted key goes over https.
+
+/// REQ: API-002, T8.2 (ADR-181) — a key pasted through the API goes to a router reached over
+/// `https://` or a loopback address; `http://` to anything else (`localhost` included: a name can
+/// be made to resolve elsewhere) is refused with 422 and a hint. Dry runs only: nothing is polled.
+#[tokio::test]
+async fn api_002_a_pasted_key_goes_only_over_https() {
+    let n = Node::new(Reload::Applies);
+    for url in [
+        "http://192.168.1.1",
+        "http://unifi.example.test:8443",
+        "http://localhost:8080",
+    ] {
+        let (s, v) = n.put("udm", &n.admin, true, unifi(url, "k")).await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{url}: {v}");
+        assert!(
+            v["detail"].as_str().unwrap_or("").contains("https://"),
+            "{url}: {v}"
+        );
+    }
+    for url in [
+        "https://192.0.2.1",
+        "https://unifi.example.test:8443",
+        "http://127.0.0.1:1",
+        "http://127.0.0.2:1",
+        "http://[::1]:1",
+    ] {
+        let (s, v) = n.put("udm", &n.admin, true, unifi(url, "k")).await;
+        assert_eq!(s, StatusCode::OK, "{url}: {v}");
+    }
 }

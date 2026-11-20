@@ -5946,7 +5946,7 @@
           "config"
         ],
         "summary": "Add or change a router integration (T8.2, API-002).",
-        "description": "The body has the same fields as `[[router]]` (the name comes from the path), e.g. a UniFi\nconsole: `{\"type\": \"unifi\", \"url\": \"https://192.168.1.1\", \"api_key\": \"…\",\n\"tls_insecure_skip_verify\": true}`. The UniFi API key, the OPNsense key and secret, or a\nUniFi password are sent as `api_key`, `api_secret`, and `password`: TelltaleDNS writes\neach to a new file only it can read under `<data_dir>/secrets/` and stores that file's\npath; the value is never stored, logged, or returned (ADR-181). Credential files named\nhere (`api_key_file`, …) must be under `<data_dir>/secrets/` too. Leave a credential out to\nkeep the current one, unless the type, address, site, or TLS settings change: then it must\nbe entered again. Admins only (agents: `config:write:routers`, which `config:write:*`\ndoesn't include). The routers are read again within seconds; a router the config files\ndefine is overridden until this one is deleted.",
+        "description": "The body has the same fields as `[[router]]` (the name comes from the path), e.g. a UniFi\nconsole: `{\"type\": \"unifi\", \"url\": \"https://192.168.1.1\", \"api_key\": \"…\",\n\"tls_insecure_skip_verify\": true}`. The UniFi API key, the OPNsense key and secret, or a\nUniFi password are sent as `api_key`, `api_secret`, and `password`: TelltaleDNS writes\neach to a new file only it can read under `<data_dir>/secrets/` on this node and stores that\nfile's path; the value is never stored, logged, or returned (ADR-181). A pasted key goes only\nto an `https://` address (or a loopback one). The body names no key file (`api_key_file`, …)\nbut the router's own, sent back unchanged at the same address: paste the key instead (a file\nelsewhere, such as a Docker or Kubernetes secret, is named in the config file). Leave a\ncredential out to keep the current one, unless the type, address, site, or TLS settings\nchange: then it must be entered again. Admins only: an administrator's own sign-in or an admin\nAPI token; agent tokens can't. The routers are read again within seconds; a router the config\nfiles define is overridden until this one is deleted.",
         "operationId": "put_router",
         "parameters": [
           {
@@ -6007,6 +6007,16 @@
               }
             }
           },
+          "403": {
+            "description": "Not an administrator (agent tokens never are).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "412": {
             "description": "The configuration changed since the If-Match version: re-read it and retry.",
             "content": {
@@ -6018,7 +6028,7 @@
             }
           },
           "422": {
-            "description": "A field is wrong (the URL, missing credentials), or the configuration wouldn't be valid.",
+            "description": "A field is wrong (the URL, missing credentials, a key file named, a pasted key for an http:// address, the key not entered again for a new address), or the configuration wouldn't be valid.",
             "content": {
               "application/json": {
                 "schema": {
@@ -6034,7 +6044,7 @@
           "config"
         ],
         "summary": "Remove a router integration (T8.2, API-002).",
-        "description": "Its devices lose the names it gave them at the next read. A router the config files define\nis hidden until the files' entry is brought back (DELETE again, or Revert to the file).",
+        "description": "Its devices lose the names it gave them at the next read. A router the config files define\nis hidden until the files' entry is brought back (DELETE again, or Revert to the file).\nAdmins only, as for `PUT`.",
         "operationId": "delete_router",
         "parameters": [
           {
@@ -6081,6 +6091,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ConfigChange"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not an administrator (agent tokens never are).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
                 }
               }
             }

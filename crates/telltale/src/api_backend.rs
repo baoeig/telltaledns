@@ -5249,20 +5249,22 @@ impl ApiBackend {
             // REQ: API-002, T8.2 (ADR-181) — routers are an administrator's: refused before the
             // body's keys are looked at.
             router_guard(&w)?;
-            // REQ: T8.2 (ADR-181) — a router's secrets, swapped for their files' paths.
-            let secrets = crate::router_secrets::prepare(&src, &mut w)?;
             let state = src
                 .auth
                 .get()
                 .map(|a| Arc::clone(a.state()))
                 .ok_or_else(|| Problem::unavailable("the state database isn't open yet"))?;
-            let (plan, current) = {
-                let (src, state, w) = (Arc::clone(&src), Arc::clone(&state), w.clone());
+            let (plan, current, secrets, w) = {
+                let (src, state) = (Arc::clone(&src), Arc::clone(&state));
                 tokio::task::spawn_blocking(move || {
+                    // REQ: T8.2, API-002 (ADR-181) — a router's pasted secrets, swapped for new
+                    // files' paths; a key file the body names is refused unless it's the
+                    // router's own (against what the write is planned on, below).
+                    let secrets = crate::router_secrets::prepare(&src, &state, &mut w)?;
                     let current = state
                         .config_version()
                         .map_err(|e| Problem::internal(e.to_string()))?;
-                    plan_managed(&src, &state, &w).map(|p| (p, current))
+                    plan_managed(&src, &state, &w).map(|p| (p, current, secrets, w))
                 })
                 .await
                 .map_err(|e| Problem::internal(format!("request worker failed: {e}")))??

@@ -2161,13 +2161,15 @@ export interface paths {
          *     console: `{"type": "unifi", "url": "https://192.168.1.1", "api_key": "…",
          *     "tls_insecure_skip_verify": true}`. The UniFi API key, the OPNsense key and secret, or a
          *     UniFi password are sent as `api_key`, `api_secret`, and `password`: TelltaleDNS writes
-         *     each to a new file only it can read under `<data_dir>/secrets/` and stores that file's
-         *     path; the value is never stored, logged, or returned (ADR-181). Credential files named
-         *     here (`api_key_file`, …) must be under `<data_dir>/secrets/` too. Leave a credential out to
-         *     keep the current one, unless the type, address, site, or TLS settings change: then it must
-         *     be entered again. Admins only (agents: `config:write:routers`, which `config:write:*`
-         *     doesn't include). The routers are read again within seconds; a router the config files
-         *     define is overridden until this one is deleted.
+         *     each to a new file only it can read under `<data_dir>/secrets/` on this node and stores that
+         *     file's path; the value is never stored, logged, or returned (ADR-181). A pasted key goes only
+         *     to an `https://` address (or a loopback one). The body names no key file (`api_key_file`, …)
+         *     but the router's own, sent back unchanged at the same address: paste the key instead (a file
+         *     elsewhere, such as a Docker or Kubernetes secret, is named in the config file). Leave a
+         *     credential out to keep the current one, unless the type, address, site, or TLS settings
+         *     change: then it must be entered again. Admins only: an administrator's own sign-in or an admin
+         *     API token; agent tokens can't. The routers are read again within seconds; a router the config
+         *     files define is overridden until this one is deleted.
          */
         put: operations["put_router"];
         post?: never;
@@ -2175,6 +2177,7 @@ export interface paths {
          * Remove a router integration (T8.2, API-002).
          * @description Its devices lose the names it gave them at the next read. A router the config files define
          *     is hidden until the files' entry is brought back (DELETE again, or Revert to the file).
+         *     Admins only, as for `PUT`.
          */
         delete: operations["delete_router"];
         options?: never;
@@ -12478,6 +12481,15 @@ export interface operations {
                     "application/json": components["schemas"]["ConfigChange"];
                 };
             };
+            /** @description Not an administrator (agent tokens never are). */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
             /** @description The configuration changed since the If-Match version: re-read it and retry. */
             412: {
                 headers: {
@@ -12487,7 +12499,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description A field is wrong (the URL, missing credentials), or the configuration wouldn't be valid. */
+            /** @description A field is wrong (the URL, missing credentials, a key file named, a pasted key for an http:// address, the key not entered again for a new address), or the configuration wouldn't be valid. */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -12532,6 +12544,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ConfigChange"];
+                };
+            };
+            /** @description Not an administrator (agent tokens never are). */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
             /** @description No entry by that name. */
