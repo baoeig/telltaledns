@@ -2376,6 +2376,42 @@ async fn ops_010_maintenance_requests_over_http() {
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{v}");
 }
 
+// REQ: OPS-014 (ADR-182) — a refused update request is audited too (`node.update.refused`, with
+// the node's problem code and the node asked); a dry run isn't audited.
+#[tokio::test]
+async fn ops_014_a_refused_update_request_is_audited() {
+    let (app, _) = app();
+    let post = |path: &str| {
+        Request::post(path)
+            .header("authorization", format!("Bearer {}", app.bearer))
+            .header("content-type", "application/json")
+            .header("x-telltale-reason", "release day")
+            .body(Body::from(r#"{"to":"0.8.0"}"#))
+            .unwrap()
+    };
+    let (s, _, v) = send(&app, post("/api/v1/nodes/pod/update")).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    let (s, _, _) = send(&app, post("/api/v1/nodes/dns-02/update?dryRun=true")).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _, v) = get(&app, "/api/v1/audit").await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let items = v["items"].as_array().unwrap();
+    let refused: Vec<&serde_json::Value> = items
+        .iter()
+        .filter(|e| e["action"] == "node.update.refused")
+        .collect();
+    assert_eq!(refused.len(), 1, "{v}");
+    assert!(
+        refused[0].to_string().contains("update_unsupported"),
+        "{}",
+        refused[0]
+    );
+    assert!(
+        !items.iter().any(|e| e["action"] == "node.update.request"),
+        "a dry run isn't audited: {v}"
+    );
+}
+
 // REQ: OPS-014, AGT-002 (ADR-182) — `?dryRun=true` asks the node to make its checks only: the
 // call is a dry run, never a request.
 #[tokio::test]

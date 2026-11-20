@@ -209,7 +209,17 @@ async fn node_update_request(
             );
             Json(r).into_response()
         }
-        Err(e) => e.into_response(),
+        Err(e) => {
+            // REQ: OPS-014 (ADR-182) — a refused attempt is audited too (only an admin or a
+            // `cluster:upgrade` token reaches this handler).
+            auth.record(
+                &actor,
+                "node.update.refused",
+                &id,
+                &serde_json::json!({ "to": to, "code": e.code }),
+            );
+            e.into_response()
+        }
     }
 }
 

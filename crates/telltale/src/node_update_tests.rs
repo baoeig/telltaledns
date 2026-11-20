@@ -386,14 +386,14 @@ fn refused() -> Served {
     }
 }
 
-/// Makes a FIFO at `p` (`mkfifo`, from coreutils).
+/// Makes a FIFO at `p`, in this process: a child process (`mkfifo`) forked while another test
+/// writes a binary it is about to run (the pinned self-update tests) can make that `exec` fail
+/// with "Text file busy".
 #[cfg(unix)]
 fn mkfifo(p: &Path) {
-    let ok = std::process::Command::new("mkfifo")
-        .arg(p)
-        .status()
-        .is_ok_and(|s| s.success());
-    assert!(ok, "mkfifo {}", p.display());
+    use rustix::fs::{CWD, FileType, Mode};
+    rustix::fs::mknodat(CWD, p, FileType::Fifo, Mode::from_raw_mode(0o600), 0)
+        .unwrap_or_else(|e| panic!("mkfifo {}: {e}", p.display()));
 }
 
 /// The update service's run on a thread of its own, waited for at most 20 s: a run that blocks

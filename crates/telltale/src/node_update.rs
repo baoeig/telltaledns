@@ -479,7 +479,14 @@ pub(crate) async fn send(
             "The node installs the version itself, so it must be up. Check the Cluster page."
         })
     })?;
-    crate::forward::decode_answer(&reply)
+    // The wire problem has no Retry-After: a node that is busy updating says when to retry here.
+    crate::forward::decode_answer(&reply).map_err(|p| {
+        if p.code == Code::UpdateInProgress {
+            p.retry_after(30)
+        } else {
+            p
+        }
+    })
 }
 
 /// REQ: OPS-014 (ADR-182) — a peer's call for this node: applied and, for a request, audited

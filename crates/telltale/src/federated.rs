@@ -1027,6 +1027,39 @@ impl Federated {
             .ok_or_else(|| Problem::invalid(format!("`node`: no cluster node `{node}`")))
     }
 
+    /// REQ: OPS-010, OPS-014 — where a call about `node`'s own state (maintenance, an update)
+    /// goes: here (`None`, for `local` and this node), a peer, or a problem: `node_unreachable`
+    /// with `unreachable_hint` for a member of the registry this node hasn't heard from since it
+    /// started, `node_unknown` otherwise.
+    fn own_state_node(
+        &self,
+        node: &str,
+        unreachable_hint: &'static str,
+    ) -> Result<Option<String>, Problem> {
+        use telltale_api::problem::Code;
+        if node == "local" {
+            return Ok(None);
+        }
+        self.resolve_node(node).map_err(|_| {
+            if self
+                .cluster
+                .identity
+                .registry()
+                .iter()
+                .any(|n| n.node_id == node)
+            {
+                Problem::new(
+                    Code::NodeUnreachable,
+                    format!("{node} isn't reachable over the cluster channel"),
+                )
+                .hint(unreachable_hint)
+            } else {
+                Problem::new(Code::NodeUnknown, format!("no cluster node `{node}`"))
+                    .hint("Use `local`, or a node's ID, site, or pod name from the Cluster page (or cluster_status).")
+            }
+        })
+    }
+
     /// REQ: CLU-014 — where a drill request for `node` goes: here (`None`), a peer, or a
     /// problem (`node_unknown`, or `node_unreachable` for a registered node not heard from).
     fn drill_node(&self, node: &str) -> Result<Option<String>, Problem> {
@@ -2003,44 +2036,17 @@ impl Backend for Federated {
         node: &str,
         w: telltale_api::MaintenanceWrite,
     ) -> BoxFuture<Result<telltale_api::model::MaintenanceResult, Problem>> {
-        use telltale_api::problem::Code;
-        if node == "local" {
-            return self.local.maintenance("local", w);
-        }
-        match self.resolve_node(node) {
+        match self.own_state_node(
+            node,
+            "Maintenance is the node's own state, so the node must be up to take it.",
+        ) {
             Ok(None) => self.local.maintenance("local", w),
             Ok(Some(peer)) => {
                 let cluster = Arc::clone(&self.cluster);
                 let label = self.label_of(&peer);
                 Box::pin(crate::maintenance::send(cluster, peer, label, w))
             }
-            // A member of the registry this node hasn't heard from since it started.
-            Err(_)
-                if self
-                    .cluster
-                    .identity
-                    .registry()
-                    .iter()
-                    .any(|n| n.node_id == node) =>
-            {
-                let node = node.to_owned();
-                Box::pin(async move {
-                    Err(Problem::new(
-                        Code::NodeUnreachable,
-                        format!("{node} isn't reachable over the cluster channel"),
-                    )
-                    .hint(
-                        "Maintenance is the node's own state, so the node must be up to take it.",
-                    ))
-                })
-            }
-            Err(_) => {
-                let node = node.to_owned();
-                Box::pin(async move {
-                    Err(Problem::new(Code::NodeUnknown, format!("no cluster node `{node}`"))
-                        .hint("Use `local`, or a node's ID, site, or pod name from the Cluster page (or cluster_status)."))
-                })
-            }
+            Err(p) => Box::pin(async move { Err(p) }),
         }
     }
     // REQ: OPS-014 (ADR-182) — installing a version is the node's own business, like
@@ -2050,41 +2056,17 @@ impl Backend for Federated {
         node: &str,
         call: telltale_api::NodeUpdateCall,
     ) -> BoxFuture<Result<telltale_api::model::NodeUpdate, Problem>> {
-        use telltale_api::problem::Code;
-        if node == "local" {
-            return self.local.node_update("local", call);
-        }
-        match self.resolve_node(node) {
+        match self.own_state_node(
+            node,
+            "The node installs the version itself, so it must be up.",
+        ) {
             Ok(None) => self.local.node_update("local", call),
             Ok(Some(peer)) => {
                 let cluster = Arc::clone(&self.cluster);
                 let label = self.label_of(&peer);
                 Box::pin(crate::node_update::send(cluster, peer, label, call))
             }
-            Err(_)
-                if self
-                    .cluster
-                    .identity
-                    .registry()
-                    .iter()
-                    .any(|n| n.node_id == node) =>
-            {
-                let node = node.to_owned();
-                Box::pin(async move {
-                    Err(Problem::new(
-                        Code::NodeUnreachable,
-                        format!("{node} isn't reachable over the cluster channel"),
-                    )
-                    .hint("The node installs the version itself, so it must be up."))
-                })
-            }
-            Err(_) => {
-                let node = node.to_owned();
-                Box::pin(async move {
-                    Err(Problem::new(Code::NodeUnknown, format!("no cluster node `{node}`"))
-                        .hint("Use `local`, or a node's ID, site, or pod name from the Cluster page (or cluster_status)."))
-                })
-            }
+            Err(p) => Box::pin(async move { Err(p) }),
         }
     }
     // REQ: CLU-014 (ADR-151) — a drill is the node's own state, like maintenance: a request for
@@ -2970,6 +2952,47 @@ mod ephemeral_tests {
                 .as_ref()
                 .is_err_and(|p| p.code != telltale_api::problem::Code::Forbidden),
             "{decoded:?}"
+        );
+    }
+
+    /// REQ: OPS-010, OPS-014 — maintenance and updates find their node the same way (one helper):
+    /// `local` and this node's own ID are here; a member of the registry not heard from is
+    /// `node_unreachable` with the call's own hint; anything else `node_unknown`.
+    #[test]
+    fn ops_014_a_call_about_a_nodes_own_state_finds_its_node() {
+        use telltale_api::problem::Code;
+        use telltale_cluster::node::{Identity, NodeRecord};
+        let dir = tempfile::tempdir().unwrap();
+        let id = Identity::init(
+            dir.path(),
+            "home",
+            vec!["https://127.0.0.1:1".into()],
+            "k8s",
+        )
+        .unwrap();
+        let me = id.meta.node_id.clone();
+        let mut registry = id.registry();
+        registry.push(NodeRecord {
+            node_id: "replica-1".into(),
+            site: "pi".into(),
+            eligible: false,
+            advertise: Vec::new(),
+            joined: 1,
+            witness: false,
+            ephemeral: false,
+        });
+        id.save_registry(&registry).unwrap();
+        let fed = Federated::new(Arc::new(NoBackend), Cluster::new(id, "0.1.0"));
+        assert_eq!(fed.own_state_node("local", "h").unwrap(), None);
+        assert_eq!(fed.own_state_node(&me, "h").unwrap(), None);
+        let p = fed.own_state_node("replica-1", "must be up").unwrap_err();
+        assert_eq!(
+            (p.code, p.hint.as_deref()),
+            (Code::NodeUnreachable, Some("must be up"))
+        );
+        assert_eq!(
+            fed.own_state_node("nope", "h").unwrap_err().code,
+            Code::NodeUnknown
         );
     }
 
