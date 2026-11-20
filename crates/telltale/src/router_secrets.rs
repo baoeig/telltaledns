@@ -962,7 +962,7 @@ impl UseCheck {
             .find(|(field, file_field, file)| !self.usable(r, field, file_field, file))?;
         if self.own_defines(r.name.as_str()) {
             return Some(format!(
-                "not read on this node: its `{file_field}` or its address isn't what this node's config files give this router, and a key file is sent only for the router as they define it (or as it was saved here). Change the config file, or enter the {field} again on the node that takes configuration changes"
+                "not read on this node: its `{file_field}` or its address isn't what this node's config files give this router, and a key file is sent only for the router as they define it (or as it was saved here). Change the config file, or move the key under /etc/telltale-secrets/ (or /run/secrets/) and name it there, or enter the {field} again on the node that takes configuration changes"
             ));
         }
         Some(format!(
@@ -1241,6 +1241,31 @@ mod tests {
             }]
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// REQ: API-002, T8.2 (ADR-181) — review round 4 (N3): a router held on a node whose own
+    /// config file defines it otherwise (a replica's older copy, a key in `/etc/telltale/`) is
+    /// told about the folder too: moving the key under `/etc/telltale-secrets/` makes it read.
+    #[test]
+    fn api_002_a_held_router_of_this_nodes_files_is_told_about_the_folder() {
+        let at = |url: &str| {
+            router(
+                serde_json::json!({"name": "udm", "type": "unifi", "url": url,
+                "api_key_file": "/etc/telltale/udm-key"}),
+            )
+        };
+        let check = UseCheck {
+            data_dir: "/var/lib/telltale".into(),
+            own: vec![at("https://192.168.1.1")],
+            written: Some(Vec::new()),
+            mounts: crate::secret_path::mount_roots(),
+        };
+        let why = check.refused(&at("https://192.168.1.2")).unwrap();
+        assert!(
+            why.contains("this node's config files give this router"),
+            "{why}"
+        );
+        assert!(why.contains("/etc/telltale-secrets/"), "{why}");
     }
 
     /// REQ: API-002, T8.2 (ADR-181) — the use-time rule: a key file is sent for a router only if
