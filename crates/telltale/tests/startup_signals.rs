@@ -90,17 +90,21 @@ listen = "127.0.0.1:{api}"
         .expect("start");
     let started = Instant::now();
     while !answers(dns) {
-        if started.elapsed() > Duration::from_secs(60) {
-            let text = std::fs::read_to_string(&log).unwrap_or_default();
-            let tail: Vec<&str> = text.lines().rev().take(15).collect();
-            panic!(
-                "never answered; the node's log, last lines first:\n{}",
-                tail.join("\n")
-            );
-        }
+        assert!(
+            started.elapsed() <= Duration::from_secs(60),
+            "never answered; the node's log, last lines first:\n{}",
+            log_tail(&log)
+        );
         std::thread::sleep(Duration::from_millis(2));
     }
     (child, dns)
+}
+
+/// The last 15 lines of the node's log, newest first.
+fn log_tail(log: &Path) -> String {
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    let tail: Vec<&str> = text.lines().rev().take(15).collect();
+    tail.join("\n")
 }
 
 fn signal(child: &Child, sig: &str) {
