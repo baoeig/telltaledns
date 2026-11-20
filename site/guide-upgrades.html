@@ -133,7 +133,7 @@ telltale backup show pi.ttbk                      # check it and list what's in 
     </div>
     <div class="card">
       <h3>Left out</h3>
-      <p>Sign-in sessions (everyone signs in again); downloaded lists, compiled snapshots, and the cache, which are rebuilt; and the cluster identity and its CA key.</p>
+      <p>Sign-in sessions (everyone signs in again); downloaded lists, compiled snapshots, and the cache, which are rebuilt; the cluster identity and its CA key; and router keys pasted in the UI: after a restore each such router says <b>key missing: enter it again</b>. A copy of the whole data folder or a volume snapshot does hold those keys, so keep it private and encrypt the volume.</p>
     </div>
   </div>
   <div class="callout warn"><p><b>Keep it private.</b> It holds password hashes and API tokens. The file is zstd-compressed tar with a manifest of BLAKE3 checksums, written owner-only (<code>0600</code>).</p></div>
