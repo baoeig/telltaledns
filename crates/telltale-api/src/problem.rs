@@ -100,6 +100,9 @@ pub enum Code {
     UpdateDowngrade,
     /// REQ: OPS-014 — not a release (`0.8.0`) or edge build (`0.8.0-edge.393`) version.
     UpdateInvalid,
+    /// REQ: OPS-014 (ADR-182) — a request never changes a node's channel: a node on the stable
+    /// channel takes only a release (an edge build is installed by hand, with `self-update`).
+    UpdateChannel,
 }
 
 impl Code {
@@ -145,6 +148,7 @@ impl Code {
             Self::UpdateNotEnabled => "https://telltaledns.dev/problems/update_not_enabled",
             Self::UpdateDowngrade => "https://telltaledns.dev/problems/update_downgrade",
             Self::UpdateInvalid => "https://telltaledns.dev/problems/update_invalid",
+            Self::UpdateChannel => "https://telltaledns.dev/problems/update_channel",
         }
     }
 
@@ -190,6 +194,7 @@ impl Code {
             Self::UpdateNotEnabled => "Updates from the cluster are off on the node",
             Self::UpdateDowngrade => "Older than the node's version",
             Self::UpdateInvalid => "Invalid version",
+            Self::UpdateChannel => "Not on the node's channel",
         }
     }
 
@@ -215,7 +220,8 @@ impl Code {
             | Self::ChangeInProgress
             | Self::UpdateUnsupported
             | Self::UpdateNotEnabled
-            | Self::UpdateDowngrade => StatusCode::CONFLICT,
+            | Self::UpdateDowngrade
+            | Self::UpdateChannel => StatusCode::CONFLICT,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::VersionConflict => StatusCode::PRECONDITION_FAILED,
             Self::InvalidConfig

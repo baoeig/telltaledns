@@ -12316,7 +12316,8 @@
           "update_unsupported",
           "update_not_enabled",
           "update_downgrade",
-          "update_invalid"
+          "update_invalid",
+          "update_channel"
         ]
       },
       "ConfigChange": {

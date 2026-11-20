@@ -25,13 +25,18 @@ use crate::{NodeUpdateCall, Shared};
 const MAX_VERSION: usize = 40;
 
 /// A version's sort key: `(major, minor, patch, edge run)`, a release after every edge build of
-/// its version. `None` for anything else (a local `dev` build, a pull request's build).
+/// its version. `None` for anything else (a local `dev` build, a pull request's build), and for
+/// a number written with a leading zero (`0.09.0`): CI never writes one, so one version has one
+/// spelling (REQ: OPS-014, ADR-182).
 pub fn version_key(v: &str) -> Option<(u64, u64, u64, u64)> {
     let (core, pre) = v.split_once('-').unwrap_or((v, ""));
     let num = |p: &str| {
-        (!p.is_empty() && p.len() <= 9 && p.bytes().all(|b| b.is_ascii_digit()))
-            .then(|| p.parse::<u64>().ok())
-            .flatten()
+        (!p.is_empty()
+            && p.len() <= 9
+            && p.bytes().all(|b| b.is_ascii_digit())
+            && (p.len() == 1 || !p.starts_with('0')))
+        .then(|| p.parse::<u64>().ok())
+        .flatten()
     };
     let mut it = core.split('.');
     let (a, b, c) = (num(it.next()?)?, num(it.next()?)?, num(it.next()?)?);
@@ -50,6 +55,21 @@ pub fn version_key(v: &str) -> Option<(u64, u64, u64, u64)> {
 pub fn is_edge(v: &str) -> bool {
     v.contains("-edge.")
 }
+
+/// REQ: OPS-014 (ADR-182) — a request never changes a node's channel: a node that runs a release
+/// takes only a release; one on the edge channel takes an edge build or a release (newer, as
+/// every request). `Err` is why not, for `current` running and `to` asked.
+pub fn same_channel(current: &str, to: &str) -> Result<(), String> {
+    if is_edge(to) && !is_edge(current) {
+        return Err(format!(
+            "this node runs {current}, on the stable channel: a request never moves it to an edge build ({to})"
+        ));
+    }
+    Ok(())
+}
+
+/// The hint for [`Code::UpdateChannel`].
+pub const CHANNEL_HINT: &str = "Ask for a release, or install an edge build by hand with self-update on that node (as root: telltale self-update --channel edge --restart).";
 
 /// A version the cluster may ask a node to install: a release or an edge build.
 pub fn check_version(to: &str) -> Result<String, Problem> {
@@ -188,6 +208,10 @@ mod tests {
             "1.2.3 -edge.4",
             "0.8.0/../..",
             "01234567890.0.0",
+            // REQ: OPS-014 (ADR-182) — one spelling per version: no leading zeros.
+            "0.09.0",
+            "00.8.0",
+            "0.8.0-edge.01",
         ] {
             let e = check_version(bad).unwrap_err();
             assert_eq!((e.code, e.status), (Code::UpdateInvalid, 422), "{bad:?}");

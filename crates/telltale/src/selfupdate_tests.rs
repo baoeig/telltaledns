@@ -292,3 +292,20 @@ async fn ops_014_an_edge_build_installs_only_while_it_is_the_newest() {
         .unwrap();
     assert!(matches!(out, Outcome::Updated { .. }), "{out:?}");
 }
+
+/// REQ: OPS-014 (ADR-182) — the signed index must be of the version's own channel: an index of
+/// the edge channel that names a release version installs nothing (part of "a request never
+/// moves a stable node to edge": the build a stable node takes is a release's).
+#[cfg(unix)]
+#[tokio::test]
+async fn ops_014_a_pinned_install_takes_only_an_index_of_the_versions_channel() {
+    let key = pinned_key();
+    let dir = tempfile::tempdir().unwrap();
+    let exe = old_binary(dir.path());
+    let base = serve(pinned_release("releases-channel.json")).await;
+    let err = update(&pinned_options(base, "9.9.9"), &exe, ASSET, &key)
+        .await
+        .unwrap_err();
+    assert!(err.contains("channel"), "{err}");
+    assert_eq!(std::fs::read(&exe).unwrap(), b"#!/bin/sh\necho old\n");
+}

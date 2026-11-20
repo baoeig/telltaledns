@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use telltale_api::NodeUpdateCall;
 use telltale_api::model::{NodeUpdate, NodeUpdatePending, NodeUpdateRun};
 use telltale_api::problem::{Code, Problem};
-use telltale_api::update_api::{check_version, is_edge, version_key};
+use telltale_api::update_api::{CHANNEL_HINT, check_version, is_edge, same_channel, version_key};
 use telltale_cluster::net::Cluster;
 use tracing::{info, warn};
 
@@ -206,6 +206,13 @@ pub(crate) fn plan(h: &Here, to: &str) -> Result<Option<String>, Problem> {
         .hint(format!(
             "The cluster only moves nodes forward. To go back, as root on the node: telltale self-update --to {to} --restart"
         )));
+    }
+    // REQ: OPS-014 (ADR-182) — never a channel change: checked here (for the API on this node
+    // and for the cluster RPC alike) and again by the update service.
+    if let Err(why) = same_channel(&h.version, &to) {
+        return Err(
+            Problem::new(Code::UpdateChannel, format!("{}: {why}", h.node)).hint(CHANNEL_HINT),
+        );
     }
     if !h.enabled {
         return Err(Problem::new(
@@ -413,48 +420,86 @@ pub(crate) enum Served {
     Done { state: String, restart: bool },
 }
 
-/// Reads the request at `path` if it is a small regular file owned by its directory's owner (not
-/// a symlink or a hard link to someone else's file), then removes it.
+/// REQ: OPS-014 (ADR-182) — what the update service records for anything at the request that
+/// isn't one: the same words whatever was there (the result is world-readable, and says nothing
+/// about the files root can see).
+const NOT_A_REQUEST: &str = "the request isn't a small regular file written by the node: ignored";
+
+/// REQ: OPS-014 (ADR-182) — reads the request at `path` and removes it. Everything is done
+/// relative to the request's folder, opened once without following a link (a folder swapped for
+/// a link afterwards changes nothing), and every check is made on the file as opened: the open
+/// follows no link and never waits (a FIFO opens at once and is refused), and the file must be
+/// a regular file with one name, at most [`MAX_REQUEST`] bytes, owned by the folder's owner, in a
+/// folder that is a real directory and not world-writable. Whatever is at the request's name
+/// afterwards goes (a directory only if it is empty: root never reaches into the node's files),
+/// so it is acted on once at most. `Ok(None)`: nothing there.
+#[cfg(unix)]
 fn take_request(path: &Path) -> Result<Option<Vec<u8>>, String> {
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("can't read the request: {e}")),
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+    use rustix::io::Errno;
+    let not_a_request = || Err(NOT_A_REQUEST.to_owned());
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return not_a_request();
     };
-    // Whatever it is, it goes: a request is acted on once at most.
+    let folder = match rustix::fs::open(
+        dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(None),
+        // Not a directory, or a link: not the node's folder, so nothing in it is touched.
+        Err(_) => return not_a_request(),
+    };
+    let Ok(fst) = rustix::fs::fstat(&folder) else {
+        return not_a_request();
+    };
+    // Not a folder anyone may write: the owner check below is what keeps others' files out.
+    if FileType::from_raw_mode(fst.st_mode) != FileType::Directory || fst.st_mode & 0o002 != 0 {
+        return not_a_request();
+    }
+    // Whatever is at the name goes: a file, a link, a FIFO, or an empty directory.
     let gone = || {
-        let _ = std::fs::remove_file(path);
+        if rustix::fs::unlinkat(&folder, name, AtFlags::empty()).is_err() {
+            let _ = rustix::fs::unlinkat(&folder, name, AtFlags::REMOVEDIR);
+        }
     };
-    if !meta.file_type().is_file() || meta.len() > MAX_REQUEST {
+    let file = match rustix::fs::openat(
+        &folder,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(None),
+        Err(_) => {
+            gone();
+            return not_a_request();
+        }
+    };
+    let ok = rustix::fs::fstat(&file).is_ok_and(|st| {
+        FileType::from_raw_mode(st.st_mode) == FileType::RegularFile
+            && st.st_nlink == 1
+            && u64::try_from(st.st_size).is_ok_and(|n| n <= MAX_REQUEST)
+            && st.st_uid == fst.st_uid
+    });
+    if !ok {
         gone();
-        return Err("the request isn't a small regular file: ignored".into());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let dir = path.parent().unwrap_or(Path::new("."));
-        let owner = std::fs::metadata(dir).map(|d| d.uid()).ok();
-        if meta.nlink() != 1 || owner != Some(meta.uid()) {
-            gone();
-            return Err("the request isn't owned by its directory's owner: ignored".into());
-        }
-    }
-    let mut f = std::fs::File::open(path).map_err(|e| format!("can't open the request: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let open = f.metadata().map_err(|e| e.to_string())?;
-        if (open.dev(), open.ino()) != (meta.dev(), meta.ino()) {
-            gone();
-            return Err("the request changed while it was read: ignored".into());
-        }
+        return not_a_request();
     }
     let mut body = Vec::new();
-    Read::take(&mut f, MAX_REQUEST)
-        .read_to_end(&mut body)
-        .map_err(|e| format!("can't read the request: {e}"))?;
+    let read = Read::take(&mut std::fs::File::from(file), MAX_REQUEST + 1).read_to_end(&mut body);
     gone();
+    if read.is_err() || !u64::try_from(body.len()).is_ok_and(|n| n <= MAX_REQUEST) {
+        return not_a_request();
+    }
     Ok(Some(body))
+}
+
+/// Only Unix has the root update service.
+#[cfg(not(unix))]
+fn take_request(_: &Path) -> Result<Option<Vec<u8>>, String> {
+    Err(NOT_A_REQUEST.to_owned())
 }
 
 /// Checks a request the update service read, against the version installed now.
@@ -489,22 +534,35 @@ fn check_request(
     {
         return bad("the request is more than an hour old (or from the future): ask again".into());
     }
-    if check_version(&r.to).is_err() {
+    // REQ: OPS-014 (ADR-182) — exactly as a release or edge build is written: what is checked
+    // below and what is fetched is this string, unchanged (padding, a newline or a leading zero
+    // is refused, never trimmed into another version).
+    let Some(want) = check_version(&r.to)
+        .ok()
+        .filter(|v| *v == r.to)
+        .and_then(|v| version_key(&v))
+    else {
+        let shown: String = r.to.chars().take(48).collect();
         return bad(format!(
             "`{}` isn't a release or edge build version",
-            r.to.escape_debug()
+            shown.escape_debug()
         ));
-    }
-    match (version_key(current), version_key(&r.to)) {
-        (None, _) => bad(format!(
+    };
+    let Some(have) = version_key(current) else {
+        return bad(format!(
             "the installed binary is a local build ({current}): install a release by hand"
-        )),
-        (Some(have), Some(want)) if want < have => bad(format!(
+        ));
+    };
+    if want < have {
+        return bad(format!(
             "{} is older than the installed {current}: the cluster only moves nodes forward",
             r.to
-        )),
-        _ => Ok(r),
+        ));
     }
+    if let Err(why) = same_channel(current, &r.to) {
+        return bad(why);
+    }
+    Ok(r)
 }
 
 /// REQ: OPS-014 — the update service's run: reads and removes the request at `request`, checks

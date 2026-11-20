@@ -1416,7 +1416,10 @@ fn run_update_request(request: &Path, result: &Path, restart: bool) -> ExitCode 
             state,
             restart: due,
         } => {
-            let ok = state == "updated" || state == "up_to_date";
+            // REQ: OPS-014 (ADR-182) — a refusal is the service doing its job, and it is
+            // recorded in the result: exit 0, so a refused request is no failed unit. A failed
+            // install is a failure.
+            let ok = state != "failed";
             out(format!(
                 "Update request: {state} (recorded in {}).",
                 result.display()

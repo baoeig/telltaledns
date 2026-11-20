@@ -93,6 +93,19 @@ fn check_pinned(
     want: &str,
 ) -> Result<(), String> {
     let ix = crate::updates::verified(key, index, sig)?;
+    // REQ: OPS-014 (ADR-182) — the index is of the version's own channel (an edge build's is the
+    // edge channel's, a release's the stable one's): a request never moves a stable node to edge.
+    let channel = if telltale_api::update_api::is_edge(to) {
+        "edge"
+    } else {
+        "stable"
+    };
+    if ix.channel != channel {
+        return Err(format!(
+            "the signed index is of the {} channel, not {channel} as {to} is: not installed",
+            ix.channel
+        ));
+    }
     if ix.version != to {
         return Err(if telltale_api::update_api::is_edge(to) {
             format!(

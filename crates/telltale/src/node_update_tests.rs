@@ -86,7 +86,8 @@ fn ops_014_a_node_takes_only_newer_versions_it_can_install() {
 #[test]
 fn ops_014_a_request_is_written_for_the_update_service_and_shown_as_pending() {
     let dir = tempfile::tempdir().unwrap();
-    let node = here(dir.path(), "native", "0.7.0", true);
+    // An edge node (a stable one never takes an edge build: ops_014_a_request_never_moves_...).
+    let node = here(dir.path(), "native", "0.7.0-edge.400", true);
     let res = request(&node, "0.8.0-edge.393", "alice via k3s", NOW).unwrap();
     assert_eq!(res.state.as_deref(), Some("requested"));
     let asked = res.pending.unwrap();
@@ -168,9 +169,9 @@ fn ops_014_the_update_service_installs_a_newer_version_once_and_records_it() {
 #[test]
 fn ops_014_a_failed_install_is_recorded_and_does_not_restart() {
     let d = tempfile::tempdir().unwrap();
-    let h = here(d.path(), "native", "0.7.0", true);
+    let h = here(d.path(), "native", "0.7.0-edge.400", true);
     request(&h, "0.8.0-edge.393", "alice", NOW).unwrap();
-    let served = serve_request(&h.request_path(), &h.result, "0.7.0", NOW, |_| {
+    let served = serve_request(&h.request_path(), &h.result, "0.7.0-edge.400", NOW, |_| {
         Err("the edge channel now serves 0.8.0-edge.394".into())
     });
     assert_eq!(
@@ -187,6 +188,9 @@ fn ops_014_a_failed_install_is_recorded_and_does_not_restart() {
 
 /// Writes `body` as the request file, as the node's user would.
 fn plant(h: &Here, body: &str) {
+    if let Some(dir) = h.request_path().parent() {
+        std::fs::create_dir_all(dir).unwrap();
+    }
     std::fs::write(h.request_path(), body).unwrap();
 }
 
@@ -318,6 +322,210 @@ fn ops_014_the_update_service_reads_no_symlink_or_large_file() {
             .unwrap()
             .file_type()
             .is_symlink()
+    );
+}
+
+/// The one error the update service records for anything at the request that isn't a small
+/// regular file of the node's own (the result is world-readable: it says no more than that).
+const NOT_A_REQUEST: &str = "the request isn't a small regular file written by the node: ignored";
+
+fn refused() -> Served {
+    Served::Done {
+        state: "refused".into(),
+        restart: false,
+    }
+}
+
+/// Makes a FIFO at `p` (`mkfifo`, from coreutils).
+#[cfg(unix)]
+fn mkfifo(p: &Path) {
+    let ok = std::process::Command::new("mkfifo")
+        .arg(p)
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(ok, "mkfifo {}", p.display());
+}
+
+/// The update service's run on a thread of its own, waited for at most 20 s: a run that blocks
+/// (an open of a FIFO with no writer) fails the test instead of hanging it.
+#[cfg(unix)]
+fn serve_bounded(h: &Here, current: &'static str) -> Served {
+    let (request, result) = (h.request_path(), h.result.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+    drop(std::thread::spawn(move || {
+        let _ = tx.send(serve_request(&request, &result, current, NOW, |_| {
+            Err("must not install".to_owned())
+        }));
+    }));
+    rx.recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the update service blocked on the request")
+}
+
+/// REQ: OPS-014 (ADR-182) — a link to a FIFO at the request is refused without the update
+/// service blocking on it (the open never follows a link and never waits for a writer); the
+/// link goes, the FIFO it named stays, and the result says only that it wasn't a request.
+#[cfg(unix)]
+#[test]
+fn ops_014_a_link_to_a_fifo_is_refused_without_blocking() {
+    let d = tempfile::tempdir().unwrap();
+    let h = here(d.path(), "native", "0.7.0", true);
+    let fifo = d.path().join("fifo");
+    mkfifo(&fifo);
+    std::fs::create_dir_all(h.request_path().parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&fifo, h.request_path()).unwrap();
+    assert_eq!(serve_bounded(&h, "0.7.0"), refused());
+    assert!(
+        std::fs::symlink_metadata(h.request_path()).is_err(),
+        "the link is removed"
+    );
+    assert!(fifo.exists(), "the FIFO it named is left alone");
+    assert_eq!(
+        status(&h).last.unwrap().error.as_deref(),
+        Some(NOT_A_REQUEST)
+    );
+}
+
+/// REQ: OPS-014 (ADR-182) — a FIFO or an empty directory at the request is refused and removed
+/// (so the path unit isn't started again for it), with the same one error. A directory with
+/// something in it can't be removed without root reaching into the node's files: it is refused
+/// each time (the path unit's start limit then stops it: ADR-182, the feature switched off).
+#[cfg(unix)]
+#[test]
+fn ops_014_a_fifo_or_directory_at_the_request_is_refused_and_removed() {
+    let d = tempfile::tempdir().unwrap();
+    let h = here(d.path(), "native", "0.7.0", true);
+    std::fs::create_dir_all(h.request_path().parent().unwrap()).unwrap();
+    mkfifo(&h.request_path());
+    assert_eq!(serve_bounded(&h, "0.7.0"), refused());
+    assert!(
+        std::fs::symlink_metadata(h.request_path()).is_err(),
+        "the FIFO is removed"
+    );
+    assert_eq!(
+        status(&h).last.unwrap().error.as_deref(),
+        Some(NOT_A_REQUEST)
+    );
+    std::fs::create_dir(h.request_path()).unwrap();
+    assert_eq!(serve_bounded(&h, "0.7.0"), refused());
+    assert!(
+        std::fs::symlink_metadata(h.request_path()).is_err(),
+        "the empty directory is removed"
+    );
+    assert_eq!(
+        status(&h).last.unwrap().error.as_deref(),
+        Some(NOT_A_REQUEST)
+    );
+    std::fs::create_dir(h.request_path()).unwrap();
+    std::fs::write(h.request_path().join("x"), "x").unwrap();
+    assert_eq!(serve_bounded(&h, "0.7.0"), refused());
+    assert!(
+        h.request_path().join("x").exists(),
+        "nothing inside is touched"
+    );
+}
+
+/// REQ: OPS-014 (ADR-182) — the update service acts only on a version written exactly as a
+/// release or edge build is: padded, with a newline, or with a leading zero is refused before
+/// anything is fetched (it used to pass the downgrade check unparsed). The node never asks for
+/// one either.
+#[test]
+fn ops_014_a_padded_or_unparseable_version_is_refused() {
+    let d = tempfile::tempdir().unwrap();
+    let h = here(d.path(), "native", "0.8.0", true);
+    for to in [
+        "0.9.0\n",
+        " 0.9.0",
+        "0.9.0 ",
+        "0.09.0",
+        "00.9.0",
+        "0.9.0-edge.01",
+    ] {
+        let body = serde_json::json!({"id": "1a-2b", "to": to, "by": "alice", "requestedMs": NOW});
+        plant(&h, &body.to_string());
+        let asked = Cell::new(false);
+        let served = serve_request(&h.request_path(), &h.result, "0.8.0", NOW, |_| {
+            asked.set(true);
+            Err("not here".to_owned())
+        });
+        assert!(!asked.get(), "{to:?}: nothing is fetched");
+        assert_eq!(served, refused(), "{to:?}");
+        assert!(
+            status(&h)
+                .last
+                .unwrap()
+                .error
+                .unwrap()
+                .contains("isn't a release or edge build version"),
+            "{to:?}"
+        );
+    }
+    for to in ["0.09.0", "00.9.0", "0.9.0-edge.01"] {
+        assert_eq!(
+            code(request(&h, to, "alice", NOW)),
+            Code::UpdateInvalid,
+            "{to:?}"
+        );
+    }
+    assert!(!h.request_path().exists());
+}
+
+/// REQ: OPS-014 (ADR-182) — a request never changes a node's channel: a stable node takes only a
+/// release (`update_channel`, 409, at the node: the same check answers the API and the cluster
+/// RPC), and the update service refuses it again; an edge node takes an edge build or a newer
+/// release.
+#[test]
+fn ops_014_a_request_never_moves_a_stable_node_to_edge() {
+    let d = tempfile::tempdir().unwrap();
+    let stable = here(d.path(), "native", "0.8.0", true);
+    let e = request(&stable, "0.9.0-edge.1", "alice", NOW).unwrap_err();
+    assert_eq!(
+        (serde_json::to_value(e.code).unwrap(), e.status),
+        (serde_json::json!("update_channel"), 409),
+        "{e:?}"
+    );
+    assert!(
+        e.hint
+            .as_deref()
+            .is_some_and(|h| h.contains("by hand with self-update")),
+        "{e:?}"
+    );
+    assert!(!stable.request_path().exists(), "nothing is written");
+    // An edge node: an edge build, or a newer release.
+    let edge_dir = tempfile::tempdir().unwrap();
+    let edge = here(edge_dir.path(), "native", "0.8.0-edge.5", true);
+    assert_eq!(
+        request(&edge, "0.8.0-edge.9", "alice", NOW)
+            .unwrap()
+            .state
+            .as_deref(),
+        Some("requested")
+    );
+    std::fs::remove_file(edge.request_path()).unwrap();
+    assert_eq!(
+        request(&edge, "0.8.0", "alice", NOW)
+            .unwrap()
+            .state
+            .as_deref(),
+        Some("requested")
+    );
+    // The update service, on a stable node, refuses an edge build however it was asked.
+    let body =
+        serde_json::json!({"id": "1a-2b", "to": "0.9.0-edge.1", "by": "alice", "requestedMs": NOW});
+    plant(&stable, &body.to_string());
+    let asked = Cell::new(false);
+    let served = serve_request(&stable.request_path(), &stable.result, "0.8.0", NOW, |_| {
+        asked.set(true);
+        Err("not here".to_owned())
+    });
+    assert!(!asked.get(), "nothing is fetched");
+    assert_eq!(served, refused());
+    assert!(
+        status(&stable)
+            .last
+            .unwrap()
+            .error
+            .unwrap()
+            .contains("stable channel"),
     );
 }
 
