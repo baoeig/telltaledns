@@ -331,16 +331,24 @@ pub(crate) async fn send(
     crate::forward::decode_answer(&reply)
 }
 
-/// REQ: OPS-014 — a peer's call for this node: applied and, for a request, audited here with
-/// the user and the entry node.
+/// REQ: OPS-014 (ADR-182) — a peer's call for this node: applied and, for a request, audited
+/// here with the entry node. `ephemeral`: the peer is an ephemeral member or one the registry
+/// doesn't list (`federated::rpc_handler`), which may read but never ask for an install.
 pub(crate) fn handle(
     src: &crate::http::Sources,
     cluster: &Cluster,
     peer: &str,
     body: &[u8],
+    ephemeral: bool,
 ) -> Result<Vec<u8>, String> {
     let Envelope { call, sent_ms } =
         serde_json::from_slice(body).map_err(|e| format!("bad update request: {e}"))?;
+    // REQ: OPS-014, CLU-009 (ADR-182, ADR-058) — as for maintenance, rollouts, removals,
+    // simulations and drills: an ephemeral member serves no UI, so no user is behind a request
+    // from it (nor from a peer the registry doesn't list).
+    if ephemeral && !matches!(call, NodeUpdateCall::Status) {
+        return Err("an ephemeral member can't change this node's state".into());
+    }
     if now_ms() > sent_ms.saturating_add(STALE_RPC_MS) {
         return Err("the request is too old; the node that sent it gave up on it".into());
     }
@@ -351,11 +359,13 @@ pub(crate) fn handle(
         .map(|m| if m.pod.is_empty() { m.site } else { m.pod })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| peer.to_owned());
-    let (call, by) = match call {
+    // Only the sender (`via`, its stream's certificate) is checked here; the user is the
+    // entry node's word for it, so the audit names the node and keeps the user as unverified.
+    let (call, said) = match call {
         NodeUpdateCall::Request { to, by } => (
             NodeUpdateCall::Request {
                 to,
-                by: format!("{by} via {via}"),
+                by: format!("{by} via {via} (unverified)"),
             },
             Some(by),
         ),
@@ -366,19 +376,28 @@ pub(crate) fn handle(
         NodeUpdateCall::Status => None,
     };
     let r = apply_here(src, call);
-    if let (Ok(res), Some(by), Some(auth)) = (&r, by, src.auth.get()) {
+    if let (Some(said), Some(auth)) = (said, src.auth.get()) {
         let actor = telltale_api::auth::Actor {
-            name: format!("{by} via {via}"),
+            name: format!("node {via}"),
             kind: "cluster",
             remote: Some(format!("node {peer}")),
             reason: None,
         };
-        auth.record(
-            &actor,
-            "node.update.request",
-            &res.node,
-            &serde_json::json!({ "to": to, "from": res.version, "state": res.state }),
-        );
+        match &r {
+            Ok(res) => auth.record(
+                &actor,
+                "node.update.request",
+                &res.node,
+                &serde_json::json!({ "to": to, "from": res.version, "state": res.state,
+                    "by": said, "byVerified": false }),
+            ),
+            Err(p) => auth.record(
+                &actor,
+                "node.update.refused",
+                &crate::maintenance::label(src),
+                &serde_json::json!({ "to": to, "code": p.code, "by": said, "byVerified": false }),
+            ),
+        }
     }
     crate::forward::encode_answer(r)
 }

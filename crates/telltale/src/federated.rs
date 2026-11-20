@@ -376,10 +376,11 @@ pub(crate) fn rpc_handler(
                 .map_err(|e| format!("maintenance worker failed: {e}"))?;
             }
             if kind == crate::node_update::KIND {
-                // REQ: OPS-014 — another node asks this node to install a version, or reads its
-                // update state (a user or `telltale ctl upgrade` acted there).
+                // REQ: OPS-014 (ADR-182) — another node asks this node to install a version, or
+                // reads its update state (a user or `telltale ctl upgrade` acted there). An
+                // ephemeral member serves no UI: it may read, and nothing it asks is installed.
                 return tokio::task::spawn_blocking(move || {
-                    crate::node_update::handle(&src, &cluster, &peer, &body)
+                    crate::node_update::handle(&src, &cluster, &peer, &body, ephemeral)
                 })
                 .await
                 .map_err(|e| format!("update worker failed: {e}"))?;
@@ -2848,6 +2849,128 @@ mod ephemeral_tests {
             from_s: 0,
             to_s: 1
         }));
+    }
+
+    /// A backend for the RPC tests below: the `update` call never reads it.
+    struct NoBackend;
+
+    impl Backend for NoBackend {
+        fn system_info(&self) -> SystemInfo {
+            unreachable!("not read here")
+        }
+        fn timeseries(&self, _: Step, _: u64, _: u64) -> Vec<TimeBucket> {
+            Vec::new()
+        }
+        fn top(&self, _: TopKind, _: Hour, _: usize, _: Option<IpAddr>) -> Vec<TopItem> {
+            Vec::new()
+        }
+        fn latency(&self, _: LatencyBy, _: Hour) -> Vec<LatencyRow> {
+            Vec::new()
+        }
+        fn queries(&self, _: &QueryParams, _: u64, _: u64, _: usize) -> Result<QueryPage, Problem> {
+            Err(Problem::unavailable("stub"))
+        }
+        fn explain(&self, _: &ExplainParams) -> Result<Explanation, Problem> {
+            Err(Problem::unavailable("stub"))
+        }
+        fn lists(&self) -> Vec<ListInfo> {
+            Vec::new()
+        }
+        fn groups(&self) -> Vec<GroupInfo> {
+            Vec::new()
+        }
+        fn clients(&self) -> Vec<ClientInfo> {
+            Vec::new()
+        }
+        fn upstreams(&self) -> Vec<UpstreamInfo> {
+            Vec::new()
+        }
+        fn config_version(&self) -> u64 {
+            0
+        }
+    }
+
+    /// REQ: OPS-014, CLU-009 (ADR-182, ADR-058) — the `update` RPC: an ephemeral member (a
+    /// resolver pod) and a peer the registry doesn't list may read a node's update state, never
+    /// ask it to install a version, as for maintenance, rollouts, removals, simulations and
+    /// drills. A member the registry lists gets the node's own answer.
+    #[tokio::test]
+    async fn ops_014_an_ephemeral_member_cannot_ask_for_an_update() {
+        use telltale_cluster::node::{Identity, NodeRecord};
+        let dir = tempfile::tempdir().unwrap();
+        let id = Identity::init(
+            dir.path(),
+            "home",
+            vec!["https://127.0.0.1:1".into()],
+            "k8s",
+        )
+        .unwrap();
+        let member = |node_id: &str, ephemeral: bool| NodeRecord {
+            node_id: node_id.into(),
+            site: node_id.into(),
+            eligible: false,
+            advertise: Vec::new(),
+            joined: 1,
+            witness: false,
+            ephemeral,
+        };
+        let mut registry = id.registry();
+        registry.push(member("replica-1", false));
+        registry.push(member("pod-1", true));
+        id.save_registry(&registry).unwrap();
+        let cluster = Cluster::new(id, "0.1.0");
+        let data = tempfile::tempdir().unwrap();
+        let src = Arc::new(crate::http::tests::sources_in(data.path()));
+        let handler = rpc_handler(src, Arc::new(NoBackend), cluster);
+        let now = crate::maintenance::now_ms();
+        let body = |call: serde_json::Value| {
+            serde_json::to_vec(&serde_json::json!({ "call": call, "sent_ms": now })).unwrap()
+        };
+        let request = serde_json::json!({"op": "request", "to": "99.0.0", "by": "mallory"});
+        let status = serde_json::json!({"op": "status"});
+        let written = || {
+            data.path().join("update-request.json").exists()
+                || data.path().join("update").join("request.json").exists()
+        };
+        for peer in ["pod-1", "a-stranger"] {
+            let e = handler(
+                peer.into(),
+                crate::node_update::KIND.into(),
+                body(request.clone()),
+            )
+            .await
+            .expect_err("an ephemeral or unlisted peer can't ask for an update");
+            assert!(e.contains("ephemeral member"), "{peer}: {e}");
+            assert!(!written(), "{peer}: nothing is written");
+            // The read stays open to it.
+            assert!(
+                handler(
+                    peer.into(),
+                    crate::node_update::KIND.into(),
+                    body(status.clone())
+                )
+                .await
+                .is_ok(),
+                "{peer}: a read is answered"
+            );
+        }
+        // A member the registry lists gets this node's answer (a test build is a local build, so
+        // a problem that says so, not a refusal of the sender).
+        let answer = handler(
+            "replica-1".into(),
+            crate::node_update::KIND.into(),
+            body(request),
+        )
+        .await
+        .expect("a listed member is answered");
+        let decoded: Result<telltale_api::model::NodeUpdate, Problem> =
+            crate::forward::decode_answer(&answer);
+        assert!(
+            decoded
+                .as_ref()
+                .is_err_and(|p| p.code != telltale_api::problem::Code::Forbidden),
+            "{decoded:?}"
+        );
     }
 
     /// The `fn` names of one `impl` block in a source file.
