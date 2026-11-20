@@ -67,6 +67,7 @@ pub(crate) fn sources_in(dir: &std::path::Path) -> Sources {
         qlog: None,
         config: ArcSwap::from_pointee(cfg),
         file_config: ArcSwap::from_pointee(telltale_config::Config::default()),
+        files_unread: std::sync::atomic::AtomicBool::new(false),
         config_files: Vec::new(),
         update: Arc::new(std::sync::Mutex::new(crate::updates::initial(false))),
         rollups: None,

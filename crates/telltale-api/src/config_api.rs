@@ -660,12 +660,19 @@ async fn group_guard(
 /// `{"type": "email", "url": "smtp://smtp.gmail.com:587", "from": "me@gmail.com", "to":
 /// ["me@gmail.com"], "username": "me@gmail.com", "password_file": "/run/secrets/smtp"}`.
 /// Secrets stay in files on the node (`token_file`, `password_file`): only the path is sent.
+/// A destination that names either file, before or after the change, is added or changed only
+/// by an administrator (an admin's sign-in or API token; agent tokens can't); without one, or to
+/// delete one, the operator role is enough. The file is an absolute path under `/run/secrets/`,
+/// `/etc/telltale-secrets/` or the data directory's `secrets/` folder (not
+/// `/run/secrets/kubernetes.io/`), written without `.` or `..`; links are followed. It needn't
+/// exist yet.
 /// A destination the config files define is overridden until this one is deleted.
 #[utoipa::path(put, path = "/api/v1/alerts/destinations/{name}", tag = "config",
     params(("name" = String, Path, description = "The name."), DryRun),
     request_body = Object,
     responses(
         (status = 200, body = ConfigChange, description = "Applied (or, with dryRun, what would change)."),
+        (status = 403, body = Problem, description = "The destination names a credential file (`token_file`, `password_file`), before or after the change, and the caller isn't an administrator."),
         (status = 412, body = Problem, description = "The configuration changed since the If-Match version: re-read it and retry."),
         (status = 422, body = Problem, description = "A field is wrong, or the configuration wouldn't be valid: problem+json says which."),
     ))]
@@ -1896,6 +1903,9 @@ async fn write(
                 expect,
                 by: actor.name.clone(),
                 simulate,
+                // REQ: OBS-010, API-002 (ADR-179) — an agent token is never an administrator
+                // here, whoever owns it and whatever else it may do.
+                by_admin: p.role == crate::auth::Role::Admin && p.agent.is_none(),
             })
             .await
             .map(|c| serde_json::to_value(c).unwrap_or_default()),
