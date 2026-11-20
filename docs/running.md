@@ -3458,7 +3458,7 @@ Edit the config file, then send `SIGHUP` (`kill -HUP <pid>`, or `docker kill -s 
 - Upstream health starts fresh after a reload and is re-learned within a few queries.
 
 ## Stop
-`SIGTERM` or `SIGINT` (Ctrl-C) shuts down gracefully, also when it arrives while the node is still starting (it is kept, and the shutdown below runs once the node is up):
+`SIGTERM` or `SIGINT` (Ctrl-C) shuts down gracefully, also when it arrives while the node is still starting (it is kept, and the shutdown below runs once the node is up). A stop during a cluster join ends the join and stops the node at once (exit 0): it isn't ready yet, so there is nothing to drain. Otherwise:
 1. `/readyz` turns 503, so load balancers stop sending new queries.
 2. TCP listeners stop accepting and finish the queries already received.
 3. Upstream lookups still in flight get up to 3 seconds to complete and reply.

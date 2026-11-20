@@ -979,7 +979,42 @@ pub(crate) async fn serve(files: Vec<PathBuf>, cfg: Config) -> io::Result<()> {
     let (stop_http, http_stopped) = tokio::sync::watch::channel(false);
     // REQ: CLU-009 — create or join the cluster on first start (the Helm chart's controller
     // and resolver pods). A resolver pod that can't join exits, so Kubernetes retries it.
-    if let Err(e) = crate::cluster::bootstrap(&cfg, Duration::from_secs(120)).await {
+    // REQ: OPS-007 (review round 4, N1) — a stop during the join (it waits up to two minutes)
+    // ends the join and the node at once: nothing is ready yet, so there is nothing to drain,
+    // and systemd's or Kubernetes' stop timeout would otherwise kill it first. A SIGHUP or
+    // SIGUSR1 meanwhile stays queued for the loop. `biased`: with no join to make, the
+    // bootstrap is ready at once and a stop already queued is drained by the loop as before.
+    let joined = tokio::select! {
+        biased;
+        r = crate::cluster::bootstrap(&cfg, Duration::from_secs(120)) => Some(r),
+        _ = term.recv() => {
+            info!(signal = "SIGTERM", "shutting down during the cluster join");
+            None
+        }
+        _ = int.recv() => {
+            info!(signal = "SIGINT", "shutting down during the cluster join");
+            None
+        }
+    };
+    let Some(joined) = joined else {
+        // What runs so far: the DNS listeners (stopped here), the health checks, the
+        // aggregator thread (joined when its guard drops) and the rollups writer (a task the
+        // runtime drops). Not yet opened or started: the state database, the API, the cluster
+        // channel, the lists; a join that was cut short saved no identity (it saves only once
+        // the primary has answered, in one step). The warm cache is kept, as on any stop.
+        for (_, s) in listeners.streams.drain(..) {
+            s.shutdown().await;
+        }
+        for (_, l) in listeners.udp.drain(..) {
+            l.shutdown();
+        }
+        health.abort();
+        if cfg.cache.persist {
+            save_cache(&cfg, &cache);
+        }
+        return Ok(());
+    };
+    if let Err(e) = joined {
         if cfg.cluster.ephemeral {
             return Err(io::Error::other(format!("cluster: {e}")));
         }

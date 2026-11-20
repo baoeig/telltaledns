@@ -1,23 +1,32 @@
-//! REQ: OPS-007, OPS-009 — a signal that arrives while the node is still starting (DNS already
-//! answers; the API, the state database and the rest are still being set up) is acted on once
-//! the node is up: SIGTERM drains and exits cleanly, SIGHUP reloads. Before, the signal's
-//! default action ended the process (review round 3, F2). The start-up is made a little longer
-//! with a bootstrap administrator (a password hash), and each signal is sent at DNS's first
-//! answer.
+//! REQ: OPS-007, OPS-009, CLU-009 — a signal that arrives while the node is still starting (DNS
+//! already answers; the API, the state database and the rest are still being set up) is acted on
+//! once the node is up: SIGTERM drains and exits cleanly, SIGHUP reloads. Before, the signal's
+//! default action ended the process (review round 3, F2). A stop during a cluster join that can't
+//! finish (a loopback port where nothing listens) ends the join and the node at once, with exit
+//! 0, rather than after the join's two minutes (review round 4, N1). The start-up is made a
+//! little longer with a bootstrap administrator (a password hash). Every failed check prints the
+//! node's log.
 
 #![allow(clippy::expect_used)] // test helpers
 
-use std::net::UdpSocket;
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::net::{TcpListener, UdpSocket};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-fn free_port() -> u16 {
+/// A UDP port nothing uses now (for DNS).
+fn free_udp_port() -> u16 {
     let s = UdpSocket::bind("127.0.0.1:0").expect("bind");
     s.local_addr().expect("addr").port()
 }
 
-/// An A query for nas.signals.test; true when an answer comes back.
+/// A TCP port nothing listens on now (for the API, the metrics, a join URL that can't answer).
+fn free_tcp_port() -> u16 {
+    let s = TcpListener::bind("127.0.0.1:0").expect("bind");
+    s.local_addr().expect("addr").port()
+}
+
+/// An A query for nas.signals.test; true when an answer comes back within 300 ms.
 fn answers(port: u16) -> bool {
     let Ok(s) = UdpSocket::bind("127.0.0.1:0") else {
         return false;
@@ -36,10 +45,87 @@ fn answers(port: u16) -> bool {
     matches!(s.recv(&mut buf), Ok(n) if n > 12 && buf[0..2] == [0x43, 0x21] && buf[7] == 1)
 }
 
-/// Starts a node in `dir` and returns it, and its DNS port, once DNS first answers (asked every
-/// 2 ms, so the signal that follows lands in the start-up).
-fn start(dir: &Path) -> (Child, u16) {
-    let (dns, api, metrics) = (free_port(), free_port(), free_port());
+/// [`answers`], tried again until one comes back or `bound` has passed.
+fn answers_within(port: u16, bound: Duration) -> bool {
+    let started = Instant::now();
+    loop {
+        if answers(port) {
+            return true;
+        }
+        if started.elapsed() >= bound {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A running node, its DNS port and its log.
+struct Node {
+    child: Child,
+    dns: u16,
+    log: PathBuf,
+}
+
+impl Node {
+    /// The last 20 lines of the node's log, newest first (for a failed check's message).
+    fn tail(&self) -> String {
+        let text = std::fs::read_to_string(&self.log).unwrap_or_default();
+        let tail: Vec<&str> = text.lines().rev().take(20).collect();
+        format!("the node's log, last lines first:\n{}", tail.join("\n"))
+    }
+
+    fn logged(&self, what: &str) -> bool {
+        std::fs::read_to_string(&self.log).is_ok_and(|t| t.contains(what))
+    }
+
+    /// Waits (at most `bound`) until the log holds `what`.
+    fn wait_logged(&self, what: &str, bound: Duration) -> bool {
+        let started = Instant::now();
+        while !self.logged(what) {
+            if started.elapsed() >= bound {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        true
+    }
+
+    fn signal(&self, sig: &str) {
+        let status = Command::new("kill")
+            .args([sig, &self.child.id().to_string()])
+            .status()
+            .expect("kill");
+        assert!(status.success(), "kill {sig}");
+    }
+
+    /// The exit status once the node has exited (at most `bound`); `None` while it runs.
+    fn wait_exit(&mut self, bound: Duration) -> Option<ExitStatus> {
+        let started = Instant::now();
+        loop {
+            if let Some(s) = self.child.try_wait().expect("try_wait") {
+                return Some(s);
+            }
+            if started.elapsed() >= bound {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Starts a node in `dir` (with `extra` appended to its configuration) and returns it once DNS
+/// first answers. A query that isn't answered waits its 300 ms, so until the node is up it is
+/// asked about every 300 ms, and once it is up the first answer comes back at once: the signal
+/// that follows lands in the start-up.
+fn start(dir: &Path, extra: &str) -> Node {
+    let (dns, api, metrics) = (free_udp_port(), free_tcp_port(), free_tcp_port());
     let cfg = dir.join("t.toml");
     std::fs::write(
         &cfg,
@@ -70,7 +156,7 @@ listen = "127.0.0.1:{metrics}"
 
 [api]
 listen = "127.0.0.1:{api}"
-"#,
+{extra}"#,
             dir.join("data").display()
         ),
     )
@@ -88,65 +174,114 @@ listen = "127.0.0.1:{api}"
         .stderr(std::fs::File::create(&log).expect("log file"))
         .spawn()
         .expect("start");
+    let node = Node { child, dns, log };
     let started = Instant::now();
-    while !answers(dns) {
+    while !answers(node.dns) {
         assert!(
             started.elapsed() <= Duration::from_secs(60),
-            "never answered; the node's log, last lines first:\n{}",
-            log_tail(&log)
+            "never answered; {}",
+            node.tail()
         );
         std::thread::sleep(Duration::from_millis(2));
     }
-    (child, dns)
-}
-
-/// The last 15 lines of the node's log, newest first.
-fn log_tail(log: &Path) -> String {
-    let text = std::fs::read_to_string(log).unwrap_or_default();
-    let tail: Vec<&str> = text.lines().rev().take(15).collect();
-    tail.join("\n")
-}
-
-fn signal(child: &Child, sig: &str) {
-    let status = Command::new("kill")
-        .args([sig, &child.id().to_string()])
-        .status()
-        .expect("kill");
-    assert!(status.success());
+    node
 }
 
 #[test]
 fn ops_007_a_stop_during_start_up_drains_and_exits_cleanly() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (mut child, dns) = start(tmp.path());
-    signal(&child, "-TERM");
+    let mut node = start(tmp.path(), "");
+    node.signal("-TERM");
     let sent = Instant::now();
     std::thread::sleep(Duration::from_millis(700));
     assert!(
-        answers(dns),
-        "a stop during start-up ended the node instead of draining it"
+        answers_within(node.dns, Duration::from_millis(1000)),
+        "a stop during start-up ended the node instead of draining it; {}",
+        node.tail()
     );
-    let code = child.wait().expect("wait");
-    assert!(code.success(), "clean exit: {code:?}");
+    let code = node.wait_exit(Duration::from_secs(30));
+    assert!(
+        code.is_some_and(|c| c.success()),
+        "clean exit: {code:?}; {}",
+        node.tail()
+    );
     assert!(
         sent.elapsed() >= Duration::from_secs(2),
-        "exited before the drain delay: {:?}",
-        sent.elapsed()
+        "exited before the drain delay: {:?}; {}",
+        sent.elapsed(),
+        node.tail()
     );
 }
 
 #[test]
 fn ops_009_a_reload_during_start_up_reloads() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (mut child, dns) = start(tmp.path());
-    signal(&child, "-HUP");
-    std::thread::sleep(Duration::from_millis(1500));
+    let mut node = start(tmp.path(), "");
+    node.signal("-HUP");
     assert!(
-        child.try_wait().expect("try_wait").is_none(),
-        "a reload during start-up ended the node"
+        node.wait_logged("configuration reloaded", Duration::from_secs(20)),
+        "no reload; {}",
+        node.tail()
     );
-    assert!(answers(dns), "answers after the reload");
-    signal(&child, "-TERM");
-    let code = child.wait().expect("wait");
-    assert!(code.success(), "clean exit: {code:?}");
+    assert!(node.logged("reloading configuration"), "{}", node.tail());
+    assert!(
+        node.wait_exit(Duration::from_millis(100)).is_none(),
+        "a reload during start-up ended the node; {}",
+        node.tail()
+    );
+    assert!(
+        answers_within(node.dns, Duration::from_secs(2)),
+        "answers after the reload; {}",
+        node.tail()
+    );
+    node.signal("-TERM");
+    let code = node.wait_exit(Duration::from_secs(30));
+    assert!(
+        code.is_some_and(|c| c.success()),
+        "clean exit: {code:?}; {}",
+        node.tail()
+    );
+}
+
+/// A node joining a cluster whose join URL can't answer (a loopback port where nothing
+/// listens: the join retries for two minutes), stopped by `sig` during the join.
+fn stop_during_a_join(sig: &str) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let secret = tmp.path().join("join-secret");
+    std::fs::write(&secret, "a join secret nobody checks").expect("secret");
+    let extra = format!(
+        "\n[cluster]\njoin_url = \"https://127.0.0.1:{}\"\nbootstrap_secret_file = \"{}\"\n",
+        free_tcp_port(),
+        secret.display()
+    );
+    let mut node = start(tmp.path(), &extra);
+    assert!(
+        node.wait_logged("joining failed, retrying", Duration::from_secs(30)),
+        "not joining; {}",
+        node.tail()
+    );
+    node.signal(sig);
+    let sent = Instant::now();
+    let code = node.wait_exit(Duration::from_secs(10));
+    assert!(
+        code.is_some_and(|c| c.success()),
+        "a stop during the join didn't end the node at once with exit 0: {code:?} after {:?}; {}",
+        sent.elapsed(),
+        node.tail()
+    );
+    assert!(
+        node.logged("during the cluster join"),
+        "the log says why; {}",
+        node.tail()
+    );
+}
+
+#[test]
+fn ops_007_a_stop_during_a_cluster_join_ends_the_node() {
+    stop_during_a_join("-TERM");
+}
+
+#[test]
+fn ops_007_ctrl_c_during_a_cluster_join_ends_the_node() {
+    stop_during_a_join("-INT");
 }
