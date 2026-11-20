@@ -293,6 +293,8 @@ fn request_key(dir: &Path) -> io::Result<[u8; 32]> {
         .and_then(|()| f.sync_all());
     drop(f);
     // `link` never replaces a file that is there: a start that lost the race reads the winner's.
+    // A crash between the link and the removal below leaves the temporary name as a second name
+    // for the key in use (the folder is 0700); the sweep removes it once it is ten minutes old.
     let placed = wrote.and_then(|()| std::fs::hard_link(&tmp, &file));
     let _ = std::fs::remove_file(&tmp);
     match placed {

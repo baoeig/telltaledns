@@ -157,6 +157,19 @@ pub(crate) fn in_folders(path: &str, roots: &[PathBuf]) -> bool {
     written(path).is_some_and(|p| within(&FS, &p, roots))
 }
 
+/// REQ: API-002, T8.2 (ADR-181) — review round 4 (final review M2): whether `path`, as written,
+/// is under this node's `<data_dir>/secrets/` folder: both in normal form, compared by
+/// components, and nothing looked up on the filesystem, so the answer can't change with what is
+/// on disk (a link, a folder this process can't search). The merge of the API's entries asks it,
+/// and must fail closed.
+pub(crate) fn in_data_secrets_as_written(path: &str, data_dir: &str) -> bool {
+    let (Some(p), Some(d)) = (written(path), written(data_dir.trim_end_matches('/'))) else {
+        return false;
+    };
+    let folder = d.join("secrets");
+    p.starts_with(&folder) && p != folder
+}
+
 /// [`in_data_secrets`], asking `look`.
 fn in_data_secrets_with(look: &Look, path: &str, data_dir: &str) -> bool {
     let (Some(p), Some(d)) = (written(path), written(data_dir.trim_end_matches('/'))) else {

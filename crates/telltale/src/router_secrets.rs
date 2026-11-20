@@ -81,6 +81,41 @@ fn new_secret_file(data_dir: &str, name: &str, field: &str) -> Result<PathBuf, P
     Ok(secrets_dir(data_dir).join(format!("router-{}.{field}.{tag}", slug(name))))
 }
 
+/// REQ: API-002, T8.2 (ADR-181) — review round 4 (final review M3): whether `name` is one
+/// [`new_secret_file`] makes: `router-<slug>.<credential>.<16 lowercase hex digits>`, the slug
+/// of [`slug`]'s characters (letters, digits, `-`, `_`), the credential one of [`FIELDS`]. The
+/// sweep removes nothing else (a unit test keeps the two in step).
+fn is_made_key_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("router-") else {
+        return false;
+    };
+    let Some((head, tag)) = rest.rsplit_once('.') else {
+        return false;
+    };
+    let Some((slug, field)) = head.rsplit_once('.') else {
+        return false;
+    };
+    tag.len() == 16
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && FIELDS.iter().any(|(f, _)| *f == field)
+        && !slug.is_empty()
+        && slug
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Whether `file`, as written, is a direct child of `<data_dir>/secrets/` with a name
+/// [`new_secret_file`] makes.
+fn made_here(file: &Path, data_dir: &str) -> bool {
+    file.parent() == Some(secrets_dir(data_dir).as_path())
+        && file
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(is_made_key_name)
+}
+
 /// A router's name as one safe file or folder name: itself when it is short and only letters,
 /// digits, `-` and `_`; otherwise the safe part, shortened, with a hash of the name.
 pub(crate) fn slug(name: &str) -> String {
@@ -113,21 +148,24 @@ fn random_hex() -> Option<String> {
     }))
 }
 
-/// REQ: API-002, T8.2 (ADR-181) — review round 3 (security S1, correctness R9): the key-file
-/// field of `r`, an entry made through the API, that names a file in a folder a platform fills
-/// with secrets (`roots`) which `files` (the config files' routers, as the merge sees them)
-/// don't give a router of that name for that credential at the same endpoint; `None` when every
-/// such file is vouched for. A router the files don't define vouches for nothing. A key pasted in
-/// the UI (in `<data_dir>/secrets/`) is never asked about here: `.written` vouches for it.
-pub(crate) fn unvouched_mounted_key(
+/// REQ: API-002, T8.2 (ADR-181) — review round 3 (security S1, correctness R9) and round 4
+/// (final review M2): the key-file field of `r`, an entry made through the API, that names a
+/// file outside this node's `<data_dir>/secrets/` (by the path as written: nothing is looked up,
+/// so it fails closed) which `files` (the config files' routers, as the merge sees them) don't
+/// give a router of that name for that credential at the same endpoint; `None` when every such
+/// file is vouched for. A router the files don't define vouches for nothing. A key pasted in the
+/// UI (in `<data_dir>/secrets/`) is never asked about here: `.written` vouches for it. So an API
+/// router entry may name only a file under `<data_dir>/secrets/`, or the very file and address
+/// the config files give that router.
+pub(crate) fn unvouched_key_file(
     files: &[RouterConfig],
     r: &RouterConfig,
-    roots: &[PathBuf],
+    data_dir: &str,
 ) -> Option<&'static str> {
     let at = Endpoint::of(r);
     files_of(r)
         .find(|(_, file_field, file)| {
-            crate::secret_path::in_folders(file, roots)
+            !crate::secret_path::in_data_secrets_as_written(file, data_dir)
                 && !files.iter().any(|f| {
                     f.name == r.name
                         && file_of(f, file_field) == Some(*file)
@@ -750,11 +788,14 @@ fn named_files(src: &Sources) -> Option<HashSet<PathBuf>> {
     }
     let state = src.auth.get()?.state();
     for m in state.managed(crate::managed::ROUTER).ok()? {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&m.body) {
-            for (_, file_field) in FIELDS {
-                if let Some(f) = v.get(file_field).and_then(serde_json::Value::as_str) {
-                    named.insert(PathBuf::from(f));
-                }
+        // Review round 4 (final review M3): a stored row that isn't a router's object can't be
+        // read for the files it names, so nothing can be said to be unnamed: no sweep.
+        let v = serde_json::from_str::<serde_json::Value>(&m.body)
+            .ok()
+            .filter(serde_json::Value::is_object)?;
+        for (_, file_field) in FIELDS {
+            if let Some(f) = v.get(file_field).and_then(serde_json::Value::as_str) {
+                named.insert(PathBuf::from(f));
             }
         }
     }
@@ -764,9 +805,11 @@ fn named_files(src: &Sources) -> Option<HashSet<PathBuf>> {
 /// REQ: API-002, T8.2 (ADR-181) — F5: removes the key files this node's API wrote (`.written`)
 /// that nothing names any more ([`named_files`]), with their records: what a rotation, a delete,
 /// or a crash between writing a file and storing its entry left behind, and, on a replica, a key
-/// the primary replaced. Never a file the API didn't write, and never one outside
-/// `<data_dir>/secrets/` (a record for one is left as it is). Returns what it removed. Blocking;
-/// run with `config_writes` held, so it never sees a file a write is about to store an entry for.
+/// the primary replaced. Review round 4 (final review M3): only a recorded file that is a direct
+/// child of `<data_dir>/secrets/` with a name [`new_secret_file`] makes, and a regular file (not
+/// a link); a record for anything else is kept, and its file left alone, with a warning (once).
+/// Nothing at all when a stored entry can't be read. Returns what it removed. Blocking; run with
+/// `config_writes` held, so it never sees a file a write is about to store an entry for.
 pub(crate) fn sweep_now(src: &Sources) -> Result<Vec<Record>, String> {
     let data_dir = src.file_config.load().node.data_dir.to_string();
     remove_old_record_temps(&secrets_dir(&data_dir));
@@ -778,11 +821,26 @@ pub(crate) fn sweep_now(src: &Sources) -> Result<Vec<Record>, String> {
     let named = named_files(src).ok_or("the entries made through the API couldn't be read")?;
     let (mut keep, mut gone) = (Vec::new(), Vec::new());
     for r in records {
-        let ours = crate::secret_path::in_data_secrets(&r.file.to_string_lossy(), &data_dir);
-        if named.contains(&r.file) || !ours || !remove(&r.file) {
+        if named.contains(&r.file) {
             keep.push(r);
-        } else {
-            gone.push(r);
+            continue;
+        }
+        let ours = made_here(&r.file, &data_dir)
+            && crate::secret_path::in_data_secrets(&r.file.to_string_lossy(), &data_dir);
+        let regular = match std::fs::symlink_metadata(&r.file) {
+            Ok(m) => Some(m.file_type().is_file()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => Some(false),
+        };
+        match (ours, regular) {
+            // Already gone: only the record goes.
+            (true, None) => gone.push(r),
+            (true, Some(true)) if remove(&r.file) => gone.push(r),
+            (true, Some(true)) => keep.push(r),
+            _ => {
+                warn_kept_once(&r.file);
+                keep.push(r);
+            }
         }
     }
     if !gone.is_empty() {
@@ -836,9 +894,11 @@ fn is_record_temp(name: &str) -> bool {
 }
 
 /// REQ: API-002, T8.2 (ADR-181) — review round 2, security N7: removes the temporary files of
-/// `.written` (and of the request key) a crash left in `dir` (they hold paths, or an unused key,
-/// only) once they are [`RECORD_TEMP_AGE`] old: only files of exactly those names, only regular
-/// files (a link is neither followed nor removed), each logged.
+/// `.written` (and of the request key) a crash left in `dir` once they are [`RECORD_TEMP_AGE`]
+/// old: only files of exactly those names, only regular files (a link is neither followed nor
+/// removed), each logged. A `.written` one holds paths only; a request-key one is either a key
+/// never put in place or, after a crash between linking it in place and removing it, a second
+/// name for the key in use (harmless in a 0700 folder, and removing it leaves the key).
 fn remove_old_record_temps(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -860,6 +920,21 @@ fn remove_old_record_temps(dir: &Path) {
         if m.file_type().is_file() && old && std::fs::remove_file(&path).is_ok() {
             info!(file = %path.display(), "router keys: removed a temporary file a stopped write left behind");
         }
+    }
+}
+
+/// A recorded file the sweep won't remove (not a name the API makes, not where it makes them, or
+/// not a regular file): said once per file and process.
+fn warn_kept_once(file: &Path) {
+    static SAID: std::sync::Mutex<Option<HashSet<PathBuf>>> = std::sync::Mutex::new(None);
+    let mut said = SAID
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if said
+        .get_or_insert_with(HashSet::new)
+        .insert(file.to_path_buf())
+    {
+        warn!(file = %file.display(), "router keys: .written lists a file this node doesn't make (or not as a regular file in secrets/); it is kept, and so is its record");
     }
 }
 
@@ -1241,6 +1316,41 @@ mod tests {
             }]
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// REQ: API-002, T8.2 (ADR-181) — review round 4 (final review M3): every name
+    /// `new_secret_file` makes, whatever the router's name, is one the sweep knows as its own,
+    /// at the place it makes them; names it doesn't make are not.
+    #[test]
+    fn api_002_the_sweep_knows_every_name_it_makes() {
+        let long = "x".repeat(200);
+        for name in ["udm", "a/../b", "Ünïcode", long.as_str(), "", "a b", "-_-"] {
+            for (field, _) in FIELDS {
+                let f = new_secret_file("/data", name, field).unwrap();
+                assert!(made_here(&f, "/data"), "{name:?} {field}: {}", f.display());
+            }
+        }
+        for bad in [
+            "mine",
+            ".request-key",
+            ".written",
+            "router-x.api_key.0123456789ABCDEF",
+            "router-x.api_key.0123456789abcde",
+            "router-.api_key.0123456789abcdef",
+            "router-x.token.0123456789abcdef",
+            "router-x y.api_key.0123456789abcdef",
+            "router-x.api_key.0123456789abcdef.tmp",
+        ] {
+            assert!(!is_made_key_name(bad), "{bad}");
+        }
+        assert!(!made_here(
+            Path::new("/data/secrets/sub/router-x.api_key.0123456789abcdef"),
+            "/data"
+        ));
+        assert!(!made_here(
+            Path::new("/elsewhere/router-x.api_key.0123456789abcdef"),
+            "/data"
+        ));
     }
 
     /// REQ: API-002, T8.2 (ADR-181) — review round 4 (N3): a router held on a node whose own

@@ -875,10 +875,13 @@ async fn api_002_a_stored_router_naming_another_routers_key_is_not_polled() {
         .iter()
         .map(|r| r.name.to_string())
         .collect();
+    // Review round 4 (final review M2): the stored entry naming a key file outside secrets/ that
+    // the files don't vouch for is left out where the entries are merged (it was held at use
+    // time before); the other held one comes before the last one polled.
     assert_eq!(
         order,
-        ["c-file", "a-evil", "b-outside", "d-override", "udm"],
-        "the held ones come before the last one polled"
+        ["c-file", "a-evil", "d-override", "udm"],
+        "b-outside left out; the held one comes before the last one polled"
     );
     let (stop, task) = poll(&n);
     wait_until("udm, the files' router and the override polled", 20, || {
@@ -2065,4 +2068,132 @@ async fn api_002_the_sweep_removes_old_temporary_record_files() {
         assert!(left(kept), "{kept} kept");
     }
     assert!(Path::new(&format!("{d}/precious")).exists());
+}
+
+// ---- Review round 4 (the final review's M2 and M3).
+
+/// REQ: API-002, T8.2 (ADR-181) — final review M2: the merge decides by the key file's path as
+/// written, so it can't fail open. An override that kept the files' mounted key, which on this
+/// node is a link out of the folder (the use-time rule doesn't take it here, so a check that
+/// looked at the filesystem would miss it), and an override that kept a key file outside every
+/// folder, are both left out once the files move their routers: the files' routers are in effect
+/// and published, at their new addresses.
+#[cfg(unix)]
+#[tokio::test]
+async fn api_002_a_stale_override_is_left_out_when_the_primary_cannot_resolve_the_key() {
+    let n = Node::new(Reload::Applies);
+    let d = n.data();
+    for dir in ["mount/udm", "elsewhere", "etc-telltale"] {
+        std::fs::create_dir_all(format!("{d}/{dir}")).unwrap();
+    }
+    std::fs::write(format!("{d}/elsewhere/udm-key"), "linked-key").unwrap();
+    let linked = format!("{d}/mount/udm/key");
+    std::os::unix::fs::symlink(format!("{d}/elsewhere/udm-key"), &linked).unwrap();
+    let outside = format!("{d}/etc-telltale/fw-key");
+    std::fs::write(&outside, "fw-key").unwrap();
+    let third = "http://127.0.0.3:1";
+    let mut file = (*n.src.file_config.load_full()).clone();
+    file.router = vec![
+        mounted_router("udm", HERE, &linked),
+        mounted_router("fw", ELSEWHERE, &outside),
+    ];
+    n.src.file_config.store(Arc::new(file.clone()));
+    apply(&n.src);
+    override_keeping(&n, "udm", HERE, &linked).await;
+    override_keeping(&n, "fw", ELSEWHERE, &outside).await;
+    let in_effect = || -> Vec<(String, String, u32)> {
+        let mut v: Vec<_> = n
+            .src
+            .config
+            .load()
+            .router
+            .iter()
+            .map(|r| (r.name.to_string(), r.url.to_string(), r.interval_secs))
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        in_effect(),
+        vec![
+            ("fw".to_owned(), ELSEWHERE.to_owned(), 60),
+            ("udm".to_owned(), HERE.to_owned(), 60)
+        ],
+        "the overrides match the files: kept"
+    );
+    // The files move both routers.
+    file.router = vec![
+        mounted_router("udm", ELSEWHERE, &linked),
+        mounted_router("fw", third, &outside),
+    ];
+    n.src.file_config.store(Arc::new(file));
+    apply(&n.src);
+    assert_eq!(
+        in_effect(),
+        vec![
+            ("fw".to_owned(), third.to_owned(), 300),
+            ("udm".to_owned(), ELSEWHERE.to_owned(), 300)
+        ],
+        "the files' routers"
+    );
+    let shared = shared_routers(&n);
+    assert!(
+        shared
+            .iter()
+            .all(|r| r["interval_secs"] == 300 && r["url"] != HERE),
+        "{shared:?}"
+    );
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — final review M3: the sweep removes only what the API makes: a
+/// direct child of `secrets/` named `router-<slug>.<credential>.<16 hex>`, a regular file. Forged
+/// records for `secrets/mine`, `secrets/.request-key` and `secrets/sub/router-x.api_key.<hex>`
+/// keep their files (and their records); a genuine orphan goes. A stored row that isn't a
+/// router's object means it can't tell what is named: no sweep at all.
+#[tokio::test]
+async fn api_002_the_sweep_removes_only_names_it_makes() {
+    let n = Node::new(Reload::Applies);
+    let d = n.data();
+    let dir = format!("{d}/secrets");
+    std::fs::create_dir_all(format!("{dir}/sub")).unwrap();
+    let forged = [
+        format!("{dir}/mine"),
+        format!("{dir}/.request-key"),
+        format!("{dir}/sub/router-x.api_key.0123456789abcdef"),
+    ];
+    let orphan = format!("{dir}/router-gone.api_key.0123456789abcdef");
+    let mut lines = String::new();
+    for f in forged.iter().chain([&orphan]) {
+        std::fs::write(f, "x").unwrap();
+        lines.push_str(
+            &serde_json::json!({"router": "gone", "field": "api_key", "file": f}).to_string(),
+        );
+        lines.push('\n');
+    }
+    std::fs::write(format!("{dir}/.written"), lines).unwrap();
+    let gone = crate::router_secrets::sweep_now(&n.src).unwrap();
+    assert_eq!(gone.len(), 1, "{gone:?}");
+    assert!(!Path::new(&orphan).exists(), "the orphan is removed");
+    for f in &forged {
+        assert!(Path::new(f).exists(), "{f} kept");
+    }
+    let written = std::fs::read_to_string(format!("{dir}/.written")).unwrap();
+    assert_eq!(written.lines().count(), 3, "their records kept: {written}");
+    // A stored row the sweep can't read: nothing is removed.
+    n.store("broken", &serde_json::json!("not a router"));
+    let orphan2 = format!("{dir}/router-gone.api_key.fedcba9876543210");
+    std::fs::write(&orphan2, "x").unwrap();
+    std::fs::write(
+        format!("{dir}/.written"),
+        format!(
+            "{}\n",
+            serde_json::json!({"router": "gone", "field": "api_key", "file": orphan2})
+        ),
+    )
+    .unwrap();
+    assert!(
+        crate::router_secrets::sweep_now(&n.src).is_err(),
+        "no sweep"
+    );
+    assert!(Path::new(&orphan2).exists(), "nothing removed");
 }

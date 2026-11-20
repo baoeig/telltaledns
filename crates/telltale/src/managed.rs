@@ -599,20 +599,21 @@ fn upstream_groups_without(
     });
 }
 
-/// REQ: API-002, T8.2 (ADR-181) — review round 3 (security S1, correctness R9): `e` without the
-/// routers made through the API that name a key file in a folder a platform fills with secrets
-/// which the files' router of that name doesn't name for that credential at the same endpoint (a
-/// router the files don't define counts as not matching), and why (`None`: there is none). Such
-/// an entry is an override kept from before the files moved or removed the router, or one
-/// restored or edited in `state.db`; a mounted key is used on any node (the use-time rule's folder
-/// rule), so it is left out here, on the node that applies the API's entries, and the
-/// configuration it publishes never carries it. The files' router, if any, is the one in effect.
-/// Routers are named by nothing else in the configuration, so the merge stays valid. A key pasted
-/// in the UI (in `<data_dir>/secrets/`) is unaffected: its `.written` record vouches for it.
+/// REQ: API-002, T8.2 (ADR-181) — review round 3 (security S1, correctness R9) and round 4
+/// (final review M2): `e` without the routers made through the API that name a key file outside
+/// this node's `<data_dir>/secrets/` (by the path as written, so it fails closed) which the
+/// files' router of that name doesn't name for that credential at the same endpoint (a router
+/// the files don't define counts as not matching), and why (`None`: there is none). Such an entry
+/// is an override kept from before the files moved or removed the router, or one restored or
+/// edited in `state.db`; a mounted key is used on any node (the use-time rule's folder rule), so
+/// it is left out here, on the node that applies the API's entries, and the configuration it
+/// publishes never carries it. The files' router, if any, is the one in effect. Routers are named
+/// by nothing else in the configuration, so the merge stays valid. A key pasted in the UI (in
+/// `<data_dir>/secrets/`) is unaffected: its `.written` record vouches for it.
 fn without_unvouched_router_keys(file: &Config, e: &Entries) -> Option<(Entries, Vec<LeftOut>)> {
-    let roots = crate::secret_path::mount_roots_for(file.node.data_dir.as_str());
+    let data_dir = file.node.data_dir.as_str();
     let unvouched = |o: &Ovr<telltale_config::RouterConfig>| match o {
-        Ovr::Set(r) => crate::router_secrets::unvouched_mounted_key(&file.router, r, &roots),
+        Ovr::Set(r) => crate::router_secrets::unvouched_key_file(&file.router, r, data_dir),
         Ovr::Hidden => None,
     };
     if !e.routers.iter().any(|(_, o)| unvouched(o).is_some()) {
@@ -632,7 +633,7 @@ fn without_unvouched_router_keys(file: &Config, e: &Entries) -> Option<(Entries,
         notes.push(LeftOut {
             name: n.clone(),
             what: format!(
-                "router `{n}` made through the API isn't used: its `{field}` is a key file in a folder for secrets (/run/secrets/, /etc/telltale-secrets/) that the config files don't give this router at this address (they moved or removed it since, or the entry was restored or edited); {instead}. Edit the router in the UI to save it again for the files' address (or paste its key), or remove this entry (DELETE /api/v1/routers/{n})"
+                "router `{n}` made through the API isn't used: its `{field}` is a key file outside this node's secrets/ folder that the config files don't give this router at this address (they moved or removed it since, or the entry was restored or edited); {instead}. Edit the router in the UI to save it again for the files' address (or paste its key), or remove this entry (DELETE /api/v1/routers/{n})"
             ),
         });
         false
