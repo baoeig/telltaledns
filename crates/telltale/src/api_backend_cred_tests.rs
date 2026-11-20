@@ -1014,3 +1014,51 @@ async fn obs_010_a_webhook_does_not_read_a_token_file() {
     }
     assert_eq!(server.got.lock().unwrap().len(), 2);
 }
+
+/// REQ: OBS-010 (ADR-179) — if a node can't read its config files at start-up, it runs on the
+/// configuration it has, which then stands in for its files. That configuration holds entries
+/// made through the API too, so nothing in it counts as the node's own: every destination with a
+/// credential file is held to the folder rule until a reload reads the files.
+#[tokio::test]
+async fn obs_010_without_its_files_a_node_holds_every_credential_file() {
+    let n = node();
+    let d = n.data();
+    let server = catcher();
+    std::fs::create_dir_all(format!("{d}/outside")).unwrap();
+    std::fs::write(format!("{d}/outside/token"), "tk").unwrap();
+    let api = ntfy_dest(
+        "api",
+        &format!("{}/api", server.url),
+        &format!("{d}/outside/token"),
+    );
+    n.auth
+        .state()
+        .put_managed(
+            crate::managed::ALERT_DESTINATION,
+            "api",
+            &serde_json::to_string(&api).unwrap(),
+            None,
+            None,
+            now(),
+            "an older version",
+        )
+        .unwrap();
+    apply(&n.src);
+    // Start-up, with the files unreadable since the configuration was made from them.
+    let broken = n.dir.path().join("broken.toml");
+    std::fs::write(&broken, "[node\n").unwrap();
+    let (files, unread) = crate::server::files_at_start(&[broken], &n.src.config.load());
+    assert!(unread);
+    assert_eq!(
+        files,
+        **n.src.config.load(),
+        "the running configuration stands in"
+    );
+    n.src.file_config.store(Arc::new(files));
+    n.src
+        .files_unread
+        .store(unread, std::sync::atomic::Ordering::Release);
+    let v = n.test_send("api").await;
+    assert_eq!(v["ok"], false, "{v}");
+    assert!(server.got.lock().unwrap().is_empty(), "nothing was sent");
+}

@@ -61,6 +61,10 @@ pub(crate) struct Sources {
     pub(crate) config: ArcSwap<telltale_config::Config>,
     /// The config files alone (what the API's entries are merged onto; ADR-040).
     pub(crate) file_config: ArcSwap<telltale_config::Config>,
+    /// REQ: OBS-010 (ADR-179) — the files couldn't be read at start-up, so `file_config` holds
+    /// the running configuration instead, until a reload reads them: nothing in it counts as this
+    /// node's own when alert destinations' credential files are checked.
+    pub(crate) files_unread: std::sync::atomic::AtomicBool,
     /// The config files' paths, for backups (ADR-063).
     pub(crate) config_files: Vec<std::path::PathBuf>,
     /// Update status from the signed release index (ADR-046).

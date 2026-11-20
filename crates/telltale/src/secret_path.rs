@@ -31,23 +31,56 @@ pub(crate) fn places() -> &'static str {
     "an absolute path to a file under /run/secrets/, /etc/telltale-secrets/ or the data directory's secrets/ folder (not /run/secrets/kubernetes.io/), written without `.`, `..` or empty parts"
 }
 
+/// What the check asks the filesystem: the real calls, or a test's. A seam, because some answers
+/// (a folder this process may not search) can't be made on a machine that runs tests as root.
+struct Look {
+    canonicalize: fn(&Path) -> std::io::Result<PathBuf>,
+    /// `Ok(true)`: a link (not followed).
+    is_link: fn(&Path) -> std::io::Result<bool>,
+    read_link: fn(&Path) -> std::io::Result<PathBuf>,
+}
+
+fn fs_canonicalize(p: &Path) -> std::io::Result<PathBuf> {
+    std::fs::canonicalize(p)
+}
+
+fn fs_is_link(p: &Path) -> std::io::Result<bool> {
+    std::fs::symlink_metadata(p).map(|m| m.file_type().is_symlink())
+}
+
+fn fs_read_link(p: &Path) -> std::io::Result<PathBuf> {
+    std::fs::read_link(p)
+}
+
+/// The filesystem itself.
+const FS: Look = Look {
+    canonicalize: fs_canonicalize,
+    is_link: fs_is_link,
+    read_link: fs_read_link,
+};
+
 /// Whether `path` is a place for a credential file on a node whose data directory is
 /// `data_dir`. Blocking (it may look at the filesystem). The answer says nothing about what is
 /// there: every refusal is the same `false`.
 pub(crate) fn allowed(path: &str, data_dir: &str) -> bool {
+    allowed_with(&FS, path, data_dir)
+}
+
+/// [`allowed`], asking `look`.
+fn allowed_with(look: &Look, path: &str, data_dir: &str) -> bool {
     let Some(p) = written(path) else {
         return false;
     };
     let roots = roots(data_dir);
-    if !inside(&p, &roots) {
+    if !inside(look, &p, &roots) {
         return false;
     }
     // The same, with links followed.
-    let Some(real) = resolve(&p, 0) else {
+    let Some(real) = resolve(look, &p, 0) else {
         return false;
     };
-    let real_roots: Vec<PathBuf> = roots.iter().filter_map(|r| resolve(r, 0)).collect();
-    inside(&real, &real_roots)
+    let real_roots: Vec<PathBuf> = roots.iter().filter_map(|r| resolve(look, r, 0)).collect();
+    inside(look, &real, &real_roots)
 }
 
 /// `path` as written, if it is in normal form: absolute, no empty, `.` or `..` part, no NUL.
@@ -73,11 +106,12 @@ fn roots(data_dir: &str) -> Vec<PathBuf> {
 
 /// `p` is strictly under one of `roots` (by components) and not under an excluded folder, as
 /// written or with its links followed.
-fn inside(p: &Path, roots: &[PathBuf]) -> bool {
-    let excluded = EXCLUDED
-        .iter()
-        .map(PathBuf::from)
-        .chain(EXCLUDED.iter().filter_map(|x| resolve(Path::new(x), 0)));
+fn inside(look: &Look, p: &Path, roots: &[PathBuf]) -> bool {
+    let excluded = EXCLUDED.iter().map(PathBuf::from).chain(
+        EXCLUDED
+            .iter()
+            .filter_map(|x| resolve(look, Path::new(x), 0)),
+    );
     roots.iter().any(|r| p.starts_with(r) && p != r)
         && !excluded.into_iter().any(|x| p.starts_with(&x))
         && p.components().all(|c| {
@@ -91,7 +125,7 @@ fn inside(p: &Path, roots: &[PathBuf]) -> bool {
 /// `p` with its links followed as far as it exists, the rest as written; `None` (refused) for a
 /// loop, a link that can't be read, or a part that can't be looked at (only a part that isn't
 /// there lets the rest be taken as written).
-fn resolve(p: &Path, links: u8) -> Option<PathBuf> {
+fn resolve(look: &Look, p: &Path, links: u8) -> Option<PathBuf> {
     if links > MAX_LINKS {
         return None;
     }
@@ -99,7 +133,7 @@ fn resolve(p: &Path, links: u8) -> Option<PathBuf> {
     for i in (1..=parts.len()).rev() {
         let head: PathBuf = parts[..i].iter().collect();
         let tail: PathBuf = parts[i..].iter().collect();
-        let missing = match std::fs::canonicalize(&head) {
+        let missing = match (look.canonicalize)(&head) {
             Ok(real) => {
                 return Some(if tail.as_os_str().is_empty() {
                     real
@@ -109,17 +143,17 @@ fn resolve(p: &Path, links: u8) -> Option<PathBuf> {
             }
             Err(e) => e.kind() == std::io::ErrorKind::NotFound,
         };
-        match std::fs::symlink_metadata(&head) {
+        match (look.is_link)(&head) {
             // A link whose target isn't there (yet), or a loop: follow it as written.
-            Ok(m) if m.file_type().is_symlink() => {
-                let target = std::fs::read_link(&head).ok()?;
+            Ok(true) => {
+                let target = (look.read_link)(&head).ok()?;
                 let parent = head.parent()?;
                 let next = if target.is_absolute() {
                     target
                 } else {
                     parent.join(target)
                 };
-                return resolve(&next.join(tail), links + 1);
+                return resolve(look, &next.join(tail), links + 1);
             }
             // Not there: look one level up.
             Err(_) if missing => {}
@@ -263,8 +297,72 @@ mod tests {
         let can_look = std::fs::read_dir(&locked).is_ok();
         let answer = allowed(&format!("{data}/secrets/locked/token"), &data);
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
-        if !can_look {
+        if can_look {
+            // The same rule is checked whoever runs the tests, through the seam below.
+            println!(
+                "skipped: this process can search a folder of mode 000 (root), so the case can't be made here"
+            );
+        } else {
             assert!(!answer, "a path that can't be looked at is refused");
         }
+    }
+
+    /// A filesystem that has `/`, `/run`, `/run/secrets`, `/run/secrets/locked`, `/var` and
+    /// `/var/lib/t`, and answers "permission denied" for everything under `/run/secrets/locked/`.
+    fn fake_canonicalize(p: &Path) -> std::io::Result<PathBuf> {
+        if p.starts_with("/run/secrets/locked") && p != Path::new("/run/secrets/locked") {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
+        let there = [
+            "/",
+            "/run",
+            "/run/secrets",
+            "/run/secrets/locked",
+            "/var",
+            "/var/lib",
+            "/var/lib/t",
+        ];
+        if there.iter().any(|t| p == Path::new(t)) {
+            Ok(p.to_path_buf())
+        } else {
+            Err(std::io::ErrorKind::NotFound.into())
+        }
+    }
+
+    fn fake_is_link(p: &Path) -> std::io::Result<bool> {
+        fake_canonicalize(p).map(|_| false)
+    }
+
+    fn fake_read_link(_: &Path) -> std::io::Result<PathBuf> {
+        Err(std::io::ErrorKind::InvalidInput.into())
+    }
+
+    /// REQ: OBS-010 (ADR-179) — fails closed whoever runs the tests: through the seam, a part
+    /// of the path that answers "permission denied" is refused, and a part that isn't there yet
+    /// lets the rest be taken as written.
+    #[test]
+    fn obs_010_a_part_that_answers_permission_denied_is_refused() {
+        let look = Look {
+            canonicalize: fake_canonicalize,
+            is_link: fake_is_link,
+            read_link: fake_read_link,
+        };
+        assert!(!allowed_with(
+            &look,
+            "/run/secrets/locked/token",
+            "/var/lib/t"
+        ));
+        assert!(!allowed_with(
+            &look,
+            "/run/secrets/locked/sub/token",
+            "/var/lib/t"
+        ));
+        assert!(allowed_with(&look, "/run/secrets/token", "/var/lib/t"));
+        assert!(allowed_with(&look, "/run/secrets/new/token", "/var/lib/t"));
+        assert!(allowed_with(
+            &look,
+            "/var/lib/t/secrets/token",
+            "/var/lib/t"
+        ));
     }
 }

@@ -304,8 +304,13 @@ pub(crate) fn refused(cfg: &Config, own: &[AlertDestination]) -> HashMap<String,
 
 /// REQ: OBS-010 (ADR-179) — the alert destinations this node's administrators control: its
 /// config files' and, on a node that takes the cluster's configuration from Git, the commit in
-/// use (`<data_dir>/cluster/git-shared.toml`). Blocking (the commit is read from disk).
+/// use (`<data_dir>/cluster/git-shared.toml`). None while the files couldn't be read at start-up
+/// (`file_config` then holds the running configuration, API entries and all): every destination
+/// with a credential file is checked. Blocking (the commit is read from disk).
 pub(crate) fn own_destinations(src: &crate::http::Sources) -> Vec<AlertDestination> {
+    if src.files_unread.load(std::sync::atomic::Ordering::Acquire) {
+        return Vec::new();
+    }
     let file = src.file_config.load_full();
     let mut own = file.alerts.destination.clone();
     if file.cluster.git.is_some()
