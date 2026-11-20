@@ -35,6 +35,10 @@ grep -q '"helm.sh/hook-delete-policy": before-hook-creation$' <<<"$job" \
   && ok "the Job's log is kept after a run that succeeded" || bad "delete policy: $(grep delete-policy <<<"$job")"
 # REQ: OPS-014 (ADR-182) — caSecret: the API's certificate for an https:// url, as --ca-file.
 grep -q -- '--ca-file' <<<"$job" && bad "--ca-file without caSecret" || ok "no CA by default"
+# REQ: OPS-014 (ADR-182) — the Job's deadline covers two native nodes at the per-node timeout
+# (15m), plus the pre-flight and the pod's start.
+grep -q 'activeDeadlineSeconds: 2700$' <<<"$job" && grep -A1 -- '- --timeout' <<<"$job" | grep -q '"15m"' \
+  && ok "activeDeadlineSeconds 2700 by default, 15m per node" || bad "deadline: $(grep -E 'activeDeadlineSeconds|timeout' <<<"$job")"
 ca=$(render "${on[@]}" --set upgradeHook.url=https://tt.example:8053 --set upgradeHook.caSecret.name=tt-api-ca \
   --show-only templates/upgrade-hook.yaml)
 grep -A1 -- '- --ca-file' <<<"$ca" | grep -q -- '- /etc/telltale-hook-ca/ca.crt' \

@@ -137,7 +137,7 @@ ok "--cluster-updates is refused with the API off"
 # release installed, goes on.
 edge='telltale 0.8.0-edge.404 (commit 99a9f22, built 2026-11-19T20:35:00Z, channel edge, aarch64-unknown-linux-musl)'
 why=$(run chan "" "$edge")
-case "$why" in "this node runs an edge build"*"pass --edge to stay on edge builds, or --stable to move it to the stable channel"*) ;;
+case "$why" in "this node runs an edge build"*"pass --edge to stay on edge builds, or --stable to move it to the stable channel (the newest release, which may be older than the edge build you run now)"*) ;;
   *) fail "an edge build with no flag: $why" ;; esac
 for flag in edge stable; do
   why=$(run chan "$flag" "$edge"); [ -z "$why" ] || fail "--$flag refused: $why"

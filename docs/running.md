@@ -2406,7 +2406,7 @@ upgradeHook:
   self-signed certificate put the certificate in a Secret and name it in `upgradeHook.caSecret`
   (`name`, and `key`, default `ca.crt`): without it the hook can't trust the API and fails.
 - **Timeouts.** Helm waits for a hook only `--timeout` (5 minutes by default), while the hook allows
-  15 minutes per node and 30 in all (`activeDeadlineSeconds: 1800`, two native nodes; raise it for more): run `helm upgrade --timeout 30m` (or more).
+  15 minutes per node and 45 in all (`activeDeadlineSeconds: 2700`: two native nodes, the pre-flight and the pod's start; raise it for more): run `helm upgrade --timeout 45m` (or more), and give Argo CD's sync at least as long.
 - A NetworkPolicy that limits the API (`networkPolicy.apiFrom`) gets a rule that lets the hook in
   (only while the hook is on).
 - **A native primary whose replicas are the chart's pods:** the hook upgrades native nodes first,
@@ -2442,6 +2442,14 @@ upgradeHook:
 - **A node rolled back:** every sync stops at it for 24 hours from that run (the node refuses that
   version, and says until when) unless the pin moves on. A run that failed in the downloads (a
   GitHub or DNS outage) holds nothing: the next sync tries again. Look at the node; upgrade it by hand when it is fixed.
+
+**A known limit.** If `systemctl` itself fails without restarting anything (its binary missing,
+or a refusal on the system bus), the old process is still running and passes the health check,
+so the run is recorded `updated` while the old build runs; the new binary is installed, so the
+next request for that version answers `up_to_date`. `journalctl -u telltale-update` shows the
+restart command's error, and `telltale --version` against `GET …/update`'s version tells. Run
+`sudo systemctl restart telltale` on the node to start the new build. (Comparing the node's
+process before and after the restart is the planned follow-up.)
 
 **What it doesn't do.** It doesn't upgrade containers or Compose installs (pull the new image),
 it doesn't choose a version for you (that's your chart bump, or `--to`), it never downgrades or

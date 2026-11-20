@@ -609,7 +609,7 @@ update_refusal() { # data-dir health-url
 update_channel_refusal() { # flag version-line
   [ -z "$1" ] || return 0
   case "$2" in
-    *-edge.*) echo "this node runs an edge build ($2): pass --edge to stay on edge builds, or --stable to move it to the stable channel (the newest release)" ;;
+    *-edge.*) echo "this node runs an edge build ($2): pass --edge to stay on edge builds, or --stable to move it to the stable channel (the newest release, which may be older than the edge build you run now)" ;;
   esac
 }
 
