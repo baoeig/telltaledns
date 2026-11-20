@@ -29,7 +29,8 @@
 #   --cluster-updates        let the cluster install newer versions on this node: enables
 #                            telltale-update.path (REQ: OPS-014). Off by default; re-runs keep
 #                            whatever it is. `telltale ctl upgrade` and the Helm chart's
-#                            upgradeHook use it.
+#                            upgradeHook use it. The units are written for the config's
+#                            [node] data_dir (they watch <data_dir>/update/ only).
 #   --uninstall              stop and remove the service, its unit, and the binary; offers to
 #                            restore systemd-resolved if the install changed it, and keeps
 #                            /etc/telltale and /var/lib/telltale unless you say otherwise
@@ -546,12 +547,51 @@ UNIT=/etc/systemd/system/telltale.service
 if [ -f "$HERE/telltale.service" ]; then cp "$HERE/telltale.service" "$TMP/telltale.service"
 else fetch "$REPO_RAW/deploy/systemd/telltale.service" "$TMP/telltale.service"; fi
 sed "s#/usr/local/bin/telltale#$PREFIX/bin/telltale#" "$TMP/telltale.service" > "$UNIT"
-# REQ: OPS-014 — the root update service for versions the cluster asks for (off until enabled).
+
+# BEGIN update-units — REQ: OPS-014 (ADR-182). deploy/systemd/update-units-test.sh cuts this block
+# out and runs it with configs of its own, so keep it self-contained (it needs only $PREFIX).
+# The node's data directory, from its effective config (the binary prints it), or the default when
+# the config names none. The root update service watches and writes only <data_dir>/update/, and
+# the path goes into its units as written, so it must be plain: absolute, of letters, digits, `.`,
+# `_`, `-` and `/`, without `.` or `..` parts. Fails (prints nothing) otherwise.
+update_data_dir() { # config
+  _cfg="$("$PREFIX/bin/telltale" config check "$1" --no-env --print 2>/dev/null)" || return 1
+  _dd="$(printf '%s\n' "$_cfg" | awk '
+    /^\[node\]/ { on = 1; next }
+    /^\[/ { on = 0; next }
+    on && /^data_dir[ \t]*=/ { v = $0; sub(/^[^=]*=[ \t]*"/, "", v); sub(/".*$/, "", v); print v; exit }')" || return 1
+  [ -n "$_dd" ] || _dd=/var/lib/telltale
+  while [ "${#_dd}" -gt 1 ] && [ "${_dd%/}" != "$_dd" ]; do _dd="${_dd%/}"; done
+  case "$_dd" in /?*) ;; *) return 1 ;; esac
+  case "$_dd" in *[!A-Za-z0-9._/-]*|*/./*|*/../*|*/.|*/..|*//*) return 1 ;; esac
+  printf '%s\n' "$_dd"
+}
+
+# The two update units from the folder $1 into the folder $2, for the binary in $PREFIX/bin and the
+# data directory $3.
+render_update_units() { # from to data-dir
+  for _u in telltale-update.path telltale-update.service; do
+    sed -e "s#/usr/local/bin#$PREFIX/bin#g" -e "s#/var/lib/telltale/update#$3/update#g" \
+      "$1/$_u" > "$2/$_u" || return 1
+  done
+}
+# END update-units
+
+# REQ: OPS-014 (ADR-182) — the root update service for versions the cluster asks for (off until
+# enabled), written for this node's data directory.
 for u in telltale-update.path telltale-update.service; do
   if [ -f "$HERE/$u" ]; then cp "$HERE/$u" "$TMP/$u"
   else fetch "$REPO_RAW/deploy/systemd/$u" "$TMP/$u"; fi
-  sed "s#/usr/local/bin#$PREFIX/bin#g" "$TMP/$u" > "/etc/systemd/system/$u"
 done
+if DATA_DIR="$(update_data_dir /etc/telltale/telltale.toml)"; then
+  render_update_units "$TMP" /etc/systemd/system "$DATA_DIR"
+else
+  systemctl disable --now telltale-update.path >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/telltale-update.path /etc/systemd/system/telltale-update.service
+  [ "$CLUSTER_UPDATES" = no ] \
+    || die "--cluster-updates needs [node] data_dir in /etc/telltale/telltale.toml to be a plain absolute path (letters, digits, . _ - /)"
+  say "Updates from the cluster aren't installed: [node] data_dir isn't a plain absolute path (letters, digits, . _ - /)"
+fi
 # The first admin, when chosen in the guided setup: its Argon2id hash goes to the service for
 # its first start only (a root-only drop-in, removed once the service is up).
 DROPIN=/etc/systemd/system/telltale.service.d/10-first-admin.conf

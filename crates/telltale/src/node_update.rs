@@ -4,16 +4,16 @@
 //!
 //! - **The node never replaces its own binary.** It runs as `telltale` under
 //!   `ProtectSystem=strict` (ADR-038), so it can't, and ADR-046 keeps it that way. It writes
-//!   `<data_dir>/update-request.json` and nothing else. `telltale-update.path` (root, installed by
+//!   `<data_dir>/update/request.json` and nothing else. `telltale-update.path` (root, installed by
 //!   `install.sh`, off until enabled) starts `telltale-update.service`, which runs
 //!   `telltale self-update --request …` as root: [`serve_request`] reads the request, removes it,
 //!   checks it again, installs the signed release with [`crate::selfupdate`], records the outcome
-//!   in [`RESULT_PATH`] (a root-owned directory the node can read), and restarts the node.
+//!   in [`RESULT_PATH`] (a root-owned directory the node can read), and restarts the node. Of the
+//!   data directory, root may write only the request's folder (`update/`, to remove the request).
 //! - **What the request file can do is bounded.** The root side trusts nothing in it: it reads
-//!   only a small regular file owned by the data directory's owner, and acts only on a release or
-//!   edge build version that is newer than the one installed. The binary still has to carry the
-//!   release signature, so the most a compromised `telltale` user can do is ask for a newer
-//!   signed release.
+//!   only a small regular file the node's user wrote, and acts only on a release or edge build
+//!   version that is newer than the one installed and on the node's channel. The binary still has
+//!   to carry the release signature (ADR-182 says exactly what each party can make root do).
 //! - **Containers and Kubernetes pods** are upgraded by their image and say so
 //!   (`update_unsupported`); a Helm chart's pre-upgrade hook (`upgradeHook`) runs
 //!   `telltale ctl upgrade` from the new image, so the native nodes go first.
@@ -33,8 +33,11 @@ use telltale_api::update_api::{CHANNEL_HINT, check_version, is_edge, same_channe
 use telltale_cluster::net::Cluster;
 use tracing::{info, warn};
 
-/// The request, in the node's data directory.
-pub(crate) const REQUEST_FILE: &str = "update-request.json";
+/// REQ: OPS-014 (ADR-182) — the request's folder, in the node's data directory: the only place
+/// in it the root update service may write (`ReadWritePaths=` of `telltale-update.service`).
+pub(crate) const REQUEST_DIR: &str = "update";
+/// The request, in [`REQUEST_DIR`] (`PathExists=` of `telltale-update.path`).
+pub(crate) const REQUEST_FILE: &str = "request.json";
 /// The update service's latest run, in its own state directory (`StateDirectory=telltale-update`).
 pub(crate) const RESULT_PATH: &str = "/var/lib/telltale-update/result.json";
 /// `systemctl enable telltale-update.path` makes this link (`WantedBy=paths.target`).
@@ -53,7 +56,7 @@ const MAX_REQUEST: u64 = 4096;
 /// The longest `by` kept.
 const MAX_BY: usize = 200;
 
-/// `<data_dir>/update-request.json`.
+/// `<data_dir>/update/request.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct RequestFile {
@@ -120,8 +123,9 @@ impl Here {
         }
     }
 
-    fn request_path(&self) -> PathBuf {
-        self.data_dir.join(REQUEST_FILE)
+    /// REQ: OPS-014 (ADR-182) — `<data_dir>/update/request.json`, where the units look.
+    pub(crate) fn request_path(&self) -> PathBuf {
+        self.data_dir.join(REQUEST_DIR).join(REQUEST_FILE)
     }
 }
 
@@ -237,12 +241,29 @@ pub(crate) fn request(h: &Here, to: &str, by: &str, now: u64) -> Result<NodeUpda
         by: by.chars().take(MAX_BY).collect(),
         requested_ms: now,
     };
-    write_atomic(&h.request_path(), &r, 0o640)
+    // REQ: OPS-014 (ADR-182) — the request's own folder (0750, this node's user's), the only
+    // place of the data directory the update service writes.
+    create_folder(&h.data_dir.join(REQUEST_DIR))
+        .and_then(|()| write_atomic(&h.request_path(), &r, 0o640))
         .map_err(|e| Problem::internal(format!("can't write the update request: {e}")))?;
     info!(to = %to, by = %r.by, "update: requested {to} (the update service installs it and restarts this node)");
     let mut s = status(h);
     s.state = Some("requested".into());
     Ok(s)
+}
+
+/// Makes the folder `p` (mode 0750) unless it is there.
+fn create_folder(p: &Path) -> std::io::Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o750);
+    }
+    match b.create(p) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => Err(e),
+        _ => Ok(()),
+    }
 }
 
 /// Writes `v` as JSON next to `path` and renames it over `path` (a reader never sees half a
@@ -454,8 +475,14 @@ fn take_request(path: &Path) -> Result<Option<Vec<u8>>, String> {
     let Ok(fst) = rustix::fs::fstat(&folder) else {
         return not_a_request();
     };
-    // Not a folder anyone may write: the owner check below is what keeps others' files out.
-    if FileType::from_raw_mode(fst.st_mode) != FileType::Directory || fst.st_mode & 0o002 != 0 {
+    // Not a folder anyone may write (the owner check below is what keeps others' files out), and
+    // the node's own: owned by whoever owns the folder above it (the data directory, the node's
+    // user's; its path is root's up to it).
+    let above = dir.parent().and_then(|p| rustix::fs::stat(p).ok());
+    if FileType::from_raw_mode(fst.st_mode) != FileType::Directory
+        || fst.st_mode & 0o002 != 0
+        || above.is_none_or(|a| a.st_uid != fst.st_uid)
+    {
         return not_a_request();
     }
     // Whatever is at the name goes: a file, a link, a FIFO, or an empty directory.

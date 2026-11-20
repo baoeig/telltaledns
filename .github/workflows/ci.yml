@@ -268,6 +268,9 @@ jobs:
         run: bash deploy/systemd/guided-e2e.sh target/bench-fast/telltale
       - name: install.sh + systemd unit
         run: sudo bash deploy/systemd/e2e.sh target/bench-fast/telltale
+      # REQ: OPS-014 (ADR-182) — install.sh writes the node's data directory into the update units.
+      - name: install.sh's update units (the data directory)
+        run: bash deploy/systemd/update-units-test.sh target/bench-fast/telltale
       # REQ: CLU-003, CLU-004 (T5.2/T5.3 AC) — a primary and a replica as real processes:
       # replication, propagation, 100% answers while the primary is killed, cold start ≤ 500 ms;
       # OPS-010 (T13.4): maintenance on the replica from the primary, restarts, a stopped node.

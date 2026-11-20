@@ -800,7 +800,11 @@ fn main() -> ExitCode {
             request,
             result,
         } => Ok(match request {
-            Some(request) => run_update_request(&request, &result, restart),
+            Some(request) => {
+                // REQ: OPS-014 (ADR-182) — the root update service's lines go to its journal.
+                init_journal_logging();
+                run_update_request(&request, &result, restart)
+            }
             None => run_self_update(channel, check, restart, to),
         }),
         Command::Import { command } => Ok(run_import(command)),
@@ -1424,14 +1428,14 @@ fn run_update_request(request: &Path, result: &Path, restart: bool) -> ExitCode 
                 "Update request: {state} (recorded in {}).",
                 result.display()
             ));
-            if due && restart {
-                let status = std::process::Command::new("systemctl")
-                    .args(["restart", "telltale"])
-                    .status();
-                if !status.is_ok_and(|s| s.success()) {
-                    eprintln!("error: installed, but `systemctl restart telltale` failed");
-                    return ExitCode::FAILURE;
-                }
+            let restarted = if due && restart {
+                selfupdate::restart_node()
+            } else {
+                Ok(())
+            };
+            if let Err(e) = restarted {
+                eprintln!("error: installed, but {e}");
+                return ExitCode::FAILURE;
             }
             if ok {
                 ExitCode::SUCCESS
@@ -1446,6 +1450,23 @@ fn node_update_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// REQ: OPS-014 (ADR-182) — logging for `self-update --request` (the root update service): its
+/// own lines on stderr, which systemd puts in the unit's journal (`journalctl -u
+/// telltale-update`). Nothing else: no support log, no files (the service writes nowhere it
+/// doesn't have to).
+fn init_journal_logging() {
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    let console = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_ansi(false)
+        .with_writer(io::stderr);
+    let _ = tracing_subscriber::registry()
+        .with(console.with_filter(tracing::level_filters::LevelFilter::INFO))
+        .try_init();
 }
 
 fn init_logging() {

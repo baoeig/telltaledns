@@ -1,11 +1,15 @@
 # TelltaleDNS: install a version the cluster asked for (REQ: OPS-014, ADR-182). Started by
-# telltale-update.path; installed by deploy/systemd/install.sh.
+# telltale-update.path; installed by deploy/systemd/install.sh, which writes the node's data
+# directory into it (/var/lib/telltale is the default).
 #
 # It runs as root because it replaces the binary and restarts the service, which the sandboxed
-# telltale service can't (ADR-038, ADR-046). It trusts nothing in the request: it reads only a
-# small regular file owned by the telltale user, removes it, acts only on a release or edge build
-# newer than the one installed, and installs only a binary carrying the release signature. The
-# outcome goes to /var/lib/telltale-update/result.json, which the node reads.
+# telltale service can't (ADR-038, ADR-046). It trusts nothing in the request: it opens it in
+# the request's own folder without following a link or waiting on it, reads it only if it is a
+# small regular file the telltale user wrote, removes it, and acts only on a release or edge
+# build newer than the one installed and on the node's own channel (a stable node takes only a
+# release). It installs only a binary that the release key signed, under the version its signed
+# index names, then restarts the node. The outcome goes to /var/lib/telltale-update/result.json,
+# which the node reads.
 [Unit]
 Description=TelltaleDNS: install a version the cluster asked for
 Documentation=https://github.com/paimonsoror/telltaledns/blob/main/docs/running.md#upgrading-from-the-cluster
@@ -14,16 +18,23 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/telltale self-update --request /var/lib/telltale/update-request.json --restart
+ExecStart=/usr/local/bin/telltale self-update --request /var/lib/telltale/update/request.json --restart
 Environment=TELLTALE_INSTALL=native
-TimeoutStartSec=600
+Environment=TELLTALE_LOG=info
+# The downloads (each has its own five-minute limit) and the restart.
+TimeoutStartSec=900
 StateDirectory=telltale-update
 StateDirectoryMode=0755
 UMask=0022
 
-# Writes only the binary's directory, the request's directory (to remove it), and its own state.
+# Root, but only what the job needs: reading and removing the request in the telltale user's
+# folder (CAP_DAC_OVERRIDE); writing the binary's own directory and its state needs no capability.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE
+NoNewPrivileges=yes
+# Writes only the binary's directory, the request's folder (to remove the request), and its own
+# state; nothing else of the data directory.
 ProtectSystem=strict
-ReadWritePaths=/usr/local/bin /var/lib/telltale
+ReadWritePaths=/usr/local/bin -/var/lib/telltale/update
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
@@ -33,10 +44,13 @@ ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
+ProtectProc=invisible
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
-NoNewPrivileges=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
 SystemCallArchitectures=native
+SystemCallFilter=@system-service
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

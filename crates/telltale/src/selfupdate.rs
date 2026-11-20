@@ -154,17 +154,34 @@ pub(crate) fn run(o: &Options) -> Result<Outcome, String> {
         .map_err(|e| e.to_string())?;
     let outcome = rt.block_on(update(o, &exe, asset, RELEASE_KEY))?;
     if o.restart && matches!(outcome, Outcome::Updated { .. }) {
-        let status = std::process::Command::new("systemctl")
-            .args(["restart", "telltale"])
-            .status()
-            .map_err(|e| format!("updated, but `systemctl restart telltale` failed: {e}"))?;
-        if !status.success() {
-            return Err(format!(
-                "updated, but `systemctl restart telltale` exited with {status}"
-            ));
-        }
+        restart_node().map_err(|e| format!("updated, but {e}"))?;
     }
     Ok(outcome)
+}
+
+/// REQ: OPS-014 (ADR-182) — `systemctl`, by its absolute path, never through `PATH` (the root
+/// update service may write `/usr/local/bin`, early in systemd's default `PATH`): `/usr/bin`, or
+/// `/bin` on a system whose `/usr` isn't merged.
+pub(crate) fn systemctl() -> &'static str {
+    if Path::new("/usr/bin/systemctl").exists() {
+        "/usr/bin/systemctl"
+    } else {
+        "/bin/systemctl"
+    }
+}
+
+/// `systemctl restart telltale`.
+pub(crate) fn restart_node() -> Result<(), String> {
+    let status = std::process::Command::new(systemctl())
+        .args(["restart", "telltale"])
+        .env_clear()
+        .status()
+        .map_err(|e| format!("`systemctl restart telltale` failed: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("`systemctl restart telltale` exited with {status}"))
+    }
 }
 
 /// Verifies and installs the release binary for `asset` over `exe`.

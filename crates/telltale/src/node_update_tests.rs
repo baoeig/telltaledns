@@ -95,24 +95,31 @@ fn ops_014_a_request_is_written_for_the_update_service_and_shown_as_pending() {
         (asked.to.as_str(), asked.by.as_str()),
         ("0.8.0-edge.393", "alice via k3s")
     );
-    let file: RequestFile =
-        serde_json::from_slice(&std::fs::read(dir.path().join(REQUEST_FILE)).unwrap()).unwrap();
+    // REQ: OPS-014 (ADR-182) — in its own folder, `<data_dir>/update/request.json`: the only
+    // place of the data directory the update service may write.
+    let written = dir.path().join("update").join("request.json");
+    assert_eq!(node.request_path(), written);
+    let file: RequestFile = serde_json::from_slice(&std::fs::read(&written).unwrap()).unwrap();
     assert_eq!(file.id, asked.id);
     assert_eq!(file.requested_ms, NOW);
-    // No temporary file is left behind.
-    let names: Vec<String> = std::fs::read_dir(dir.path())
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(names, vec![REQUEST_FILE.to_owned()]);
+    // Nothing else in the data directory, and no temporary file left behind.
+    let names = |p: &Path| -> Vec<String> {
+        std::fs::read_dir(p)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    };
+    assert_eq!(names(dir.path()), vec!["update".to_owned()]);
+    assert_eq!(
+        names(&dir.path().join("update")),
+        vec!["request.json".to_owned()]
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(dir.path().join(REQUEST_FILE))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o640);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&written), 0o640);
+        assert_eq!(mode(&dir.path().join("update")), 0o750);
     }
     // A read shows it, and no run yet.
     let read = status(&node);
@@ -272,6 +279,7 @@ fn ops_014_the_update_service_reads_no_symlink_or_large_file() {
         r#"{"id":"1a","to":"0.8.0","by":"a","requestedMs":1795000000000}"#,
     )
     .unwrap();
+    std::fs::create_dir_all(h.request_path().parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(&secret, h.request_path()).unwrap();
     let served = serve_request(&h.request_path(), &h.result, "0.7.0", NOW, never);
     assert_eq!(
@@ -527,6 +535,94 @@ fn ops_014_a_request_never_moves_a_stable_node_to_edge() {
             .unwrap()
             .contains("stable channel"),
     );
+}
+
+/// REQ: OPS-014 (ADR-182) — the request's folder must be the node's own real directory: one
+/// swapped for a link to another folder, or one anyone may write, is refused and nothing in it is
+/// read or removed (root writes only in the node's `update/`, never through a link).
+#[cfg(unix)]
+#[test]
+fn ops_014_a_request_folder_that_isnt_the_nodes_is_left_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let h = here(d.path(), "native", "0.7.0", true);
+    let elsewhere = d.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let body = serde_json::json!({"id": "1a-2b", "to": "0.8.0", "by": "a", "requestedMs": NOW});
+    std::fs::write(elsewhere.join("request.json"), body.to_string()).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, d.path().join("update")).unwrap();
+    assert_eq!(serve_bounded(&h, "0.7.0"), refused());
+    assert!(
+        elsewhere.join("request.json").exists(),
+        "nothing is removed through the link"
+    );
+    assert_eq!(
+        status(&h).last.unwrap().error.as_deref(),
+        Some(NOT_A_REQUEST)
+    );
+    std::fs::remove_file(d.path().join("update")).unwrap();
+    plant(&h, &body.to_string());
+    std::fs::set_permissions(
+        h.request_path().parent().unwrap(),
+        std::fs::Permissions::from_mode(0o777),
+    )
+    .unwrap();
+    assert_eq!(serve_bounded(&h, "0.7.0"), refused());
+    assert!(
+        h.request_path().exists(),
+        "a folder anyone may write isn't the node's: nothing in it is touched"
+    );
+}
+
+/// REQ: OPS-014 (ADR-182) — the shipped units agree with the code and keep root's reach small:
+/// the path unit watches `<data_dir>/update/request.json`; the service reads it there and may
+/// write only that folder, the binary's directory and its own state, with one capability and the
+/// node unit's own sandbox; `systemctl` is run by its absolute path.
+#[test]
+fn ops_014_the_units_watch_and_write_only_the_request_folder() {
+    let path = include_str!("../../../deploy/systemd/telltale-update.path");
+    let svc = include_str!("../../../deploy/systemd/telltale-update.service");
+    // `Here::request_path` (ops_014_a_request_is_written_...) for the default data directory.
+    let request = "/var/lib/telltale/update/request.json".to_owned();
+    let lines = |unit: &'static str, key: &str| -> Vec<&'static str> {
+        unit.lines()
+            .filter_map(|l| l.strip_prefix(key).and_then(|l| l.strip_prefix('=')))
+            .collect()
+    };
+    assert_eq!(lines(path, "PathExists"), [request.as_str()]);
+    assert_eq!(
+        lines(svc, "ExecStart"),
+        [format!("/usr/local/bin/telltale self-update --request {request} --restart").as_str()]
+    );
+    assert_eq!(
+        lines(svc, "ReadWritePaths"),
+        ["/usr/local/bin -/var/lib/telltale/update"]
+    );
+    for (key, want) in [
+        ("CapabilityBoundingSet", "CAP_DAC_OVERRIDE"),
+        ("NoNewPrivileges", "yes"),
+        ("ProtectSystem", "strict"),
+        ("PrivateTmp", "yes"),
+        ("ProtectProc", "invisible"),
+        ("MemoryDenyWriteExecute", "yes"),
+        ("RemoveIPC", "yes"),
+        ("SystemCallFilter", "@system-service"),
+        ("RestrictAddressFamilies", "AF_INET AF_INET6 AF_UNIX"),
+        ("Type", "oneshot"),
+    ] {
+        assert_eq!(lines(svc, key), [want], "{key}");
+    }
+    assert!(lines(svc, "User").is_empty() && lines(svc, "Environment").len() == 2);
+    // `systemctl` is never looked up through PATH (the service may write /usr/local/bin).
+    for (file, src) in [
+        ("main.rs", include_str!("main.rs")),
+        ("selfupdate.rs", include_str!("selfupdate.rs")),
+    ] {
+        assert!(
+            !src.contains("Command::new(\"systemctl\")"),
+            "{file} runs systemctl through PATH"
+        );
+    }
 }
 
 #[test]

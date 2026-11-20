@@ -2258,12 +2258,15 @@ upgrades the native nodes first and the pods after them: nothing to do by hand.
 
 **How it works.** The node's service runs as the `telltale` user in a sandbox and can't replace
 its own binary, so it doesn't: asked for a version, it writes
-`/var/lib/telltale/update-request.json` and nothing else. A second, root unit installed next to
-it, `telltale-update.path`, sees the file and starts `telltale-update.service`, which runs
-`telltale self-update --request …`:
-1. it reads the request (a small regular file owned by `telltale`, nothing else) and removes it;
-2. it refuses anything but a release or edge build **newer** than the one installed, and a
-   request more than an hour old;
+`/var/lib/telltale/update/request.json` (in the config's `[node] data_dir`) and nothing else. A
+second, root unit installed next to it, `telltale-update.path`, sees the file and starts
+`telltale-update.service`, which runs `telltale self-update --request …`. Of the data directory
+it may write only that `update/` folder:
+1. it reads the request (a small regular file written by `telltale`, opened without following a
+   link or waiting on it) and removes it;
+2. it refuses anything but a release or edge build **newer** than the one installed, on the
+   node's own channel (a node on releases takes only a release), and a request more than an hour
+   old;
 3. it downloads the version, checks the release signature and the checksum (the release's
    signed `releases.json` must name that version), test-runs it, and swaps it in;
 4. it records the outcome in `/var/lib/telltale-update/result.json` (`installing`, `updated`,
