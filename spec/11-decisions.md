@@ -1297,7 +1297,7 @@ The engine can already express device-scoped rules (`$client` in the manual-rule
 - Nothing new is persisted, and a plan can't outlive the configuration it was checked against.
 - In a cluster, an operator approves on the node the agent used. Agents should use the node whose UI people use (normally the primary). If agents and people use different nodes, plans would need to move to the replicated `state.db`.
 
-## ADR-176 — Routers from the UI: API-managed `[[router]]` entries, pasted secrets saved as private files (Proposed)
+## ADR-181 — Routers from the UI: API-managed `[[router]]` entries, pasted secrets saved as private files (Proposed)
 **Context:** T8.2, ADR-080 (community request 2026-11-17). Routers can only be set in `telltale.toml`, with each credential in a file the operator creates, and a change needs a restart. Users who run TelltaleDNS from the UI (Docker on a NAS) want to add their UniFi console or OPNsense box there and paste the API key, as they do in the router's own UI. Revised after review (PR #66): the first version let an API writer name any file as a credential (and the poll would send its content to the router's address), reused a saved key when the address changed, replaced the key in use before the change was known to apply, and could delete files it hadn't written.
 **Decision (proposed):**
 - **Managed like the other named kinds (ADR-069).** `PUT`/`DELETE /api/v1/routers/{name}` with the `[[router]]` fields; an API entry overrides or hides the files' entry of that name; dry run, `If-Match`, idempotency, audit, Keep it in Git, forwarding from replicas; listed by `GET /api/v1/config/entries?kind=router`.
