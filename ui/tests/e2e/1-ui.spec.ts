@@ -2043,6 +2043,8 @@ test('t8_6 discovered devices, group settings, and zones', async () => {
 // 422s are let through as their console messages arrive (`expectedRefusal`) until later requests
 // have been answered and shown: a refusal's console message can come after the page shows it.
 test('api_002 routers are added and changed in the UI', async () => {
+  // Several 30 s waits below: more than the default 30 s for the whole test (review round 2, R5).
+  test.setTimeout(90_000);
   // A request to this router (PUT as a dry run or not, or DELETE), awaited by its response. An
   // apply is answered once the change is stored and the configuration reloaded on the node's main
   // loop; the build VM has been seen to stall for seconds right after the server starts, so each

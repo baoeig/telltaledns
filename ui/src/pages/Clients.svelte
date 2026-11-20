@@ -37,13 +37,16 @@
   // password is pasted, never a file named: the server saves it to a new file under secrets/
   // in the data folder of the node that took the change, and never shows it again. Changing the
   // address, type, site or TLS settings needs it pasted again. Each row says whether the node
-  // that answered has its keys and uses them, or not (after a restore or a failover; a key in
-  // /run/secrets/ or /etc/telltale-secrets/ is used on any node).
+  // that answered (on a replica, the primary) has its keys and uses them, or not (after a
+  // restore or a failover; a key in /run/secrets/ or /etc/telltale-secrets/ is used on any
+  // node). A key file a platform mounts, or a config file names, that isn't there is put back
+  // as a file, not pasted (review round 2, R7: `file_missing`).
   type KeyStatus = { credentials?: Record<string, string> | null };
   const kept = (field: string, what: string) => (_: Record<string, unknown>, __: string, e?: KeyStatus) => {
     const s = e?.credentials?.[field];
     if (s === 'saved') return `Saved. Type a new ${what} to replace it.`;
     if (s === 'missing') return `Key missing: enter the ${what} again`;
+    if (s === 'file_missing') return `Key file missing: put the file there (or paste the ${what})`;
     if (s === 'not_used') return `Not used: enter the ${what} again`;
     return `Paste the ${what}`;
   };
@@ -51,6 +54,7 @@
     const s = Object.values(e.credentials ?? {});
     if (s.length === 0) return null;
     if (s.includes('missing')) return { text: 'key missing: enter it again', cls: 'bad' };
+    if (s.includes('file_missing')) return { text: 'key file missing: put the file there', cls: 'bad' };
     if (s.includes('not_used')) return { text: 'key not used: enter it again', cls: 'bad' };
     return { text: 'key saved', cls: 'ok' };
   };
