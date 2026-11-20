@@ -2471,6 +2471,7 @@ impl Backend for ApiBackend {
     fn alert_test(
         &self,
         name: &str,
+        by_admin: bool,
     ) -> telltale_api::BoxFuture<Result<telltale_api::model::AlertTest, Problem>> {
         let cfg = self.src.config.load_full();
         let d = cfg
@@ -2496,6 +2497,15 @@ impl Backend for ApiBackend {
                 Some(why) => Err(why.clone()),
                 None => crate::alerts::send_test(&d, &node).await,
             };
+            // REQ: OBS-010 (ADR-180) — what went wrong reading the private CA file (a line of it,
+            // whether it is there) is an administrator's to see; the node's log has it.
+            let r = r.map_err(|e| match &d.tls_ca {
+                Some(ca) if !by_admin && e.contains(ca.as_str()) => {
+                    tracing::info!(destination = %d.name, error = %e, "test send: the private CA file couldn't be used");
+                    "the private CA file (`tls_ca`) couldn't be used; an administrator sees why, and the node's log says".to_owned()
+                }
+                _ => e,
+            });
             Ok(telltale_api::model::AlertTest {
                 ok: r.is_ok(),
                 error: r.err(),
@@ -2507,9 +2517,10 @@ impl Backend for ApiBackend {
     fn check_upstream(
         &self,
         body: serde_json::Value,
+        by_admin: bool,
     ) -> telltale_api::BoxFuture<Result<telltale_api::model::CheckResult, Problem>> {
         let cfg = self.src.config.load_full();
-        Box::pin(async move { crate::checks::upstream(&cfg, body).await })
+        Box::pin(async move { crate::checks::upstream(&cfg, body, by_admin).await })
     }
 
     // REQ: API-002 (T9.12) — a draft list downloaded (or its rules taken) and parsed.
@@ -2527,6 +2538,7 @@ impl Backend for ApiBackend {
         &self,
         config: serde_json::Value,
         opts: telltale_api::SimulateOpts,
+        by_admin: bool,
     ) -> telltale_api::BoxFuture<Result<telltale_api::model::Simulation, Problem>> {
         let src = Arc::clone(&self.src);
         let mut config = config;
@@ -2550,6 +2562,11 @@ impl Backend for ApiBackend {
                         "Send the shared sections as JSON, as a Git commit's shared TOML becomes.",
                     )
                 })?;
+            // REQ: OBS-024 (ADR-180) — below admin, refused before anything is read.
+            if !by_admin && let Some(field) = crate::simulate::new_local_name(&current, &candidate)
+            {
+                return Err(crate::simulate::local_name_refused(&field));
+            }
             crate::simulate::simulate(&src, current, Arc::new(candidate), &opts)
                 .await
                 .map(Option::unwrap_or_default)
@@ -3944,6 +3961,13 @@ fn forward_of(v: &serde_json::Value, name: &str) -> Result<crate::managed::Forwa
             format!("`{name}`: give at least one server"),
         ));
     }
+    // REQ: UPS-011, API-002 (ADR-180) — a server becomes an upstream: not a program or a socket.
+    if let Some(i) = servers
+        .iter()
+        .position(|s| crate::managed::is_plugin_url(&crate::managed::server_url(s)))
+    {
+        return Err(plugin_refused(&format!("servers[{i}]")));
+    }
     // REQ: DNS-022 — a stub zone's servers are asked directly, by address.
     if input.stub
         && let Some(bad) = servers
@@ -4495,14 +4519,16 @@ type AlsoStored = Vec<(&'static str, String, Option<String>)>;
 fn upstream_cascade(
     name: &str,
     file: &telltale_config::Config,
-    before_cfg: &telltale_config::Config,
     entries: &mut crate::managed::Entries,
 ) -> Result<(AlsoStored, Vec<String>), Problem> {
     use crate::managed::Named;
     let mut also = Vec::new();
     let mut groups = Vec::new();
-    for g in before_cfg
-        .upstream_group
+    // The groups as the files and the API define them: one made through the API may still name
+    // an upstream that the merge leaves out (REQ: UPS-011, ADR-180), and loses it here too.
+    let mut defined = file.upstream_group.clone();
+    crate::managed::apply_ovr(&mut defined, &entries.upstream_groups);
+    for g in defined
         .iter()
         .filter(|g| g.members.iter().any(|m| m.as_str() == name))
     {
@@ -4628,6 +4654,60 @@ fn named_json<T: crate::managed::Named + Serialize>(
         .map(|x| serde_json::to_value(x).unwrap_or_default())
 }
 
+/// REQ: UPS-011, API-002 (ADR-180) — an upstream that names a program the server would start
+/// (`exec://`, its `args`) or a local socket it would connect to (`unix://`) is a configuration
+/// file matter: a write through the API, a dry run, a forward's servers, and a pre-save check are
+/// refused for every caller, an administrator included. `field` is the one that says so.
+pub(crate) fn plugin_refused(field: &str) -> Problem {
+    Problem::new(
+        Code::InvalidConfig,
+        format!(
+            "`{field}`: an upstream that names a program or a local socket isn't set through the API"
+        ),
+    )
+    .hint("Plugin upstreams (`exec://`, `unix://`) are defined in the config file.")
+}
+
+/// REQ: UPS-011, API-002 (ADR-180) — the plugin field of an upstream's body (JSON), if any.
+fn plugin_field_of(body: &serde_json::Value) -> Option<&'static str> {
+    crate::managed::plugin_field(
+        body.get("url")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(""),
+        body.get("args")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|a| !a.is_empty()),
+    )
+}
+
+/// REQ: FLT-004, API-002 (ADR-180) — a list made through the API that reads a local file
+/// (`path`) is pointed at that file only by an administrator: the server reads it on every
+/// refresh, so which file is read is for someone trusted with the node. `current` is the file
+/// the list in effect reads, if any: a write that keeps it (another setting changed) needs only
+/// the operator role, as do URL lists, inline rules, and deletes. Dry runs and writes forwarded
+/// from another node are checked the same way.
+fn local_file_guard(w: &ManagedWrite, current: Option<&str>) -> Result<(), Problem> {
+    if w.by_admin {
+        return Ok(());
+    }
+    let Some(after) = w
+        .body
+        .as_ref()
+        .and_then(|b| b.get("path"))
+        .filter(|p| !p.is_null())
+    else {
+        return Ok(());
+    };
+    if after.as_str().is_some_and(|p| Some(p) == current) {
+        return Ok(());
+    }
+    Err(Problem::new(
+        Code::Forbidden,
+        "a list's `path` (a local file) is set or changed only by an administrator",
+    )
+    .hint("Setting or changing a list's local file needs an administrator. A URL list, inline rules, a change that keeps the list's file, or deleting it, need only the operator role."))
+}
+
 /// REQ: OBS-010, API-002 (ADR-179) — the credential-file fields an alert destination (as JSON)
 /// names.
 fn credential_fields(d: &serde_json::Value) -> Vec<&'static str> {
@@ -4717,13 +4797,30 @@ fn plan_override(
             .map(|d| serde_json::to_value(d).unwrap_or_default());
         credential_guard(w, current.as_ref())?;
     }
+    // REQ: UPS-011, API-002 (ADR-180) — likewise first: plugin upstreams are the config file's.
+    if w.kind == ManagedKind::Upstream
+        && let Some(field) = w.body.as_ref().and_then(plugin_field_of)
+    {
+        return Err(plugin_refused(field));
+    }
+    // REQ: FLT-004, API-002 (ADR-180) — likewise first: a list's local file is an
+    // administrator's to choose.
+    if w.kind == ManagedKind::List {
+        let current = before_cfg
+            .list
+            .iter()
+            .find(|l| l.name() == name)
+            .and_then(|l| l.path.as_ref())
+            .map(ToString::to_string);
+        local_file_guard(w, current.as_deref())?;
+    }
     // REQ: API-002 (T9.22) — removing an upstream also takes it out of its upstream groups.
     // A DELETE that reverts an override of the files' entry (or un-hides it) brings the
     // upstream back: nothing to cascade.
     let reverting = entries.upstreams.iter().any(|(n, _)| *n == name)
         && file.upstream.iter().any(|u| u.name() == name);
     let (also, also_groups) = if w.kind == ManagedKind::Upstream && w.body.is_none() && !reverting {
-        upstream_cascade(&name, &file, &before_cfg, &mut entries)?
+        upstream_cascade(&name, &file, &mut entries)?
     } else {
         (Vec::new(), Vec::new())
     };
@@ -5102,16 +5199,8 @@ impl ApiBackend {
                 // Other writes needn't wait for the replay.
                 drop(one_at_a_time);
                 if let Some(opts) = &w.simulate {
-                    let baseline = Arc::new(
-                        crate::managed::merge(
-                            &src.file_config.load_full(),
-                            &crate::managed::entries(&state),
-                        )
-                        .map_err(|errs| Problem::internal(errs.join("; ")))?,
-                    );
-                    let candidate = Arc::new(plan.candidate.clone());
                     out.simulation =
-                        crate::simulate::simulate(&src, baseline, candidate, opts).await?;
+                        dry_run_simulation(&src, &state, &plan.candidate, opts, w.by_admin).await?;
                 }
                 return Ok(out);
             }
@@ -5163,6 +5252,32 @@ impl ApiBackend {
             Ok(change(true, version))
         })
     }
+}
+
+/// REQ: OBS-024 — a dry run's `simulate`: what `candidate` (the planned configuration) would have
+/// done to the logged queries, against the configuration the API's entries make now.
+async fn dry_run_simulation(
+    src: &Arc<Sources>,
+    state: &telltale_store::state::State,
+    candidate: &telltale_config::Config,
+    opts: &telltale_api::SimulateOpts,
+    by_admin: bool,
+) -> Result<Option<telltale_api::model::Simulation>, Problem> {
+    let baseline = Arc::new(
+        crate::managed::merge(
+            &src.file_config.load_full(),
+            &crate::managed::entries(state),
+        )
+        .map_err(|errs| Problem::internal(errs.join("; ")))?,
+    );
+    let candidate = Arc::new(candidate.clone());
+    // REQ: OBS-024 (ADR-180) — the rule of `POST /api/v1/simulate`, before anything is read:
+    // here the plan still answers, and its simulation says it wasn't run.
+    let asked = !opts.auto || src.config.load().simulate.plans_by_default;
+    if asked && !by_admin && crate::simulate::new_local_name(&baseline, &candidate).is_some() {
+        return Ok(Some(crate::simulate::local_name_unavailable()));
+    }
+    crate::simulate::simulate(src, baseline, candidate, opts).await
 }
 
 /// REQ: OBS-033 — the change about to be applied came from `by` and is configuration
@@ -6191,3 +6306,13 @@ mod rule_edit_tests {
 #[cfg(test)]
 #[path = "api_backend_cred_tests.rs"]
 mod cred_file_tests;
+
+// REQ: UPS-011, API-002 (ADR-180) — plugin upstreams and the API.
+#[cfg(test)]
+#[path = "api_backend_local_access_tests.rs"]
+mod local_access_tests;
+
+// REQ: FLT-004, OBS-024, OBS-010, API-002 (ADR-180) — local files named through the API.
+#[cfg(test)]
+#[path = "api_backend_local_file_tests.rs"]
+mod local_file_tests;

@@ -2229,15 +2229,17 @@ impl Backend for Federated {
     fn alert_test(
         &self,
         name: &str,
+        by_admin: bool,
     ) -> telltale_api::BoxFuture<Result<telltale_api::model::AlertTest, Problem>> {
-        self.local.alert_test(name)
+        self.local.alert_test(name, by_admin)
     }
     // REQ: API-002 (T9.12) — checks run where the request landed.
     fn check_upstream(
         &self,
         body: serde_json::Value,
+        by_admin: bool,
     ) -> telltale_api::BoxFuture<Result<telltale_api::model::CheckResult, Problem>> {
-        self.local.check_upstream(body)
+        self.local.check_upstream(body, by_admin)
     }
     fn check_list(
         &self,
@@ -2250,8 +2252,9 @@ impl Backend for Federated {
         &self,
         config: serde_json::Value,
         opts: telltale_api::SimulateOpts,
+        by_admin: bool,
     ) -> telltale_api::BoxFuture<Result<telltale_api::model::Simulation, Problem>> {
-        self.local.simulate(config, opts)
+        self.local.simulate(config, opts, by_admin)
     }
     fn client_name(&self, ip: IpAddr) -> Option<String> {
         self.local.client_name(ip)

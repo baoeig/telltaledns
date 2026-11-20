@@ -213,17 +213,26 @@ pub trait Backend: Send + Sync + 'static {
         model::AlertsStatus::default()
     }
     /// REQ: OBS-010 (T9.6) — sends a test alert to destination `name` from this node.
-    fn alert_test(&self, name: &str) -> BoxFuture<Result<model::AlertTest, Problem>> {
-        let _ = name;
+    /// REQ: OBS-010 (ADR-180) — `by_admin`: the caller is an administrator, who alone is told what
+    /// went wrong reading the destination's private CA file.
+    fn alert_test(
+        &self,
+        name: &str,
+        by_admin: bool,
+    ) -> BoxFuture<Result<model::AlertTest, Problem>> {
+        let _ = (name, by_admin);
         Box::pin(async { Err(Problem::unavailable("alerts aren't available on this node")) })
     }
     /// REQ: API-002 (T9.12) — a draft upstream (the `PUT /upstreams/{name}` body) asked a
     /// probe from this node, before it's saved.
+    /// REQ: API-002 (ADR-180) — `by_admin`: the caller is an administrator, who alone is told
+    /// what went wrong reading a TLS file the draft names.
     fn check_upstream(
         &self,
         body: serde_json::Value,
+        by_admin: bool,
     ) -> BoxFuture<Result<model::CheckResult, Problem>> {
-        let _ = body;
+        let _ = (body, by_admin);
         Box::pin(async { Err(Problem::unavailable("checks aren't available on this node")) })
     }
     /// REQ: API-002 (T9.12) — a draft list (the `PUT /lists/{name}` body) downloaded and
@@ -550,12 +559,15 @@ pub trait Backend: Send + Sync + 'static {
     /// REQ: OBS-024 (T13.1) — what the shared configuration `config` (JSON) would have done to
     /// the logged queries over `opts`' window, compared with the configuration in effect
     /// (`POST /api/v1/simulate`).
+    /// REQ: OBS-024 (ADR-180) — `by_admin`: the caller is an administrator; anyone else's
+    /// candidate names no local file, program or socket the configuration in effect doesn't.
     fn simulate(
         &self,
         config: serde_json::Value,
         opts: SimulateOpts,
+        by_admin: bool,
     ) -> BoxFuture<Result<model::Simulation, Problem>> {
-        let _ = (config, opts);
+        let _ = (config, opts, by_admin);
         Box::pin(async {
             Err(Problem::unavailable(
                 "simulation isn't available on this node",
@@ -1843,10 +1855,15 @@ async fn explain(
 ///
 /// Every configured list with its kind (block/allow), source, download state (`ok`, `failed`,
 /// `pending`) and last error, size, and how many names it contributes to the active snapshot.
-/// `hits` adds up every node's in a cluster.
+/// `hits` adds up every node's in a cluster. For a list read from a local file, the error is
+/// shown in full to an administrator; anyone else sees a generic reason (ADR-180).
 #[utoipa::path(get, path = "/api/v1/lists", tag = "config",
     responses((status = 200, body = Items<ListInfo>, description = "The result.")))]
-async fn lists(State(b): State<Shared>) -> Result<Json<Items<ListInfo>>, Problem> {
+async fn lists(
+    State(b): State<Shared>,
+    ext: axum::http::Extensions,
+) -> Result<Json<Items<ListInfo>>, Problem> {
+    let admin = auth::routes::principal(&ext).is_ok_and(|p| config_api::by_admin(&p));
     let bk = Arc::clone(&b);
     // REQ: OBS-009 (T7.14) — hits from every node: in a cluster the API's node may answer
     // few or no queries itself.
@@ -1855,6 +1872,11 @@ async fn lists(State(b): State<Shared>) -> Result<Json<Items<ListInfo>>, Problem
         let mut items = bk.lists();
         for l in &mut items {
             l.hits = hits.get(&l.name).copied().unwrap_or(0);
+            // REQ: FLT-004, API-002 (ADR-180) — what went wrong reading a local file (a line of
+            // it, whether it is there) is an administrator's to see; the node's log has it too.
+            if !admin && l.error.is_some() && from_local_file(&l.source) {
+                l.error = Some(LOCAL_LIST_ERROR.to_owned());
+            }
         }
         Ok(items)
     })
@@ -1863,6 +1885,21 @@ async fn lists(State(b): State<Shared>) -> Result<Json<Items<ListInfo>>, Problem
         missing_nodes: b.missing_nodes(),
         items,
     }))
+}
+
+/// REQ: FLT-004 (ADR-180) — what a caller below admin sees of a failing list read from a local
+/// file.
+const LOCAL_LIST_ERROR: &str = "the list's local file couldn't be used; an administrator sees why here, and the node's log says";
+
+/// Whether a list's `source` (URL, file path, or `inline`) is a local file.
+fn from_local_file(source: &str) -> bool {
+    source != "inline"
+        && !source
+            .get(..8)
+            .is_some_and(|s| s.eq_ignore_ascii_case("https://"))
+        && !source
+            .get(..7)
+            .is_some_and(|s| s.eq_ignore_ascii_case("http://"))
 }
 
 /// Blockable services.

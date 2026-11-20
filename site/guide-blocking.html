@@ -72,7 +72,7 @@ rules = ["||ads.example.com^", "@@||cdn.example.com^"]</code></pre>
     </div>
 
     <div class="panel" id="add-api"><h3>API / CLI</h3>
-      <p><code>PUT /api/v1/lists/{name}</code> takes the same fields as <code>[[list]]</code>; add <code>?dryRun=true</code> to preview. <code>POST /api/v1/checks/list</code> tests a draft without saving it.</p>
+      <p><code>PUT /api/v1/lists/{name}</code> takes the same fields as <code>[[list]]</code>; add <code>?dryRun=true</code> to preview. <code>POST /api/v1/checks/list</code> tests a draft without saving it. A <code>path</code> (a file on the node) is set by an administrator; URL lists and inline rules need only the operator role.</p>
 <pre><code>telltale ctl put lists/hagezi-pro --data '{"url": "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt"}'
 telltale ctl lists                      # with unique names and hits</code></pre>
     </div>
