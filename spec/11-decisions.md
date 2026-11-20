@@ -200,7 +200,7 @@ Workspace crates set `publish = false`, so the short prefix can't collide on cra
 - **Chain:** client ID → EDNS MAC (only from `trust_edns_mac_from`: the option is client-supplied, so trusting it by default would let any device claim another's identity) → MAC from the kernel neighbor table (rtnetlink dump, IPv4 + IPv6, in `telltale-net`, refreshed only while some client is matched by MAC) → exact IP (IPv4-mapped IPv6 canonicalized) → most specific CIDR → `default`. Lookups are hash maps and a short sorted prefix list; a prefix trie can replace the list if CIDR counts grow.
 - **Groups:** a device in several groups gets the union of their lists; other settings come from the highest-priority group. Per-client list masks are precomputed whenever the snapshot or the client config changes. The filter state records the client table it was built for, so a query racing a reload never pairs one table's identity with another's masks.
 - **Routing:** client group names feed `[[route]] match_group`. Resolution now looks up the upstream group by the cache view chosen at selection time, rather than re-selecting without groups.
-- **Deferred:** hostname-based matching (DHCP leases / rDNS, FLT-006), client IDs until the DoH/DoT listeners (T4.5), and per-group block mode, pause, and schedules (T2.6, FLT-009/010).
+- **Deferred:** hostname-based matching (DHCP leases / rDNS, FLT-006), client IDs until the DoH/DoT listeners (T4.5), and per-group block mode, pause, and schedules (T2.6, FLT-009/010). *(Closed by ADR-183, Proposed: host-name matching (DHCP leases, rDNS) is not built. The routers' lists contribute MAC addresses, not names, to identification, through the same MAC step as the kernel's neighbor table.)*
 
 **Consequences:** Pi-hole-style per-device filtering, with MAC identification that survives DHCP and IPv6 privacy addresses on host-networked installs. Identification costs a few hash lookups per query and allocates nothing.
 
@@ -1224,7 +1224,7 @@ The engine can already express device-scoped rules (`$client` in the manual-rule
 **Decision:**
 - **A quick rule:**
   - allow or block a domain and its subdomains;
-  - for listed devices (by name, IP, or MAC, as `[[client]]` keys), listed groups, or everyone;
+  - for listed devices (by name, IP, or MAC, as `[[client]]` keys), listed groups, or everyone; *(Amended by ADR-183, Proposed: `devices` takes a `[[client]]` name (any case), an IP or a CIDR, as the code always has. A MAC is given through a named device (`[[client]] match = ["aa:bb:cc:dd:ee:ff"]`), and a rule for that device then follows it wherever the neighbor table or a router sees that MAC.)*
   - an optional expiry (an absolute time; the UI offers durations);
   - a note, who made it (user or agent), and when.
 - **Storage:** in `state.db` as a managed entry of kind `rule` (ADR-040). In a cluster, rules travel with the shared configuration the primary publishes (ADR-047), and a replica's UI forwards the write to the primary (ADR-054). Rules are capped at 1,000 per cluster.
@@ -1637,6 +1637,179 @@ Notes on the table:
 - Mixed versions: nodes with this feature and without it can be in one cluster; `ctl upgrade` stops at one without it (pre-flight), with `--skip-down` too.
 - A transient download failure is a plain `failed` with the old build untouched: it holds nothing back, and the next request (the next sync) tries again.
 **Verification:** `ops_014_versions_are_checked_and_ordered`, `ops_014_a_node_keeps_the_channel_set_for_it`, `ops_014_update_routes_need_their_scope`, `ops_014_update_requests_over_http`, `ops_014_a_dry_run_reaches_the_node_as_one`, `ops_014_a_refused_update_request_is_audited`, `ops_014_an_oauth_token_never_carries_cluster_upgrade`, `ops_014_a_call_about_a_nodes_own_state_finds_its_node`; `ops_014_a_node_takes_only_newer_versions_it_can_install`, `ops_014_a_request_is_written_for_the_update_service_and_shown_as_pending`, `ops_014_the_answer_names_the_request_written_and_marks_a_peers_by`, `ops_014_a_second_request_waits_for_the_first`, `ops_014_a_dry_run_writes_nothing`, `ops_014_a_dry_run_leaves_a_dead_request_in_place`, `ops_014_an_ephemeral_member_cannot_ask_for_an_update`; `ops_014_the_update_service_installs_a_newer_version_once_and_records_it`, `ops_014_a_failed_install_is_recorded_and_does_not_restart`, `ops_014_the_update_service_trusts_nothing_in_the_request`, `ops_014_the_update_service_reads_no_symlink_or_large_file`, `ops_014_a_link_to_a_fifo_is_refused_without_blocking`, `ops_014_a_fifo_or_directory_at_the_request_is_refused_and_removed`, `ops_014_a_padded_or_unparseable_version_is_refused`, `ops_014_a_request_never_moves_a_stable_node_to_edge`, `ops_014_an_edge_node_that_took_a_release_stays_on_edge`, `ops_014_a_request_folder_that_isnt_the_nodes_is_left_alone`, `ops_014_the_units_watch_and_write_only_the_request_folder`, `ops_014_a_host_not_set_up_for_it_refuses_before_fetching`, `ops_014_the_health_gate_takes_only_a_plain_address_of_this_host`, `ops_014_the_install_location_must_be_roots_alone`, `ops_014_the_run_fits_in_the_units_time_limit`, `ops_014_a_build_that_does_not_come_up_is_rolled_back`, `ops_014_a_slow_or_failed_restart_command_is_left_to_the_health_check`, `ops_014_a_rollback_whose_check_fails_too_is_recorded_as_rolled_back`, `ops_014_a_failed_rollback_is_recorded_and_stops`, `ops_014_a_version_that_failed_is_not_asked_for_again_for_a_day`, `ops_014_a_failure_before_the_install_holds_nothing_back`, `ops_014_an_edge_build_no_longer_served_is_unavailable`; `ops_014_a_pinned_release_is_downloaded_from_its_own_page`, `ops_014_a_pinned_install_takes_only_the_version_its_signed_index_names`, `ops_014_an_edge_build_installs_only_while_it_is_the_newest`, `ops_014_a_pinned_install_takes_only_an_index_of_the_versions_channel`, `ops_014_downloads_that_take_too_long_install_nothing`; `ops_014_upgrade_order`, `ops_014_the_preflight_reads_each_node`, `ops_014_a_node_that_cant_take_the_upgrade_stops_the_run_before_any_is_asked`, `ops_014_ctl_upgrade_goes_one_node_at_a_time_and_stops_on_failure`, `ops_014_ctl_waits_for_updated_and_stops_at_a_late_rollback`, `ops_014_ctl_upgrade_works_with_an_agent_token`, `ops_014_only_a_first_install_is_skipped`, `ops_014_ctl_upgrade_and_an_edge_build_no_longer_served`, `ops_014_nodes_on_the_version_are_not_asked`; `deploy/helm/upgrade-hook-test.sh`, `deploy/systemd/update-units-test.sh`, and the `deploy/systemd/e2e.sh` step "the update service picks a request up" (the units' channel and health address, the sandbox, a refusal, a FIFO, `install.sh --cluster-updates`).
+
+## ADR-183 — Named devices follow their MAC address: the routers' address-to-MAC lists join the neighbor table for identification, under rules that keep one device's rules off another; host names never identify (Proposed)
+**Context:** GitHub issue #73 (a user's report, 2026-11-20). A quick rule made from the query log was pre-filled with the name the router reported for a TV ("LGwebOSTV"), and a rule can't target that name. The user gave the address instead, and asked for rules that survive address changes: "a hostname or even better a MAC address".
+
+Phase 0 (no ADR) fixed the form and the refusal. What remains is that a device is recognized by MAC only from the kernel's neighbor table (ADR-021). That table sees a device only with host networking on the same layer-2 network: not in a Docker bridge, a Kubernetes pod or another VLAN.
+
+TelltaleDNS serves no DHCP (ADR-091), but the router integrations (ADR-080, ADR-166, ADR-181) already read:
+- UniFi's connected clients;
+- OPNsense's DHCP lease rows.
+
+Each gives an IPv4 address and a MAC, and every node shares what its routers report (ADR-125). Until now these were for display only.
+
+ADR-021 deferred host-name matching (FLT-006). ADR-067 says a quick rule's devices may be given "by name, IP, or MAC, as `[[client]]` keys"; the code takes a device name, an IP or a CIDR.
+
+A review of the first design (2026-11-20) found four ways a router binding could put one device's rules on another, which are closed below:
+1. a lower source filling an address a higher one distrusts;
+2. day-long trust windows on the wall clock;
+3. older members' unchecked lists;
+4. one MAC at many addresses.
+
+**Decision (proposed):**
+
+**Host names never identify a device.** A DHCP host name, a UniFi alias, an mDNS name and a reverse-DNS name name a device for display only. Any device can announce any name, many devices of one model announce the same one, and a UniFi alias arrives in the same field as the DHCP name. This closes ADR-021's deferral: the routers' lists contribute **MAC addresses**, not names, to identification.
+
+**One table, three sources, in this order.**
+1. The kernel's neighbor table: what this host saw on its own link.
+2. The bindings this node's routers report.
+3. Those other full cluster members' routers report.
+
+The chain is otherwise unchanged: client ID → EDNS MAC from a trusted forwarder → **this table** → Kubernetes workload → exact IP → most specific CIDR → network group / `default`.
+- A binding identifies only a `[[client]]` that lists that MAC in `match`; it never creates a device.
+- Where the table maps an address to a named device's MAC, that device wins over a `[[client]]` keyed by the exact IP, as a kernel entry already does. Where the binding is withheld (below), the exact-IP device wins again.
+
+**A router binding is withheld** when any of these holds:
+- **Offline, unparsable or non-unicast:** the client isn't connected (ADR-166), or its MAC doesn't parse, is all zero, or is multicast.
+- **`unsure`:** this node marks a binding `unsure` when:
+  - its fresh routers, or two rows of one router, give one address different MACs (compared as parsed bytes);
+  - they place one MAC at two or more addresses (a range extender or bridge that shares its MAC);
+  - UniFi gave a connected client's address from `last_ip` or `fixed_ip` rather than `ip`;
+  - the router hasn't answered for **15 minutes**.
+- **Tombstone:** an address this node marks `unsure` can't be filled by any lower source. The kernel still wins.
+
+Silence is counted on a monotonic clock from the node's start (never the wall clock, which can step), with saturating arithmetic. Locally administered ("private") MACs count, and the UI says they may change. Display names keep their rules (within one router the last row still names an address; between routers the order is now fixed).
+
+**Across the cluster.** A node takes other members' bindings from their `devices.names` answers (ADR-125) only when all of these hold:
+- the answer is from a **full member** (listed in the registry and not ephemeral, ADR-143; a resolver pod holds no router keys, ADR-120);
+- the answer carries **`vetted`** (a new field, written by this version: an answer from an older member, whose lists lack these rules, gives no bindings);
+- the member answered within the last **15 minutes**.
+
+Any member's `unsure` lease for an address removes that address. So does a disagreement between two members, and so does one MAC at two addresses across this node's and the members' bindings.
+
+A node never passes on what it learned from others, so a stale binding lives at most one router-silence window plus one member-silence window: about 30 minutes, plus one exchange.
+
+Until a full member has answered, a node asks every 5 seconds for at most 2 minutes, then once a minute as before.
+
+`Lease.unsure` and `Names.vetted` are written only when true: a node on an earlier build ignores both and reads the same form. ADR-125's display names are unchanged.
+
+**Where it runs.** One task on every node, off the query path.
+- It reads the kernel table every `neighbor_refresh_secs` while `[clients] neighbor_table` is on.
+- It adds router and member bindings only while some `[[client]]` matches by MAC.
+- It rebuilds when an input changes (at once when the first MAC-keyed device appears), in a blocking task.
+- The table is swapped atomically, and the previous one is freed on a background thread after 2 seconds (ADR-023's `retire`).
+
+On the query path: the same one atomic load and one hash lookup as before, and only while a device matches by MAC; a 7-byte entry instead of 6, and one branch on its source. No allocation, lock or I/O, and `QuickRules::decide` is untouched.
+
+**The setting.** `[clients] router_macs`: default `true`; with `false`, only the kernel table and EDNS MACs.
+- It is shared configuration, because identity must be the same on every node.
+- It **is not written while it is the default**, so a node on an earlier build (the section refuses unknown fields) still reads the shared configuration.
+- Set to `false`, it makes an older replica refuse each new version with `shared configuration: unknown field …` (it keeps serving its last one), and an older build won't start with it in its own file. So the opt-out can be used only once every node runs this version.
+- It applies on reload, without a restart.
+
+**Rules and devices.** No new scope kind, and no change to what a rule targets: a quick rule's `devices` takes a `[[client]]` name (any case), an IP or a CIDR, as before. A rule that should follow a device names a device recognized by MAC (`[[client]] match = ["aa:bb:cc:dd:ee:ff"]`). Validation reads the configuration alone.
+
+**Naming in the UI and for agents.** `GET /api/v1/clients/{address}/identity` (MCP `identify_device`) gains `recognition`:
+- `device`: the configured device the address is recognized as now;
+- `identifiedBy`: how;
+- `mac`, `macFrom` (`neighbor`, `router` or `peer`), `macShared`: the MAC a device there could be named by;
+- `macRandomized`: the MAC is locally administered.
+
+How it is built:
+- It is the answering node's own view (set after the federated merge).
+- It is computed in the request from the table and the same withholding rules, with no kernel read in the request.
+- It is left out at query-log privacy level 2 and above.
+- `mac`, `macFrom` and `macShared` are given only to a caller who may read `/api/v1/clients` (which already shows MAC keys): signed-in users and API tokens of any role, and agent tokens with `config:read` not restricted to a group. Others get `recognition` without them.
+- Explain follows the same rule for `client.mac` (unless the caller gave it) and its new `macFrom`. It reports `identifiedBy: router_mac`.
+
+"Name this device…":
+- It edits the device the address is recognized as (or the one that already lists the MAC) instead of making a second one.
+- It offers **its MAC address**, as the default only when the MAC comes from a router (every node can use it) and isn't shared; otherwise it offers the MAC and says why.
+- With the MAC, it stores the MAC without the address: an address key would name whoever gets that address next.
+
+**Observability.**
+- `telltale_neighbors` counts the kernel's entries.
+- `telltale_router_macs{source="router"|"peer"}` counts the bindings in use.
+- `telltale_router_macs_unsure` counts the ones withheld.
+- The log says when router bindings start and stop being used, and once when devices match by MAC but this node can see no MACs. It warns when a router with `tls_insecure_skip_verify` starts feeding identification.
+
+REQ: FLT-006, FLT-005, API-010, CLU-002, CLU-010, OBS-005, AGT-004. Implemented in:
+- `telltale_policy::clients` (`MacTable`, `MacFrom`, `IdSource::RouterMac`);
+- `devices.rs` (`eligible`, `router_bindings`, the members' bindings, `vetted`);
+- `routers.rs` (`rebuild`, `unsure`);
+- `server.rs` (`spawn_mac_table`);
+- `explain.rs`, `api_backend::recognize`, `federated::identity`, the identity and explain handlers (`telltale-api`);
+- `ClientChip.svelte`.
+
+**Alternatives rejected:**
+- **A host-name scope or host-name matching:** names are client-chosen and often shared, and node-local names would make validation or matching differ between nodes.
+- **A MAC in a rule's `devices`:** it would need the MAC in `decide()` and a schema key an earlier node refuses.
+- **Router bindings as a second identification step:** a second lookup per query.
+- **Storing the address with the MAC when naming:** the next holder of the address is named and filtered as the device.
+- **A node-local switch:** a replica could identify devices differently from the primary.
+- **A day-long trust window:** during a controller outage, a revoked API key or a failover, a device that took a departed device's address would inherit its rules for most of a day, up to two days through a member. **One hour** is the alternative if router firmware updates should keep MAC-only devices recognized: still well under typical lease times.
+- **Bindings from older members:** their lists have none of the withholding rules.
+- **One MAC at several addresses kept:** a MAC-sharing extender would give one device's rules to every device behind it.
+
+**Not covered:**
+- MAC spoofing and forged DHCP client addresses: a device that copies a named device's MAC is that device, as with the kernel table.
+- A compromised or misconfigured router or full member, which can bind any address to any MAC.
+- IPv6 bindings from routers: a MAC-only device's IPv6 queries are recognized only through the kernel's NDP table.
+- OPNsense lease states: rows are taken as the API returns them, and conflicts are caught by `unsure`.
+- A per-router or per-site choice of which routers identify. In a cluster spanning sites that reuse one private range, a member at another site can bind a local address.
+- An address reused within one router interval (300 s by default) before the next poll.
+- Recognition by MAC in change simulations and rule-impact estimates (they identify by address, ADR-115), in anomaly mutes (a device needs an address to be muted, ADR-161), on the Clients page's device guess and in identity or rhythm reads by name, and in `telltale explain` on the command line (no routers there).
+- Sites beyond about 7,000 connected clients, where the `devices.names` answer outgrows the cluster channel's 1 MiB frame.
+- Source NAT in front of a resolver pod, rootless Docker, Podman and Docker Desktop: the address seen isn't the device's.
+
+**Consequences:**
+- **What users get.** A device named by its MAC keeps its name, groups and device rules when its address changes, within one router interval plus up to a minute on the other nodes. This works with host networking, rootful Docker, Kubernetes with preserved sources (the chart's `externalTrafficPolicy: Local`), and across VLANs.
+- **Behaviour change at the default** (release note). Where a `[[client]]` matches by MAC (by hand, or from the Pi-hole importer's MAC clients) and a router reports that MAC at an address the kernel doesn't hold, the device now gets that `[[client]]`'s identity instead of IP, CIDR, network group or `default`. It arrives with the first upgraded node that reads a router. `[clients] router_macs = false` keeps the old behaviour, but only once every node is upgraded.
+- **When a binding is missing or withheld:** at start-up, more than 15 minutes into a router or member silence, on an older member's answer, or when the binding is shared or `unsure`. A block rule for the device then fails open and an allow rule fails closed, and the device takes its network's or the default group. DNS is answered throughout (CLU-004).
+  - A router firmware update longer than 15 minutes moves MAC-only devices to that fallback until the router answers.
+  - A device that moved while its old OPNsense lease is still listed isn't recognized by MAC until the old lease goes.
+- **HA.** Router-based identity survives a failover only if the router's key is on two full members: config-file routers with the key in `/etc/telltale-secrets/` or `/run/secrets/` on both. A key pasted in the UI stays on the node that saved it (ADR-181), so after a failover MAC-only devices fall back 15 minutes later, until the key is entered on the new primary.
+- **Mixed versions (CLU-010).** A node on an earlier build accepts a MAC-only `[[client]]` (MAC keys were always valid) but recognizes it only through its kernel table. Upgraded nodes take no bindings from an older member. So in a rolling upgrade (replicas first), MAC-only devices are recognized by router data only once the node that reads the router (usually the primary) runs this version. Nothing in the shared configuration changes for older nodes while `router_macs` is at its default.
+- **Cost.**
+  - Memory: about 50 KB per 1,000 table entries (twice that during a swap).
+  - About 11 bytes per binding per full member that reads a router (kept whether or not a device matches by MAC).
+  - A neighbor-table read every `neighbor_refresh_secs` on every node with `neighbor_table` on: new for nodes without a MAC-keyed device.
+- **Display.** Past queries are named by the device that holds the address now (names resolve when read, API-010).
+- **Amended ADRs.** ADR-067's wording is amended, ADR-021's host-name deferral is closed, and ADR-125's exchange feeds identification (pointers in those ADRs).
+
+**Verification (planned):**
+- **`telltale-policy`:** `flt_006_router_mac_identifies_named_device`, `flt_006_kernel_entry_wins_over_router_and_peer`, `flt_006_router_macs_counted_by_source`, `flt_006_no_mac_clients_never_read_the_table`, `flt_006_router_macs_off_ignores_router_entries`.
+- **`telltale-config`:** `flt_006_router_macs_default_on_and_not_written`, `clu_010_router_macs_left_out_of_the_shared_part_at_its_default`.
+- **Routers and members:**
+  - `flt_006_routers_disagreeing_on_an_address_mark_it_unsure`
+  - `flt_006_unifi_client_without_a_current_address_is_unsure`
+  - `flt_006_a_router_silent_for_15_minutes_is_unsure`
+  - `flt_006_silence_survives_a_clock_step`
+  - `flt_006_rebuild_is_deterministic`
+  - `flt_006_one_mac_at_two_addresses_does_not_identify`
+  - `flt_006_unsure_mark_is_compatible_on_the_wire`
+  - `flt_006_offline_and_unsure_leases_never_identify`
+  - `clu_002_peer_router_macs_come_only_from_full_members`
+  - `clu_002_a_peers_unsure_lease_counts_as_a_disagreement`
+  - `clu_002_peers_disagreeing_on_an_address_drop_it`
+  - `clu_002_a_silent_member_is_dropped_after_15_minutes`
+  - `clu_010_bindings_from_an_older_member_are_not_used`
+  - `clu_002_names_are_asked_again_soon_until_a_full_member_answers`
+- **The table:**
+  - `flt_006_own_unsure_address_is_not_filled_by_a_peer`
+  - `flt_006_exact_ip_device_wins_again_when_the_binding_is_unsure`
+  - `flt_006_router_lease_mac_identifies_named_device`
+  - `flt_006_kernel_neighbor_wins_over_router_lease`
+  - `flt_006_router_macs_off_keeps_ip_identification`
+  - `flt_006_peer_router_macs_identify`
+  - `flt_005_quick_rule_follows_mac_device_across_ip_change`
+  - `flt_006_without_mac_clients_the_table_holds_kernel_entries_only`
+  - `flt_006_the_old_table_is_retired`
+- **API:** `flt_013_explain_says_a_router_mac_identified_the_client`, `api_010_identity_says_how_an_address_is_recognized`, `api_010_recognition_offers_a_router_mac_before_any_device_matches_by_mac`, `api_010_recognition_withholds_a_shared_or_tombstoned_mac`, `agt_004_recognition_mac_needs_config_read`.
+- **Playwright:** `api_010 name this device offers its MAC address when the router knows it`, `api_010 a device named by MAC is edited, not overwritten`, `api_010 a MAC only this node sees is offered, not chosen`.
+- **End to end:** `deploy/routers-e2e.sh` and `deploy/cluster/router-macs-e2e.sh`.
+- **Benchmarks:** the `flt_006_identify_mac` benches against the base, and `make bench-smoke`.
 
 ## ADR-172 — A cluster support package: each node redacts its own part under one key, with labels every node agrees on (Accepted)
 **Context:** GitHub issue #55 (the later phase of #50, ADR-156): in a cluster the problem is often on another node, and a package of the node that answered covers only that one. ADR-156 settled the direction (each node redacts before its data leaves it, the asking node's key travels over the mutually authenticated stream) and left three points: how the key reaches the others, what an older peer does, and the size cap across nodes. One more came up in building it: ADR-156 numbers a name by when it is first met (`device-3`), so two nodes would give one device two labels, and the issue asks that a device have one name on every node.
@@ -2204,6 +2377,7 @@ A list the configuration disables (`enabled = false`) is left out of the `tellta
 - A node answers with only what it learned itself, never what it got from peers, so a name a router forgot doesn't keep circulating. When no peer answers, the last table stays. A peer on an older build answers "unknown call" and is skipped.
 - As a backstop, the federated query log names any row a peer sent without a client name, using the node assembling the page. A row's own name always stays.
 - Rejected: mounting the router credentials in every pod. Each node would poll the router, the secret would spread, and mDNS would still be missing.
+- *(Amended by ADR-183, Proposed: the router list a node shares also feeds identification on the other nodes, from full members' answers that carry `vetted` only, each kept up to 15 minutes. A `Lease` may carry `unsure`, written only when true. Until a full member has answered, a node asks every 5 seconds for at most 2 minutes. Display names are unchanged.)*
 **Consequences:** a resolver pod's rows, findings, and device identities use the same names as the primary within a minute of start (or of a router change). The table is a few hundred entries a minute over the existing mTLS channel. Nothing touches the DNS path (CLU-004). `GET /api/v1/dhcp/leases` still lists only the node's own sources.
 
 ## ADR-124 — SQLite never needs a temp file (Proposed)
