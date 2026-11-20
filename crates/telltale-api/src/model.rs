@@ -563,7 +563,9 @@ pub struct QueryRow {
     pub ts_unix_micros: u64,
     /// Client address.
     pub client: String,
-    /// The configured device name, when known.
+    /// The name shown for the client: a configured device's name, else what the router or mDNS
+    /// reports for the address (or a Kubernetes workload's `namespace/kind/name`). Only a
+    /// configured device's name works in a quick rule's `devices`; use the address for the others.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_name: Option<String>,
     /// The client's primary group.
@@ -1661,7 +1663,10 @@ pub struct RuleInput {
     /// The domain; its subdomains are included.
     #[schema(example = "game.example.com")]
     pub domain: String,
-    /// Device names, IPs, or CIDRs it applies to.
+    /// Who it applies to: the names of configured devices (`[[client]]`, any case), IPs, or CIDRs.
+    /// A name a router or a device gives an address (the query log's `clientName` for an unnamed
+    /// device) isn't a device here and is refused (422, with a hint): use the address, or name the
+    /// device first. A rule for an address stops matching when the address changes.
     #[serde(default)]
     pub devices: Vec<String>,
     /// Groups it applies to. With neither devices nor groups: everyone.

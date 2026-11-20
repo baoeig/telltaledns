@@ -1427,8 +1427,19 @@ A quick rule allows or blocks a site, and everything under it, for one device, a
 - allow something a list blocks by mistake while you report it.
 
 **Making one:**
-- In the **query log**, press **Why?** on a query and use **Make a quick rule**. The site, the device, and its group are filled in.
+- In the **query log**, press **Why?** on a query and use **Make a quick rule**. The site is filled in, and so is who it's for (see below): the device you've named if the address is one, otherwise the address itself. For a Kubernetes workload the rule starts for the workload's group, because its pods' addresses change.
 - On the **Quick rules** page (Filtering & DNS), which also lists what's in effect with a countdown, who made each rule, and Edit and Remove buttons.
+
+**Who a rule can be for:**
+- a **named device** (a `[[client]]`, or one you named with **Name this device…**), by its name in any case;
+- an **IP address**, or a **network** such as `192.168.1.0/24`;
+- a **group**, or everyone.
+
+The name the query log shows for a device nobody named here (for example `LGwebOSTV`) is what your router's DHCP or the device itself over mDNS calls it. It's good for recognizing the device, but it isn't a device TelltaleDNS knows, so a rule can't be for it: the form fills in the address and shows that name beside it, and the API refuses it (422) with a hint that names the address. The check doesn't depend on a node's own router or mDNS tables: every node gives the same answer.
+
+A rule for an address stops matching when the address changes (a new lease, a phone's private Wi-Fi address). Two ways to keep it:
+- give the device a fixed address in your router (a DHCP reservation);
+- **name the device** (click its address, then **Name this device…**) and make the rule for the name. Naming recognizes the device by the address it has now, so the name alone doesn't survive an address change; what it saves is the rules: change the device's `match` list once (in the config file, or `PUT /api/v1/clients/{name}`) instead of every rule. A device recognized by its MAC address (`match = ["aa:bb:cc:dd:ee:ff"]`) keeps its rules when its address changes, where TelltaleDNS can see MAC addresses (see **How a query's device is recognized** under Groups and devices).
 
 **Changing one:** press **Edit** on the rule. The form opens filled in, with the same preview as for a new rule, and **Save changes** replaces the rule under the same ID, so it applies on the next query. The rule keeps who made it and when (the audit log records who changed it, with the rule before and after). The end time stays as it was (**Keep the current end**) unless you pick a new duration, which counts from now. There is no Edit for rules in a config file (change the file), or for a rule made through the API for several devices or groups (use `PUT /api/v1/rules/{id}`).
 
