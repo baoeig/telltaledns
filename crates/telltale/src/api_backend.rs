@@ -2842,6 +2842,7 @@ impl Backend for ApiBackend {
                     }
                     .to_owned(),
                     definition: serde_json::to_value(e).ok(),
+                    credentials: None,
                 });
             }
             for (n, o) in stored {
@@ -2851,6 +2852,7 @@ impl Backend for ApiBackend {
                         name: n.clone(),
                         source: "hidden".to_owned(),
                         definition: None,
+                        credentials: None,
                     });
                 }
             }
@@ -2919,6 +2921,7 @@ impl Backend for ApiBackend {
                 }
                 .to_owned(),
                 definition: serde_json::to_value(&cfg.ratelimit).ok(),
+                credentials: None,
             });
         }
         // REQ: OBS-022 (T12.1) — likewise, the exclusions.
@@ -2933,6 +2936,7 @@ impl Backend for ApiBackend {
                 }
                 .to_owned(),
                 definition: serde_json::to_value(&cfg.exclusions).ok(),
+                credentials: None,
             });
         }
         // REQ: CLU-013 (T13.2) — likewise, the rollout settings.
@@ -2947,6 +2951,7 @@ impl Backend for ApiBackend {
                 }
                 .to_owned(),
                 definition: serde_json::to_value(&cfg.cluster.rollout).ok(),
+                credentials: None,
             });
         }
         // REQ: OBS-024 (T13.1) — likewise, the simulation settings.
@@ -2961,6 +2966,7 @@ impl Backend for ApiBackend {
                 }
                 .to_owned(),
                 definition: serde_json::to_value(&cfg.simulate).ok(),
+                credentials: None,
             });
         }
         // REQ: FLT-010 (T9.7)
@@ -2973,9 +2979,22 @@ impl Backend for ApiBackend {
                 &mut out,
             );
         }
-        // REQ: T8.2 (ADR-181) — the definitions name files, never the secrets themselves.
+        // REQ: T8.2 (ADR-181) — the definitions name files, never the secrets themselves. REQ:
+        // API-002, T8.2 (ADR-181) — each router's credentials have a status that takes no secret
+        // to read: saved, missing (enter it again), or not used on this node.
         if want("router") {
+            let start = out.len();
             rows("router", &cfg.router, &file.router, &e.routers, &mut out);
+            let check = crate::router_secrets::UseCheck::load(&self.src);
+            for entry in &mut out[start..] {
+                entry.credentials = entry
+                    .definition
+                    .as_ref()
+                    .and_then(|d| {
+                        serde_json::from_value::<telltale_config::RouterConfig>(d.clone()).ok()
+                    })
+                    .map(|r| check.status(&r));
+            }
         }
         // REQ: OBS-038
         if want("anomaly_mute") {
@@ -5320,8 +5339,24 @@ async fn run_managed_write(
         }
         return Ok(out);
     }
-    // ADR-181 — new files, removed again unless the change applies.
-    let written = secrets.write()?;
+    // REQ: T8.2, API-002 (ADR-181) — new key files, recorded for the router as planned (its
+    // name, credential and endpoint), removed again unless the entry naming them is stored.
+    let secrets = Arc::new(secrets);
+    let written = {
+        let (secrets, planned) = (
+            Arc::clone(&secrets),
+            (w.kind == ManagedKind::Router)
+                .then(|| {
+                    plan.after.as_ref().and_then(|a| {
+                        serde_json::from_value::<telltale_config::RouterConfig>(a.clone()).ok()
+                    })
+                })
+                .flatten(),
+        );
+        tokio::task::spawn_blocking(move || secrets.write(planned.as_ref()))
+            .await
+            .map_err(|e| Problem::internal(format!("request worker failed: {e}")))??
+    };
     let stored = {
         let (state, w, name, body, also) = (
             Arc::clone(&state),
@@ -5372,7 +5407,10 @@ async fn run_managed_write(
         ));
     }
     // Only once the change is in effect: the router's old files that nothing names now.
-    secrets.prune(&src);
+    if w.kind == ManagedKind::Router {
+        let src = Arc::clone(&src);
+        let _ = tokio::task::spawn_blocking(move || secrets.prune(&src)).await;
+    }
     Ok(change(true, version))
 }
 

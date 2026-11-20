@@ -1530,6 +1530,13 @@ pub struct ConfigEntry {
     /// hidden).
     #[schema(value_type = Option<Object>)]
     pub definition: Option<serde_json::Value>,
+    /// REQ: API-002, T8.2 (ADR-181) — a router's credentials, by name (`api_key`, `api_secret`,
+    /// `password`): `saved` (its file is on the node that answered, and that node uses it),
+    /// `missing` (no file there: enter the key again, as after a restore on another machine or a
+    /// failover), or `not_used` (the file is there, but it isn't one that node sends for this
+    /// router). Read without the secret. Absent for other kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// `GET /api/v1/config/entries` parameters.

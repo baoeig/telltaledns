@@ -2,8 +2,9 @@
 // saved as files on the node that took the write, driven through the real routes, sign-in and
 // backend. The router consoles here are loopback fakes; nothing leaves the machine.
 
+use std::io::{Read as _, Write as _};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -234,6 +235,31 @@ impl Node {
                 crate::managed::Ovr::Set(r) if n == name => Some(r),
                 _ => None,
             })
+    }
+
+    /// Stores a router as an earlier build, a backup or a hand edit would have.
+    fn store(&self, name: &str, body: &serde_json::Value) {
+        self.auth
+            .state()
+            .put_managed(
+                crate::managed::ROUTER,
+                name,
+                &body.to_string(),
+                None,
+                None,
+                now(),
+                "an older version",
+            )
+            .unwrap();
+    }
+
+    /// The routers in `GET /api/v1/config/entries?kind=router`, as `creds` sees them.
+    async fn routers(&self, creds: &Creds) -> Vec<serde_json::Value> {
+        let (s, v) = self
+            .send("GET", "/api/v1/config/entries?kind=router", creds, None)
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        v["items"].as_array().cloned().unwrap_or_default()
     }
 
     /// The key file the stored entry for `name` names.
@@ -602,4 +628,244 @@ async fn api_002_router_key_kept_when_the_client_goes_away() {
         std::fs::read_to_string(&f).ok().as_deref().map(str::trim),
         Some("the-key")
     );
+}
+
+/// A UniFi console on loopback. It answers `stat/sta` for any site with one device, and keeps,
+/// for every request, the site and the API key it came with.
+struct Console {
+    url: String,
+    asked: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl Console {
+    fn sites(&self) -> Vec<String> {
+        self.asked
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(s, _)| s.clone())
+            .collect()
+    }
+
+    fn key_for(&self, site: &str) -> Option<String> {
+        self.asked
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(s, _)| s == site)
+            .map(|(_, k)| k.clone())
+    }
+}
+
+fn console() -> Console {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let keep = Arc::clone(&asked);
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut c) = conn else { continue };
+            let _ = c.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !String::from_utf8_lossy(&buf).contains("\r\n\r\n") {
+                match c.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(k) => buf.extend_from_slice(&chunk[..k]),
+                }
+            }
+            let head = String::from_utf8_lossy(&buf).to_string();
+            let path = head.split_whitespace().nth(1).unwrap_or("").to_owned();
+            let key = head
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.trim()
+                        .eq_ignore_ascii_case("x-api-key")
+                        .then(|| v.trim().to_owned())
+                })
+                .unwrap_or_default();
+            let site = path
+                .strip_prefix("/proxy/network/api/s/")
+                .and_then(|r| r.strip_suffix("/stat/sta"))
+                .unwrap_or("")
+                .to_owned();
+            keep.lock().unwrap().push((site.clone(), key));
+            let body = serde_json::json!({"meta": {"rc": "ok"}, "data": [
+                {"mac": "02:00:00:00:07:01", "ip": "192.168.7.20", "name": format!("{site} device")}
+            ]})
+            .to_string();
+            let _ = write!(
+                c,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    Console { url, asked }
+}
+
+/// The router task, polling the routers in effect until the returned sender says stop.
+fn poll(
+    n: &Node,
+) -> (
+    tokio::sync::watch::Sender<bool>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let view = Arc::new(arc_swap::ArcSwap::from_pointee(
+        crate::devices::Leases::new(),
+    ));
+    let task = tokio::spawn(crate::routers::run(
+        Arc::clone(&n.src),
+        view,
+        stopped,
+        false,
+    ));
+    (stop, task)
+}
+
+// ---- T3: what a node polls with.
+
+/// REQ: API-002, T8.2 (ADR-181) — at use time, a router in effect that names a key file is polled
+/// only if this node's own config files define it with that file for the same endpoint, or the
+/// file is one this node wrote for that router (`.written`) under its `secrets/`. A stored entry
+/// that names another router's key (with another site), or a file outside `secrets/`, isn't
+/// polled; the files' router, a stored override of it that keeps its file and endpoint, and a
+/// router with its own pasted key are.
+#[tokio::test]
+async fn api_002_a_stored_router_naming_another_routers_key_is_not_polled() {
+    let n = Node::new(Reload::Applies);
+    let d = n.data();
+    let fake = console();
+    let udm_key = marker("udm-key");
+    let (s, v) = n
+        .put("udm", &n.admin, false, unifi(&fake.url, &udm_key))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let udm_file = n.key_file("udm").unwrap();
+    std::fs::create_dir_all(format!("{d}/outside")).unwrap();
+    for (f, k) in [
+        ("key", "outside-key"),
+        ("key2", "file-key"),
+        ("key3", "override-key"),
+    ] {
+        std::fs::write(format!("{d}/outside/{f}"), k).unwrap();
+    }
+    // The files' routers.
+    let mut file = (*n.src.file_config.load_full()).clone();
+    for (name, site, key) in [
+        ("c-file", "file", "key2"),
+        ("d-override", "override", "key3"),
+    ] {
+        file.router.push(
+            serde_json::from_value(serde_json::json!({
+                "name": name, "type": "unifi", "url": fake.url, "site": site,
+                "api_key_file": format!("{d}/outside/{key}"), "offline_days": 0,
+            }))
+            .unwrap(),
+        );
+    }
+    n.src.file_config.store(Arc::new(file));
+    // An override of a files' router that keeps its file and endpoint, and entries stored as an
+    // earlier build, a backup or a hand edit could have.
+    n.store(
+        "d-override",
+        &serde_json::json!({"name": "d-override", "type": "unifi", "url": fake.url, "site": "override",
+            "api_key_file": format!("{d}/outside/key3"), "offline_days": 0, "interval_secs": 60}),
+    );
+    n.store(
+        "a-evil",
+        &serde_json::json!({"name": "a-evil", "type": "unifi", "url": fake.url, "site": "evil",
+            "api_key_file": udm_file, "offline_days": 0}),
+    );
+    n.store(
+        "b-outside",
+        &serde_json::json!({"name": "b-outside", "type": "unifi", "url": fake.url, "site": "outside",
+            "api_key_file": format!("{d}/outside/key"), "offline_days": 0}),
+    );
+    apply(&n.src);
+    let order: Vec<String> = n
+        .src
+        .config
+        .load()
+        .router
+        .iter()
+        .map(|r| r.name.to_string())
+        .collect();
+    assert_eq!(
+        order,
+        ["c-file", "a-evil", "b-outside", "d-override", "udm"],
+        "the held ones come before the last one polled"
+    );
+    let (stop, task) = poll(&n);
+    wait_until("udm, the files' router and the override polled", 20, || {
+        let s = fake.sites();
+        ["default", "file", "override"]
+            .iter()
+            .all(|w| s.iter().any(|x| x == w))
+    })
+    .await;
+    let _ = stop.send(true);
+    let _ = task.await;
+    let sites = fake.sites();
+    assert!(
+        !sites.iter().any(|s| s == "evil" || s == "outside"),
+        "the held routers weren't polled: {:?}",
+        fake.asked.lock().unwrap()
+    );
+    assert_eq!(fake.key_for("default").as_deref(), Some(udm_key.as_str()));
+    assert_eq!(fake.key_for("file").as_deref(), Some("file-key"));
+    assert_eq!(fake.key_for("override").as_deref(), Some("override-key"));
+    // Through the API too: an administrator's override of the files' router that keeps its file
+    // (outside secrets/) and its endpoint is accepted, since it is what the node uses already.
+    let (s, v) = n
+        .put(
+            "c-file",
+            &n.admin,
+            true,
+            serde_json::json!({"type": "unifi", "url": fake.url, "site": "file",
+                "api_key_file": format!("{d}/outside/key2"), "offline_days": 0, "interval_secs": 60}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+}
+
+// ---- Decision 1: the status needs no secret to read.
+
+/// REQ: API-002, T8.2 (ADR-181) — a router's credentials have a status anyone who may read the
+/// configuration sees, read without the secret: `saved`, `missing` once the file is gone (after a
+/// restore elsewhere, or a failover: enter it again), and `not_used` for a stored entry naming a
+/// file this node won't send for it. Entering the key again makes it `saved`.
+#[tokio::test]
+async fn api_002_a_router_whose_key_file_is_gone_says_key_missing() {
+    let n = Node::new(Reload::Applies);
+    let (s, v) = n.put("udm", &n.admin, false, unifi(HERE, "k1")).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let status = |items: &[serde_json::Value], name: &str| {
+        items
+            .iter()
+            .find(|e| e["name"] == name)
+            .map(|e| e["credentials"]["api_key"].clone())
+            .unwrap_or_default()
+    };
+    for creds in [&n.admin, &n.viewer] {
+        assert_eq!(status(&n.routers(creds).await, "udm"), "saved");
+    }
+    let f = n.key_file("udm").unwrap();
+    std::fs::remove_file(&f).unwrap();
+    for creds in [&n.admin, &n.viewer] {
+        assert_eq!(status(&n.routers(creds).await, "udm"), "missing");
+    }
+    let (s, v) = n.put("udm", &n.admin, false, unifi(HERE, "k2")).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    n.store(
+        "a-evil",
+        &serde_json::json!({"name": "a-evil", "type": "unifi", "url": HERE, "site": "evil",
+            "api_key_file": n.key_file("udm").unwrap(), "offline_days": 0}),
+    );
+    apply(&n.src);
+    let items = n.routers(&n.viewer).await;
+    assert_eq!(status(&items, "udm"), "saved");
+    assert_eq!(status(&items, "a-evil"), "not_used");
 }

@@ -71,12 +71,33 @@ fn allowed_with(look: &Look, path: &str, data_dir: &str) -> bool {
     let Some(p) = written(path) else {
         return false;
     };
-    let roots = roots(data_dir);
-    if !inside(look, &p, &roots) {
+    within(look, &p, &roots(data_dir))
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — whether `path` is in this node's `<data_dir>/secrets/` folder,
+/// by the rule of [`allowed`] (normal form, compared by components as written and with its links
+/// followed) with that folder the only one: where the API writes a router's pasted key, and the
+/// only place a key file it recorded is used from, or removed from. Blocking.
+pub(crate) fn in_data_secrets(path: &str, data_dir: &str) -> bool {
+    in_data_secrets_with(&FS, path, data_dir)
+}
+
+/// [`in_data_secrets`], asking `look`.
+fn in_data_secrets_with(look: &Look, path: &str, data_dir: &str) -> bool {
+    let (Some(p), Some(d)) = (written(path), written(data_dir.trim_end_matches('/'))) else {
+        return false;
+    };
+    within(look, &p, &[d.join("secrets")])
+}
+
+/// `p` (in normal form) is strictly under one of `roots`, as written and with its links followed
+/// against the folders with theirs followed.
+fn within(look: &Look, p: &Path, roots: &[PathBuf]) -> bool {
+    if !inside(look, p, roots) {
         return false;
     }
     // The same, with links followed.
-    let Some(real) = resolve(look, &p, 0) else {
+    let Some(real) = resolve(look, p, 0) else {
         return false;
     };
     let real_roots: Vec<PathBuf> = roots.iter().filter_map(|r| resolve(look, r, 0)).collect();
@@ -279,6 +300,38 @@ mod tests {
             &format!("{}/secrets/token", link.to_str().unwrap()),
             link.to_str().unwrap()
         ));
+    }
+
+    /// REQ: API-002, T8.2 (ADR-181) — a router key the API wrote is in the data directory's
+    /// `secrets/` and nowhere else: the other folders for secrets, the data directory itself, a
+    /// path not in normal form, and a link that leads out are not.
+    #[cfg(unix)]
+    #[test]
+    fn api_002_a_router_key_is_in_the_data_directorys_secrets_folder() {
+        use std::os::unix::fs::symlink;
+        let d = Dir::new("router-keys");
+        let data = d.s();
+        let sec = d.0.join("secrets");
+        std::fs::create_dir_all(&sec).unwrap();
+        std::fs::write(sec.join("router-udm.api_key.1"), "k").unwrap();
+        std::fs::write(d.0.join("state.db"), "db").unwrap();
+        symlink(d.0.join("state.db"), sec.join("to-state")).unwrap();
+        let p = |s: &str| format!("{data}/secrets/{s}");
+        for ok in ["router-udm.api_key.1", "not-yet"] {
+            assert!(in_data_secrets(&p(ok), &data), "{ok}");
+        }
+        for bad in [
+            p("to-state"),
+            p("../state.db"),
+            format!("{data}/secrets"),
+            format!("{data}/state.db"),
+            "/run/secrets/udm-key".to_owned(),
+            "/etc/telltale-secrets/udm/api_key".to_owned(),
+            "secrets/router-udm.api_key.1".to_owned(),
+        ] {
+            assert!(!in_data_secrets(&bad, &data), "{bad}");
+        }
+        assert!(!in_data_secrets(&p("router-udm.api_key.1"), "relative"));
     }
 
     /// REQ: OBS-010 (ADR-179) — fails closed: a path whose links can't be looked at (a folder on

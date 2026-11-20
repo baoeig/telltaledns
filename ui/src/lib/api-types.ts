@@ -4339,6 +4339,16 @@ export interface components {
          */
         ConfigEntry: {
             /**
+             * @description REQ: API-002, T8.2 (ADR-181) — a router's credentials, by name (`api_key`, `api_secret`,
+             *     `password`): `saved` (its file is on the node that answered, and that node uses it),
+             *     `missing` (no file there: enter the key again, as after a restore on another machine or a
+             *     failover), or `not_used` (the file is there, but it isn't one that node sends for this
+             *     router). Read without the secret. Absent for other kinds.
+             */
+            credentials?: {
+                [key: string]: string;
+            } | null;
+            /**
              * @description The definition in effect, with the same fields as in `telltale.toml` (absent when
              *     hidden).
              */
@@ -5435,6 +5445,16 @@ export interface components {
         /** @description A list wrapper used by every collection endpoint. */
         Items_ConfigEntry: {
             items: {
+                /**
+                 * @description REQ: API-002, T8.2 (ADR-181) — a router's credentials, by name (`api_key`, `api_secret`,
+                 *     `password`): `saved` (its file is on the node that answered, and that node uses it),
+                 *     `missing` (no file there: enter the key again, as after a restore on another machine or a
+                 *     failover), or `not_used` (the file is there, but it isn't one that node sends for this
+                 *     router). Read without the secret. Absent for other kinds.
+                 */
+                credentials?: {
+                    [key: string]: string;
+                } | null;
                 /**
                  * @description The definition in effect, with the same fields as in `telltale.toml` (absent when
                  *     hidden).

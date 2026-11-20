@@ -62,9 +62,36 @@ fn secret(path: Option<&telltale_config::SafeString>) -> Result<Option<String>, 
     path.map(|p| {
         std::fs::read_to_string(p.as_str())
             .map(|s| s.trim().to_owned())
-            .map_err(|e| format!("{}: {e}", p.as_str()))
+            .map_err(|e| {
+                // REQ: T8.2 (ADR-181) — after a restore elsewhere or a failover the key isn't
+                // on this node: say what to do, not only that the file is missing.
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    format!(
+                        "{}: the key file isn't on this node (key missing: enter it again under Clients → Discovered → Routers, or put the file there)",
+                        p.as_str()
+                    )
+                } else {
+                    format!("{}: {e}", p.as_str())
+                }
+            })
     })
     .transpose()
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — the routers this node holds back (a key file it won't send for
+/// them), by name, with why: each is logged when it is first held or its reason changes, not at
+/// every round. Returns the ones to log.
+fn held_now(
+    held: &mut HashMap<String, String>,
+    now: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let fresh: Vec<(String, String)> = now
+        .iter()
+        .filter(|(n, why)| held.get(n) != Some(why))
+        .cloned()
+        .collect();
+    *held = now.into_iter().collect();
+    fresh
 }
 
 fn base64(input: &[u8]) -> String {
@@ -420,6 +447,7 @@ fn rebuild(parts: &HashMap<String, Polled>, view: &ArcSwap<Leases>) {
 /// Polls every `[[router]]` until `stop`. `resolver_pod`: a Helm resolver pod, which has the
 /// routers' settings but not their key files (ADR-120), logs its failures as info; the
 /// controller, which serves the names in the UI, warns.
+#[allow(clippy::too_many_lines)] // one round: which routers to hold back, the polls, the wait
 pub(crate) async fn run(
     sources: Arc<crate::http::Sources>,
     view: Arc<ArcSwap<Leases>>,
@@ -431,6 +459,7 @@ pub(crate) async fn run(
         Arc::new(telltale_filter::fetch::SystemResolver);
     let mut parts: HashMap<String, Polled> = HashMap::new();
     let mut failing: HashMap<String, bool> = HashMap::new();
+    let mut held: HashMap<String, String> = HashMap::new();
     // The routers last read: one removed, or now pointing at another device (type, address,
     // site), drops its answer, so no names linger from a router that's gone (ADR-181). Other
     // changes (credentials, TLS, timing) keep it until the next answer replaces it.
@@ -453,7 +482,33 @@ pub(crate) async fn run(
             .map(|r| r.interval_secs.max(30))
             .min()
             .unwrap_or(300);
+        // REQ: API-002, T8.2 (ADR-181) — the use-time rule, worked out for this round: a router
+        // whose key file this node won't send for it isn't polled, and keeps no names. If the
+        // check can't run, none with a key file is polled (fails closed).
+        let check = {
+            let s = Arc::clone(&sources);
+            tokio::task::spawn_blocking(move || crate::router_secrets::UseCheck::load(&s))
+                .await
+                .unwrap_or_default()
+        };
+        let refused: Vec<(String, String)> = routers
+            .iter()
+            .filter_map(|r| check.refused(r).map(|why| (r.name.to_string(), why)))
+            .collect();
+        let primary = sources.cluster.as_ref().is_none_or(|c| c.is_primary());
+        for (name, why) in held_now(&mut held, refused) {
+            if resolver_pod || !primary {
+                info!(router = %name, reason = %why, "router integration: not read on this node");
+            } else {
+                warn!(router = %name, reason = %why, "router integration: not read on this node");
+            }
+        }
         for r in &routers {
+            if held.contains_key(r.name.as_str()) {
+                parts.remove(r.name.as_str());
+                failing.remove(r.name.as_str());
+                continue;
+            }
             let client = if r.tls_insecure_skip_verify {
                 telltale_filter::fetch::Client::insecure(Arc::clone(&resolver))
             } else if let Some(p) = &r.tls_ca {
@@ -717,6 +772,34 @@ mod tests {
         assert_eq!(
             (phone.hostname.as_deref(), phone.offline),
             (Some("Old phone"), true)
+        );
+    }
+
+    /// REQ: API-002, T8.2 (ADR-181) — a router held back is logged when it is first held and when
+    /// its reason changes, not at every round; one no longer held is forgotten, so it is logged
+    /// again if it is held again.
+    #[test]
+    fn api_002_a_held_router_is_logged_once_per_reason() {
+        let mut held = HashMap::new();
+        let v = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+                .collect()
+        };
+        assert_eq!(
+            held_now(&mut held, v(&[("evil", "a")])),
+            v(&[("evil", "a")])
+        );
+        assert_eq!(held_now(&mut held, v(&[("evil", "a")])), v(&[]));
+        assert_eq!(
+            held_now(&mut held, v(&[("evil", "b")])),
+            v(&[("evil", "b")])
+        );
+        assert_eq!(held_now(&mut held, v(&[])), v(&[]));
+        assert_eq!(
+            held_now(&mut held, v(&[("evil", "b")])),
+            v(&[("evil", "b")])
         );
     }
 

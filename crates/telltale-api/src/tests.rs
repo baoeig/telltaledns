@@ -3237,6 +3237,7 @@ impl Backend for ParkingBackend {
             name: "from-the-gate".into(),
             source: "added".into(),
             definition: None,
+            credentials: None,
         }]
     }
     /// 4242 when the gate opened (the primary's version), 0 otherwise (a replica's own).

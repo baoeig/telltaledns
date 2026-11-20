@@ -1,9 +1,9 @@
 //! REQ: T8.2, API-002 (ADR-181) — the credentials of a router set through the API or the UI.
 //!
 //! A router body may carry `api_key`, `api_secret`, or `password`. Each pasted value is written
-//! to a new file under `<data_dir>/secrets/` (0600, in a 0700 directory, created exclusively,
-//! so nothing is ever overwritten) and only that file's path is stored, listed, audited, or
-//! returned. The rules, from the reviews:
+//! to a new file under `<data_dir>/secrets/` (0600, in a 0700 directory, created exclusively and
+//! synced with its directory, so nothing is ever overwritten) and only that file's path is
+//! stored, listed to administrators, audited, or replicated. The rules, from the reviews:
 //! - **Paste only.** A body never names a key file: the poll sends a file's content to the
 //!   router's address, so a named file would let a writer send another router's key, or any
 //!   file the process can read, to an address of their choosing. The one exception is the file
@@ -14,18 +14,28 @@
 //!   was entered for the old endpoint and isn't sent to a new one without being typed again.
 //! - **Over https.** A pasted key goes to a router reached over `https://`, or at a loopback
 //!   address.
-//! - **Written as new files, switched to after the change applies.** A failed or conflicting
-//!   change removes what it wrote; the key in use is never replaced in place.
-//! - **Only what the API wrote is removed.** `secrets/.written` lists the files the API
-//!   created; a router's old files are removed once nothing in effect names them, and only if
-//!   they are on that list.
+//! - **Used for the router it was saved for.** `secrets/.written` records each file the API
+//!   wrote: for which router, which credential, and the endpoint the key was entered for. A node
+//!   sends a key file for a router in effect only if its own config files define that router
+//!   with that file at the same endpoint, or the file is recorded there for that router,
+//!   credential and endpoint and lies in its `secrets/` ([`UseCheck`]). Otherwise the router isn't
+//!   polled here and its status says why: a stored entry naming another router's key, a line an
+//!   earlier build wrote, a restored or hand-edited `state.db`, a replica's copy of a router whose
+//!   key is on another node.
+//! - **Written as new files, kept once stored.** A change that fails or conflicts before its
+//!   entry is stored removes what it wrote; the key in use is never replaced in place.
+//! - **Only what the API wrote is removed.** A router's old files are removed once nothing in
+//!   effect names them, and only if they are recorded and in `secrets/`.
 
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use telltale_api::problem::{Code, Problem};
 use telltale_api::{ManagedKind, ManagedWrite};
 use telltale_config::RouterConfig;
+use tracing::warn;
 
 use crate::http::Sources;
 
@@ -45,12 +55,11 @@ pub(crate) fn secrets_dir(data_dir: &str) -> PathBuf {
     Path::new(data_dir).join("secrets")
 }
 
-/// A router's credential files, as configured.
-fn files_of(r: &RouterConfig) -> impl Iterator<Item = PathBuf> + '_ {
-    [&r.api_key_file, &r.api_secret_file, &r.password_file]
+/// A router's credential files, as configured: (credential, its file field, the file).
+fn files_of(r: &RouterConfig) -> impl Iterator<Item = (&'static str, &'static str, &str)> + '_ {
+    FIELDS
         .into_iter()
-        .flatten()
-        .map(|f| PathBuf::from(f.as_str()))
+        .filter_map(|(field, file_field)| file_of(r, file_field).map(|f| (field, file_field, f)))
 }
 
 /// The configured file for one credential field.
@@ -64,8 +73,9 @@ fn file_of<'a>(r: &'a RouterConfig, file_field: &str) -> Option<&'a str> {
 }
 
 /// A new file name for a pasted secret: `secrets/router-<name>.<field>.<random>` (the name made
-/// safe for a file name, with a hash when that changed it).
-fn new_secret_file(data_dir: &str, name: &str, field: &str) -> PathBuf {
+/// safe for a file name, with a hash when that changed or shortened it). REQ: T8.2 (ADR-181) —
+/// F9: a random source that fails is an error, not a name of zeros.
+fn new_secret_file(data_dir: &str, name: &str, field: &str) -> Result<PathBuf, Problem> {
     let slug: String = name
         .chars()
         .map(|c| {
@@ -76,19 +86,22 @@ fn new_secret_file(data_dir: &str, name: &str, field: &str) -> PathBuf {
             }
         })
         .collect();
-    let slug = if slug == name {
+    let slug = if slug == name && slug.len() <= 64 {
         slug
     } else {
         let hash = blake3::hash(name.as_bytes()).to_hex();
-        format!("{slug}-{}", hash.as_str().get(..8).unwrap_or_default())
+        let short: String = slug.chars().take(48).collect();
+        format!("{short}-{}", hash.as_str().get(..8).unwrap_or_default())
     };
     let mut r = [0u8; 8];
-    let _ = ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut r);
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut r).map_err(|_| {
+        Problem::internal("couldn't name the key file: the system's random source failed")
+    })?;
     let tag = r.iter().fold(String::new(), |mut t, b| {
         let _ = std::fmt::Write::write_fmt(&mut t, format_args!("{b:02x}"));
         t
     });
-    secrets_dir(data_dir).join(format!("router-{slug}.{field}.{tag}"))
+    Ok(secrets_dir(data_dir).join(format!("router-{slug}.{field}.{tag}")))
 }
 
 /// The hint of every refusal that asks for the key: the body carries the key, never a path.
@@ -141,32 +154,78 @@ fn loopback(rest: &str) -> bool {
         .is_ok_and(|ip| ip.is_loopback())
 }
 
+/// REQ: T8.2, API-002 (ADR-181) — where a router's keys are sent: its type, address, site and
+/// TLS settings. A key is used only for the endpoint it was entered for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Endpoint {
+    #[serde(rename = "type")]
+    kind: String,
+    url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    site: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tls_ca: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tls_server_name: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    tls_insecure_skip_verify: bool,
+}
+
+/// A setting as an endpoint compares it: trimmed, and empty is none.
+fn setting(v: Option<&str>) -> Option<String> {
+    v.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+impl Endpoint {
+    fn of(r: &RouterConfig) -> Self {
+        Self {
+            kind: serde_json::to_value(r.kind)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default(),
+            url: r.url.trim().to_owned(),
+            site: setting(r.site.as_deref()),
+            tls_ca: setting(r.tls_ca.as_deref()),
+            tls_server_name: setting(r.tls_server_name.as_deref()),
+            tls_insecure_skip_verify: r.tls_insecure_skip_verify,
+        }
+    }
+
+    /// The endpoint a router body says, compared the same way.
+    fn of_body(o: &serde_json::Map<String, serde_json::Value>) -> Self {
+        let s = |k: &str| setting(o.get(k).and_then(serde_json::Value::as_str));
+        Self {
+            kind: s("type").unwrap_or_default(),
+            url: s("url").unwrap_or_default(),
+            site: s("site"),
+            tls_ca: s("tls_ca"),
+            tls_server_name: s("tls_server_name"),
+            tls_insecure_skip_verify: o
+                .get("tls_insecure_skip_verify")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        }
+    }
+}
+
 /// Whether the body sends credentials somewhere other than `current` does: another type,
 /// address, site, or TLS setting.
 fn endpoint_changed(
     current: &RouterConfig,
     o: &serde_json::Map<String, serde_json::Value>,
 ) -> bool {
-    let s = |k: &str| {
-        o.get(k)
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-    };
-    let cur = |v: &Option<telltale_config::SafeString>| v.as_ref().map(ToString::to_string);
-    let kind = serde_json::to_value(current.kind)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_owned));
-    s("type") != kind
-        || s("url").as_deref() != Some(current.url.as_str())
-        || s("site") != cur(&current.site)
-        || s("tls_ca") != cur(&current.tls_ca)
-        || s("tls_server_name") != cur(&current.tls_server_name)
-        || o.get("tls_insecure_skip_verify")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-            != current.tls_insecure_skip_verify
+    Endpoint::of(current) != Endpoint::of_body(o)
+}
+
+/// A pasted value and the new file it goes to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct NewKey {
+    /// The credential (`api_key`, `api_secret`, `password`).
+    field: &'static str,
+    file: PathBuf,
+    value: String,
 }
 
 /// A router write's credentials, prepared: the body already names the files.
@@ -174,7 +233,7 @@ fn endpoint_changed(
 pub(crate) struct Prepared {
     data_dir: String,
     /// New files and what goes in them.
-    writes: Vec<(PathBuf, String)>,
+    writes: Vec<NewKey>,
     /// The router's files before the change (removed after it, if the API wrote them and
     /// nothing in effect names them).
     old: Vec<PathBuf>,
@@ -200,7 +259,9 @@ pub(crate) fn prepare(
     let data_dir = file.node.data_dir.to_string();
     let name = w.name.trim().to_owned();
     let current = before.router.iter().find(|r| r.name.as_str() == name);
-    let old = current.map(|c| files_of(c).collect()).unwrap_or_default();
+    let old = current
+        .map(|c| files_of(c).map(|(_, _, f)| PathBuf::from(f)).collect())
+        .unwrap_or_default();
     let writes = match w.body.as_mut() {
         Some(b) => prepare_body(&data_dir, &name, current, b)?,
         None => Vec::new(),
@@ -218,7 +279,7 @@ pub(crate) fn prepare_body(
     name: &str,
     current: Option<&RouterConfig>,
     body: &mut serde_json::Value,
-) -> Result<Vec<(PathBuf, String)>, Problem> {
+) -> Result<Vec<NewKey>, Problem> {
     use serde_json::Value;
     let Some(o) = body.as_object_mut() else {
         return Ok(Vec::new());
@@ -246,10 +307,14 @@ pub(crate) fn prepare_body(
         }
         let file = match secret {
             // A pasted value: a new file, never one that exists (created exclusively).
-            Some(v) => {
-                let f = new_secret_file(data_dir, name, field);
+            Some(value) => {
+                let f = new_secret_file(data_dir, name, field)?;
                 let path = f.to_string_lossy().into_owned();
-                out.push((f, v));
+                out.push(NewKey {
+                    field,
+                    file: f,
+                    value,
+                });
                 Some(path)
             }
             // ADR-181 (review) — a key isn't sent to an endpoint it wasn't entered for.
@@ -280,41 +345,85 @@ pub(crate) fn prepare_body(
 }
 
 impl Prepared {
-    /// Writes the new files (never on a dry run). They're removed again when the returned
-    /// guard is dropped without [`Written::keep`]: the change failed or conflicted.
-    pub(crate) fn write(&self) -> Result<Written, Problem> {
+    /// Writes the new files for `router` (the router as planned; never on a dry run), each
+    /// recorded in `.written` first, for that router, credential and endpoint. They're removed
+    /// again, with their records, when the returned guard is dropped without [`Written::keep`]:
+    /// the change failed or conflicted before its entry was stored. Blocking.
+    pub(crate) fn write(&self, router: Option<&RouterConfig>) -> Result<Written, Problem> {
         let mut done = Written {
             data_dir: self.data_dir.clone(),
-            files: Vec::new(),
+            recorded: Vec::new(),
+            made: Vec::new(),
             kept: false,
         };
-        for (path, value) in &self.writes {
-            write_new(path, value).map_err(|e| {
-                Problem::internal(format!(
-                    "{}: couldn't write the secret: {e}",
-                    path.display()
-                ))
+        if self.writes.is_empty() {
+            return Ok(done);
+        }
+        let Some(r) = router else {
+            return Err(Problem::internal(
+                "the planned router is missing; no key was saved",
+            ));
+        };
+        let dir = secrets_dir(&self.data_dir);
+        private_dir(&dir).map_err(|e| {
+            Problem::internal(format!(
+                "{}: couldn't make the folder for the key: {e}",
+                dir.display()
+            ))
+        })?;
+        // Recorded first: a file made and then left behind by a crash is on the list, for the
+        // sweep (ADR-181).
+        let records: Vec<Record> = self
+            .writes
+            .iter()
+            .map(|k| Record {
+                router: Some(r.name.to_string()),
+                field: Some(k.field.to_owned()),
+                endpoint: Some(Endpoint::of(r)),
+                file: k.file.clone(),
+            })
+            .collect();
+        add_records(&self.data_dir, &records).map_err(|e| {
+            Problem::internal(format!(
+                "{}: couldn't record the new key file: {e}",
+                dir.join(WRITTEN).display()
+            ))
+        })?;
+        done.recorded = records.into_iter().map(|x| x.file).collect();
+        for k in &self.writes {
+            write_new(&k.file, &k.value).map_err(|e| {
+                Problem::internal(format!("{}: couldn't write the key: {e}", k.file.display()))
             })?;
-            done.files.push(path.clone());
-            note_written(&self.data_dir, path, true);
+            done.made.push(k.file.clone());
         }
         Ok(done)
     }
 
     /// After the change applied: the router's old files the API wrote, that nothing in effect
-    /// names any more, are removed (best effort: a file left behind is only untidy).
+    /// names any more, are removed with their records (best effort: a file left behind is only
+    /// untidy). Blocking.
     pub(crate) fn prune(&self, src: &Sources) {
         if self.old.is_empty() {
             return;
         }
         let cfg = src.config.load();
-        let written = read_written(&self.data_dir);
+        let Ok(records) = read_records(&self.data_dir) else {
+            return;
+        };
+        let mut gone = Vec::new();
         for f in &self.old {
-            let used = cfg.router.iter().any(|r| files_of(r).any(|x| &x == f));
-            if !used && written.contains(f) {
-                let _ = std::fs::remove_file(f);
-                note_written(&self.data_dir, f, false);
+            let used = cfg
+                .router
+                .iter()
+                .any(|r| files_of(r).any(|(_, _, x)| Path::new(x) == f));
+            let ours = records.iter().any(|x| &x.file == f)
+                && crate::secret_path::in_data_secrets(&f.to_string_lossy(), &self.data_dir);
+            if !used && ours && remove(f) {
+                gone.push(f.clone());
             }
+        }
+        if let Err(e) = remove_records(&self.data_dir, &gone) {
+            warn!(error = %e, "router keys: couldn't update the list of key files written");
         }
     }
 }
@@ -322,7 +431,10 @@ impl Prepared {
 /// The files a write created, removed on drop unless kept.
 pub(crate) struct Written {
     data_dir: String,
-    files: Vec<PathBuf>,
+    /// Recorded in `.written` (un-recorded on drop).
+    recorded: Vec<PathBuf>,
+    /// Created by this write (removed on drop): never a file that was there before.
+    made: Vec<PathBuf>,
     kept: bool,
 }
 
@@ -337,63 +449,257 @@ impl Drop for Written {
         if self.kept {
             return;
         }
-        for f in &self.files {
+        for f in &self.made {
             let _ = std::fs::remove_file(f);
-            note_written(&self.data_dir, f, false);
+        }
+        if let Err(e) = remove_records(&self.data_dir, &self.recorded) {
+            warn!(error = %e, "router keys: couldn't update the list of key files written");
         }
     }
 }
 
-/// Creates `path` (it must not exist) with `value`, readable only by this user, in a 0700
-/// directory. A partial file is removed.
+/// Removes `f`; true when it's gone (or was already).
+fn remove(f: &Path) -> bool {
+    match std::fs::remove_file(f) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            warn!(file = %f.display(), error = %e, "router keys: couldn't remove a key file");
+            false
+        }
+    }
+}
+
+/// REQ: T8.2 (ADR-181) — F9: `dir`, made with 0700 on every level this creates, and 0700 itself.
+fn private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+/// Makes what was just created or renamed in `dir` durable.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+/// Creates `path` (it must not exist) with `value`, readable only by this user, synced with its
+/// directory (F9). A partial file is removed.
 fn write_new(path: &Path, value: &str) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(dir)?;
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        use std::os::unix::fs::OpenOptionsExt as _;
         o.mode(0o600);
     }
     let mut f = o.open(path)?;
-    let r = f.write_all(value.as_bytes()).and_then(|()| f.sync_all());
+    let r = f
+        .write_all(value.as_bytes())
+        .and_then(|()| f.sync_all())
+        .and_then(|()| sync_dir(dir));
     if r.is_err() {
         let _ = std::fs::remove_file(path);
     }
     r
 }
 
-/// The files the API wrote (`secrets/.written`, one path a line).
-fn read_written(data_dir: &str) -> Vec<PathBuf> {
-    std::fs::read_to_string(secrets_dir(data_dir).join(WRITTEN))
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(PathBuf::from)
-        .collect()
+/// REQ: T8.2 (ADR-181) — one file the API wrote, a line of `secrets/.written` (JSON).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Record {
+    /// The router it was written for, the credential, and the endpoint the key was entered for.
+    /// All absent in a line an earlier build wrote (the path alone): such a file is never used
+    /// for any router, only removed once nothing names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    router: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoint: Option<Endpoint>,
+    file: PathBuf,
 }
 
-/// Adds `path` to, or removes it from, the list of files the API wrote. Configuration writes
-/// run one at a time, so this needs no lock of its own.
-fn note_written(data_dir: &str, path: &Path, add: bool) {
-    let mut list = read_written(data_dir);
-    list.retain(|p| p != path);
-    if add {
-        list.push(path.to_path_buf());
+/// What `secrets/.written` records (none when there's no list yet).
+fn read_records(data_dir: &str) -> std::io::Result<Vec<Record>> {
+    let text = match std::fs::read_to_string(secrets_dir(data_dir).join(WRITTEN)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            serde_json::from_str(l).unwrap_or_else(|_| Record {
+                router: None,
+                field: None,
+                endpoint: None,
+                file: PathBuf::from(l),
+            })
+        })
+        .collect())
+}
+
+/// REQ: T8.2 (ADR-181) — F9: replaces the list, durably (a private temporary file, synced,
+/// renamed over it, the folder synced). Configuration writes, and the sweep, run one at a time
+/// (`config_writes`), so this needs no lock of its own.
+fn write_records(data_dir: &str, records: &[Record]) -> std::io::Result<()> {
+    let dir = secrets_dir(data_dir);
+    let mut text = String::new();
+    for r in records {
+        text.push_str(&serde_json::to_string(r).map_err(std::io::Error::other)?);
+        text.push('\n');
     }
-    let text = list.iter().fold(String::new(), |mut t, p| {
-        t.push_str(&p.to_string_lossy());
-        t.push('\n');
-        t
-    });
-    let file = secrets_dir(data_dir).join(WRITTEN);
-    let mut tmp = file.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    if std::fs::write(&tmp, text).is_ok() {
-        let _ = std::fs::rename(&tmp, &file);
+    let tmp = dir.join(".written.tmp");
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        o.mode(0o600);
+    }
+    let mut f = o.open(&tmp)?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, dir.join(WRITTEN))?;
+    sync_dir(&dir)
+}
+
+/// Adds `new` to the list. A file already on it is refused (a name that came up twice): its
+/// record stays as it is, and nothing is added.
+fn add_records(data_dir: &str, new: &[Record]) -> std::io::Result<()> {
+    let mut list = read_records(data_dir)?;
+    if new.iter().any(|n| list.iter().any(|x| x.file == n.file)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "a key file of that name is already recorded",
+        ));
+    }
+    list.extend(new.iter().cloned());
+    write_records(data_dir, &list)
+}
+
+/// Takes `files` off the list.
+fn remove_records(data_dir: &str, files: &[PathBuf]) -> std::io::Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let mut list = read_records(data_dir)?;
+    let before = list.len();
+    list.retain(|x| !files.contains(&x.file));
+    if list.len() == before {
+        return Ok(());
+    }
+    write_records(data_dir, &list)
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — which key files this node sends for the routers in effect (the
+/// use-time rule), and each router's credential status.
+#[derive(Debug, Default)]
+pub(crate) struct UseCheck {
+    data_dir: String,
+    /// The routers this node's administrators define: its config files and, on a node that takes
+    /// the cluster's configuration from Git, the commit in use. None while the files couldn't be
+    /// read at start-up (`file_config` then holds the running configuration, API entries and all).
+    own: Vec<RouterConfig>,
+    /// What `.written` records; `None` when it couldn't be read, so nothing counts as written
+    /// (fails closed).
+    written: Option<Vec<Record>>,
+}
+
+impl UseCheck {
+    /// The check for this node now. Blocking (it reads `.written` and the commit in use).
+    pub(crate) fn load(src: &Sources) -> Self {
+        let file = src.file_config.load_full();
+        let data_dir = file.node.data_dir.to_string();
+        let own = if src.files_unread.load(std::sync::atomic::Ordering::Acquire) {
+            Vec::new()
+        } else {
+            let mut own = file.router.clone();
+            if file.cluster.git.is_some()
+                && let Some(list) = crate::gitsource::shared(&file)
+                    .as_ref()
+                    .and_then(|s| s.get("router"))
+                && let Ok(git) = serde_json::from_value::<Vec<RouterConfig>>(list.clone())
+            {
+                own.extend(git);
+            }
+            own
+        };
+        let written = read_records(&data_dir).ok();
+        Self {
+            data_dir,
+            own,
+            written,
+        }
+    }
+
+    /// Whether this node sends `file` as `r`'s `field` (`file_field` in the configuration).
+    fn usable(&self, r: &RouterConfig, field: &str, file_field: &str, file: &str) -> bool {
+        let at = Endpoint::of(r);
+        // The node's own: its files define this router with this file for this endpoint (an
+        // API entry that keeps the file and the endpoint of the files' router counts).
+        if self.own.iter().any(|o| {
+            o.name == r.name && file_of(o, file_field) == Some(file) && Endpoint::of(o) == at
+        }) {
+            return true;
+        }
+        // Saved here, through the API, for this router, credential and endpoint.
+        self.written.as_ref().is_some_and(|w| {
+            w.iter().any(|x| {
+                x.router.as_deref() == Some(r.name.as_str())
+                    && x.field.as_deref() == Some(field)
+                    && x.endpoint.as_ref() == Some(&at)
+                    && x.file == Path::new(file)
+            })
+        }) && crate::secret_path::in_data_secrets(file, &self.data_dir)
+    }
+
+    /// Why this node doesn't poll `r`, if it doesn't: a key file it won't send for it.
+    pub(crate) fn refused(&self, r: &RouterConfig) -> Option<String> {
+        let (field, file_field, _) = files_of(r)
+            .find(|(field, file_field, file)| !self.usable(r, field, file_field, file))?;
+        Some(format!(
+            "not read on this node: its `{file_field}` isn't a key this node saved for this router at this address, and this node's config files don't define the router with it; an administrator can enter the {field} again (Clients → Discovered → Routers)"
+        ))
+    }
+
+    /// Each credential `r` names, by its body name: `saved` (the file is there and this node
+    /// uses it), `missing` (no file there on this node: enter it again), or `not_used` (there,
+    /// but not one this node sends for this router). Nothing in a file is read.
+    pub(crate) fn status(&self, r: &RouterConfig) -> BTreeMap<String, String> {
+        files_of(r)
+            .map(|(field, file_field, file)| {
+                let s = if !Path::new(file).is_file() {
+                    "missing"
+                } else if self.usable(r, field, file_field, file) {
+                    "saved"
+                } else {
+                    "not_used"
+                };
+                (field.to_owned(), s.to_owned())
+            })
+            .collect()
     }
 }
 
@@ -420,8 +726,8 @@ mod tests {
             serde_json::json!({"type": "unifi", "url": "https://192.168.1.1", "api_key": " k1 "});
         let w = prepare_body("/data", "udm", None, &mut b).unwrap();
         assert_eq!(w.len(), 1);
-        assert_eq!(w[0].1, "k1");
-        let f = w[0].0.to_string_lossy().into_owned();
+        assert_eq!((w[0].field, w[0].value.as_str()), ("api_key", "k1"));
+        let f = w[0].file.to_string_lossy().into_owned();
         assert!(f.starts_with("/data/secrets/router-udm.api_key."), "{f}");
         assert_eq!(b["api_key_file"], f.as_str());
         assert!(b.get("api_key").is_none());
@@ -437,6 +743,19 @@ mod tests {
                 .starts_with("/data/secrets/router-fw.api_secret."),
             "{b}"
         );
+        // A name that isn't a safe file name, or a long one, is shortened and hashed.
+        for name in ["a b/../c", &"x".repeat(200)] {
+            let mut b = serde_json::json!({"type": "unifi", "url": "https://h", "api_key": "k"});
+            let w = prepare_body("/data", name, None, &mut b).unwrap();
+            let base = w[0]
+                .file
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            assert!(w[0].file.starts_with("/data/secrets"), "{name}");
+            assert!(base.len() < 100 && !base.contains('/'), "{base}");
+        }
 
         // Left out, or sent back unchanged: the current file stays (same endpoint).
         let current = router(serde_json::json!({"name": "udm", "type": "unifi",
@@ -529,6 +848,7 @@ mod tests {
             serde_json::json!({"type": "unifi", "url": "https://203.0.113.9"}),
             serde_json::json!({"type": "unifi", "url": "https://203.0.113.9", "api_key_file": "/data/secrets/k"}),
             serde_json::json!({"type": "unifi", "url": "https://192.168.1.1", "tls_insecure_skip_verify": true}),
+            serde_json::json!({"type": "unifi", "url": "https://192.168.1.1", "site": "other"}),
             serde_json::json!({"type": "opnsense", "url": "https://192.168.1.1"}),
         ] {
             let mut b = moved;
@@ -546,43 +866,161 @@ mod tests {
         );
     }
 
-    /// REQ: T8.2 (ADR-181) — new files are private and never overwrite one; a failed change
-    /// removes what it wrote; only files the API wrote are pruned.
+    /// REQ: API-002, T8.2 (ADR-181) — F9: a new key file is private (0600, in a 0700 folder, and
+    /// the list of files written too), recorded first for its router, credential and endpoint,
+    /// and never overwrites a file; a change that fails before its entry is stored removes what
+    /// it made and its records, and never a file that was there before or a record another write
+    /// made.
     #[cfg(unix)]
     #[test]
-    fn t8_2_secret_files_private_and_undone() {
+    fn api_002_router_key_files_are_private_recorded_and_undone() {
         use std::os::unix::fs::PermissionsExt as _;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         let d = tmp("files");
         let dd = d.to_string_lossy().into_owned();
+        let r = router(serde_json::json!({"name": "udm", "type": "unifi",
+            "url": "https://192.168.1.1", "api_key_file": "x"}));
         let f = secrets_dir(&dd).join("router-udm.api_key.1");
-        let p = Prepared {
+        let first = Prepared {
             data_dir: dd.clone(),
-            writes: vec![(f.clone(), "k1".into())],
+            writes: vec![NewKey {
+                field: "api_key",
+                file: f.clone(),
+                value: "k1".into(),
+            }],
             old: Vec::new(),
         };
         // Dropped without keep: undone.
-        drop(p.write().unwrap());
+        drop(first.write(Some(&r)).unwrap());
         assert!(!f.exists());
-        assert_eq!(read_written(&dd), Vec::<PathBuf>::new());
+        assert_eq!(read_records(&dd).unwrap(), Vec::new());
         // Kept.
-        p.write().unwrap().keep();
+        first.write(Some(&r)).unwrap().keep();
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "k1");
+        assert_eq!(mode(&f), 0o600);
+        assert_eq!(mode(&secrets_dir(&dd)), 0o700);
+        assert_eq!(mode(&secrets_dir(&dd).join(WRITTEN)), 0o600);
+        let saved = vec![Record {
+            router: Some("udm".into()),
+            field: Some("api_key".into()),
+            endpoint: Some(Endpoint::of(&r)),
+            file: f.clone(),
+        }];
+        assert_eq!(read_records(&dd).unwrap(), saved);
+        // Never overwritten; the record of the kept file stays.
+        assert!(first.write(Some(&r)).is_err());
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "k1");
+        assert_eq!(read_records(&dd).unwrap(), saved);
+        // A file someone put there under that name stays, and isn't recorded.
+        let theirs = secrets_dir(&dd).join("router-udm.api_key.2");
+        std::fs::write(&theirs, "theirs").unwrap();
+        let second = Prepared {
+            data_dir: dd.clone(),
+            writes: vec![NewKey {
+                field: "api_key",
+                file: theirs.clone(),
+                value: "k2".into(),
+            }],
+            old: Vec::new(),
+        };
+        assert!(second.write(Some(&r)).is_err());
+        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "theirs");
+        assert_eq!(read_records(&dd).unwrap(), saved);
+        // A line an earlier build wrote (the path alone) reads as a record for no router.
+        std::fs::write(secrets_dir(&dd).join(WRITTEN), format!("{}\n", f.display())).unwrap();
         assert_eq!(
-            std::fs::metadata(&f).unwrap().permissions().mode() & 0o777,
-            0o600
+            read_records(&dd).unwrap(),
+            vec![Record {
+                router: None,
+                field: None,
+                endpoint: None,
+                file: f.clone()
+            }]
         );
-        assert_eq!(
-            std::fs::metadata(secrets_dir(&dd))
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// REQ: API-002, T8.2 (ADR-181) — the use-time rule: a key file is sent for a router only if
+    /// it was saved here for that router, credential and endpoint and is in `secrets/`, or this
+    /// node's own files define the router with it at that endpoint. Another router naming it, the
+    /// same router at another address, a line from an earlier build, an unreadable list, and a
+    /// record for a file outside `secrets/` are all refused; a missing file reads as missing.
+    #[test]
+    fn api_002_a_key_file_is_used_only_for_the_router_it_was_saved_for() {
+        let d = tmp("use");
+        let dd = d.to_string_lossy().into_owned();
+        std::fs::create_dir_all(secrets_dir(&dd)).unwrap();
+        let key = secrets_dir(&dd).join("router-udm.api_key.1");
+        let out = d.join("outside-key");
+        std::fs::write(&key, "k").unwrap();
+        std::fs::write(&out, "k").unwrap();
+        let at = |name: &str, url: &str, file: &Path| {
+            router(
+                serde_json::json!({"name": name, "type": "unifi", "url": url,
+                "api_key_file": file.to_str().unwrap()}),
+            )
+        };
+        let rec = |name: Option<&str>, r: &RouterConfig, file: &Path| Record {
+            router: name.map(str::to_owned),
+            field: Some("api_key".into()),
+            endpoint: Some(Endpoint::of(r)),
+            file: file.to_path_buf(),
+        };
+        let check = |own: Vec<RouterConfig>, written: Option<Vec<Record>>| UseCheck {
+            data_dir: dd.clone(),
+            own,
+            written,
+        };
+        let udm = at("udm", "https://192.168.1.1", &key);
+        let c = check(Vec::new(), Some(vec![rec(Some("udm"), &udm, &key)]));
+        assert!(c.refused(&udm).is_none());
+        assert_eq!(c.status(&udm)["api_key"], "saved");
+        for other in [
+            at("evil", "https://192.168.1.1", &key),
+            at("udm", "https://203.0.113.9", &key),
+        ] {
+            assert!(c.refused(&other).is_some(), "{other:?}");
+            assert_eq!(c.status(&other)["api_key"], "not_used");
+        }
+        let legacy = Record {
+            router: None,
+            field: None,
+            endpoint: None,
+            file: key.clone(),
+        };
+        for c in [
+            check(Vec::new(), Some(vec![legacy])),
+            check(Vec::new(), None),
+        ] {
+            assert!(c.refused(&udm).is_some());
+        }
+        let udm_out = at("udm", "https://192.168.1.1", &out);
+        assert!(
+            check(Vec::new(), Some(vec![rec(Some("udm"), &udm_out, &out)]))
+                .refused(&udm_out)
+                .is_some(),
+            "recorded, but outside secrets/"
+        );
+        // The node's own files: the same router, file and endpoint, whatever else differs.
+        let c = check(vec![udm_out.clone()], None);
+        let mut slower = udm_out.clone();
+        slower.interval_secs = 600;
+        assert!(c.refused(&udm_out).is_none() && c.refused(&slower).is_none());
+        assert!(
+            c.refused(&at("udm", "https://203.0.113.9", &out))
                 .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
+                .contains("api_key_file")
         );
-        assert_eq!(read_written(&dd), vec![f.clone()]);
-        // Never overwritten.
-        assert!(p.write().is_err());
-        assert_eq!(std::fs::read_to_string(&f).unwrap(), "k1");
+        assert!(
+            c.refused(&at("other", "https://192.168.1.1", &out))
+                .is_some()
+        );
+        // Not there: missing.
+        std::fs::remove_file(&key).unwrap();
+        assert_eq!(
+            check(Vec::new(), Some(vec![rec(Some("udm"), &udm, &key)])).status(&udm)["api_key"],
+            "missing"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 }
