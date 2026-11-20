@@ -869,3 +869,93 @@ async fn api_002_a_router_whose_key_file_is_gone_says_key_missing() {
     assert_eq!(status(&items, "udm"), "saved");
     assert_eq!(status(&items, "a-evil"), "not_used");
 }
+
+// ---- T5: the sweep.
+
+/// REQ: API-002, T8.2 (ADR-181) — F5: each node removes the key files it wrote that nothing names
+/// any more: at start (an entry gone without the API: a crash before the prune, a restored
+/// `state.db`), and after a change (a replica whose primary now names another file). Never a file
+/// the API didn't write, and never one outside `<data_dir>/secrets/`.
+#[tokio::test]
+async fn api_002_orphaned_router_key_files_removed() {
+    let n = Node::new(Reload::Applies);
+    let d = n.data();
+    let fake = console();
+    for (name, key) in [("udm", "k1"), ("tmp", "k2")] {
+        let (s, v) = n.put(name, &n.admin, false, unifi(&fake.url, key)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+    }
+    let (udm_file, tmp_file) = (n.key_file("udm").unwrap(), n.key_file("tmp").unwrap());
+    // `tmp` goes without the API: its key file is an orphan.
+    n.auth
+        .state()
+        .delete_managed(crate::managed::ROUTER, "tmp", None)
+        .unwrap();
+    apply(&n.src);
+    // A file the API didn't write, and a record (as this version keeps them) for a file outside
+    // secrets/.
+    std::fs::write(format!("{d}/secrets/mine"), "keep").unwrap();
+    std::fs::write(format!("{d}/outside-file"), "keep").unwrap();
+    let mut written = std::fs::OpenOptions::new()
+        .append(true)
+        .open(format!("{d}/secrets/.written"))
+        .unwrap();
+    writeln!(
+        written,
+        "{}",
+        serde_json::json!({"router": "tmp", "field": "api_key", "file": format!("{d}/outside-file")})
+    )
+    .unwrap();
+    drop(written);
+    let (stop, task) = poll(&n);
+    wait_until("the orphan removed at start", 20, || {
+        !Path::new(&tmp_file).exists()
+    })
+    .await;
+    assert!(Path::new(&udm_file).exists(), "udm's key is named");
+    // The routers in effect stop naming udm's file (a replica, after the key was entered again on
+    // the primary), and this node's own stored entry doesn't name it either.
+    let mut cfg = (*n.src.config.load_full()).clone();
+    if let Some(r) = cfg.router.iter_mut().find(|r| r.name.as_str() == "udm") {
+        r.api_key_file =
+            Some(telltale_config::SafeString::new(format!("{d}/secrets/elsewhere")).unwrap());
+    }
+    n.auth
+        .state()
+        .delete_managed(crate::managed::ROUTER, "udm", None)
+        .unwrap();
+    n.src.config.store(Arc::new(cfg));
+    wait_until("udm's old key removed after the change", 20, || {
+        !Path::new(&udm_file).exists()
+    })
+    .await;
+    let _ = stop.send(true);
+    let _ = task.await;
+    assert!(Path::new(&format!("{d}/secrets/mine")).exists());
+    assert!(Path::new(&format!("{d}/outside-file")).exists());
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — the sweep keeps a file the API wrote while this node's own stored
+/// entry still names it, though the configuration in effect doesn't (a reload that fell back to
+/// the config files, a pinned version, a primary that was demoted and may be promoted again).
+#[tokio::test]
+async fn api_002_a_key_its_own_stored_entry_names_is_kept() {
+    let n = Node::new(Reload::Applies);
+    let fake = console();
+    for (name, key) in [("udm", "k1"), ("tmp", "k2")] {
+        let (s, v) = n.put(name, &n.admin, false, unifi(&fake.url, key)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+    }
+    let (udm_file, tmp_file) = (n.key_file("udm").unwrap(), n.key_file("tmp").unwrap());
+    // The configuration in effect is the files' alone; `tmp` is gone from state.db.
+    n.auth
+        .state()
+        .delete_managed(crate::managed::ROUTER, "tmp", None)
+        .unwrap();
+    n.src.config.store(n.src.file_config.load_full());
+    let (stop, task) = poll(&n);
+    wait_until("the orphan removed", 20, || !Path::new(&tmp_file).exists()).await;
+    let _ = stop.send(true);
+    let _ = task.await;
+    assert!(Path::new(&udm_file).exists(), "named by the stored entry");
+}

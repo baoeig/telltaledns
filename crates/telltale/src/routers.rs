@@ -460,12 +460,21 @@ pub(crate) async fn run(
     let mut parts: HashMap<String, Polled> = HashMap::new();
     let mut failing: HashMap<String, bool> = HashMap::new();
     let mut held: HashMap<String, String> = HashMap::new();
+    // REQ: API-002, T8.2 (ADR-181) — F5: the routers the last sweep of key files saw.
+    let mut swept_for: Option<Vec<RouterConfig>> = None;
     // The routers last read: one removed, or now pointing at another device (type, address,
     // site), drops its answer, so no names linger from a router that's gone (ADR-181). Other
     // changes (credentials, TLS, timing) keep it until the next answer replaces it.
     let mut read_with: Vec<RouterConfig> = Vec::new();
     loop {
         let routers = routers_now();
+        // REQ: API-002, T8.2 (ADR-181) — F5: at start, and after each change of the routers in
+        // effect (a write, a reload, a replicated version, a failover), the key files this node
+        // wrote that nothing names any more are removed.
+        if swept_for.as_ref() != Some(&routers) {
+            crate::router_secrets::sweep(&sources).await;
+            swept_for = Some(routers.clone());
+        }
         let same_device = |a: &RouterConfig, b: &RouterConfig| {
             a.name == b.name && a.kind == b.kind && a.url == b.url && a.site == b.site
         };

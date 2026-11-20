@@ -24,18 +24,22 @@
 //!   key is on another node.
 //! - **Written as new files, kept once stored.** A change that fails or conflicts before its
 //!   entry is stored removes what it wrote; the key in use is never replaced in place.
-//! - **Only what the API wrote is removed.** A router's old files are removed once nothing in
-//!   effect names them, and only if they are recorded and in `secrets/`.
+//! - **Only what the API wrote is removed, on each node.** A file recorded in this node's
+//!   `.written` and in its `secrets/` is removed once no router names it: not in effect, not in
+//!   this node's config files, not in its own stored entries. Each node sweeps at start and after
+//!   every change of the routers in effect ([`sweep`]), so a key rotated, deleted, replaced on
+//!   another node, or left by a crash doesn't stay behind.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use telltale_api::problem::{Code, Problem};
 use telltale_api::{ManagedKind, ManagedWrite};
 use telltale_config::RouterConfig;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::http::Sources;
 
@@ -399,31 +403,17 @@ impl Prepared {
         Ok(done)
     }
 
-    /// After the change applied: the router's old files the API wrote, that nothing in effect
-    /// names any more, are removed with their records (best effort: a file left behind is only
-    /// untidy). Blocking.
+    /// After the change applied, when the router had key files: those of them, and any other
+    /// file the API wrote here, that nothing names any more are removed with their records, by
+    /// the sweep's rule ([`sweep_now`]; best effort: a file left behind is only untidy, and the
+    /// next sweep looks again). Blocking; the write holds `config_writes`.
     pub(crate) fn prune(&self, src: &Sources) {
         if self.old.is_empty() {
             return;
         }
-        let cfg = src.config.load();
-        let Ok(records) = read_records(&self.data_dir) else {
-            return;
-        };
-        let mut gone = Vec::new();
-        for f in &self.old {
-            let used = cfg
-                .router
-                .iter()
-                .any(|r| files_of(r).any(|(_, _, x)| Path::new(x) == f));
-            let ours = records.iter().any(|x| &x.file == f)
-                && crate::secret_path::in_data_secrets(&f.to_string_lossy(), &self.data_dir);
-            if !used && ours && remove(f) {
-                gone.push(f.clone());
-            }
-        }
-        if let Err(e) = remove_records(&self.data_dir, &gone) {
-            warn!(error = %e, "router keys: couldn't update the list of key files written");
+        match sweep_now(src) {
+            Ok(gone) => log_removed(&gone),
+            Err(e) => warn!(error = %e, "router keys: the old key files weren't removed"),
         }
     }
 }
@@ -611,6 +601,89 @@ fn remove_records(data_dir: &str, files: &[PathBuf]) -> std::io::Result<()> {
         return Ok(());
     }
     write_records(data_dir, &list)
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — F5: every key file a router names that this node keeps: in the
+/// configuration in effect, in this node's config files, and in this node's own entries made
+/// through the API (`state.db`, read as JSON so a row that no longer decodes still keeps its
+/// files). The last two cover a configuration in effect that leaves the API's entries out for a
+/// while (a reload that fell back to the config files, a pinned version) and a primary that was
+/// demoted and may be promoted again (its stored entries apply again then). `None` when the
+/// stored entries can't be read: nothing is removed then.
+fn named_files(src: &Sources) -> Option<HashSet<PathBuf>> {
+    let mut named = HashSet::new();
+    let cfg = src.config.load();
+    let file = src.file_config.load();
+    for r in cfg.router.iter().chain(file.router.iter()) {
+        named.extend(files_of(r).map(|(_, _, f)| PathBuf::from(f)));
+    }
+    let state = src.auth.get()?.state();
+    for m in state.managed(crate::managed::ROUTER).ok()? {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&m.body) {
+            for (_, file_field) in FIELDS {
+                if let Some(f) = v.get(file_field).and_then(serde_json::Value::as_str) {
+                    named.insert(PathBuf::from(f));
+                }
+            }
+        }
+    }
+    Some(named)
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — F5: removes the key files this node's API wrote (`.written`)
+/// that nothing names any more ([`named_files`]), with their records: what a rotation, a delete,
+/// or a crash between writing a file and storing its entry left behind, and, on a replica, a key
+/// the primary replaced. Never a file the API didn't write, and never one outside
+/// `<data_dir>/secrets/` (a record for one is left as it is). Returns what it removed. Blocking;
+/// run with `config_writes` held, so it never sees a file a write is about to store an entry for.
+pub(crate) fn sweep_now(src: &Sources) -> Result<Vec<Record>, String> {
+    let data_dir = src.file_config.load().node.data_dir.to_string();
+    let list = secrets_dir(&data_dir).join(WRITTEN);
+    let records = read_records(&data_dir).map_err(|e| format!("{}: {e}", list.display()))?;
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
+    let named = named_files(src).ok_or("the entries made through the API couldn't be read")?;
+    let (mut keep, mut gone) = (Vec::new(), Vec::new());
+    for r in records {
+        let ours = crate::secret_path::in_data_secrets(&r.file.to_string_lossy(), &data_dir);
+        if named.contains(&r.file) || !ours || !remove(&r.file) {
+            keep.push(r);
+        } else {
+            gone.push(r);
+        }
+    }
+    if !gone.is_empty() {
+        write_records(&data_dir, &keep).map_err(|e| format!("{}: {e}", list.display()))?;
+    }
+    Ok(gone)
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — F5: the sweep, as the router task runs it at start and after
+/// each change of the routers in effect: one change at a time (`config_writes`), off the async
+/// workers. Each removed file is logged at info, on every node.
+pub(crate) async fn sweep(src: &Arc<Sources>) {
+    let _one_at_a_time = src.config_writes.lock().await;
+    let s = Arc::clone(src);
+    match tokio::task::spawn_blocking(move || sweep_now(&s)).await {
+        Ok(Ok(gone)) => log_removed(&gone),
+        Ok(Err(e)) => {
+            warn!(error = %e, "router keys: the sweep of key files no router names didn't run");
+        }
+        Err(e) => {
+            warn!(error = %e, "router keys: the sweep of key files no router names failed");
+        }
+    }
+}
+
+fn log_removed(gone: &[Record]) {
+    for r in gone {
+        info!(
+            router = r.router.as_deref().unwrap_or("(an earlier build's)"),
+            file = %r.file.display(),
+            "router keys: removed a key file this node wrote that no router names any more"
+        );
+    }
 }
 
 /// REQ: API-002, T8.2 (ADR-181) — which key files this node sends for the routers in effect (the
