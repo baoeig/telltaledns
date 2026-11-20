@@ -3870,6 +3870,98 @@ fn rule_of(
     })
 }
 
+/// What every quick-rule device refusal's hint ends with (GitHub issue #73).
+const RULE_DEVICE_HINT: &str =
+    "Use the address, or name the device first (Clients → Name this device…) so rules follow it.";
+
+/// REQ: FLT-005 (GitHub issue #73) — what to do about a device a quick rule can't name. When the
+/// string is a name this node's router, mDNS, or the other nodes' tables give an address (what the
+/// query log shows for a device nobody named), the hint says which address. Words only: whether a
+/// device is accepted is the validator's answer, from the configuration alone, so every node gives
+/// the same one; this reads node-local tables, off the DNS path, and only once a rule was refused.
+fn rule_device_hint(
+    src: &Sources,
+    file: &telltale_config::Config,
+    entries: &crate::managed::Entries,
+    rule: &serde_json::Value,
+    refusal: Problem,
+) -> Problem {
+    let known: std::collections::HashSet<String> = file
+        .client
+        .iter()
+        .chain(&entries.clients)
+        .map(|c| c.name.as_str().to_ascii_lowercase())
+        .collect();
+    let refused: Vec<&str> = rule["devices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .filter(|d| !telltale_config::rule_device_known(&known, d))
+        .collect();
+    if refused.is_empty() {
+        return refusal; // refused for another reason
+    }
+    let mut hint = String::new();
+    for device in refused {
+        if let Some(says) = discovered_name_says(src, device) {
+            hint.push_str(&says);
+            hint.push(' ');
+        }
+    }
+    hint.push_str(RULE_DEVICE_HINT);
+    refusal.hint(hint)
+}
+
+/// A sentence naming the addresses `name` is the discovered name of (any case): this node's
+/// router, then its mDNS, then the other nodes' routers and mDNS, as the query log reads them.
+fn discovered_name_says(src: &Sources, name: &str) -> Option<String> {
+    /// How many addresses a sentence lists before "and N more".
+    const SHOWN: usize = 4;
+    let routers = src.pipeline.router_leases.load();
+    let mdns = src.pipeline.mdns_names.load();
+    let peers = src.pipeline.peer_names.load();
+    // Address -> named by a router (not by the device itself over mDNS); the first table to know
+    // an address names it, as for the query log.
+    let mut found = std::collections::BTreeMap::<std::net::Ipv4Addr, bool>::new();
+    for (table, by_router) in [
+        (&**routers, true),
+        (&**mdns, false),
+        (&peers.routers, true),
+        (&peers.mdns, false),
+    ] {
+        for (ip, lease) in table {
+            if lease
+                .hostname
+                .as_deref()
+                .is_some_and(|h| h.eq_ignore_ascii_case(name))
+            {
+                found.entry(*ip).or_insert(by_router);
+            }
+        }
+    }
+    match found.len() {
+        0 => None,
+        1 => found.iter().next().map(|(ip, by_router)| {
+            if *by_router {
+                format!("`{name}` is what your router calls {ip}.")
+            } else {
+                format!("`{name}` is what {ip} calls itself.")
+            }
+        }),
+        n => {
+            let mut list: Vec<String> = found.keys().take(SHOWN).map(ToString::to_string).collect();
+            if n > SHOWN {
+                list.push(format!("and {} more", n - SHOWN));
+            }
+            Some(format!(
+                "`{name}` is the name of more than one device here ({}), so pick the address of the one you mean.",
+                list.join(", ")
+            ))
+        }
+    }
+}
+
 /// AGT-002 impact of a quick rule: recent queries for its domain (or names under it) and a
 /// sentence saying for whom it changes.
 fn rule_impact(src: &Sources, rule: &telltale_config::RuleConfig, setting: bool) -> (u64, String) {
@@ -4238,8 +4330,16 @@ fn plan_managed(
             "`{name}` wasn't created through the API"
         )));
     }
-    let merged = crate::managed::merge(&file, &entries)
-        .map_err(|errs| Problem::new(Code::InvalidConfig, errs.join("; ")))?;
+    let merged = crate::managed::merge(&file, &entries).map_err(|errs| {
+        let refusal = Problem::new(Code::InvalidConfig, errs.join("; "));
+        match (w.kind, after.as_ref()) {
+            // REQ: FLT-005 (GitHub issue #73) — a device a rule can't name says what to do.
+            (ManagedKind::Rule, Some(rule)) => {
+                rule_device_hint(src, &file, &entries, rule, refusal)
+            }
+            _ => refusal,
+        }
+    })?;
     let warnings = telltale_config::validate_config(&merged).unwrap_or_default();
     let body = match (w.kind, &after) {
         (_, None) => None,
@@ -6606,3 +6706,8 @@ mod local_file_tests;
 #[cfg(test)]
 #[path = "api_backend_router_tests.rs"]
 mod router_tests;
+
+// REQ: FLT-005 (issue #73) — a quick rule's device: what a rule can name, and the refusal's hint.
+#[cfg(test)]
+#[path = "api_backend_rule_device_tests.rs"]
+mod rule_device_tests;
