@@ -181,13 +181,18 @@ case " $(/usr/local/bin/telltale --version) " in
   *" dev "*) ;;
   *) fail "the binary under test isn't a local (dev) build: $(/usr/local/bin/telltale --version)" ;;
 esac
+# This run's journal lines only (a machine that ran the e2e before keeps the older ones).
+since="$(date '+%Y-%m-%d %H:%M:%S')"
 ask "{\"id\":\"1a-2b\",\"to\":\"9.9.9\",\"by\":\"e2e\",\"requestedMs\":$(( $(date +%s) * 1000 ))}"
 outcome '"id": "1a-2b"' || { fail "no outcome recorded for the request"; }
 result="$(sudo -u telltale cat "$RESULT" 2>&1)" || { fail "the node can't read the outcome: $result"; }
 grep -q '"state": "refused"' <<<"$result" || { fail "no refusal recorded: $result"; }
 [ ! -e "$UPD/request.json" ] || { fail "the request was left behind"; }
 settled
-journalctl -u telltale-update --no-pager | grep -q 'update: refused' || { fail "the refusal isn't in the journal"; }
+# Read whole, then searched: `journalctl | grep -q` under pipefail fails when grep stops reading
+# early and journalctl, still writing, gets SIGPIPE (a long journal from earlier runs).
+journal="$(journalctl -u telltale-update --since "$since" --no-pager)"
+grep -q 'update: refused' <<<"$journal" || { fail "the refusal isn't in the journal"; }
 systemctl is-active --quiet telltale || { fail "the update service stopped the node"; }
 rm -f "$RESULT"
 sudo -u telltale mkfifo "$UPD/request.json"
