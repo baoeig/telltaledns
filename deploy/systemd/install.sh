@@ -16,6 +16,8 @@
 #
 # Options:
 #   --edge                   follow builds from main instead of tagged releases
+#   --stable                 follow tagged releases (the default). With --cluster-updates on a node
+#                            that runs an edge build, one of --edge or --stable must be given.
 #   --yes                    skip the guided questions: the recommended settings. (In a terminal,
 #                            the one about systemd-resolved's stub listener is still asked,
 #                            unless --disable-resolved-stub answers it.)
@@ -34,8 +36,9 @@
 #                            address (the health check after an update), and the update channel
 #                            (--edge: edge, else the installed version's). Refused when the
 #                            binary's folder isn't root's alone, the data directory is under
-#                            /home or /root or in a folder that isn't root's, or the node doesn't
-#                            answer at its [api] address. On an edge node, give --edge too.
+#                            /home or /root or in a folder that isn't root's, the API is off, or
+#                            the node doesn't answer at its [api] address; and on a node that
+#                            runs an edge build unless --edge (stay on edge) or --stable is given.
 #   --uninstall              stop and remove the service, its unit, and the binary; offers to
 #                            restore systemd-resolved if the install changed it, and keeps
 #                            /etc/telltale and /var/lib/telltale unless you say otherwise
@@ -53,6 +56,7 @@ PUBKEY_DEFAULT="RWQSVukPYI4mZximvuqnLSiH56cyTwz6uEWQEFyWDhqvpBHC8DdyYK5T"
 PUBKEY="${TELLTALE_RELEASE_PUBKEY:-$PUBKEY_DEFAULT}"
 PREFIX="${TELLTALE_PREFIX:-/usr/local}"
 CHANNEL=stable
+CHANNEL_FLAG=
 DISABLE_STUB=ask
 START=yes
 INTERACTIVE=auto
@@ -68,7 +72,8 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --edge) CHANNEL=edge ;;
+    --edge) CHANNEL=edge; CHANNEL_FLAG=edge ;;
+    --stable) CHANNEL=stable; CHANNEL_FLAG=stable ;;
     --disable-resolved-stub) DISABLE_STUB=yes ;;
     --no-start) START=no ;;
     --cluster-updates) CLUSTER_UPDATES=yes ;;
@@ -285,6 +290,7 @@ guided() {
   if [ "$CHANNEL" = edge ]; then _d=2; else _d=1; fi
   choose "   Which" "$_d" 2
   if [ "$REPLY" = 2 ]; then CHANNEL=edge; else CHANNEL=stable; fi
+  CHANNEL_FLAG=$CHANNEL
 
   echo
   echo "2. Where answers come from (upstream DNS servers)"
@@ -531,7 +537,7 @@ update_data_dir() { # config
 # The URL the root update service's health gate asks, from the node's effective [api] (as the
 # install's own readiness wait below asks it): http://<address>:<port>/readyz?startup=1 at the
 # listen address and port, a wildcard bind (0.0.0.0, [::]) asked at loopback. Prints nothing when
-# the API is off ([api] enabled = false: no health check, said in result.json). Fails when the
+# the API is off ([api] enabled = false: then --cluster-updates is refused). Fails when the
 # config can't be read or its listen address isn't a plain IP address and port.
 update_health_url() { # config
   _cfg="$("$PREFIX/bin/telltale" config check "$1" --no-env --print 2>/dev/null)" || return 1
@@ -572,14 +578,19 @@ update_root_owned() { # dir
   done
 }
 
-# Why --cluster-updates can't be used with the binary in $PREFIX/bin and the data directory $1, or
-# nothing: the binary's folder must be root's alone, and the data directory not under /home or
-# /root, in a folder root's alone (only its update/ folder is the node's to write).
-update_refusal() { # data-dir
+# Why --cluster-updates can't be used with the binary in $PREFIX/bin, the data directory $1 and
+# the health check's URL $2, or nothing: the binary's folder must be root's alone, the data
+# directory not under /home or /root, in a folder root's alone (only its update/ folder is the
+# node's to write), and the API on (its /readyz is how the update service sees a new build come up).
+update_refusal() { # data-dir health-url
   _d="$PREFIX/bin"
   while [ ! -d "$_d" ]; do _d="$(dirname "$_d")"; done
   if _bad="$(update_root_owned "$_d")"; then :; else
-    echo "install location is not root-owned: $_bad belongs to another user or can be written by its group or others (install to a prefix only root can write: TELLTALE_PREFIX)"
+    echo "install location is not root-owned: $_bad belongs to another user or can be written by its group or others (on older Debian and Raspberry Pi OS images /usr/local is root:staff 2775: sudo chmod g-w /usr/local /usr/local/bin, or install to a prefix only root can write with TELLTALE_PREFIX)"
+    return 0
+  fi
+  if [ -z "$2" ]; then
+    echo "the update service needs the API: it checks the node's /readyz to see that a new build came up, and [api] enabled = false leaves it nothing to ask (turn the API on, or upgrade this node by hand)"
     return 0
   fi
   case "$1/" in /home/*|/root/*)
@@ -591,9 +602,20 @@ update_refusal() { # data-dir
   fi
 }
 
+# Why --cluster-updates can't go on over the installed binary whose version line is $2, given the
+# channel flag $1 (edge, stable, or empty), or nothing: a node running an edge build needs one of
+# them (without --edge, a re-run installs the newest release: an older version, and the stable
+# channel).
+update_channel_refusal() { # flag version-line
+  [ -z "$1" ] || return 0
+  case "$2" in
+    *-edge.*) echo "this node runs an edge build ($2): pass --edge to stay on edge builds, or --stable to move it to the stable channel (the newest release)" ;;
+  esac
+}
+
 # The two update units from the folder $1 into the folder $2, for the binary in $PREFIX/bin, the
 # data directory $3, the node's update channel $4 (edge or stable), and the health gate's URL $5
-# (empty: the API is off, no check).
+# (empty only with the API off, which --cluster-updates refuses: the service then installs nothing).
 render_update_units() { # from to data-dir channel health-url
   for _u in telltale-update.path telltale-update.service; do
     sed -e "s#/usr/local/bin#$PREFIX/bin#g" -e "s#/var/lib/telltale/update#$3/update#g" \
@@ -607,10 +629,16 @@ render_update_units() { # from to data-dir channel health-url
 # REQ: OPS-014 (ADR-182) — --cluster-updates over an existing install is refused before anything
 # is downloaded or changed when the binary's folder or the data directory isn't fit for a root
 # service (a new install is checked below, once its config exists).
+if [ "$CLUSTER_UPDATES" = yes ] && [ -x "$PREFIX/bin/telltale" ]; then
+  WHY="$(update_channel_refusal "$CHANNEL_FLAG" "$("$PREFIX/bin/telltale" --version 2>/dev/null || true)")"
+  [ -z "$WHY" ] || die "--cluster-updates: $WHY. Nothing was changed."
+fi
 if [ "$CLUSTER_UPDATES" = yes ] && [ -x "$PREFIX/bin/telltale" ] && [ -f /etc/telltale/telltale.toml ]; then
   DATA_DIR="$(update_data_dir /etc/telltale/telltale.toml)" \
     || die "--cluster-updates needs [node] data_dir in /etc/telltale/telltale.toml to be a plain absolute path (letters, digits, . _ - /). Nothing was changed."
-  WHY="$(update_refusal "$DATA_DIR")"
+  HEALTH_URL_NOW="$(update_health_url /etc/telltale/telltale.toml)" \
+    || die "--cluster-updates needs [api] listen in /etc/telltale/telltale.toml to be a plain IP address and port. Nothing was changed."
+  WHY="$(update_refusal "$DATA_DIR" "$HEALTH_URL_NOW")"
   [ -z "$WHY" ] || die "--cluster-updates: $WHY. Nothing was changed."
 fi
 
@@ -687,7 +715,7 @@ if DATA_DIR="$(update_data_dir /etc/telltale/telltale.toml)" \
    && UPDATE_HEALTH_URL="$(update_health_url /etc/telltale/telltale.toml)"; then
   HEALTH_KNOWN=yes
   if [ "$CLUSTER_UPDATES" = yes ]; then
-    WHY="$(update_refusal "$DATA_DIR")"
+    WHY="$(update_refusal "$DATA_DIR" "$UPDATE_HEALTH_URL")"
     [ -z "$WHY" ] || die "--cluster-updates: $WHY"
   fi
   render_update_units "$TMP" /etc/systemd/system "$DATA_DIR" "$UPDATE_CHANNEL" "$UPDATE_HEALTH_URL"
@@ -898,11 +926,7 @@ if [ "$START" = yes ]; then
     # gate will ask (else every update would be rolled back).
     if [ "$CLUSTER_UPDATES" = yes ]; then
       systemctl enable --now telltale-update.path >/dev/null
-      if [ -n "$UPDATE_HEALTH_URL" ]; then
-        say "Updates from the cluster are on (telltale-update.path, $UPDATE_CHANNEL channel); the health check after each update asks $UPDATE_HEALTH_URL, which answers now"
-      else
-        say "Updates from the cluster are on (telltale-update.path, $UPDATE_CHANNEL channel), WITHOUT a health check: the API is off ([api] enabled = false), so a new build is not checked and never rolled back"
-      fi
+      say "Updates from the cluster are on (telltale-update.path, $UPDATE_CHANNEL channel); the health check after each update asks $UPDATE_HEALTH_URL, which answers now"
     fi
   else
     systemctl --no-pager status telltale | tail -n 15 || true
@@ -930,9 +954,5 @@ EOF
 elif [ "$CLUSTER_UPDATES" = yes ]; then
   # REQ: OPS-014 (ADR-182) — not started (--no-start): on, with the check left to the admin.
   systemctl enable --now telltale-update.path >/dev/null
-  if [ -n "$UPDATE_HEALTH_URL" ]; then
-    say "WARNING: updates from the cluster are on (telltale-update.path, $UPDATE_CHANNEL channel), but the service isn't running, so its health check couldn't be tried: once it runs, check that curl -fsS '$UPDATE_HEALTH_URL' answers before asking for an update, or every update is rolled back"
-  else
-    say "WARNING: updates from the cluster are on (telltale-update.path, $UPDATE_CHANNEL channel), WITHOUT a health check: the API is off ([api] enabled = false)"
-  fi
+  say "WARNING: updates from the cluster are on (telltale-update.path, $UPDATE_CHANNEL channel), but the service isn't running, so its health check couldn't be tried: once it runs, check that curl -fsS '$UPDATE_HEALTH_URL' answers before asking for an update, or every update is rolled back"
 fi

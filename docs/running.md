@@ -2276,9 +2276,11 @@ it may write only that `update/` folder:
    signed `releases.json` must be of the version's channel, name that version and list the same
    checksum), test-runs it, and swaps it in, keeping the old binary as `telltale.old`. All the
    downloads together get eight minutes; past that nothing is installed;
-5. it restarts the node and waits up to **two minutes** for it to answer ready twice in a row
-   (`/readyz?startup=1`) at the address `install.sh` wrote into its unit (below). If it doesn't,
-   it puts `telltale.old` back and restarts once more: `rolled_back`;
+5. it restarts the node (`systemctl restart`, waited for a minute; if that command is slow or
+   fails, the restart goes on in systemd and the health check decides) and waits up to **two
+   minutes** for it to answer ready twice in a row (`/readyz?startup=1`) at the address
+   `install.sh` wrote into its unit (below). If it doesn't, it puts `telltale.old` back and
+   restarts once more: `rolled_back`;
 6. it records the outcome in `/var/lib/telltale-update/result.json`: `installing`, `updated` (with
    how its health was checked), `up_to_date`, `rolled_back` (with why), `unavailable` (an edge
    build no longer served), `failed`, or `refused`, with the error. `journalctl -u
@@ -2286,8 +2288,8 @@ it may write only that `update/` folder:
    can't check it, and says so.
 
 So what anyone who can write that file can do is have the node restarted on a newer signed build
-of its channel. The whole run fits in the unit's 15-minute limit with room to spare, so systemd
-never stops it between the install and the check.
+of its channel. The whole run (at most about 15 minutes) fits in the unit's 16-minute limit with room to spare,
+so systemd never stops it between the install and the check.
 
 **The channel.** `install.sh` writes the node's update channel into its unit and the update
 service's: `edge` when you install with `--edge`, otherwise the channel of the version it
@@ -2305,8 +2307,8 @@ wildcard (`0.0.0.0`, `[::]`) asked at loopback. The request never names one. Two
 update roll back, so `install.sh --cluster-updates` checks the address answers before it turns
 the feature on: an `[access] allowed_networks` that leaves out this host's own address (loopback
 for a wildcard listen), and an API that isn't up. With the API off (`[api] enabled = false`) there
-is no check at all: `updated` says `not checked: the API is off`, and such a node is never rolled
-back. A node that takes longer than two minutes to come up (very large lists on an SD card) is
+is nothing to check, so updates from the cluster aren't available: `install.sh --cluster-updates`
+refuses, and the update service installs nothing (`refused: no health check configured`). A node that takes longer than two minutes to come up (very large lists on an SD card) is
 rolled back; upgrade such a node by hand.
 
 **`rolled_back` is an incident.** It means the new build didn't answer ready in time, so the
@@ -2326,8 +2328,12 @@ sudo sh install.sh --cluster-updates          # on an edge node: sudo sh install
 It writes the units for the node's data directory, channel and API address, and turns them on
 once the node answers at that address (it prints the address it tried). It refuses, and on an
 existing install changes nothing, when the binary's folder isn't root's alone (a `TELLTALE_PREFIX`
-others can write), or the data directory is under `/home` or `/root` or in a folder that isn't
-root's. A node installed before this feature needs one upgrade by hand first, on its own channel
+others can write; older Debian and Raspberry Pi OS images have `/usr/local` as `root:staff 2775`:
+check `stat -c '%U:%G %a' /usr/local /usr/local/bin`, and fix it with `sudo chmod g-w /usr/local
+/usr/local/bin`), the data directory is under `/home` or `/root` or in a folder that isn't
+root's, or the API is off. On a node that runs an edge build it also refuses unless you say which
+channel: `--edge` to stay on edge builds, or `--stable` to move to releases (without either, a
+re-run would install the newest release, an older version). A node installed before this feature needs one upgrade by hand first, on its own channel
 (`sudo telltale self-update --restart`, with `--channel edge` on an edge node), then
 `install.sh` as above. (`sudo systemctl enable --now telltale-update.path` also turns it on, but
 skips the check.)
@@ -2346,7 +2352,7 @@ telltale ctl --url https://dns.example.com upgrade --to 0.8.0
   while you ask for an edge build, or refusing the version for a day after a rollback) stops it
   there, with nothing asked and every such node named, with why and how to fix it. A node that is
   down stops it too; `--skip-down` leaves out nodes that are down, and only those.
-- Then it asks each node in turn and waits (`--timeout`, 10 minutes each by default) until the
+- Then it asks each node in turn and waits (`--timeout`, 15 minutes each by default: at least the update service's longest run) until the
   node's update service has recorded `updated` for that request **and** the node is back on the
   version, ready and in sync. A node that fails, is rolled back, or refuses stops it: the nodes
   after it keep their version, and the error is the node's own. One node: `--node dns-02`.
@@ -2400,7 +2406,7 @@ upgradeHook:
   self-signed certificate put the certificate in a Secret and name it in `upgradeHook.caSecret`
   (`name`, and `key`, default `ca.crt`): without it the hook can't trust the API and fails.
 - **Timeouts.** Helm waits for a hook only `--timeout` (5 minutes by default), while the hook allows
-  10 minutes per node and 30 in all (`activeDeadlineSeconds: 1800`): run `helm upgrade --timeout 30m`.
+  15 minutes per node and 30 in all (`activeDeadlineSeconds: 1800`, two native nodes; raise it for more): run `helm upgrade --timeout 30m` (or more).
 - A NetworkPolicy that limits the API (`networkPolicy.apiFrom`) gets a rule that lets the hook in
   (only while the hook is on).
 - **A native primary whose replicas are the chart's pods:** the hook upgrades native nodes first,
@@ -2426,6 +2432,10 @@ upgradeHook:
   sync that needs it (a PreSync hook runs before the app's own resources): create it outside the
   app, or with an ExternalSecret or SealedSecret that is applied before it (an earlier sync wave
   of another app, or a PreSync resource with a lower `argocd.argoproj.io/hook-weight`).
+- **The controller up but not ready:** on some CNIs (Cilium) a Service with no ready endpoints
+  drops the connection instead of refusing it, so the hook fails (it doesn't skip) and the sync
+  waits until the controller answers. That is intended. With the hook on and the controller
+  dead, turn the hook off in the chart to roll the fix.
 - **A node down:** the hook fails before asking any node (the pods keep their version) unless
   `skipDown: true`. For the first 90 seconds after the node that answers starts, a native node
   that hasn't connected since isn't listed at all, so a hook run then can pass without it.

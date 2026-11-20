@@ -1470,7 +1470,6 @@ impl node_update::Host for RootHost {
     fn healthy(&mut self) -> Result<String, String> {
         let url = match &self.gate {
             Ok(node_update::HealthGate::Check(url)) => url.clone(),
-            Ok(node_update::HealthGate::Skip(why)) => return Ok((*why).to_owned()),
             Err(e) => return Err(e.clone()),
         };
         let started = std::time::Instant::now();

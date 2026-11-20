@@ -741,7 +741,7 @@ fn ops_014_a_second_request_waits_for_the_first() {
         "{e:?}"
     );
     assert!(!h.request_path().exists());
-    let after = later + 15 * 60 * 1000 + 1;
+    let after = later + RUNNING_MS + 1;
     assert_eq!(
         request(&h, "0.8.2", "carol", after)
             .unwrap()
@@ -785,12 +785,14 @@ fn ops_014_a_dry_run_writes_nothing() {
     );
 }
 
-/// A host whose steps are scripted: the install's outcome, each health check's answer in turn,
-/// whether the previous binary can be put back, the channel set for the node, and whether the
-/// host is set up for an update (`not_ready`: why not). `calls` has every step, in order.
+/// A host whose steps are scripted: the install's outcome, each restart command's and each health
+/// check's answer in turn (none left: fine), whether the previous binary can be put back, the
+/// channel set for the node, and whether the host is set up for an update (`not_ready`: why
+/// not). `calls` has every step, in order.
 #[derive(Default)]
 struct Scripted {
     install: Option<Result<Outcome, String>>,
+    restarts: Vec<Result<(), String>>,
     health: Vec<Result<(), String>>,
     restore_fails: bool,
     channel: Option<String>,
@@ -813,7 +815,11 @@ impl Host for Scripted {
     }
     fn restart(&mut self) -> Result<(), String> {
         self.calls.push("restart".into());
-        Ok(())
+        if self.restarts.is_empty() {
+            Ok(())
+        } else {
+            self.restarts.remove(0)
+        }
     }
     fn healthy(&mut self) -> Result<String, String> {
         self.calls.push("healthy".into());
@@ -907,6 +913,73 @@ fn ops_014_a_build_that_does_not_come_up_is_rolled_back() {
         Some("checked at the test's address")
     );
     assert!(served_ok("updated") && served_ok("refused"));
+}
+
+/// REQ: OPS-014 (ADR-182) — the restart command's own outcome isn't the build's: a `systemctl
+/// restart` that outlasts its wait (a long drain, a stop systemd ends with SIGKILL) or exits
+/// non-zero goes on to the health check, which decides. Healthy then: `updated`, with the
+/// restart's trouble noted in `health` (and nothing held back). Never healthy: rolled back, as
+/// any build that doesn't come up.
+#[test]
+fn ops_014_a_slow_or_failed_restart_command_is_left_to_the_health_check() {
+    let slow = "`systemctl restart telltale`: didn't finish within 60 s";
+    let failed = "`systemctl restart telltale` exited with exit status: 1";
+    for why in [slow, failed] {
+        let d = tempfile::tempdir().unwrap();
+        let h = here(d.path(), "native", "0.7.0", true);
+        request(&h, "0.8.0", "hook", NOW).unwrap();
+        let mut host = Scripted {
+            install: Some(Ok(installed())),
+            restarts: vec![Err(why.into())],
+            ..Scripted::default()
+        };
+        let served = serve_request(&h.request_path(), &h.result, "0.7.0", NOW, true, &mut host);
+        assert_eq!(
+            served,
+            Served::Done {
+                state: "updated".into()
+            },
+            "{why}"
+        );
+        assert_eq!(host.calls, ["install 0.8.0", "restart", "healthy"], "{why}");
+        let s = status(&h);
+        let health = s.last.unwrap().health.unwrap();
+        assert!(
+            health.contains("checked at") && health.contains(why),
+            "{health}"
+        );
+        assert!(s.held.is_none(), "{why}");
+    }
+    // Slow, and never healthy: rolled back (the previous build put back, restarted, checked).
+    let d = tempfile::tempdir().unwrap();
+    let h = here(d.path(), "native", "0.7.0", true);
+    request(&h, "0.8.0", "hook", NOW).unwrap();
+    let mut host = Scripted {
+        install: Some(Ok(installed())),
+        restarts: vec![Err(slow.into())],
+        health: vec![Err("not healthy within 120 s".into()), Ok(())],
+        ..Scripted::default()
+    };
+    let served = serve_request(&h.request_path(), &h.result, "0.7.0", NOW, true, &mut host);
+    assert_eq!(
+        served,
+        Served::Done {
+            state: "rolled_back".into()
+        }
+    );
+    assert_eq!(
+        host.calls,
+        [
+            "install 0.8.0",
+            "restart",
+            "healthy",
+            "restore /usr/local/bin/telltale.old",
+            "restart",
+            "healthy"
+        ]
+    );
+    let why = status(&h).last.unwrap().error.unwrap();
+    assert!(why.contains("not healthy within 120 s"), "{why}");
 }
 
 /// REQ: OPS-014 (ADR-182) — the previous build is back and restarted, but its check fails too:
@@ -1368,29 +1441,9 @@ fn ops_014_a_host_not_set_up_for_it_refuses_before_fetching() {
     );
 }
 
-/// A host whose unit says the API is off (no health check), for the install `0`.
-struct Off(Option<Install<'static>>);
-
-impl Host for Off {
-    fn install(&mut self, to: &str) -> Result<Outcome, String> {
-        self.0.take().map_or_else(|| Err("twice".into()), |f| f(to))
-    }
-    fn restart(&mut self) -> Result<(), String> {
-        Ok(())
-    }
-    fn healthy(&mut self) -> Result<String, String> {
-        match health_gate(Some(""), |_| false) {
-            Ok(HealthGate::Skip(why)) => Ok(why.to_owned()),
-            other => Err(format!("{other:?}")),
-        }
-    }
-    fn restore(&mut self, _: &Path) -> Result<(), String> {
-        Ok(())
-    }
-}
-
 /// REQ: OPS-014 (ADR-182) — the health gate's address comes from the unit only: unset is the
-/// old default (an older unit), empty is no check (the API is off: `updated` says so), and a
+/// old default (an older unit); empty (the API is off) is no check, so nothing is installed
+/// (`refused: no health check configured`): nothing could prove the new build came up; and a
 /// value must be a plain `http://` URL of `/readyz` at an IP address and port of this host.
 #[test]
 fn ops_014_the_health_gate_takes_only_a_plain_address_of_this_host() {
@@ -1399,9 +1452,10 @@ fn ops_014_the_health_gate_takes_only_a_plain_address_of_this_host() {
         health_gate(None, here_ip),
         Ok(HealthGate::Check(DEFAULT_HEALTH_URL.into()))
     );
-    assert_eq!(
-        health_gate(Some(""), here_ip),
-        Ok(HealthGate::Skip("not checked: the API is off"))
+    let e = health_gate(Some(""), here_ip).unwrap_err();
+    assert!(
+        e.starts_with("no health check configured") && e.contains(HEALTH_URL_ENV),
+        "{e}"
     );
     for ok in [
         "http://127.0.0.1:8053/readyz?startup=1",
@@ -1432,27 +1486,26 @@ fn ops_014_the_health_gate_takes_only_a_plain_address_of_this_host() {
     // The real check: loopback is this host's; a documentation address isn't (no packet sent).
     assert!(is_this_host(std::net::IpAddr::from([127, 0, 0, 1])));
     assert!(!is_this_host(std::net::IpAddr::from([192, 0, 2, 1])));
-    // The API off: `updated`, with the reason as its health.
+    // A unit whose variable is empty: the run is refused before anything is fetched, and the
+    // node isn't restarted.
     let d = tempfile::tempdir().unwrap();
     let h = here(d.path(), "native", "0.7.0", true);
     request(&h, "0.8.0", "alice", NOW).unwrap();
-    let served = serve_request(
-        &h.request_path(),
-        &h.result,
-        "0.7.0",
-        NOW,
-        true,
-        &mut Off(Some(Box::new(|_| Ok(installed())))),
-    );
-    assert_eq!(
-        served,
-        Served::Done {
-            state: "updated".into()
-        }
-    );
-    assert_eq!(
-        status(&h).last.unwrap().health.as_deref(),
-        Some("not checked: the API is off")
+    let mut host = Scripted {
+        install: Some(Err("must not install".into())),
+        not_ready: health_gate(Some(""), |_| false).err(),
+        ..Scripted::default()
+    };
+    let served = serve_request(&h.request_path(), &h.result, "0.7.0", NOW, true, &mut host);
+    assert_eq!(served, refused());
+    assert!(host.calls.is_empty(), "{:?}", host.calls);
+    assert!(
+        status(&h)
+            .last
+            .unwrap()
+            .error
+            .unwrap()
+            .starts_with("no health check configured")
     );
 }
 
@@ -1517,6 +1570,34 @@ fn ops_014_the_run_fits_in_the_units_time_limit() {
     );
     // The node's lock on a run that says `installing` is the unit's limit.
     assert_eq!(RUNNING_MS / 1000, limit);
+    // REQ: OPS-014 (ADR-182) — the restart command is waited for longer than the node unit takes
+    // to stop (a drain, then SIGKILL), so the old process is gone when the health check starts.
+    let node = include_str!("../../../deploy/systemd/telltale.service");
+    let stop: u64 = node
+        .lines()
+        .find_map(|l| l.strip_prefix("TimeoutStopSec="))
+        .and_then(|v| v.trim().parse().ok())
+        .expect("TimeoutStopSec");
+    assert!(crate::selfupdate::RESTART_WAIT.as_secs() >= 2 * stop);
+    // REQ: OPS-014 (ADR-182) — `ctl upgrade` (and the chart's hook) waits for a node at least as
+    // long as the update service may take.
+    let ctl = crate::ctl::parse_duration(crate::ctl::UPGRADE_TIMEOUT).unwrap();
+    assert!(
+        u64::from(ctl) >= run_budget_secs(),
+        "ctl waits {ctl} s, the run may take {} s",
+        run_budget_secs()
+    );
+    let values = include_str!("../../../deploy/helm/telltale/values.yaml");
+    let hook: u32 = values
+        .lines()
+        .skip_while(|l| !l.starts_with("upgradeHook:"))
+        .find_map(|l| l.trim().strip_prefix("timeout: "))
+        .and_then(|v| crate::ctl::parse_duration(v).ok())
+        .expect("upgradeHook.timeout");
+    assert!(
+        u64::from(hook) >= run_budget_secs(),
+        "the hook waits {hook} s"
+    );
 }
 
 #[test]

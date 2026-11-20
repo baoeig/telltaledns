@@ -12,7 +12,7 @@
 # not on a version whose build it installed here and that didn't come up in the last day. It installs only a binary that the
 # release key signed, under the version its signed index names, and only where root alone can
 # write; then it restarts the node and waits up to two minutes for it to be healthy at
-# TELLTALE_UPDATE_HEALTH_URL (empty: the API is off, no check); if it isn't, it puts the previous
+# TELLTALE_UPDATE_HEALTH_URL (empty: the API is off, and it installs nothing); if it isn't, it puts the previous
 # binary back and restarts once more. The outcome goes to /var/lib/telltale-update/result.json,
 # which the node reads.
 [Unit]
@@ -27,13 +27,15 @@ ExecStart=/usr/local/bin/telltale self-update --request /var/lib/telltale/update
 Environment=TELLTALE_INSTALL=native
 Environment=TELLTALE_LOG=info
 # Written by install.sh: the node's update channel (edge or stable), and where the health check
-# after an install asks (the node's [api] address; empty when the API is off). Never from the
+# after an install asks (the node's [api] address; empty when the API is off: then nothing is
+# installed). Never from the
 # request.
 Environment=TELLTALE_UPDATE_CHANNEL=stable
 Environment=TELLTALE_UPDATE_HEALTH_URL=http://127.0.0.1:8053/readyz?startup=1
-# The downloads (eight minutes for them all), the restart and two minutes for the new build to be
-# healthy, and one rollback: under this limit with room to spare (node_update::run_budget_secs).
-TimeoutStartSec=900
+# The downloads (eight minutes for them all), the restart (up to a minute) and two minutes for the
+# new build to be healthy, and one rollback: under this limit with room to spare
+# (node_update::run_budget_secs).
+TimeoutStartSec=960
 StateDirectory=telltale-update
 StateDirectoryMode=0755
 UMask=0022

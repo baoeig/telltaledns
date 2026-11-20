@@ -276,7 +276,7 @@ pub(crate) struct UpgradeArgs {
     pub(crate) nodes: Vec<String>,
     /// How long each node may take to install the version and come back in sync: `90s`,
     /// `10m`, or seconds.
-    #[arg(long, value_parser = parse_duration, default_value = "10m")]
+    #[arg(long, value_parser = parse_duration, default_value = UPGRADE_TIMEOUT)]
     pub(crate) timeout: u32,
     /// Leave nodes that are down out instead of stopping. A node that is up but can't take the
     /// request (its update service is off, an update is running there, it follows another
@@ -1241,8 +1241,13 @@ enum Preflight {
     Block(String),
 }
 
-/// How long an `installing` run counts as running (the node's own lock is the same).
-const INSTALLING_MS: u64 = 15 * 60 * 1000;
+/// How long an `installing` run counts as running (the node's own lock).
+const INSTALLING_MS: u64 = crate::node_update::RUNNING_MS;
+
+/// REQ: OPS-014 (ADR-182) — `ctl upgrade --timeout`'s default: at least the root update service's
+/// longest run (`node_update::run_budget_secs`, checked by a test), so `ctl` and the chart's hook
+/// don't give up on a node that is still within its time.
+pub(crate) const UPGRADE_TIMEOUT: &str = "15m";
 
 /// REQ: OPS-014 (ADR-182) — whether a node whose update state is `u` can be asked for `to` now
 /// (`now_ms`: this machine's clock, for the age of a run that says `installing`).

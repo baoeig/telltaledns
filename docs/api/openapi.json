@@ -18522,7 +18522,7 @@
               "string",
               "null"
             ],
-            "description": "For `updated`: how the new build's health was checked (`checked at <url>`), or why it\nwasn't (`not checked: the API is off`). REQ: OPS-014 (ADR-182)."
+            "description": "For `updated`: how the new build's health was checked (`checked at <url>`, with any trouble\nthe restart command had), or why it wasn't (`not checked: the node wasn't restarted`, for a\nrun without `--restart`). REQ: OPS-014 (ADR-182)."
           },
           "id": {
             "type": "string",
@@ -18530,7 +18530,7 @@
           },
           "state": {
             "type": "string",
-            "description": "`installing` (also while the restarted node is checked), `updated` (installed, restarted,\nand healthy, or not checked: see `health`), `up_to_date`, `rolled_back` (the new build\nwasn't healthy after the restart: the previous binary is back in place; an incident to\nlook into, see `error`), `unavailable` (an edge build the edge channel no longer serves:\nnothing installed; the error names the one it serves), `failed` (not installed, or the\nprevious binary couldn't be put back), or `refused` (the request was stale, malformed,\nolder than the node's version, on another channel, of a version whose build was installed\nthere and didn't come up in the last day, or the host wasn't set up for it). REQ: OPS-014 (ADR-182).",
+            "description": "`installing` (also while the restarted node is checked), `updated` (installed, restarted,\nand healthy: see `health`), `up_to_date`, `rolled_back` (the new build\nwasn't healthy after the restart: the previous binary is back in place; an incident to\nlook into, see `error`), `unavailable` (an edge build the edge channel no longer serves:\nnothing installed; the error names the one it serves), `failed` (not installed, or the\nprevious binary couldn't be put back), or `refused` (the request was stale, malformed,\nolder than the node's version, on another channel, of a version whose build was installed\nthere and didn't come up in the last day, or the host wasn't set up for it). REQ: OPS-014 (ADR-182).",
             "example": "updated"
           },
           "to": {

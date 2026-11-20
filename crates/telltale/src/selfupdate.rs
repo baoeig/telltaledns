@@ -31,9 +31,11 @@ const MAX_BINARY: u64 = 128 * 1024 * 1024;
 pub(crate) const FETCH_DEADLINE: Duration = Duration::from_secs(480);
 /// How long the new binary's test run (`--version`) may take before it is killed and refused.
 pub(crate) const VERSION_WAIT: Duration = Duration::from_secs(10);
-/// How long `systemctl restart telltale` is waited for. The restart itself goes on if it takes
-/// longer; the health check after it then decides.
-pub(crate) const RESTART_WAIT: Duration = Duration::from_secs(30);
+/// How long `systemctl restart telltale` is waited for: twice the node unit's `TimeoutStopSec=30`
+/// (a graceful drain, then systemd's SIGKILL), so the old process is gone by then. The restart
+/// itself goes on if it takes longer, and neither that nor a non-zero exit fails the build: the
+/// health check after it decides (`node_update::restart_and_check`).
+pub(crate) const RESTART_WAIT: Duration = Duration::from_secs(60);
 
 /// Which releases to follow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]

@@ -422,8 +422,8 @@ pub(crate) fn dry_run(h: &Here, to: &str, now: u64) -> Result<NodeUpdate, Proble
 }
 
 /// REQ: OPS-014 (ADR-182) — a run that says `installing` holds a new request off this long (the
-/// update service's own limit, `TimeoutStartSec=900`): one that died is no lock for ever.
-const RUNNING_MS: u64 = 15 * 60 * 1000;
+/// update service's own limit, `TimeoutStartSec=960`): one that died is no lock for ever.
+pub(crate) const RUNNING_MS: u64 = 16 * 60 * 1000;
 
 fn busy_waiting(h: &Here) -> Problem {
     Problem::new(
@@ -1051,7 +1051,9 @@ pub(crate) fn serve_request(
 /// state to record (`updated`, `rolled_back`, `failed`), why, and how the health was checked.
 /// Once the previous binary is back in place the run is `rolled_back` whatever its own check
 /// says (that check failing too points at the check, and says so); `failed` only when it can't
-/// be put back.
+/// be put back. The restart command's own trouble (it outlasted its wait, or exited non-zero:
+/// the restart may still be going on in systemd) is no verdict on the build: the health check,
+/// with its own window, decides, and `health` notes it.
 fn restart_and_check(
     to: &str,
     current: &str,
@@ -1059,9 +1061,14 @@ fn restart_and_check(
     host: &mut impl Host,
 ) -> (&'static str, Option<String>, Option<String>) {
     info!("update: installed {to}; restarting the node");
-    let why = match host.restart().and_then(|()| host.healthy()) {
+    let restart_note = restart_leaving_it_to_the_check(host);
+    let why = match host.healthy() {
         Ok(how) => {
             info!("update: {to} is running and healthy ({how})");
+            let how = match restart_note {
+                Some(n) => format!("{how} (the restart command: {n})"),
+                None => how,
+            };
             return ("updated", None, Some(how));
         }
         Err(why) => why,
@@ -1074,7 +1081,8 @@ fn restart_and_check(
         warn!("update: {e}");
         return ("failed", Some(e), None);
     }
-    let e = match host.restart().and_then(|()| host.healthy()) {
+    let _ = restart_leaving_it_to_the_check(host);
+    let e = match host.healthy() {
         Ok(_) => {
             format!("{to} wasn't healthy after the restart ({why}); {current} is back and running")
         }
@@ -1084,6 +1092,14 @@ fn restart_and_check(
     };
     warn!("update: rolled back: {e}");
     ("rolled_back", Some(e), None)
+}
+
+/// REQ: OPS-014 (ADR-182) — restarts the node; what went wrong with the command, if anything, for
+/// a note (the health check after it decides, not this).
+fn restart_leaving_it_to_the_check(host: &mut impl Host) -> Option<String> {
+    let e = host.restart().err()?;
+    warn!("update: {e}: the health check decides");
+    Some(e)
 }
 
 fn done(state: &str) -> Served {
@@ -1134,21 +1150,19 @@ pub(crate) const fn run_budget_secs() -> u64 {
         + gate
 }
 
-/// Where the health gate asks, or why it doesn't.
+/// Where the health gate asks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HealthGate {
     /// GET this URL until it answers 200 twice in a row.
     Check(String),
-    /// No check (the run records `updated` with this as `health`).
-    Skip(&'static str),
 }
 
 /// REQ: OPS-014 (ADR-182) — the health gate from the unit's [`HEALTH_URL_ENV`] (`set`: its value,
-/// `None` when the unit has none): unset is [`DEFAULT_HEALTH_URL`] (an older unit); empty is no
-/// check (the API is off, so nothing answers); anything else must be a plain `http://` URL of
-/// `/readyz` (or `/readyz?startup=1`) at an IP address of this host (`is_here`: loopback always
-/// is), with a port. No name (no lookup), no user, no other path: `Err` says why, and the run is
-/// refused before anything is fetched.
+/// `None` when the unit has none): unset is [`DEFAULT_HEALTH_URL`] (an older unit); empty (the
+/// API is off) is no check at all, so nothing is installed: nothing could prove a new build came
+/// up; anything else must be a plain `http://` URL of `/readyz` (or `/readyz?startup=1`) at an IP
+/// address of this host (`is_here`: loopback always is), with a port. No name (no lookup), no
+/// user, no other path: `Err` says why, and the run is refused before anything is fetched.
 pub(crate) fn health_gate(
     set: Option<&str>,
     is_here: impl Fn(std::net::IpAddr) -> bool,
@@ -1157,7 +1171,9 @@ pub(crate) fn health_gate(
         return Ok(HealthGate::Check(DEFAULT_HEALTH_URL.to_owned()));
     };
     if url.is_empty() {
-        return Ok(HealthGate::Skip("not checked: the API is off"));
+        return Err(format!(
+            "no health check configured: {HEALTH_URL_ENV} is empty in telltale-update.service (the node's API is off), so nothing could prove a new build came up; nothing installed. Turn the API on and re-run install.sh --cluster-updates, or upgrade this node by hand"
+        ));
     }
     let bad = |why: &str| {
         Err(format!(

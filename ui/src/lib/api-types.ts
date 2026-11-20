@@ -6829,15 +6829,16 @@ export interface components {
              */
             from: string;
             /**
-             * @description For `updated`: how the new build's health was checked (`checked at <url>`), or why it
-             *     wasn't (`not checked: the API is off`). REQ: OPS-014 (ADR-182).
+             * @description For `updated`: how the new build's health was checked (`checked at <url>`, with any trouble
+             *     the restart command had), or why it wasn't (`not checked: the node wasn't restarted`, for a
+             *     run without `--restart`). REQ: OPS-014 (ADR-182).
              */
             health?: string | null;
             /** @description The request it answers. */
             id: string;
             /**
              * @description `installing` (also while the restarted node is checked), `updated` (installed, restarted,
-             *     and healthy, or not checked: see `health`), `up_to_date`, `rolled_back` (the new build
+             *     and healthy: see `health`), `up_to_date`, `rolled_back` (the new build
              *     wasn't healthy after the restart: the previous binary is back in place; an incident to
              *     look into, see `error`), `unavailable` (an edge build the edge channel no longer serves:
              *     nothing installed; the error names the one it serves), `failed` (not installed, or the

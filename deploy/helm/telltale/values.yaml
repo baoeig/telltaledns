@@ -290,9 +290,10 @@ grafanaDashboard:
 # its update service on (install.sh --cluster-updates, or systemctl enable --now
 # telltale-update.path). An edge image's build can be installed on the nodes only while it is
 # the newest on the edge channel (see whenUnavailable). Nodes on an older version without this
-# feature are upgraded by hand once (telltale self-update --restart). Helm waits for a hook only
-# `helm upgrade --timeout` (5m by default): give it at least activeDeadlineSeconds
-# (`--timeout 30m`). docs/running.md "Upgrading from the cluster" has the Argo CD notes.
+# feature are upgraded by hand once, on their own channel (telltale self-update --restart, with
+# --channel edge on an edge node). Helm waits for a hook only `helm upgrade --timeout` (5m by
+# default): give it at least activeDeadlineSeconds (`--timeout 30m`). docs/running.md
+# "Upgrading from the cluster" has the Argo CD notes.
 upgradeHook:
   enabled: false
   # A Secret with an agent token (Settings → API tokens → for an AI agent, made by an admin)
@@ -317,8 +318,10 @@ upgradeHook:
   caSecret:
     name: ""
     key: ca.crt
-  # How long each node may take to install the version and come back in sync.
-  timeout: 10m
+  # How long each node may take to install the version and come back in sync: at least the
+  # update service's longest run (about 15 minutes: the downloads, the restart, the health
+  # check and a rollback).
+  timeout: 15m
   # Leave nodes that are down out instead of failing. A node that is up but can't take the
   # request (its update service off, another channel, an update running there) still fails the
   # hook: that is set up wrong, not down.
@@ -328,7 +331,8 @@ upgradeHook:
   # release; `skip` leaves that node on its version with a loud log line and goes on (the
   # replicas-first order is lost for that node in that run).
   whenUnavailable: fail
-  # The whole hook's limit, for every node together.
+  # The whole hook's limit, for every node together: give it `timeout` for each native node it
+  # may upgrade (1800 covers two; raise it, and helm's --timeout and Argo CD's, for more).
   activeDeadlineSeconds: 1800
   resources:
     requests:

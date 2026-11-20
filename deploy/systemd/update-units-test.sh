@@ -3,7 +3,8 @@
 # where the health check asks into the root update units: the path unit watches
 # <data_dir>/update/request.json, and the service reads the request there and may write only that
 # folder, the binary's directory and its own state; its health check asks the node's [api]
-# address (a wildcard bind at loopback; nothing when the API is off). The data directory comes
+# address (a wildcard bind at loopback; nothing when the API is off, and then --cluster-updates is
+# refused). The data directory comes
 # from the config's effective [node] data_dir (the default when it names none); one that isn't a
 # plain absolute path gets no units. --cluster-updates is refused for a binary folder or a data
 # directory that isn't fit for a root service. No root, nothing installed: the `update-units`
@@ -32,9 +33,11 @@ run() {
     url) update_health_url "$2" ;;
     render) render_update_units deploy/systemd "$3" "$2" "$4" "$5" ;;
     owned) update_root_owned "$2" ;;
-    refusal) update_refusal "$2" ;;
+    refusal) update_refusal "$2" "$3" ;;
+    chan) update_channel_refusal "$2" "$3" ;;
   esac' sh "$T/block.sh" "$@"
 }
+URL='http://127.0.0.1:8053/readyz?startup=1'
 cfg() { # name [data_dir]
   { echo 'config_version = 1'
     if [ -n "${2:-}" ]; then printf '[node]\ndata_dir = "%s"\n' "$2"; fi
@@ -73,7 +76,7 @@ done
 ok "the health URL: the default, a specific address, another port, a wildcard (IPv4 and IPv6) at loopback, IPv6"
 u=$(run url "$(api off 127.0.0.1:8053 false)") || fail "the API off: refused"
 [ -z "$u" ] || fail "the API off: $u"
-ok "the API off: no health URL (no check)"
+ok "the API off: no health URL (--cluster-updates is then refused)"
 
 run render "$d" "$T/units" edge 'http://192.168.3.2:8053/readyz?startup=1'
 path="$T/units/telltale-update.path" svc="$T/units/telltale-update.service"
@@ -92,13 +95,13 @@ ok "the service gets the node's channel and the health URL as Environment lines 
 run render "$d" "$T/units" stable ''
 grep -qx 'Environment=TELLTALE_UPDATE_HEALTH_URL=' "$svc" || fail "API off: $(grep HEALTH_URL "$svc")"
 grep -qx 'Environment=TELLTALE_UPDATE_CHANNEL=stable' "$svc" || fail "stable: $(grep CHANNEL "$svc")"
-ok "the API off: the health URL is written empty (no check)"
-# REQ: OPS-014 (ADR-182) — the run fits in the unit's limit: node_update::run_budget_secs (822 s)
+ok "the API off: the health URL is written empty (the update service then installs nothing)"
+# REQ: OPS-014 (ADR-182) — the run fits in the unit's limit: node_update::run_budget_secs (882 s)
 # is checked against this value by ops_014_the_run_fits_in_the_units_time_limit; the render keeps it.
 [ "$(grep '^TimeoutStartSec=' "$svc")" = "$(grep '^TimeoutStartSec=' deploy/systemd/telltale-update.service)" ] \
   || fail "the render changed TimeoutStartSec"
-[ "$(sed -n 's/^TimeoutStartSec=//p' "$svc")" -ge 900 ] || fail "TimeoutStartSec is under the run's budget"
-ok "the rendered service keeps TimeoutStartSec=900 (above the run's 822 s budget)"
+[ "$(sed -n 's/^TimeoutStartSec=//p' "$svc")" -ge 942 ] || fail "TimeoutStartSec is under the run's budget and a minute"
+ok "the rendered service keeps TimeoutStartSec=960 (above the run's 882 s budget and a minute)"
 
 # (The last one is a letter outside the explicit list, which a locale's range might take.)
 for bad in "/srv/my data" "relative/dir" "/srv/../etc" "/srv/./x" "/srv/tt;rm" '/srv/$HOME' $'/srv/tt\xc3\xa9'; do
@@ -112,16 +115,36 @@ run owned /usr/bin >/dev/null || fail "/usr/bin isn't root-owned?"
 mkdir -p "$T/mine/bin"
 bad=$(run owned "$T/mine/bin") && fail "a folder of $(id -un) passed"
 [ "$bad" = "$(cd "$T/mine/bin" && pwd -P)" ] || fail "the folder named: $bad"
-why=$(P="$T/mine" run refusal /var/lib/telltale)
+why=$(P="$T/mine" run refusal /var/lib/telltale "$URL")
 case "$why" in "install location is not root-owned: $(cd "$T/mine/bin" && pwd -P) "*) ;; *) fail "prefix: $why" ;; esac
-why=$(P=/usr run refusal /var/lib/telltale)
+case "$why" in *"chmod g-w"*) ;; *) fail "the prefix refusal doesn't say how to fix it: $why" ;; esac
+why=$(P=/usr run refusal /var/lib/telltale "$URL")
 [ -z "$why" ] || fail "/usr and /var/lib/telltale refused: $why"
 for dd in /home/pi/telltale /root/telltale; do
-  why=$(P=/usr run refusal "$dd")
+  why=$(P=/usr run refusal "$dd" "$URL")
   case "$why" in *"under /home or /root"*) ;; *) fail "$dd: $why" ;; esac
 done
-why=$(P=/usr run refusal "$T/mine/data")
+why=$(P=/usr run refusal "$T/mine/data" "$URL")
 case "$why" in "the data directory's parent folder is not root-owned"*) ;; *) fail "$T/mine/data: $why" ;; esac
 ok "--cluster-updates is refused for a binary folder that isn't root's, and a data directory under /home, /root or a folder that isn't root's"
+# REQ: OPS-014 (ADR-182) — and with the API off: nothing could prove a new build came up.
+why=$(P=/usr run refusal /var/lib/telltale "")
+case "$why" in *"needs the API"*"[api] enabled = false"*) ;; *) fail "the API off: $why" ;; esac
+ok "--cluster-updates is refused with the API off"
+
+# REQ: OPS-014 (ADR-182) — an edge build installed and neither --edge nor --stable given: refused
+# before anything changes (a re-run would replace it with the newest release). A flag, or a
+# release installed, goes on.
+edge='telltale 0.8.0-edge.404 (commit 99a9f22, built 2026-11-19T20:35:00Z, channel edge, aarch64-unknown-linux-musl)'
+why=$(run chan "" "$edge")
+case "$why" in "this node runs an edge build"*"pass --edge to stay on edge builds, or --stable to move it to the stable channel"*) ;;
+  *) fail "an edge build with no flag: $why" ;; esac
+for flag in edge stable; do
+  why=$(run chan "$flag" "$edge"); [ -z "$why" ] || fail "--$flag refused: $why"
+done
+why=$(run chan "" 'telltale 0.7.0 (commit 1234567, built 2026-11-16T00:00:00Z, channel stable, x86_64-unknown-linux-musl)')
+[ -z "$why" ] || fail "a release with no flag refused: $why"
+grep -q -- '--stable) CHANNEL=stable; CHANNEL_FLAG=stable ;;' deploy/systemd/install.sh || fail "install.sh has no --stable"
+ok "--cluster-updates over an edge build needs --edge or --stable"
 
 echo "PASS ($n checks)"

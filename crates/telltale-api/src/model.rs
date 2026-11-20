@@ -2503,7 +2503,7 @@ pub struct NodeUpdateRun {
     #[schema(example = "0.7.0")]
     pub from: String,
     /// `installing` (also while the restarted node is checked), `updated` (installed, restarted,
-    /// and healthy, or not checked: see `health`), `up_to_date`, `rolled_back` (the new build
+    /// and healthy: see `health`), `up_to_date`, `rolled_back` (the new build
     /// wasn't healthy after the restart: the previous binary is back in place; an incident to
     /// look into, see `error`), `unavailable` (an edge build the edge channel no longer serves:
     /// nothing installed; the error names the one it serves), `failed` (not installed, or the
@@ -2515,8 +2515,9 @@ pub struct NodeUpdateRun {
     /// What went wrong, for `failed`, `rolled_back`, `unavailable` and `refused`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// For `updated`: how the new build's health was checked (`checked at <url>`), or why it
-    /// wasn't (`not checked: the API is off`). REQ: OPS-014 (ADR-182).
+    /// For `updated`: how the new build's health was checked (`checked at <url>`, with any trouble
+    /// the restart command had), or why it wasn't (`not checked: the node wasn't restarted`, for a
+    /// run without `--restart`). REQ: OPS-014 (ADR-182).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<String>,
     /// Who asked, as the node wrote it in the request: the update service can't check it
