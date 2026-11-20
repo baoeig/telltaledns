@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # REQ: T8.2, API-002 (ADR-181) — a router added through the API, as the UI does: its API key is
 # saved to a new private file under <data_dir>/secrets/ (never stored, listed, or audited), the
-# router is read without a restart, credential files outside secrets/ are refused, a change to
-# another field keeps the key but a new address needs it again, a refused change writes
-# nothing, a new key switches files, and a delete removes the router and only the files the
-# API wrote.
+# router is read without a restart, a body that names a key file is refused (outside secrets/,
+# or another router's), the key's status reads "saved", a change to another field keeps the key
+# but a new address needs it again, a refused change writes nothing, a new key switches files,
+# and a delete removes the router and only the files the API wrote. Loopback only.
 # Needs python3, curl.
 # Usage: deploy/routers-ui-e2e.sh [path/to/telltale]   (default: target/debug/telltale)
 set -euo pipefail
@@ -105,6 +105,17 @@ items = {x["ip"]: x for x in json.load(sys.stdin)["items"]}
 assert items["192.168.7.20"]["hostname"] == "Hall tablet", items
 ' || fail "the router added through the API wasn't read"
 echo "added: key saved to a new file under secrets/ (0600), router read without a restart"
+
+# Another router can't name this key's file (paste only), and the key's status takes no secret.
+code=$(put evil "{\"type\":\"unifi\",\"url\":\"http://127.0.0.2:26984\",\"api_key_file\":\"$F\",\"offline_days\":0}")
+[ "$code" = 422 ] && grep -q "Paste the key" "$E/out" || fail "a router named another router's key file ($code): $(cat "$E/out")"
+curl -sf -b "$E/jar" "$API/api/v1/config/entries?kind=router" | python3 -c '
+import json, sys
+items = {x["name"]: x for x in json.load(sys.stdin)["items"]}
+assert "evil" not in items, items
+assert items["udm"]["credentials"] == {"api_key": "saved"}, items
+' || fail "the key's status isn't saved, or the refused router was stored"
+echo "paste only: another router can't name the key's file; its status reads saved"
 
 # The key is nowhere the API can show it.
 curl -sf -b "$E/jar" "$API/api/v1/config/entries?kind=router" > "$E/entries"
