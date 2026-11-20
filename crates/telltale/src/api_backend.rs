@@ -5234,124 +5234,146 @@ impl ApiBackend {
         out
     }
 
-    #[allow(clippy::too_many_lines)] // one write, from its plan to its reload
+    /// A write to an entry made through the API (ADR-069): planned, stored and applied. REQ:
+    /// API-002, T8.2 (ADR-181) — F3: a write that stores something runs to its end in a task of
+    /// its own, so a client that goes away can't stop it between writing a router's new key file
+    /// and storing the entry that names it, or between storing and applying. A dry run stores
+    /// nothing: it stays tied to its request (a simulation stops when its client goes).
     pub(crate) fn do_write_managed(
         &self,
-        mut w: ManagedWrite,
+        w: ManagedWrite,
     ) -> BoxFuture<Result<ConfigChange, Problem>> {
         let src = Arc::clone(&self.src);
+        if w.dry_run {
+            return Box::pin(run_managed_write(src, w));
+        }
         Box::pin(async move {
-            // REQ: API-002, API-010 (ADR-040) — one change at a time: the plan below is
-            // checked against what the store then changes, and the result is applied before
-            // the next write looks (two writes planned on the same snapshot could each be
-            // valid and together not: the reload would then fall back to the files alone).
-            let one_at_a_time = src.config_writes.lock().await;
-            // REQ: API-002, T8.2 (ADR-181) — routers are an administrator's: refused before the
-            // body's keys are looked at.
-            router_guard(&w)?;
-            let state = src
-                .auth
-                .get()
-                .map(|a| Arc::clone(a.state()))
-                .ok_or_else(|| Problem::unavailable("the state database isn't open yet"))?;
-            let (plan, current, secrets, w) = {
-                let (src, state) = (Arc::clone(&src), Arc::clone(&state));
-                tokio::task::spawn_blocking(move || {
-                    // REQ: T8.2, API-002 (ADR-181) — a router's pasted secrets, swapped for new
-                    // files' paths; a key file the body names is refused unless it's the
-                    // router's own (against what the write is planned on, below).
-                    let secrets = crate::router_secrets::prepare(&src, &state, &mut w)?;
-                    let current = state
-                        .config_version()
-                        .map_err(|e| Problem::internal(e.to_string()))?;
-                    plan_managed(&src, &state, &w).map(|p| (p, current, secrets, w))
-                })
-                .await
-                .map_err(|e| Problem::internal(format!("request worker failed: {e}")))??
-            };
-            // T7.5 — on a Git-managed node, what to add to Git to keep the change.
-            let keep_in_git = (src.config.load().cluster.config_source.as_str() == "gitops")
-                .then(|| keep_in_git(w.kind, &plan.name, w.body.as_ref(), plan.after.as_ref()));
-            let change = |applied, version| ConfigChange {
-                applied,
-                config_version: version,
-                before: plan.before.clone(),
-                after: plan.after.clone(),
-                recent_queries: plan.recent_queries,
-                impact: plan.impact.clone(),
-                warnings: plan.warnings.clone(),
-                keep_in_git: keep_in_git.clone(),
-                simulation: None,
-            };
-            if w.dry_run {
-                if let Some(v) = w.expect
-                    && v != current
-                {
-                    return Err(version_conflict(current));
-                }
-                let mut out = change(false, current);
-                // REQ: OBS-024 — `simulate`: what the change would have done to the logged
-                // queries (after the version check: a stale plan isn't worth replaying).
-                // Other writes needn't wait for the replay.
-                drop(one_at_a_time);
-                if let Some(opts) = &w.simulate {
-                    out.simulation =
-                        dry_run_simulation(&src, &state, &plan.candidate, opts, w.by_admin).await?;
-                }
-                return Ok(out);
-            }
-            // ADR-181 — new files, removed again unless the change applies.
-            let written = secrets.write()?;
-            let stored = {
-                let (state, w, name, body, also) = (
-                    Arc::clone(&state),
-                    w.clone(),
-                    plan.name.clone(),
-                    plan.body.clone(),
-                    plan.also.clone(),
-                );
-                tokio::task::spawn_blocking(move || {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_secs());
-                    let kind = kind_name(w.kind);
-                    // REQ: API-002 (T9.22) — what the change also needs, first; the version
-                    // check applies to the first write.
-                    let mut expect = w.expect;
-                    for (k, n, b) in &also {
-                        let r = match b {
-                            Some(b) => state.put_managed(k, n, b, None, expect, now, &w.by),
-                            None => state.delete_managed(k, n, expect),
-                        };
-                        r?;
-                        expect = None;
-                    }
-                    match &body {
-                        Some(b) => state.put_managed(kind, &name, b, None, expect, now, &w.by),
-                        None => state.delete_managed(kind, &name, expect),
-                    }
-                })
+            tokio::spawn(run_managed_write(src, w))
                 .await
                 .map_err(|e| Problem::internal(format!("request worker failed: {e}")))?
-            };
-            let version = stored.map_err(|e| match e {
-                ManagedError::VersionConflict { current } => version_conflict(current),
-                ManagedError::NotFound { .. } => Problem::not_found(e.to_string()),
-                ManagedError::State(e) => Problem::internal(e.to_string()),
-            })?;
-            provenance(&w.by, version);
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let applied = src.reload.send(tx).await.is_ok() && rx.await.unwrap_or(false);
-            if !applied {
-                return Err(Problem::internal(
-                    "the change was saved but couldn't be applied; the server log says why",
-                ));
-            }
-            written.keep();
-            secrets.prune(&src);
-            Ok(change(true, version))
         })
     }
+}
+
+/// [`ApiBackend::do_write_managed`]'s work.
+#[allow(clippy::too_many_lines)] // one write, from its plan to its reload
+async fn run_managed_write(
+    src: Arc<Sources>,
+    mut w: ManagedWrite,
+) -> Result<ConfigChange, Problem> {
+    // REQ: API-002, API-010 (ADR-040) — one change at a time: the plan below is
+    // checked against what the store then changes, and the result is applied before
+    // the next write looks (two writes planned on the same snapshot could each be
+    // valid and together not: the reload would then fall back to the files alone).
+    let one_at_a_time = src.config_writes.lock().await;
+    // REQ: API-002, T8.2 (ADR-181) — routers are an administrator's: refused before the
+    // body's keys are looked at.
+    router_guard(&w)?;
+    let state = src
+        .auth
+        .get()
+        .map(|a| Arc::clone(a.state()))
+        .ok_or_else(|| Problem::unavailable("the state database isn't open yet"))?;
+    let (plan, current, secrets, w) = {
+        let (src, state) = (Arc::clone(&src), Arc::clone(&state));
+        tokio::task::spawn_blocking(move || {
+            // REQ: T8.2, API-002 (ADR-181) — a router's pasted secrets, swapped for new
+            // files' paths; a key file the body names is refused unless it's the
+            // router's own (against what the write is planned on, below).
+            let secrets = crate::router_secrets::prepare(&src, &state, &mut w)?;
+            let current = state
+                .config_version()
+                .map_err(|e| Problem::internal(e.to_string()))?;
+            plan_managed(&src, &state, &w).map(|p| (p, current, secrets, w))
+        })
+        .await
+        .map_err(|e| Problem::internal(format!("request worker failed: {e}")))??
+    };
+    // T7.5 — on a Git-managed node, what to add to Git to keep the change.
+    let keep_in_git = (src.config.load().cluster.config_source.as_str() == "gitops")
+        .then(|| keep_in_git(w.kind, &plan.name, w.body.as_ref(), plan.after.as_ref()));
+    let change = |applied, version| ConfigChange {
+        applied,
+        config_version: version,
+        before: plan.before.clone(),
+        after: plan.after.clone(),
+        recent_queries: plan.recent_queries,
+        impact: plan.impact.clone(),
+        warnings: plan.warnings.clone(),
+        keep_in_git: keep_in_git.clone(),
+        simulation: None,
+    };
+    if w.dry_run {
+        if let Some(v) = w.expect
+            && v != current
+        {
+            return Err(version_conflict(current));
+        }
+        let mut out = change(false, current);
+        // REQ: OBS-024 — `simulate`: what the change would have done to the logged
+        // queries (after the version check: a stale plan isn't worth replaying).
+        // Other writes needn't wait for the replay.
+        drop(one_at_a_time);
+        if let Some(opts) = &w.simulate {
+            out.simulation =
+                dry_run_simulation(&src, &state, &plan.candidate, opts, w.by_admin).await?;
+        }
+        return Ok(out);
+    }
+    // ADR-181 — new files, removed again unless the change applies.
+    let written = secrets.write()?;
+    let stored = {
+        let (state, w, name, body, also) = (
+            Arc::clone(&state),
+            w.clone(),
+            plan.name.clone(),
+            plan.body.clone(),
+            plan.also.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let kind = kind_name(w.kind);
+            // REQ: API-002 (T9.22) — what the change also needs, first; the version
+            // check applies to the first write.
+            let mut expect = w.expect;
+            for (k, n, b) in &also {
+                let r = match b {
+                    Some(b) => state.put_managed(k, n, b, None, expect, now, &w.by),
+                    None => state.delete_managed(k, n, expect),
+                };
+                r?;
+                expect = None;
+            }
+            match &body {
+                Some(b) => state.put_managed(kind, &name, b, None, expect, now, &w.by),
+                None => state.delete_managed(kind, &name, expect),
+            }
+        })
+        .await
+        .map_err(|e| Problem::internal(format!("request worker failed: {e}")))?
+    };
+    let version = stored.map_err(|e| match e {
+        ManagedError::VersionConflict { current } => version_conflict(current),
+        ManagedError::NotFound { .. } => Problem::not_found(e.to_string()),
+        ManagedError::State(e) => Problem::internal(e.to_string()),
+    })?;
+    // REQ: API-002, T8.2 (ADR-181) — F3: the entry naming the new key files is stored,
+    // so they stay, whatever the reload says next (removing them would leave a stored
+    // entry naming files that are gone).
+    written.keep();
+    provenance(&w.by, version);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let applied = src.reload.send(tx).await.is_ok() && rx.await.unwrap_or(false);
+    if !applied {
+        return Err(Problem::internal(
+            "the change was saved but couldn't be applied; the server log says why",
+        ));
+    }
+    // Only once the change is in effect: the router's old files that nothing names now.
+    secrets.prune(&src);
+    Ok(change(true, version))
 }
 
 /// REQ: OBS-024 — a dry run's `simulate`: what `candidate` (the planned configuration) would have

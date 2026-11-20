@@ -2,7 +2,9 @@
 // saved as files on the node that took the write, driven through the real routes, sign-in and
 // backend. The router consoles here are loopback fakes; nothing leaves the machine.
 
+use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -58,6 +60,13 @@ fn apply(src: &Sources) {
 enum Reload {
     /// Applies the change (the files plus `state.db`), as the main loop does.
     Applies,
+    /// Answers that it couldn't apply it.
+    Fails,
+    /// Says on `asked` that a reload was asked for, then waits for `go` before applying.
+    Gated {
+        asked: tokio::sync::mpsc::UnboundedSender<()>,
+        go: Arc<tokio::sync::Notify>,
+    },
 }
 
 /// One node with a state database and callers of every kind.
@@ -98,6 +107,15 @@ impl Node {
             while let Some(done) = rx.recv().await {
                 match &reload {
                     Reload::Applies => {
+                        apply(&applier);
+                        let _ = done.send(true);
+                    }
+                    Reload::Fails => {
+                        let _ = done.send(false);
+                    }
+                    Reload::Gated { asked, go } => {
+                        let _ = asked.send(());
+                        go.notified().await;
                         apply(&applier);
                         let _ = done.send(true);
                     }
@@ -253,9 +271,21 @@ fn marker(tag: &str) -> String {
     format!("{tag}-{}", auth::crypto::random_id())
 }
 
-/// Loopback addresses nothing listens on (no test here polls a router).
+/// Loopback addresses nothing listens on, for tests that don't poll a router.
 const HERE: &str = "http://127.0.0.1:1";
 const ELSEWHERE: &str = "http://127.0.0.2:1";
+
+/// Waits (at most `secs`) until `f` holds.
+async fn wait_until(what: &str, secs: u64, mut f: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    while !f() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for: {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
 
 // ---- T1: who may write a router.
 
@@ -508,4 +538,68 @@ async fn api_002_a_pasted_key_goes_only_over_https() {
         let (s, v) = n.put("udm", &n.admin, true, unifi(url, "k")).await;
         assert_eq!(s, StatusCode::OK, "{url}: {v}");
     }
+}
+
+// ---- T4: a saved key is kept.
+
+/// REQ: API-002, T8.2 (ADR-181) — F3: once the entry naming a new key file is stored, the file is
+/// kept even when the reload then fails: the stored entry never names a file that was removed.
+#[tokio::test]
+async fn api_002_router_key_kept_when_saved_but_not_applied() {
+    let n = Node::new(Reload::Fails);
+    let (s, v) = n.put("udm", &n.admin, false, unifi(HERE, "the-key")).await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+    assert!(
+        v["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("saved but couldn't be applied"),
+        "{v}"
+    );
+    let f = n.key_file("udm").expect("the entry is stored");
+    assert_eq!(
+        std::fs::read_to_string(&f).ok().as_deref().map(str::trim),
+        Some("the-key"),
+        "the file the stored entry names is there: {f}"
+    );
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — F3: a client that goes away after the change is stored doesn't
+/// undo it half way: the key file stays, and the change is still applied.
+#[tokio::test]
+async fn api_002_router_key_kept_when_the_client_goes_away() {
+    let (asked, mut reload_asked) = tokio::sync::mpsc::unbounded_channel();
+    let go = Arc::new(tokio::sync::Notify::new());
+    let n = Node::new(Reload::Gated {
+        asked,
+        go: Arc::clone(&go),
+    });
+    let req = Node::request(
+        "PUT",
+        "/api/v1/routers/udm",
+        &n.admin,
+        Some(&unifi(HERE, "the-key")),
+    );
+    let app = n.app.clone();
+    let client = tokio::spawn(async move { app.oneshot(req).await });
+    // The change is stored and its reload asked for: the client goes away.
+    reload_asked.recv().await.unwrap();
+    client.abort();
+    let _ = client.await;
+    let f = n.key_file("udm").expect("the entry is stored");
+    assert!(Path::new(&f).exists(), "the key stays: {f}");
+    go.notify_one();
+    wait_until("the change applied", 10, || {
+        n.src
+            .config
+            .load()
+            .router
+            .iter()
+            .any(|r| r.name.as_str() == "udm")
+    })
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(&f).ok().as_deref().map(str::trim),
+        Some("the-key")
+    );
 }
