@@ -2027,6 +2027,46 @@ test('t8_6 discovered devices, group settings, and zones', async () => {
   await expect(zones.locator('tbody tr', { hasText: 'zone.e2e.test' })).toContainText('ipv6only');
 });
 
+// REQ: T8.2, API-002 (ADR-176) — a UniFi router added under Discovered: its key is typed once,
+// saved to a file (the default path is shown), never shown back, and kept when another field
+// changes; then it's removed.
+test('t8_2 routers are added and changed in the UI', async () => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.goto('/#/clients?tab=discovered');
+  const editor = page.getByTestId('editor-router');
+  await editor.getByRole('button', { name: 'Add router' }).click();
+  await page.getByLabel('Name', { exact: true }).fill('udm-e2e');
+  await page.getByLabel('Address', { exact: true }).fill('https://192.0.2.1');
+  await expect(page.getByLabel('API key file', { exact: true })).toHaveAttribute('placeholder', 'default: secrets/router-udm-e2e.api_key.…');
+  await page.getByLabel('API key', { exact: true }).fill('e2e-secret-key');
+  await page.getByLabel("Don't check the certificate", { exact: true }).check();
+  await page.getByRole('button', { name: 'Check', exact: true }).click();
+  await expect(page.getByTestId('entry-preview')).not.toContainText('e2e-secret-key');
+  await page.getByRole('button', { name: 'Apply' }).click();
+  const row = editor.getByTestId('entry-row').filter({ hasText: 'udm-e2e' });
+  await expect(row).toContainText('added here');
+  await expect(row).toContainText('unifi · https://192.0.2.1');
+
+  await row.getByRole('button', { name: 'Edit' }).click();
+  const key = page.getByLabel('API key', { exact: true });
+  await expect(key).toHaveValue('');
+  await expect(key).toHaveAttribute('placeholder', 'Saved. Type a new API key to replace it.');
+  await expect(page.getByLabel('API key file', { exact: true })).toHaveValue(/secrets\/router-udm-e2e\.api_key\.[0-9a-f]+$/);
+  // A new address needs the key again (it isn't sent to an endpoint it wasn't entered for).
+  await page.getByLabel('Address', { exact: true }).fill('https://192.0.2.2');
+  await page.getByRole('button', { name: 'Check', exact: true }).click();
+  await expect(page.getByText(/enter it again/)).toBeVisible();
+  // That refusal is expected: not a page problem.
+  for (let i = problems.length - 1; i >= 0; i--) if (problems[i].includes('status of 422')) problems.splice(i, 1);
+  await key.fill('e2e-secret-key-2');
+  await page.getByRole('button', { name: 'Check', exact: true }).click();
+  await page.getByRole('button', { name: 'Apply' }).click();
+  await expect(row).toContainText('unifi · https://192.0.2.2');
+
+  await row.getByRole('button', { name: 'Remove' }).click();
+  await expect(row).toHaveCount(0);
+});
+
 // REQ: OBS-010 (T9.6) — the Alerts page: add a destination, send it a test, add a rule that
 // fires, see it under "Now" with the delivery, then remove both.
 test('obs_010 alerts page: destinations, test, rules', async () => {

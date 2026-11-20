@@ -2147,6 +2147,41 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/routers/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Add or change a router integration (T8.2, API-002).
+         * @description The body has the same fields as `[[router]]` (the name comes from the path), e.g. a UniFi
+         *     console: `{"type": "unifi", "url": "https://192.168.1.1", "api_key": "…",
+         *     "tls_insecure_skip_verify": true}`. The UniFi API key, the OPNsense key and secret, or a
+         *     UniFi password are sent as `api_key`, `api_secret`, and `password`: TelltaleDNS writes
+         *     each to a new file only it can read under `<data_dir>/secrets/` and stores that file's
+         *     path; the value is never stored, logged, or returned (ADR-176). Credential files named
+         *     here (`api_key_file`, …) must be under `<data_dir>/secrets/` too. Leave a credential out to
+         *     keep the current one, unless the type, address, site, or TLS settings change: then it must
+         *     be entered again. Admins only (agents: `config:write:routers`, which `config:write:*`
+         *     doesn't include). The routers are read again within seconds; a router the config files
+         *     define is overridden until this one is deleted.
+         */
+        put: operations["put_router"];
+        post?: never;
+        /**
+         * Remove a router integration (T8.2, API-002).
+         * @description Its devices lose the names it gave them at the next read. A router the config files define
+         *     is hidden until the files' entry is brought back (DELETE again, or Revert to the file).
+         */
+        delete: operations["delete_router"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/rules": {
         parameters: {
             query?: never;
@@ -12394,6 +12429,113 @@ export interface operations {
             };
             /** @description The configuration changed since the If-Match version: re-read it and retry. */
             412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_router: {
+        parameters: {
+            query?: {
+                /** @description Validate and report the change without applying it. */
+                dryRun?: boolean;
+                /**
+                 * @description REQ: OBS-024 — with `dryRun=true`: replay the query log over this window (`24h`,
+                 *     `7d`; at most 7 days; `true` for `[simulate] default_window`) and report what the
+                 *     change would have done to those queries (`simulation`). `auto`: only when
+                 *     `[simulate] plans_by_default` is on.
+                 */
+                simulate?: string;
+                /**
+                 * @description REQ: OBS-024 — where the simulated window ends: RFC 3339 or relative (`-24h`).
+                 *     Default now.
+                 */
+                simulateUntil?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The name. */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": Record<string, never>;
+            };
+        };
+        responses: {
+            /** @description Applied (or, with dryRun, what would change). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConfigChange"];
+                };
+            };
+            /** @description The configuration changed since the If-Match version: re-read it and retry. */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A field is wrong (the URL, missing credentials), or the configuration wouldn't be valid. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    delete_router: {
+        parameters: {
+            query?: {
+                /** @description Validate and report the change without applying it. */
+                dryRun?: boolean;
+                /**
+                 * @description REQ: OBS-024 — with `dryRun=true`: replay the query log over this window (`24h`,
+                 *     `7d`; at most 7 days; `true` for `[simulate] default_window`) and report what the
+                 *     change would have done to those queries (`simulation`). `auto`: only when
+                 *     `[simulate] plans_by_default` is on.
+                 */
+                simulate?: string;
+                /**
+                 * @description REQ: OBS-024 — where the simulated window ends: RFC 3339 or relative (`-24h`).
+                 *     Default now.
+                 */
+                simulateUntil?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The name. */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConfigChange"];
+                };
+            };
+            /** @description No entry by that name. */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

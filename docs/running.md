@@ -1312,7 +1312,11 @@ window = [{ days = ["weekdays"], start = "08:00", end = "15:00" }]
 - **In the UI:** **Groups → Schedules** adds, changes, or removes schedules (windows one per line, like `weekdays 21:00-07:00`), and a group's editor picks the schedules it follows. Through the API: `PUT`/`DELETE /api/v1/schedules/{name}` with the same fields as `[[schedule]]` (agents need `config:write:groups`, and AI agents can plan one with the MCP tool `plan_set_schedule`).
 
 ### Names from your router (UniFi, OPNsense)
-TelltaleDNS doesn't hand out addresses: your router's DHCP does that, and TelltaleDNS can read its client list, so devices show up by name:
+TelltaleDNS doesn't hand out addresses: your router's DHCP does that, and TelltaleDNS can read its client list, so devices show up by name.
+
+**In the UI (admins):** **Clients → Discovered → Routers → Add router**. Pick UniFi or OPNsense, give its address, and paste the API key (for OPNsense, the key and the secret; for UniFi without a key, Advanced shows a username and password). TelltaleDNS saves each pasted value to a new file only it can read, under `secrets/` in the data folder (`secrets/router-<name>.api_key.<random>` unless you name a new file there), and never shows it again. Editing the router later keeps the key unless you type a new one, except that changing the address, the type, or the TLS settings needs the key typed again, so a key is never sent somewhere it wasn't entered for. A file you put in `secrets/` yourself can be named instead of pasting; a file elsewhere (a Docker or Kubernetes secret) is set in the configuration file. A router added, changed, or removed is read (or dropped) within 5 seconds, without a restart; replacing or removing one removes the key files TelltaleDNS wrote for it, and never others. Through the API: `PUT`/`DELETE /api/v1/routers/{name}` with the fields below, plus `api_key`, `api_secret`, or `password` in place of their files (admins; agents need `config:write:routers`, which `config:write:*` doesn't include). In a cluster, the key file is on the primary that took the change: after a failover, enter it again on the new primary.
+
+**In the configuration file:**
 ```toml
 [[router]]
 name = "udm"
@@ -1337,7 +1341,7 @@ api_secret_file = "/etc/telltale/opn-secret"
 - A self-signed console: save its certificate (`openssl s_client -connect 192.168.1.1:443 </dev/null | openssl x509 > udm.pem`) as `tls_ca`. Its certificate names `unifi.local`, not the address you reach it at, so set `tls_server_name` to the name in it (`openssl x509 -in udm.pem -noout -ext subjectAltName` shows it): the console is then verified, and only that certificate is trusted. `tls_insecure_skip_verify = true` also works, but then anything on your network could pose as the console and receive the API key.
 - Read every `interval_secs` (300); a router that doesn't answer is asked again after 15 seconds and keeps its last list meanwhile.
 - Names you give devices in TelltaleDNS win; then the routers'. `GET /api/v1/dhcp/leases` lists them (`source = router`).
-- Credentials stay in files, out of the configuration. Changes to `[[router]]` need a restart.
+- Credentials stay in files, out of the configuration (a key pasted in the UI is saved to a file too). Routers in the file are read at startup; ones added or changed in the UI apply within 5 seconds, and a router made in the UI with the name of one in the file replaces it until it's removed (**Revert to the file**).
 - In a cluster, only one node needs to read the router (or hear mDNS). Every node asks the others for the device names they know, once a minute, so a resolver pod without the router's key names devices the same way the primary does.
 
 ### Names devices announce (mDNS)

@@ -5940,6 +5940,164 @@
         }
       }
     },
+    "/api/v1/routers/{name}": {
+      "put": {
+        "tags": [
+          "config"
+        ],
+        "summary": "Add or change a router integration (T8.2, API-002).",
+        "description": "The body has the same fields as `[[router]]` (the name comes from the path), e.g. a UniFi\nconsole: `{\"type\": \"unifi\", \"url\": \"https://192.168.1.1\", \"api_key\": \"…\",\n\"tls_insecure_skip_verify\": true}`. The UniFi API key, the OPNsense key and secret, or a\nUniFi password are sent as `api_key`, `api_secret`, and `password`: TelltaleDNS writes\neach to a new file only it can read under `<data_dir>/secrets/` and stores that file's\npath; the value is never stored, logged, or returned (ADR-176). Credential files named\nhere (`api_key_file`, …) must be under `<data_dir>/secrets/` too. Leave a credential out to\nkeep the current one, unless the type, address, site, or TLS settings change: then it must\nbe entered again. Admins only (agents: `config:write:routers`, which `config:write:*`\ndoesn't include). The routers are read again within seconds; a router the config files\ndefine is overridden until this one is deleted.",
+        "operationId": "put_router",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "dryRun",
+            "in": "query",
+            "description": "Validate and report the change without applying it.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "simulate",
+            "in": "query",
+            "description": "REQ: OBS-024 — with `dryRun=true`: replay the query log over this window (`24h`,\n`7d`; at most 7 days; `true` for `[simulate] default_window`) and report what the\nchange would have done to those queries (`simulation`). `auto`: only when\n`[simulate] plans_by_default` is on.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "simulateUntil",
+            "in": "query",
+            "description": "REQ: OBS-024 — where the simulated window ends: RFC 3339 or relative (`-24h`).\nDefault now.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Applied (or, with dryRun, what would change).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigChange"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "The configuration changed since the If-Match version: re-read it and retry.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A field is wrong (the URL, missing credentials), or the configuration wouldn't be valid.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "config"
+        ],
+        "summary": "Remove a router integration (T8.2, API-002).",
+        "description": "Its devices lose the names it gave them at the next read. A router the config files define\nis hidden until the files' entry is brought back (DELETE again, or Revert to the file).",
+        "operationId": "delete_router",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "dryRun",
+            "in": "query",
+            "description": "Validate and report the change without applying it.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "simulate",
+            "in": "query",
+            "description": "REQ: OBS-024 — with `dryRun=true`: replay the query log over this window (`24h`,\n`7d`; at most 7 days; `true` for `[simulate] default_window`) and report what the\nchange would have done to those queries (`simulation`). `auto`: only when\n`[simulate] plans_by_default` is on.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "simulateUntil",
+            "in": "query",
+            "description": "REQ: OBS-024 — where the simulated window ends: RFC 3339 or relative (`-24h`).\nDefault now.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The result.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigChange"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No entry by that name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/rules": {
       "get": {
         "tags": [

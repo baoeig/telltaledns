@@ -2973,6 +2973,10 @@ impl Backend for ApiBackend {
                 &mut out,
             );
         }
+        // REQ: T8.2 (ADR-176) — the definitions name files, never the secrets themselves.
+        if want("router") {
+            rows("router", &cfg.router, &file.router, &e.routers, &mut out);
+        }
         // REQ: OBS-038
         if want("anomaly_mute") {
             rows(
@@ -3689,6 +3693,7 @@ fn kind_name(k: ManagedKind) -> &'static str {
         ManagedKind::Simulate => crate::managed::SIMULATE,
         ManagedKind::Rollout => crate::managed::ROLLOUT,
         ManagedKind::KubernetesMap => crate::managed::KUBERNETES_MAP,
+        ManagedKind::Router => crate::managed::ROUTER,
     }
 }
 
@@ -4028,6 +4033,13 @@ fn managed_impact(src: &Sources, kind: ManagedKind, name: &str, setting: bool) -
         (ManagedKind::Schedule, _) => {
             "Applies within 15 seconds to the groups that use it.".into()
         }
+        // REQ: T8.2 (ADR-176)
+        (ManagedKind::Router, true) => {
+            "The router is read within 5 seconds; its devices are named once it answers (the log says if it doesn't).".into()
+        }
+        (ManagedKind::Router, false) => {
+            "Its devices lose the names it gave them within 5 seconds.".into()
+        }
         // REQ: OBS-038 — decided when a finding is created, so nothing already recorded changes.
         (ManagedKind::AnomalyMute, true) => {
             "Applies to findings created from now on, on every node: they are still recorded and listed (with Show muted), but not counted in the badge, the alerts or /metrics (telltale_anomalies_muted_total counts them). Findings already recorded stay as they are.".into()
@@ -4100,6 +4112,7 @@ fn plan_managed(
             | ManagedKind::Schedule
             | ManagedKind::AnomalyMute
             | ManagedKind::KubernetesMap
+            | ManagedKind::Router
     ) {
         return plan_override(src, state, w);
     }
@@ -4921,6 +4934,14 @@ fn plan_override(
             before_cfg.schedule.iter().find(|u| u.name() == name),
             &mut entries.schedules,
         )?,
+        // REQ: T8.2 (ADR-176) — the secrets were swapped for their files' paths already.
+        ManagedKind::Router => override_step(
+            &name,
+            w.body.as_ref(),
+            file.router.iter().any(|u| u.name() == name),
+            before_cfg.router.iter().find(|u| u.name() == name),
+            &mut entries.routers,
+        )?,
         ManagedKind::AnomalyMute => override_step(
             &name,
             w.body.as_ref(),
@@ -4957,6 +4978,7 @@ fn plan_override(
         ManagedKind::AlertDestination => named_json(&merged.alerts.destination, &name),
         ManagedKind::AlertRule => named_json(&merged.alerts.rule, &name),
         ManagedKind::Schedule => named_json(&merged.schedule, &name),
+        ManagedKind::Router => named_json(&merged.router, &name),
         ManagedKind::AnomalyMute => named_json(&merged.anomaly_mute, &name),
         ManagedKind::KubernetesMap => merged
             .kubernetes
@@ -5193,9 +5215,10 @@ impl ApiBackend {
         out
     }
 
+    #[allow(clippy::too_many_lines)] // one write, from its plan to its reload
     pub(crate) fn do_write_managed(
         &self,
-        w: ManagedWrite,
+        mut w: ManagedWrite,
     ) -> BoxFuture<Result<ConfigChange, Problem>> {
         let src = Arc::clone(&self.src);
         Box::pin(async move {
@@ -5204,6 +5227,8 @@ impl ApiBackend {
             // the next write looks (two writes planned on the same snapshot could each be
             // valid and together not: the reload would then fall back to the files alone).
             let one_at_a_time = src.config_writes.lock().await;
+            // REQ: T8.2 (ADR-176) — a router's secrets, swapped for their files' paths.
+            let secrets = crate::router_secrets::prepare(&src, &mut w)?;
             let state = src
                 .auth
                 .get()
@@ -5251,6 +5276,8 @@ impl ApiBackend {
                 }
                 return Ok(out);
             }
+            // ADR-176 — new files, removed again unless the change applies.
+            let written = secrets.write()?;
             let stored = {
                 let (state, w, name, body, also) = (
                     Arc::clone(&state),
@@ -5296,6 +5323,8 @@ impl ApiBackend {
                     "the change was saved but couldn't be applied; the server log says why",
                 ));
             }
+            written.keep();
+            secrets.prune(&src);
             Ok(change(true, version))
         })
     }
@@ -5422,6 +5451,7 @@ fn keep_in_git(
         ManagedKind::Simulate => "simulate",
         ManagedKind::Rollout => "cluster.rollout",
         ManagedKind::KubernetesMap => "kubernetes.map",
+        ManagedKind::Router => "router",
     };
     let head = "# Add to the configuration in Git (with the Helm chart: under `config:`).\n";
     // REQ: FLT-017 — a map rule: `[[kubernetes.map]]`, or a label on the namespace or pod.

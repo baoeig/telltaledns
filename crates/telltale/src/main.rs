@@ -49,6 +49,7 @@ mod replay;
 mod replication;
 mod rollout;
 mod rollups;
+mod router_secrets;
 mod routers;
 mod secret_path;
 mod selfupdate;
