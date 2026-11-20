@@ -108,6 +108,16 @@
               }
             }
           },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "412": {
             "description": "The configuration changed since the If-Match version: re-read it and retry.",
             "content": {
@@ -120,6 +130,16 @@
           },
           "422": {
             "description": "A field is wrong, or the configuration wouldn't be valid: problem+json says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -196,8 +216,28 @@
               }
             }
           },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "422": {
             "description": "A rule still uses it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -319,6 +359,16 @@
               }
             }
           },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "412": {
             "description": "The configuration changed since the If-Match version: re-read it and retry.",
             "content": {
@@ -331,6 +381,16 @@
           },
           "422": {
             "description": "A field is wrong, or the configuration wouldn't be valid: problem+json says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -399,6 +459,26 @@
           },
           "404": {
             "description": "No entry by that name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -987,6 +1067,16 @@
               }
             }
           },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "412": {
             "description": "The configuration changed since the If-Match version: re-read it and retry.",
             "content": {
@@ -999,6 +1089,16 @@
           },
           "422": {
             "description": "A field is wrong (no device or group, an unknown kind, a name that matches nothing, a MAC address), or the configuration wouldn't be valid.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -1067,6 +1167,26 @@
           },
           "404": {
             "description": "No entry by that name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -2446,7 +2566,7 @@
             }
           },
           "409": {
-            "description": "Defined in the config files, or an Idempotency-Key reused for another request.",
+            "description": "Defined in the config files, or an Idempotency-Key reused for another request; or the Idempotency-Key's first request is still running (`Retry-After`: retry shortly for its answer).",
             "content": {
               "application/json": {
                 "schema": {
@@ -2467,6 +2587,16 @@
           },
           "422": {
             "description": "The resulting configuration is invalid (e.g. an unknown group).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -2544,7 +2674,7 @@
             }
           },
           "409": {
-            "description": "Defined in the config files.",
+            "description": "Defined in the config files; or the Idempotency-Key's first request is still running (`Retry-After`: retry shortly for its answer).",
             "content": {
               "application/json": {
                 "schema": {
@@ -2555,6 +2685,16 @@
           },
           "412": {
             "description": "The configuration changed since the If-Match version: re-read it and retry.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -2995,6 +3135,16 @@
               }
             }
           },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "412": {
             "description": "The configuration changed since the If-Match version: re-read it and retry.",
             "content": {
@@ -3007,6 +3157,16 @@
           },
           "422": {
             "description": "A bound is out of range or a canary isn't a node ID, `site:<name>`, or `ephemeral`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -3066,6 +3226,26 @@
           },
           "404": {
             "description": "Nothing was changed through the API: the file's settings are in effect already.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -3650,6 +3830,16 @@
               }
             }
           },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "412": {
             "description": "The configuration changed since the If-Match version: re-read it and retry.",
             "content": {
@@ -3662,6 +3852,16 @@
           },
           "422": {
             "description": "A name isn't a domain name, a client isn't an address or network, or the configuration wouldn't be valid.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -3721,6 +3921,26 @@
           },
           "404": {
             "description": "Nothing was changed through the API: the file's exclusions are in effect already.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -3893,7 +4113,7 @@
             }
           },
           "409": {
-            "description": "Conflicts with the current state: problem+json says what to change.",
+            "description": "Conflicts with the current state: problem+json says what to change; or the Idempotency-Key's first request is still running (`Retry-After`: retry shortly for its answer).",
             "content": {
               "application/json": {
                 "schema": {
@@ -3914,6 +4134,16 @@
           },
           "422": {
             "description": "A server isn't an address or a supported URL, or it's a plugin (`exec://`, `unix://`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -3991,7 +4221,7 @@
             }
           },
           "409": {
-            "description": "Conflicts with the current state: problem+json says what to change.",
+            "description": "Conflicts with the current state: problem+json says what to change; or the Idempotency-Key's first request is still running (`Retry-After`: retry shortly for its answer).",
             "content": {
               "application/json": {
                 "schema": {
@@ -4002,6 +4232,16 @@
           },
           "412": {
             "description": "The configuration changed since the If-Match version: re-read it and retry.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -4102,6 +4342,16 @@
               }
             }
           },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "412": {
             "description": "The configuration changed since the If-Match version: re-read it and retry.",
             "content": {
@@ -4114,6 +4364,16 @@
           },
           "422": {
             "description": "A field is wrong, or the configuration wouldn't be valid: problem+json says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -4190,6 +4450,16 @@
               }
             }
           },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "412": {
             "description": "The configuration changed since the If-Match version: re-read it and retry.",
             "content": {
@@ -4202,6 +4472,16 @@
           },
           "422": {
             "description": "Something still uses it: problem+json says what.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -4325,6 +4605,16 @@
               }
             }
           },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "412": {
             "description": "The configuration changed since the If-Match version: re-read it and retry.",
             "content": {
@@ -4337,6 +4627,16 @@
           },
           "422": {
             "description": "No such group, or an unknown kind.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -4405,6 +4705,26 @@
           },
           "404": {
             "description": "No rule by that key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -4628,6 +4948,16 @@
               }
             }
           },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "412": {
             "description": "The configuration changed since the If-Match version: re-read it and retry.",
             "content": {
@@ -4640,6 +4970,16 @@
           },
           "422": {
             "description": "A field is wrong, or the configuration wouldn't be valid: problem+json says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -4716,6 +5056,16 @@
               }
             }
           },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "412": {
             "description": "The configuration changed since the If-Match version: re-read it and retry.",
             "content": {
@@ -4728,6 +5078,16 @@
           },
           "422": {
             "description": "Something still uses it: problem+json says what.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -5648,6 +6008,16 @@
               }
             }
           },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "412": {
             "description": "The configuration changed since the If-Match version: re-read it and retry.",
             "content": {
@@ -5660,6 +6030,16 @@
           },
           "422": {
             "description": "A field is wrong (a prefix, a CIDR, zero queries while enabled), or the configuration wouldn't be valid.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -5719,6 +6099,26 @@
           },
           "404": {
             "description": "Nothing was changed through the API: the file's rate limit is in effect already.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -5820,7 +6220,7 @@
             }
           },
           "409": {
-            "description": "Defined in the config files, or an Idempotency-Key reused.",
+            "description": "Defined in the config files, or an Idempotency-Key reused; or the Idempotency-Key's first request is still running (`Retry-After`: retry shortly for its answer).",
             "content": {
               "application/json": {
                 "schema": {
@@ -5841,6 +6241,16 @@
           },
           "422": {
             "description": "A value doesn't fit its type (e.g. A with a name), or the result is invalid.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -5918,7 +6328,7 @@
             }
           },
           "409": {
-            "description": "Conflicts with the current state: problem+json says what to change.",
+            "description": "Conflicts with the current state: problem+json says what to change; or the Idempotency-Key's first request is still running (`Retry-After`: retry shortly for its answer).",
             "content": {
               "application/json": {
                 "schema": {
@@ -5936,6 +6346,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
           }
         }
       }
@@ -5946,7 +6366,7 @@
           "config"
         ],
         "summary": "Add or change a router integration (T8.2, API-002).",
-        "description": "The body has the same fields as `[[router]]` (the name comes from the path), e.g. a UniFi\nconsole: `{\"type\": \"unifi\", \"url\": \"https://192.168.1.1\", \"api_key\": \"…\",\n\"tls_insecure_skip_verify\": true}`. The UniFi API key, the OPNsense key and secret, or a\nUniFi password are sent as `api_key`, `api_secret`, and `password`: TelltaleDNS writes\neach to a new file only it can read under `<data_dir>/secrets/` on this node and stores that\nfile's path. The value itself is never stored, logged, or returned; with an `Idempotency-Key`,\nthe record kept for a retry holds only a keyed hash of it, for a day (ADR-181). A pasted key goes only\nto an `https://` address (or a loopback one), and with `tls_insecure_skip_verify` only to an\naddress written as a number, not a host name. The body names no key file (`api_key_file`, …)\nbut the router's own, sent back unchanged at the same address: paste the key instead (a file\nelsewhere, such as a Docker or Kubernetes secret, is named in the config file); with a pasted\nvalue, the file named for it is replaced. Leave a credential out to keep the current one,\nunless the type, address, site, or TLS settings change: then it must be entered again. Admins\nonly: an administrator's own sign-in or an admin API token; agent tokens can't. The routers\nare read again within 5 seconds, or once a read in progress ends; a router the config files\ndefine is overridden until this one is deleted.",
+        "description": "The body has the same fields as `[[router]]` (the name comes from the path), e.g. a UniFi\nconsole: `{\"type\": \"unifi\", \"url\": \"https://192.168.1.1\", \"api_key\": \"…\",\n\"tls_insecure_skip_verify\": true}`. The UniFi API key, the OPNsense key and secret, or a\nUniFi password are sent as `api_key`, `api_secret`, and `password`: TelltaleDNS writes\neach to a new file only it can read under `<data_dir>/secrets/` on this node and stores that\nfile's path. The value itself is never stored, logged, or returned; with an `Idempotency-Key`,\nthe record kept for a retry holds only a keyed hash of it, for a day (ADR-181). A pasted key goes only\nto an `https://` address (or a loopback one), and with `tls_insecure_skip_verify` only to an\naddress written as a number, not a host name. The body names no key file (`api_key_file`, …)\nbut the router's own, sent back unchanged at the same address: paste the key instead (a file\nelsewhere, such as a Docker or Kubernetes secret, is named in the config file); with a pasted\nvalue, the file named for it is replaced. Leave a credential out to keep the current one,\nunless the type, address, site, or TLS settings change: then it must be entered again. Admins\nonly: an administrator's own sign-in or an admin API token; agent tokens can't. The routers\nare read again within 5 seconds after the reads in progress end; a router the config files\ndefine is overridden until this one is deleted. A key left out with none of its own is\nrefused (422) by the name to paste (`api_key`, `api_secret`, `password`).",
         "operationId": "put_router",
         "parameters": [
           {
@@ -6017,6 +6437,16 @@
               }
             }
           },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "412": {
             "description": "The configuration changed since the If-Match version: re-read it and retry.",
             "content": {
@@ -6036,6 +6466,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
           }
         }
       },
@@ -6044,7 +6484,7 @@
           "config"
         ],
         "summary": "Remove a router integration (T8.2, API-002).",
-        "description": "Its devices lose the names it gave them at the next read. A router the config files define\nis hidden until the files' entry is brought back (DELETE again, or Revert to the file).\nAdmins only, as for `PUT`.",
+        "description": "Its devices lose the names it gave them after the next round of reads, which starts within 5\nseconds after the reads in progress end. A router the config files define\nis hidden until the files' entry is brought back (DELETE again, or Revert to the file).\nAdmins only, as for `PUT`.",
         "operationId": "delete_router",
         "parameters": [
           {
@@ -6107,6 +6547,26 @@
           },
           "404": {
             "description": "No entry by that name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -6208,7 +6668,7 @@
             }
           },
           "409": {
-            "description": "Defined in the config files, or an Idempotency-Key reused.",
+            "description": "Defined in the config files, or an Idempotency-Key reused; or the Idempotency-Key's first request is still running (`Retry-After`: retry shortly for its answer).",
             "content": {
               "application/json": {
                 "schema": {
@@ -6229,6 +6689,16 @@
           },
           "422": {
             "description": "An unknown device or group, a bad domain, or an expiry in the past.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -6306,7 +6776,7 @@
             }
           },
           "409": {
-            "description": "Defined in the config files.",
+            "description": "Defined in the config files; or the Idempotency-Key's first request is still running (`Retry-After`: retry shortly for its answer).",
             "content": {
               "application/json": {
                 "schema": {
@@ -6317,6 +6787,16 @@
           },
           "412": {
             "description": "The configuration changed since the If-Match version: re-read it and retry.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -6395,6 +6875,16 @@
               }
             }
           },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "412": {
             "description": "The configuration changed since the If-Match version: re-read it and retry.",
             "content": {
@@ -6407,6 +6897,16 @@
           },
           "422": {
             "description": "A field is wrong (a window's time, an unknown list or service), or the configuration wouldn't be valid.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -6483,8 +6983,28 @@
               }
             }
           },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "422": {
             "description": "A group still uses it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -6628,6 +7148,16 @@
               }
             }
           },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "412": {
             "description": "The configuration changed since the If-Match version: re-read it and retry.",
             "content": {
@@ -6640,6 +7170,16 @@
           },
           "422": {
             "description": "A bound is out of range, or the configuration wouldn't be valid.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -6699,6 +7239,26 @@
           },
           "404": {
             "description": "Nothing was changed through the API: the file's settings are in effect already.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -7878,6 +8438,16 @@
               }
             }
           },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "412": {
             "description": "The configuration changed since the If-Match version: re-read it and retry.",
             "content": {
@@ -7890,6 +8460,16 @@
           },
           "422": {
             "description": "A field is wrong, or the configuration wouldn't be valid: problem+json says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -7966,6 +8546,16 @@
               }
             }
           },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "412": {
             "description": "The configuration changed since the If-Match version: re-read it and retry.",
             "content": {
@@ -7978,6 +8568,16 @@
           },
           "422": {
             "description": "Something still uses it: problem+json says what.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -8078,6 +8678,16 @@
               }
             }
           },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "412": {
             "description": "The configuration changed since the If-Match version: re-read it and retry.",
             "content": {
@@ -8090,6 +8700,16 @@
           },
           "422": {
             "description": "A field is wrong, the configuration wouldn't be valid, or the upstream is a plugin (`exec://`, `unix://`): problem+json says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -8166,6 +8786,16 @@
               }
             }
           },
+          "409": {
+            "description": "The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "412": {
             "description": "The configuration changed since the If-Match version: re-read it and retry.",
             "content": {
@@ -8178,6 +8808,16 @@
           },
           "422": {
             "description": "Something still uses it: problem+json says what.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many configuration changes are running at once (`Retry-After`: retry shortly).",
             "content": {
               "application/json": {
                 "schema": {
@@ -11624,7 +12264,7 @@
               "object",
               "null"
             ],
-            "description": "REQ: API-002, T8.2 (ADR-181) — a router's credentials, by name (`api_key`, `api_secret`,\n`password`): `saved` (its file is on the node that answered, and that node uses it),\n`missing` (no file there: enter the key again, as after a restore on another machine or a\nfailover), or `not_used` (the file is there, but it isn't one that node sends for this\nrouter). Read without the secret. Absent for other kinds.",
+            "description": "REQ: API-002, T8.2 (ADR-181) — a router's credentials, by name (`api_key`, `api_secret`,\n`password`), as the node that answered sees them (on a replica, the primary): `saved` (its\nfile is there, and that node uses it), `missing` (no file there, and it is one the node\nsaves when a key is pasted: enter the key again, as after a restore on another machine or\na failover), `file_missing` (no file there, and it is one a platform mounts or a config\nfile names: put the file there), or `not_used` (the file is there, but it isn't one that\nnode sends for this router). Read without the secret. Absent for other kinds.",
             "additionalProperties": {
               "type": "string"
             },
@@ -14445,7 +15085,7 @@
                     "object",
                     "null"
                   ],
-                  "description": "REQ: API-002, T8.2 (ADR-181) — a router's credentials, by name (`api_key`, `api_secret`,\n`password`): `saved` (its file is on the node that answered, and that node uses it),\n`missing` (no file there: enter the key again, as after a restore on another machine or a\nfailover), or `not_used` (the file is there, but it isn't one that node sends for this\nrouter). Read without the secret. Absent for other kinds.",
+                  "description": "REQ: API-002, T8.2 (ADR-181) — a router's credentials, by name (`api_key`, `api_secret`,\n`password`), as the node that answered sees them (on a replica, the primary): `saved` (its\nfile is there, and that node uses it), `missing` (no file there, and it is one the node\nsaves when a key is pasted: enter the key again, as after a restore on another machine or\na failover), `file_missing` (no file there, and it is one a platform mounts or a config\nfile names: put the file there), or `not_used` (the file is there, but it isn't one that\nnode sends for this router). Read without the secret. Absent for other kinds.",
                   "additionalProperties": {
                     "type": "string"
                   },

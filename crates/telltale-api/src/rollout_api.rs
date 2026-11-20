@@ -108,10 +108,18 @@ async fn run(
         Err(e) => return e.into_response(),
     };
     let dry = w.dry_run();
+    let admin = crate::config_api::by_admin(&p);
     let actor = auth.actor(&p, remote(auth, ext, headers), reason(headers));
     let w = w.with_by(actor.name.clone());
     match backend.rollout_command(w).await {
-        Ok(r) => {
+        Ok(mut r) => {
+            // REQ: API-002, T8.2 (ADR-181) — review round 2, security N1: what a pin or an
+            // unpin changes names a router's key files and username to an administrator only.
+            // An agent never is one, so an MCP plan's preview (a dry run of this, which every
+            // operator reads through `GET /api/v1/plans`) is masked too.
+            if !admin {
+                crate::mask_router_diff(&mut r.diff);
+            }
             if !dry {
                 auth.record(
                     &actor,

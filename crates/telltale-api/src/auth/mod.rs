@@ -426,6 +426,8 @@ pub struct Auth {
     /// REQ: API-002, AGT-003 (ADR-181) — the key of [`Auth::request_digest`]: random per process
     /// until the server sets this node's ([`Auth::set_request_key`]).
     request_key: Mutex<[u8; 32]>,
+    /// REQ: API-002, AGT-003 (ADR-181) — the configuration changes running on this node.
+    write_gate: Arc<crate::config_api::WriteGate>,
 }
 
 /// A slot for one password check; given back when dropped.
@@ -510,7 +512,14 @@ impl Auth {
             audit_gap: Mutex::new(None),
             proxy_hint: routes::ProxyHint::new(),
             request_key: Mutex::new(rand::random()),
+            write_gate: Arc::new(crate::config_api::WriteGate::new()),
         }
+    }
+
+    /// REQ: API-002, AGT-003 (ADR-181) — the configuration changes running on this node: the
+    /// Idempotency-Keys whose first request hasn't finished, and the places for changes at once.
+    pub(crate) fn write_gate(&self) -> &Arc<crate::config_api::WriteGate> {
+        &self.write_gate
     }
 
     /// REQ: API-002, AGT-003 (ADR-181) — this node's request key, kept in a file so a retry
