@@ -726,13 +726,6 @@ else
     || die "--cluster-updates needs [node] data_dir in /etc/telltale/telltale.toml to be a plain absolute path (letters, digits, . _ - /), and [api] listen a plain IP address and port"
   say "Updates from the cluster aren't installed: [node] data_dir isn't a plain absolute path (letters, digits, . _ - /), or [api] listen isn't a plain IP address and port"
 fi
-# Whether the node answers where the update service's health gate asks (the API's own address;
-# with the API off, systemd's word that it runs; without a known address, the default one).
-node_ready() {
-  if [ "$HEALTH_KNOWN" = no ]; then "$PREFIX/bin/telltale" health >/dev/null 2>&1
-  elif [ -n "$UPDATE_HEALTH_URL" ]; then "$PREFIX/bin/telltale" health --url "$UPDATE_HEALTH_URL" >/dev/null 2>&1
-  else systemctl is-active --quiet telltale; fi
-}
 # The first admin, when chosen in the guided setup: its Argon2id hash goes to the service for
 # its first start only (a root-only drop-in, removed once the service is up).
 DROPIN=/etc/systemd/system/telltale.service.d/10-first-admin.conf
@@ -878,6 +871,17 @@ wait_for_port53() { # config
   return 1
 }
 # END port53-wait
+
+# Whether the node answers where the update service's health gate asks (the API's own address;
+# with the API off, systemd's word that it runs; without a known address, the default one). Here,
+# after the port53-wait block, with the start it serves: portwait-test.sh runs this part of the
+# script on its own (it sets what the script sets before it: HEALTH_KNOWN, UPDATE_HEALTH_URL,
+# UPDATE_CHANNEL, CLUSTER_UPDATES).
+node_ready() {
+  if [ "$HEALTH_KNOWN" = no ]; then "$PREFIX/bin/telltale" health >/dev/null 2>&1
+  elif [ -n "$UPDATE_HEALTH_URL" ]; then "$PREFIX/bin/telltale" health --url "$UPDATE_HEALTH_URL" >/dev/null 2>&1
+  else systemctl is-active --quiet telltale; fi
+}
 
 # systemd-resolved's stub listener holds 127.0.0.53:53, which blocks binding 0.0.0.0:53.
 if systemctl is-active --quiet systemd-resolved 2>/dev/null \
