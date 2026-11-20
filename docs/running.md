@@ -2254,7 +2254,7 @@ A cluster whose nodes run outside Kubernetes (installed with `install.sh`) can u
 you, one at a time, in the order a cluster needs: **replicas first, the primary last**, each back
 on the new version, ready, and in sync before the next one starts. With the Helm chart's
 `upgradeHook`, bumping the chart (or merging the Renovate pull request in a GitOps repository)
-upgrades the native nodes first and the pods after them: nothing to do by hand.
+upgrades the native nodes first and the pods after them.
 
 **How it works.** The node's service runs as the `telltale` user in a sandbox and can't replace
 its own binary, so it doesn't: asked for a version, it writes
@@ -2265,23 +2265,29 @@ it may write only that `update/` folder:
 1. it reads the request (a small regular file written by `telltale`, opened without following a
    link or waiting on it) and removes it;
 2. it refuses anything but a release or edge build **newer** than the one installed, on the
-   node's own channel (a node on releases takes only a release), and a request more than an hour
-   old;
+   node's own channel (a node on releases takes only a release; an edge node takes an edge build
+   or a newer release), and a request more than an hour old;
 3. it downloads the version, checks the release signature and the checksum (the release's
-   signed `releases.json` must name that version), test-runs it, and swaps it in;
-4. it records the outcome in `/var/lib/telltale-update/result.json` (`installing`, `updated`,
-   `up_to_date`, `failed`, or `refused`, with the error), and restarts the node.
+   signed `releases.json` must be of the version's channel, name that version and list the same
+   checksum), test-runs it, and swaps it in, keeping the old binary as `telltale.old`;
+4. it restarts the node and waits up to a minute for it to be healthy (`telltale health` on
+   `/readyz?startup=1`). If it isn't, it puts `telltale.old` back and restarts once more;
+5. it records the outcome in `/var/lib/telltale-update/result.json`: `installing`, `updated`,
+   `up_to_date`, `rolled_back` (with why), `unavailable` (an edge build no longer served),
+   `failed`, or `refused`, with the error. `journalctl -u telltale-update` has its lines.
 
-So the most anyone who can write that file can do is ask for a newer signed release. The
-cluster never moves a node backwards: to go back, run `sudo telltale self-update --to <version>
---restart` on the node.
+So what anyone who can write that file can do is have the node restarted on a newer signed build
+of its own channel. The cluster never moves a node backwards or onto another channel: to go back,
+or to move a node to edge builds, run `sudo telltale self-update --to <version> --restart` (or
+`--channel edge`) on the node.
 
 **Turning it on.** The update service is installed and **off**. On each native node:
 ```sh
 sudo systemctl enable --now telltale-update.path     # or: sudo sh install.sh --cluster-updates
 ```
-A node installed before this feature gets the units by running `install.sh` again (or by
-upgrading by hand once, then re-running it).
+A node installed before this feature gets the units by running `install.sh` again (after
+upgrading it by hand once to a build that has the feature). `install.sh` writes the node's data
+directory into the units; it must be a plain absolute path.
 
 **Upgrading.** From anywhere with an admin's token (or an agent token with `analytics:read` and
 `cluster:upgrade`):
@@ -2289,18 +2295,28 @@ upgrading by hand once, then re-running it).
 telltale ctl --url https://dns.example.com upgrade --to 0.8.0 --dry-run   # the order, nothing asked
 telltale ctl --url https://dns.example.com upgrade --to 0.8.0
 ```
-It reads the Cluster page's view, leaves Kubernetes pods to the chart (and nodes already on the
-version, or newer), then asks each node in turn and waits (`--timeout`, 10 minutes each by
-default). A node that fails stops it: the nodes after it keep their version, and the error says
-why (from the node's `result.json`). A node that is down stops it before anything starts
-(`--skip-down` leaves it out). One node: `--node dns-02`. The same call for one node is
-`POST /api/v1/nodes/{id}/update {"to": "0.8.0"}` (admin), and `GET` on the same path shows the
-node's version, whether its update service is on, a request it hasn't picked up yet, and the
-latest outcome.
+- It reads the Cluster page's view and leaves alone Kubernetes pods (the chart's), witnesses
+  (they only vote: upgrade them by hand), containers (pull the new image), and nodes already on the
+  version or newer.
+- Before it asks any node it reads each one's update state. A node that is down or unreachable,
+  has its update service off, has a request waiting or an update running, or runs releases while
+  you ask for an edge build stops it there, with nothing asked and every such node named
+  (`--skip-down` leaves them out instead).
+- Then it asks each node in turn and waits (`--timeout`, 10 minutes each by default). A node that
+  fails, is rolled back, or refuses stops it: the nodes after it keep their version, and the
+  error is the node's own. One node: `--node dns-02`.
+- The same call for one node is `POST /api/v1/nodes/{id}/update {"to": "0.8.0"}` (admin;
+  `?dryRun=true` checks without asking), and `GET` on the same path shows the node's version,
+  whether its update service is on, a request it hasn't picked up yet, and the latest outcome. One
+  request at a time per node: another gets `update_in_progress` until the first is done.
+- **No maintenance window.** The node restarts without one, so a `node_down` alert can fire for
+  the few seconds it takes; put the node in maintenance first if that matters to you.
 
 **Edge builds.** An edge build can be installed only while it is the newest on the edge channel:
-edge binaries are replaced on every build. If a newer one was published since, the node refuses
-("the edge channel now serves …"): ask for that one, or wait for the release.
+edge binaries are replaced on every build. If a newer one was published since, the node records
+`unavailable` ("the edge channel now serves …"): ask for that one, or wait for the release.
+`--skip-unavailable` leaves such a node on its version, with a loud line, and goes on (the order is
+then lost for that node in that run).
 
 **With the Helm chart.** When the controller runs in Kubernetes and the other nodes don't, turn
 on the chart's hook: a Job that runs before the pods roll (`helm.sh/hook: pre-upgrade`, a
@@ -2310,17 +2326,46 @@ upgradeHook:
   enabled: true
   tokenSecret:
     name: telltale-upgrade   # key `token`: an agent token with analytics:read and cluster:upgrade
+  whenUnavailable: fail      # or skip (see below)
 ```
 - It upgrades every native node to the image's version and waits for each; only then does Helm
   (or Argo CD) roll the pods. A node that fails fails the hook, and the pods keep their version.
-- Under Argo CD it runs on every sync: with every node on the version it finishes at once, and on
-  the first install (no API answering yet) it has nothing to do.
-- A NetworkPolicy that limits the API (`networkPolicy.apiFrom`) gets a rule that lets the hook in.
-- With an edge image, the native nodes can take its build only while it is the newest edge build,
-  so pin the chart to the newest edge build when you move to one.
+- **The token.** Make it in Settings → API tokens (for an AI agent) as an admin, with the scopes
+  `analytics:read` and `cluster:upgrade` and an expiry (`expires_in_days`); rotate it before it
+  expires (a new token in the Secret, then revoke the old one). It reaches only the update route.
+  An OAuth sign-in for MCP never gets `cluster:upgrade`.
+- **https.** The hook asks the release's API Service over plain HTTP inside the cluster; when the
+  API serves TLS (`[api] tls`), set `upgradeHook.url` to its `https://` address.
+- **Timeouts.** Helm waits for a hook only `--timeout` (5 minutes by default), while the hook allows
+  10 minutes per node and 30 in all (`activeDeadlineSeconds: 1800`): run `helm upgrade --timeout 30m`.
+- A NetworkPolicy that limits the API (`networkPolicy.apiFrom`) gets a rule that lets the hook in
+  (only while the hook is on).
+- **A native primary whose replicas are the chart's pods:** the hook upgrades native nodes first,
+  so it would upgrade that primary before its pod replicas. In that shape, run `telltale ctl
+  upgrade` by hand instead of the hook.
 
-**What it doesn't do.** It doesn't upgrade containers or Compose installs (pull the new image), it
-doesn't choose a version for you (that's your chart bump, or `--to`), and it never downgrades.
+**With Argo CD (GitOps).** Argo CD runs the hook as a PreSync hook on every sync:
+- **Pinned to a release:** the first sync after the bump upgrades each native node behind it,
+  then rolls the pods. Every later sync finds the nodes on it and asks nothing (no request, no
+  download).
+- **Pinned to an edge build:** the same while it is the newest edge build. Once main has
+  published a newer one, a native node still behind the pin can't fetch it: with
+  `whenUnavailable: fail` (the default) the sync stays blocked until you pin the newest edge
+  build or a release; with `skip` that node stays on its version (the hook says so loudly) and the
+  pods roll. Nodes already on the pin or newer are never asked, so a pin that has gone stale
+  blocks only while a node is behind it. Pin a release, or set `skip`, if you don't want a sync
+  to wait on that.
+- **The first install:** PreSync runs before anything of the app exists, so nothing answers; the
+  hook succeeds and says so. The token Secret must exist before that sync (a PreSync hook runs
+  before the app's own resources): create it outside the app, or with an ExternalSecret or
+  SealedSecret that is applied before it (an earlier sync wave of another app, or a PreSync
+  resource with a lower `argocd.argoproj.io/hook-weight`).
+- **A node down:** the hook fails before asking any node (the pods keep their version) unless
+  `skipDown: true`.
+
+**What it doesn't do.** It doesn't upgrade containers or Compose installs (pull the new image),
+it doesn't choose a version for you (that's your chart bump, or `--to`), it never downgrades or
+changes a node's channel, and it doesn't put the node in maintenance.
 
 ## Taking a node down for maintenance
 Swapping a Pi's SD card, moving a box, or upgrading a node by hand: put the node in maintenance
@@ -3266,7 +3311,7 @@ Give an AI assistant (or any automation) an **agent token** instead of your own 
 | `ops:pause`, `ops:cache`, `ops:anomalies`, `ops:maintenance`, `ops:annotate` | pause blocking; flush the cache; acknowledge device anomalies; start and end [node maintenance](#taking-a-node-down-for-maintenance) (at most 2 hours); leave [notes](#change-markers) on the time charts |
 | `ops:drill` | start and end [failover drills](#failover-drills) (at most 5 minutes; never a default scope) |
 | `cluster:admin` | promote a node to primary |
-| `cluster:upgrade` | ask native nodes to [install a newer version](#upgrading-from-the-cluster) (never a default scope) |
+| `cluster:upgrade` | ask native nodes to [install a newer version](#upgrading-from-the-cluster) (admin level, never a default scope, never granted to an OAuth sign-in for MCP: make an agent token for it, as the chart's upgrade hook needs) |
 
 The default is `analytics:read` and `config:read`: read-only, without the query log. A token never gets more than its owner's role allows.
 

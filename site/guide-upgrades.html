@@ -119,12 +119,13 @@ sudo telltale self-update --to 0.8.0 --restart    # one version (older ones too)
 <pre><code>telltale ctl --url https://dns.example.com upgrade --to 0.8.0 --dry-run   # the order
 telltale ctl --url https://dns.example.com upgrade --to 0.8.0</code></pre>
   <ul>
-    <li><b>Replicas first, the primary last</b>, each back on the version, ready, and in sync before the next. The first failure stops it, and the error is the node's own.</li>
-    <li><b>The node's service never gets root.</b> It writes a request; a root update service checks it, installs only a newer release carrying the release signature, and restarts it. It never downgrades.</li>
-    <li><b>With the Helm chart</b>, set <code>upgradeHook.enabled</code> and a token Secret: a bump of the chart (or a merged Renovate pull request) upgrades the native nodes first, then the pods.</li>
-    <li><b>Edge builds</b> can be installed this way only while they are the newest on the edge channel.</li>
+    <li><b>Every node is checked first</b> (reachable, update service on, nothing already running); then <b>replicas first, the primary last</b>, each back on the version, ready, and in sync before the next. The first failure stops it, and the error is the node's own. Witnesses and containers are left to you, pods to the chart.</li>
+    <li><b>The node's service never gets root.</b> It writes a request; a root update service checks it, installs only a newer build of the node's own channel carrying the release signature, restarts the node, and puts the previous binary back if the new one isn't healthy within a minute. It never downgrades, and never moves a node from releases to edge builds.</li>
+    <li><b>No maintenance window:</b> the node just restarts, so a node-down alert can fire for a moment.</li>
+    <li><b>With the Helm chart</b>, set <code>upgradeHook.enabled</code> and a token Secret (an agent token with <code>analytics:read</code> and <code>cluster:upgrade</code>, with an expiry): a bump of the chart (or a merged Renovate pull request) upgrades the native nodes first, then the pods. Run <code>helm upgrade --timeout 30m</code>.</li>
+    <li><b>Edge builds</b> can be installed this way only while they are the newest on the edge channel. Under Argo CD, a pin that main has passed blocks the sync while a native node is behind it (<code>upgradeHook.whenUnavailable: fail</code>, the default), or leaves that node on its version (<code>skip</code>). Pin a release to avoid both.</li>
   </ul>
-  <p class="muted">More in <a href="guide-cluster.html#upgrade">Build a cluster</a> and the <a href="https://github.com/paimonsoror/telltaledns/blob/main/docs/running.md#clusters">cluster docs</a>.</p>
+  <p class="muted">More in <a href="guide-cluster.html#upgrade">Build a cluster</a> and the <a href="https://github.com/paimonsoror/telltaledns/blob/main/docs/running.md#upgrading-from-the-cluster">running guide</a>.</p>
 </section>
 
 <section id="backup">
