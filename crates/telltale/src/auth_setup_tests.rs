@@ -73,6 +73,37 @@ fn api_002_the_request_key_is_private_and_kept_across_restarts() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// REQ: API-002, AGT-003 (ADR-181) — review round 2, security N6: the request key appears whole or
+// not at all. Starts racing to make it (a server and a CLI, say) all get the same key, none reads
+// a file still being written, and no temporary file is left.
+#[test]
+fn api_002_the_request_key_is_made_whole_or_not_at_all() {
+    for round in 0..30 {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let keys: Vec<_> = std::thread::scope(|s| {
+            let racers: Vec<_> = (0..8).map(|_| s.spawn(|| request_key(&dir))).collect();
+            racers.into_iter().map(|r| r.join().unwrap()).collect()
+        });
+        let first = keys[0].as_ref().map_err(ToString::to_string).cloned();
+        for k in &keys {
+            assert_eq!(
+                k.as_ref().map_err(ToString::to_string).cloned(),
+                first,
+                "round {round}"
+            );
+        }
+        assert!(first.is_ok(), "round {round}: {first:?}");
+        let left: Vec<_> = std::fs::read_dir(dir.join("secrets"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec![".request-key".to_owned()], "round {round}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// What a test subscriber saw: each event's level and message, in order.
 #[derive(Clone, Default)]
 struct Seen(Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);

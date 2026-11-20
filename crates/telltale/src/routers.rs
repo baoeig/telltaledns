@@ -524,9 +524,11 @@ pub(crate) async fn run(
             .iter()
             .filter_map(|r| check.refused(r).map(|why| (r.name.to_string(), why)))
             .collect();
-        let primary = sources.cluster.as_ref().is_none_or(|c| c.is_primary());
+        // Review round 2, R1: a warning on a replica too (once per router and reason): its
+        // Routers page shows the primary's status, so the log is where it says what it does. A
+        // Helm resolver pod has no keys by design (ADR-120): information there.
         for (name, why) in held_now(&mut held, refused) {
-            if resolver_pod || !primary {
+            if resolver_pod {
                 info!(router = %name, reason = %why, "router integration: not read on this node");
             } else {
                 warn!(router = %name, reason = %why, "router integration: not read on this node");

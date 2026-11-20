@@ -239,7 +239,10 @@ const REQUEST_KEY_FILE: &str = "secrets/.request-key";
 
 /// This node's request key: read from `<data_dir>/secrets/.request-key` (64 hex digits), or
 /// made there on the first start (random, readable by this user only, the folder by this user
-/// only). A file that isn't a key is an error: it is left as it is.
+/// only). A file that isn't a key is an error: it is left as it is. Review round 2 (security
+/// N6): the key appears whole or not at all: it is written to a temporary file of a random
+/// name (created exclusively, synced), linked into place without replacing a key that is there
+/// already, and the folder synced; a start racing another reads the one that won.
 fn request_key(dir: &Path) -> io::Result<[u8; 32]> {
     use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
     let file = dir.join(REQUEST_KEY_FILE);
@@ -274,25 +277,31 @@ fn request_key(dir: &Path) -> io::Result<[u8; 32]> {
             .create(parent)?;
     }
     let mut key = [0u8; 32];
-    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut key)
+    let mut tag = [0u8; 8];
+    let random = ring::rand::SystemRandom::new();
+    ring::rand::SecureRandom::fill(&random, &mut key)
+        .and_then(|()| ring::rand::SecureRandom::fill(&random, &mut tag))
         .map_err(|_| io::Error::other("the system's random source failed"))?;
-    let made = std::fs::OpenOptions::new()
+    let tmp = file.with_file_name(format!(".request-key.{}.tmp", crypto::hex(&tag)));
+    let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&file);
-    match made {
-        Ok(mut f) => {
-            let wrote = f
-                .write_all(crypto::hex(&key).as_bytes())
-                .and_then(|()| f.sync_all());
-            if let Err(e) = wrote {
-                let _ = std::fs::remove_file(&file);
-                return Err(e);
+        .open(&tmp)?;
+    let wrote = f
+        .write_all(crypto::hex(&key).as_bytes())
+        .and_then(|()| f.sync_all());
+    drop(f);
+    // `link` never replaces a file that is there: a start that lost the race reads the winner's.
+    let placed = wrote.and_then(|()| std::fs::hard_link(&tmp, &file));
+    let _ = std::fs::remove_file(&tmp);
+    match placed {
+        Ok(()) => {
+            if let Some(parent) = file.parent() {
+                std::fs::File::open(parent)?.sync_all()?;
             }
             Ok(key)
         }
-        // Made at the same moment by another start: that one.
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => read(&file),
         Err(e) => Err(e),
     }

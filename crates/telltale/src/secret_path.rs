@@ -17,11 +17,28 @@ use std::path::{Path, PathBuf};
 const FIXED_ROOTS: &[&str] = &["/run/secrets", "/etc/telltale-secrets"];
 
 /// Under `/run/secrets` but never a credential file's place: the pod's service-account token, CA
-/// and namespace (`/var/run/secrets/...` is the same folder where `/var/run` links to `/run`).
+/// and namespace, and (review round 2, security N5) the cloud workload-identity tokens projected
+/// next to them: EKS's `eks.amazonaws.com` and Azure's `azure` (`/var/run/secrets/...` is the
+/// same folder where `/var/run` links to `/run`). One list, for alert destinations (ADR-179) and
+/// routers (ADR-181); it is checked as written and with links followed.
 const EXCLUDED: &[&str] = &[
     "/run/secrets/kubernetes.io",
     "/var/run/secrets/kubernetes.io",
+    "/run/secrets/eks.amazonaws.com",
+    "/var/run/secrets/eks.amazonaws.com",
+    "/run/secrets/azure",
+    "/var/run/secrets/azure",
 ];
+
+/// REQ: OBS-010, API-002 (ADR-179, ADR-181) — review round 2, security N6: what the routers
+/// feature keeps in `<data_dir>/secrets/` (a router's pasted key, the list of them and its
+/// temporary files, the request key), by the first name under that folder. An alert destination
+/// never names one, so even an administrator can't send a router's key to an alert's address.
+fn feature_file(first: &std::ffi::OsStr) -> bool {
+    first.to_str().is_some_and(|n| {
+        n.starts_with("router-") || n.starts_with(".written") || n.starts_with(".request-key")
+    })
+}
 
 /// Links followed before giving up (a loop, or a chain that long, is refused).
 const MAX_LINKS: u8 = 40;
@@ -71,7 +88,29 @@ fn allowed_with(look: &Look, path: &str, data_dir: &str) -> bool {
     let Some(p) = written(path) else {
         return false;
     };
-    within(look, &p, &roots(data_dir))
+    within(look, &p, &roots(data_dir)) && !names_a_feature_file(look, &p, data_dir)
+}
+
+/// Whether `p` (in normal form), as written or with its links followed, is one of the files the
+/// routers feature keeps in `<data_dir>/secrets/` ([`feature_file`]).
+fn names_a_feature_file(look: &Look, p: &Path, data_dir: &str) -> bool {
+    let Some(d) = written(data_dir.trim_end_matches('/')) else {
+        return false;
+    };
+    let folder = d.join("secrets");
+    let first_under = |path: &Path, root: &Path| {
+        path.strip_prefix(root)
+            .ok()
+            .and_then(|rest| rest.components().next())
+            .is_some_and(|c| feature_file(c.as_os_str()))
+    };
+    let real_folder = resolve(look, &folder, 0);
+    // A path that can't be resolved is refused by `within` already.
+    let real = resolve(look, p, 0);
+    first_under(p, &folder)
+        || real.as_deref().is_some_and(|r| {
+            first_under(r, &folder) || real_folder.as_deref().is_some_and(|f| first_under(r, f))
+        })
 }
 
 /// REQ: API-002, T8.2 (ADR-181) — whether `path` is in this node's `<data_dir>/secrets/` folder,
@@ -313,6 +352,74 @@ mod tests {
         assert!(allowed(
             &format!("{}/secrets/token", link.to_str().unwrap()),
             link.to_str().unwrap()
+        ));
+    }
+
+    /// REQ: OBS-010, API-002 (ADR-179, ADR-181) — review round 2, security N5: the cloud
+    /// workload-identity tokens projected under `/run/secrets/` (`/var/run/secrets/`) are no
+    /// credential file's place, for an alert destination (`allowed`) or a router (`in_folders`):
+    /// EKS's `eks.amazonaws.com` and Azure's `azure`, as written and through a link.
+    #[test]
+    fn obs_010_cloud_identity_tokens_are_no_credential_files() {
+        let data = "/var/lib/telltale-test-data";
+        let roots = mount_roots();
+        for bad in [
+            "/run/secrets/eks.amazonaws.com/serviceaccount/token",
+            "/var/run/secrets/eks.amazonaws.com/serviceaccount/token",
+            "/run/secrets/azure/tokens/azure-identity-token",
+            "/var/run/secrets/azure/tokens/azure-identity-token",
+            "/run/secrets/kubernetes.io/serviceaccount/token",
+        ] {
+            assert!(!allowed(bad, data), "alert destination: {bad}");
+            assert!(!in_folders(bad, &roots), "router: {bad}");
+        }
+        for ok in ["/run/secrets/unifi-key", "/etc/telltale-secrets/unifi/key"] {
+            assert!(allowed(ok, data), "{ok}");
+            assert!(in_folders(ok, &roots), "{ok}");
+        }
+    }
+
+    /// REQ: OBS-010, API-002 (ADR-179, ADR-181) — review round 2, security N6: an alert
+    /// destination can't name a file this feature keeps in `<data_dir>/secrets/` (a router's
+    /// key, the list of them, the request key), as written or through a link, even for an
+    /// administrator; any other file there is still allowed. The router's own rule is unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn obs_010_an_alert_destination_names_no_router_key() {
+        use std::os::unix::fs::symlink;
+        let d = Dir::new("feature-files");
+        let data = d.s();
+        let sec = d.0.join("secrets");
+        std::fs::create_dir_all(&sec).unwrap();
+        for f in [
+            "router-udm.api_key.0123456789abcdef",
+            ".written",
+            ".request-key",
+            "ntfy-token",
+        ] {
+            std::fs::write(sec.join(f), "x").unwrap();
+        }
+        symlink(
+            sec.join("router-udm.api_key.0123456789abcdef"),
+            sec.join("alias"),
+        )
+        .unwrap();
+        let p = |s: &str| format!("{data}/secrets/{s}");
+        for bad in [
+            "router-udm.api_key.0123456789abcdef",
+            "router-anything",
+            ".written",
+            ".written.0123456789abcdef.tmp",
+            ".request-key",
+            "alias",
+        ] {
+            assert!(!allowed(&p(bad), &data), "{bad}");
+        }
+        assert!(allowed(&p("ntfy-token"), &data));
+        assert!(allowed(&p("nested/token"), &data));
+        assert!(in_data_secrets(
+            &p("router-udm.api_key.0123456789abcdef"),
+            &data
         ));
     }
 

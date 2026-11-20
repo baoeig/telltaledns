@@ -4052,12 +4052,12 @@ fn managed_impact(src: &Sources, kind: ManagedKind, name: &str, setting: bool) -
         (ManagedKind::Schedule, _) => {
             "Applies within 15 seconds to the groups that use it.".into()
         }
-        // REQ: T8.2 (ADR-181)
+        // REQ: T8.2 (ADR-181) — review round 2, correctness R3: what the router task does.
         (ManagedKind::Router, true) => {
-            "The router is read within 5 seconds, or once a read in progress ends; its devices are named once it answers (the log says if it doesn't).".into()
+            "The router is read within 5 seconds after the reads in progress end; its devices are named once it answers (the log says if it doesn't).".into()
         }
         (ManagedKind::Router, false) => {
-            "Its devices lose the names it gave them within 5 seconds, or once a read in progress ends.".into()
+            "Its devices lose the names it gave them after the next round of reads, which starts within 5 seconds after the reads in progress end.".into()
         }
         // REQ: OBS-038 — decided when a finding is created, so nothing already recorded changes.
         (ManagedKind::AnomalyMute, true) => {
@@ -5007,8 +5007,16 @@ fn plan_override(
         credential_place(d, file.node.data_dir.as_str())?;
     }
     left_out_guard(w.kind, &name, &file, &entries)?;
-    let merged = crate::managed::merge(&file, &entries)
-        .map_err(|errs| Problem::new(Code::InvalidConfig, errs.join("; ")))?;
+    let merged = crate::managed::merge(&file, &entries).map_err(|errs| {
+        // REQ: API-002, T8.2 (ADR-181) — correctness R4: a router written here names no key
+        // file; a missing key is said as what to paste.
+        let errs = if w.kind == ManagedKind::Router {
+            crate::router_secrets::paste_wording(errs)
+        } else {
+            errs
+        };
+        Problem::new(Code::InvalidConfig, errs.join("; "))
+    })?;
     let after = match w.kind {
         ManagedKind::Upstream => named_json(&merged.upstream, &name),
         ManagedKind::UpstreamGroup => named_json(&merged.upstream_group, &name),
@@ -5257,7 +5265,9 @@ impl ApiBackend {
     /// API-002, T8.2 (ADR-181) — F3: a write that stores something runs to its end in a task of
     /// its own, so a client that goes away can't stop it between writing a router's new key file
     /// and storing the entry that names it, or between storing and applying. A dry run stores
-    /// nothing: it stays tied to its request (a simulation stops when its client goes).
+    /// nothing: it stays tied to its request (a simulation stops when its client goes). The API's
+    /// handler runs a change in a task of its own too; this one covers the writes that come
+    /// another way (a write a replica forwarded, on the primary: review round 2, R5).
     pub(crate) fn do_write_managed(
         &self,
         w: ManagedWrite,
@@ -5267,9 +5277,11 @@ impl ApiBackend {
             return Box::pin(run_managed_write(src, w));
         }
         Box::pin(async move {
-            tokio::spawn(run_managed_write(src, w))
-                .await
-                .map_err(|e| Problem::internal(format!("request worker failed: {e}")))?
+            tokio::spawn(run_managed_write(src, w)).await.map_err(|e| {
+                // Review round 2, R6: the runtime's text stays in the log.
+                tracing::error!(error = %e, "a configuration change's task failed");
+                Problem::internal("the change didn't finish; the server log says why")
+            })?
         })
     }
 }

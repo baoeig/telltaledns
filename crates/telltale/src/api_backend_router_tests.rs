@@ -1173,10 +1173,11 @@ async fn api_002_a_shared_router_with_its_key_in_a_secrets_folder_is_polled_on_a
     let items = shared_router_on(None).await;
     assert_eq!(key_status(&items, "d-mounted"), "saved");
     assert_eq!(key_status(&items, "b-etc"), "not_used");
-    // A native replica, and a node promoted to primary (a newer epoch): the same rule, the held
-    // router said at info on the replica and as a warning on the primary.
+    // A native replica, and a node promoted to primary (a newer epoch): the same rule, and the
+    // held router is a warning on both (review round 2, R1: a replica's page shows the primary's
+    // status, so its log is where it says what it does).
     for (role, epoch, level) in [
-        (NodeRole::Replica, 1, tracing::Level::INFO),
+        (NodeRole::Replica, 1, tracing::Level::WARN),
         (NodeRole::Primary, 2, tracing::Level::WARN),
     ] {
         let items = shared_router_on(Some((role, epoch, level))).await;
@@ -1448,6 +1449,12 @@ async fn api_002_a_pasted_key_is_kept_for_a_retry_only_as_a_keyed_hash() {
     let plain = blake3::hash(key.as_bytes()).to_hex().to_string();
     let db = state_bytes(&n);
     assert_ne!(db.len(), 0, "state.db read");
+    // Review round 2, R5(c): the record is there, with the keyed hash.
+    let keyed = format!("keyed:{}", n.auth.request_digest(&key));
+    assert!(
+        db.windows(keyed.len()).any(|w| w == keyed.as_bytes()),
+        "no idempotency record with the keyed hash"
+    );
     assert!(
         !db.windows(plain.len()).any(|w| w == plain.as_bytes()),
         "a plain hash of the key is in state.db"
@@ -1601,4 +1608,316 @@ async fn api_002_the_use_rule_without_files_and_with_a_git_commit() {
     .unwrap();
     assert!(check().refused(&outside("git")).is_none(), "the Git commit");
     assert!(check().refused(&outside("other")).is_some());
+}
+
+// ---- Review round 2.
+
+/// REQ: API-002, AGT-003 (ADR-181) — security N2: a retry with the same Idempotency-Key while the
+/// first change still runs isn't made a second time: it gets 409 with `Retry-After`, and once the
+/// first has finished, the first answer. One reload, one audit row.
+#[tokio::test]
+async fn api_002_a_retry_while_the_first_change_runs_is_not_made_twice() {
+    let (asked, mut reload_asked) = tokio::sync::mpsc::unbounded_channel();
+    let go = Arc::new(tokio::sync::Notify::new());
+    let n = Node::new(Reload::Gated {
+        asked,
+        go: Arc::clone(&go),
+    });
+    let mut creds = n.admin.clone();
+    creds.push(("idempotency-key", marker("retry")));
+    let body = serde_json::json!({"url": "udp://192.0.2.53"});
+    let req = || Node::request("PUT", "/api/v1/upstreams/up", &creds, Some(&body));
+    let app = n.app.clone();
+    let first_req = req();
+    let first = tokio::spawn(async move { app.oneshot(first_req).await.unwrap() });
+    reload_asked.recv().await.unwrap();
+    // The retry, while the first waits for its reload.
+    let retry = tokio::time::timeout(Duration::from_secs(5), n.app.clone().oneshot(req()))
+        .await
+        .expect("answered at once, not queued behind the first")
+        .unwrap();
+    assert_eq!(retry.status(), StatusCode::CONFLICT);
+    assert!(
+        retry.headers().get("retry-after").is_some(),
+        "{:?}",
+        retry.headers()
+    );
+    go.notify_one();
+    let first = first.await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = axum::body::to_bytes(first.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    // Afterwards: the first answer.
+    let again = tokio::time::timeout(Duration::from_secs(5), n.app.clone().oneshot(req()))
+        .await
+        .expect("replayed, not made again")
+        .unwrap();
+    assert_eq!(again.status(), StatusCode::OK);
+    assert!(again.headers().get("idempotency-replayed").is_some());
+    let again = axum::body::to_bytes(again.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    assert_eq!(again, first, "the first answer");
+    assert!(reload_asked.try_recv().is_err(), "one reload");
+    let rows = n
+        .auth
+        .state()
+        .audit_page(None, 100, None, None)
+        .unwrap()
+        .iter()
+        .filter(|e| e.action == "upstream.put" && e.target == "up")
+        .count();
+    assert_eq!(rows, 1, "one audit row");
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — correctness R5(a): a write that reaches the backend without the
+/// API's handler (a write a replica forwarded, on the primary) runs to its end in the backend's
+/// own task too: the caller goes away after the store, and the key file stays and the change is
+/// applied.
+#[tokio::test]
+async fn api_002_a_backend_write_whose_caller_goes_away_runs_to_its_end() {
+    let (asked, mut reload_asked) = tokio::sync::mpsc::unbounded_channel();
+    let go = Arc::new(tokio::sync::Notify::new());
+    let n = Node::new(Reload::Gated {
+        asked,
+        go: Arc::clone(&go),
+    });
+    let backend = ApiBackend {
+        src: Arc::clone(&n.src),
+    };
+    let w = telltale_api::ManagedWrite {
+        kind: ManagedKind::Router,
+        name: "udm".into(),
+        body: Some(unifi(HERE, "the-key")),
+        dry_run: false,
+        expect: None,
+        by: "root".into(),
+        simulate: None,
+        by_admin: true,
+    };
+    let caller = tokio::spawn(backend.write_managed(w));
+    reload_asked.recv().await.unwrap();
+    caller.abort();
+    let _ = caller.await;
+    let f = n.key_file("udm").expect("the entry is stored");
+    go.notify_one();
+    wait_until("the change applied", 10, || {
+        n.src
+            .config
+            .load()
+            .router
+            .iter()
+            .any(|r| r.name.as_str() == "udm")
+    })
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(&f).ok().as_deref().map(str::trim),
+        Some("the-key")
+    );
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — correctness R5(b): the router task sweeps after a change of the
+/// routers in effect, within one 5-second check: a key file this node saved for a router that is
+/// gone (here its stored entry removed by hand, so no write prunes it) is removed.
+#[tokio::test]
+async fn api_002_the_router_task_sweeps_after_the_routers_change() {
+    let n = Node::new(Reload::Applies);
+    let (s, v) = n.put("udm", &n.admin, false, unifi(HERE, "the-key")).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let f = n.key_file("udm").unwrap();
+    let (stop, task) = poll(&n);
+    // The task's first round has seen the router (its key named, so kept).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(Path::new(&f).exists());
+    n.auth
+        .state()
+        .delete_managed("router", "udm", None)
+        .unwrap();
+    apply(&n.src);
+    wait_until("the key file of the router that's gone removed", 20, || {
+        !Path::new(&f).exists()
+    })
+    .await;
+    let _ = stop.send(true);
+    let _ = task.await;
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — security N4, correctness R2: the folder rule doesn't let a
+/// stored override keep sending a mounted key to an endpoint this node's own files no longer
+/// give that router. The override kept the file router's mounted key and address; the file then
+/// moved the router: the override is held (as in round 1), and its console is never asked.
+#[tokio::test]
+async fn api_002_a_stored_override_keeps_no_mounted_key_for_a_moved_router() {
+    let n = Node::new(Reload::Applies);
+    let d = n.data();
+    let fake = console();
+    std::fs::create_dir_all(format!("{d}/mount/udm")).unwrap();
+    let key = format!("{d}/mount/udm/key");
+    std::fs::write(&key, "mounted-key").unwrap();
+    let file_router = |url: &str| -> telltale_config::RouterConfig {
+        serde_json::from_value(serde_json::json!({
+            "name": "udm", "type": "unifi", "url": url, "site": "default",
+            "api_key_file": key, "offline_days": 0,
+        }))
+        .unwrap()
+    };
+    let mut file = (*n.src.file_config.load_full()).clone();
+    file.router.push(file_router(&fake.url));
+    n.src.file_config.store(Arc::new(file.clone()));
+    apply(&n.src);
+    // An administrator's override keeps the file's key and address (allowed), and changes the
+    // interval.
+    let (s, v) = n
+        .put(
+            "udm",
+            &n.admin,
+            false,
+            serde_json::json!({"type": "unifi", "url": fake.url, "site": "default",
+                "api_key_file": key, "interval_secs": 60, "offline_days": 0}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    // The file moves the router; the override still says the old address.
+    file.router = vec![file_router(ELSEWHERE)];
+    n.src.file_config.store(Arc::new(file));
+    apply(&n.src);
+    let in_effect = n
+        .src
+        .config
+        .load()
+        .router
+        .iter()
+        .find(|r| r.name.as_str() == "udm")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        in_effect.url.as_str(),
+        fake.url,
+        "the override is in effect"
+    );
+    assert!(
+        crate::router_secrets::UseCheck::load(&n.src)
+            .refused(&in_effect)
+            .is_some(),
+        "the override's mounted key is held"
+    );
+    let seen = super::local_access_tests::Seen::default();
+    let _log = tracing::subscriber::set_default(seen.subscriber());
+    let (stop, task) = poll(&n);
+    wait_until("the held router logged", 20, || {
+        !seen
+            .lines(|l| l.contains("not read on this node") && l.contains("udm"))
+            .is_empty()
+    })
+    .await;
+    let _ = stop.send(true);
+    let _ = task.await;
+    assert!(
+        fake.sites().is_empty(),
+        "the console was asked: {:?}",
+        fake.sites()
+    );
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — correctness R4: a router write that leaves its key out (nothing
+/// pasted, no key file of its own) is refused with what to paste, by the names the editor uses,
+/// not by the configuration's key-file fields.
+#[tokio::test]
+async fn api_002_a_router_without_its_key_asks_for_the_key_to_be_pasted() {
+    let n = Node::new(Reload::Applies);
+    for (body, wants) in [
+        (
+            serde_json::json!({"type": "unifi", "url": HERE, "offline_days": 0}),
+            "paste the API key",
+        ),
+        (
+            serde_json::json!({"type": "opnsense", "url": HERE, "api_key": "k"}),
+            "paste the API key and the API secret",
+        ),
+    ] {
+        let (s, v) = n.put("r", &n.admin, true, body.clone()).await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}: {v}");
+        let detail = v["detail"].as_str().unwrap_or("");
+        assert!(detail.contains(wants), "{body}: {v}");
+        assert!(!detail.contains("_file"), "{body}: {v}");
+    }
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — correctness R7: a key file that isn't there reads `file_missing`
+/// ("put the key file there") when it isn't one this node saves (a platform's folder for secrets,
+/// a path the config file names), and `missing` ("enter it again") when it is.
+#[tokio::test]
+async fn api_002_a_missing_mounted_key_says_put_the_file_there() {
+    let n = Node::new(Reload::Applies);
+    let d = n.data();
+    let mut file = (*n.src.file_config.load_full()).clone();
+    file.router.push(
+        serde_json::from_value(serde_json::json!({
+            "name": "mounted", "type": "unifi", "url": HERE,
+            "api_key_file": format!("{d}/mount/gone/key"), "offline_days": 0,
+        }))
+        .unwrap(),
+    );
+    n.src.file_config.store(Arc::new(file));
+    apply(&n.src);
+    let (s, v) = n.put("pasted", &n.admin, false, unifi(HERE, "k")).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    std::fs::remove_file(n.key_file("pasted").unwrap()).unwrap();
+    let items = n.routers(&n.viewer).await;
+    assert_eq!(key_status(&items, "mounted"), "file_missing", "{items:?}");
+    assert_eq!(key_status(&items, "pasted"), "missing", "{items:?}");
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — security N7: the sweep removes `.written.<16 hex>.tmp` files a
+/// crash left behind once they are a few minutes old, and nothing else: not a fresh one, not
+/// another name, not a link (nor what it leads to).
+#[cfg(unix)]
+#[tokio::test]
+async fn api_002_the_sweep_removes_old_temporary_record_files() {
+    let n = Node::new(Reload::Applies);
+    let d = n.data();
+    let dir = format!("{d}/secrets");
+    std::fs::create_dir_all(&dir).unwrap();
+    let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+    let make = |name: &str, aged: bool| {
+        let f = std::fs::File::create(format!("{dir}/{name}")).unwrap();
+        if aged {
+            f.set_modified(old).unwrap();
+        }
+    };
+    make(".written.0123456789abcdef.tmp", true);
+    make(".written.fedcba9876543210.tmp", false);
+    make(".written.tmp", true);
+    make(".written.0123456789abcdeg.tmp", true);
+    make("router-x.api_key.0123456789abcdef", true);
+    std::fs::write(format!("{d}/precious"), "not a record").unwrap();
+    std::fs::File::open(format!("{d}/precious"))
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    std::os::unix::fs::symlink(
+        format!("{d}/precious"),
+        format!("{dir}/.written.aaaaaaaaaaaaaaaa.tmp"),
+    )
+    .unwrap();
+    crate::router_secrets::sweep_now(&n.src).unwrap();
+    let left = |name: &str| {
+        Path::new(&format!("{dir}/{name}")).exists()
+            || std::fs::symlink_metadata(format!("{dir}/{name}")).is_ok()
+    };
+    assert!(
+        !left(".written.0123456789abcdef.tmp"),
+        "an old one is removed"
+    );
+    for kept in [
+        ".written.fedcba9876543210.tmp",
+        ".written.tmp",
+        ".written.0123456789abcdeg.tmp",
+        "router-x.api_key.0123456789abcdef",
+        ".written.aaaaaaaaaaaaaaaa.tmp",
+    ] {
+        assert!(left(kept), "{kept} kept");
+    }
+    assert!(Path::new(&format!("{d}/precious")).exists());
 }

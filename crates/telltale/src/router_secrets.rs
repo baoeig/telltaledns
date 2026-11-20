@@ -113,6 +113,25 @@ fn random_hex() -> Option<String> {
     }))
 }
 
+/// REQ: API-002, T8.2 (ADR-181) — review round 2, correctness R4: the configuration's errors for
+/// a router write, with "a key file is missing" said as what to paste, by the names the editor
+/// and the API body use (`api_key`, `api_secret`, `password`), not the configuration's `*_file`
+/// fields, which a router written through the API never names. Other errors stay as they are.
+pub(crate) fn paste_wording(errs: Vec<String>) -> Vec<String> {
+    errs.into_iter()
+        .map(|e| {
+            e.replace(
+                "UniFi needs api_key_file, or username and password_file",
+                "UniFi needs a key: paste the API key (`api_key`), or, under Advanced, a username and a password (`password`)",
+            )
+            .replace(
+                "OPNsense needs api_key_file and api_secret_file",
+                "OPNsense needs a key: paste the API key and the API secret (`api_key`, `api_secret`)",
+            )
+        })
+        .collect()
+}
+
 /// The hint of every refusal that asks for the key: the body carries the key, never a path.
 const PASTE: &str = "Paste the key; the node saves it. A key file elsewhere (a Docker or Kubernetes secret) is named in telltale.toml.";
 
@@ -726,6 +745,7 @@ fn named_files(src: &Sources) -> Option<HashSet<PathBuf>> {
 /// run with `config_writes` held, so it never sees a file a write is about to store an entry for.
 pub(crate) fn sweep_now(src: &Sources) -> Result<Vec<Record>, String> {
     let data_dir = src.file_config.load().node.data_dir.to_string();
+    remove_old_record_temps(&secrets_dir(&data_dir));
     let list = secrets_dir(&data_dir).join(WRITTEN);
     let records = read_records(&data_dir).map_err(|e| format!("{}: {e}", list.display()))?;
     if records.is_empty() {
@@ -770,6 +790,51 @@ pub(crate) async fn sweep(src: &Arc<Sources>) -> bool {
         }
     }
     true
+}
+
+/// How old a temporary file of `.written` is before the sweep takes it for one a stopped write
+/// left behind (a write makes, syncs and renames it in well under a second).
+const RECORD_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Whether `name` is `.written.<16 lowercase hex digits>.tmp`, the temporary file
+/// `write_records` makes.
+fn is_record_temp(name: &str) -> bool {
+    name.strip_prefix(".written.")
+        .and_then(|r| r.strip_suffix(".tmp"))
+        .is_some_and(|tag| {
+            tag.len() == 16
+                && tag
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+}
+
+/// REQ: API-002, T8.2 (ADR-181) — review round 2, security N7: removes the temporary files of
+/// `.written` a crash left in `dir` (they hold paths only) once they are [`RECORD_TEMP_AGE`]
+/// old: only files of exactly that name, only regular files (a link is neither followed nor
+/// removed), each logged.
+fn remove_old_record_temps(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for e in entries.flatten() {
+        if !e.file_name().to_str().is_some_and(is_record_temp) {
+            continue;
+        }
+        let path = e.path();
+        let Ok(m) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let old = m
+            .modified()
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age >= RECORD_TEMP_AGE);
+        if m.file_type().is_file() && old && std::fs::remove_file(&path).is_ok() {
+            info!(file = %path.display(), "router keys: removed a temporary file a stopped write left behind");
+        }
+    }
 }
 
 fn log_removed(gone: &[Record]) {
@@ -827,6 +892,11 @@ impl UseCheck {
         }
     }
 
+    /// Whether this node's own files (or the Git commit in use) define a router named `name`.
+    fn own_defines(&self, name: &str) -> bool {
+        self.own.iter().any(|o| o.name.as_str() == name)
+    }
+
     /// Whether this node sends `file` as `r`'s `field` (`file_field` in the configuration).
     fn usable(&self, r: &RouterConfig, field: &str, file_field: &str, file: &str) -> bool {
         let at = Endpoint::of(r);
@@ -839,10 +909,13 @@ impl UseCheck {
         }
         // REQ: API-002, T8.2 (ADR-181, ADR-120) — owner decision (review round 1): a key file in
         // a folder a platform fills with secrets (`/run/secrets/`, `/etc/telltale-secrets/`, links
-        // followed by `secret_path`'s rule) is used from the cluster's shared configuration too,
-        // on a replica or a promoted primary. No API body can name one for a router (paste
-        // only), so such a path comes from whoever writes the primary's config files or Git.
-        if crate::secret_path::in_folders(file, &self.mounts) {
+        // followed by `secret_path`'s rule) is used for a router this node's own files don't
+        // define: one from the cluster's shared configuration, on a replica or a promoted
+        // primary. Review round 2 (security N4, correctness R2): when its own files do define
+        // the router, the check above is the one: a stored override isn't sent a mounted key for
+        // an endpoint the files no longer give it.
+        if !self.own_defines(r.name.as_str()) && crate::secret_path::in_folders(file, &self.mounts)
+        {
             return true;
         }
         // Saved here, through the API, for this router, credential and endpoint.
@@ -860,19 +933,32 @@ impl UseCheck {
     pub(crate) fn refused(&self, r: &RouterConfig) -> Option<String> {
         let (field, file_field, _) = files_of(r)
             .find(|(field, file_field, file)| !self.usable(r, field, file_field, file))?;
+        if self.own_defines(r.name.as_str()) {
+            return Some(format!(
+                "not read on this node: its `{file_field}` or its address isn't what this node's config files give this router, and a key file is sent only for the router as they define it (or as it was saved here). Change the config file, or enter the {field} again on the node that takes configuration changes"
+            ));
+        }
         Some(format!(
             "not read on this node: its `{file_field}` is neither in a folder for secrets (/run/secrets/, /etc/telltale-secrets/) nor a key this node saved for this router at this address, and this node's config files don't define the router with it. Define the router in this node's config file, or put its key under /etc/telltale-secrets/ (the Helm chart's secretMounts) or /run/secrets/; for a router made in the UI, enter the {field} again on the node that takes configuration changes"
         ))
     }
 
     /// Each credential `r` names, by its body name: `saved` (the file is there and this node
-    /// uses it), `missing` (no file there on this node: enter it again), or `not_used` (there,
-    /// but not one this node sends for this router). Nothing in a file is read.
+    /// uses it), `missing` (no file there, and it is one this node saves when a key is pasted:
+    /// enter it again), `file_missing` (no file there, and it isn't one this node saves: a
+    /// platform's folder for secrets or a path a config file names; put the file there), or
+    /// `not_used` (there, but not one this node sends for this router). Nothing in a file is
+    /// read.
     pub(crate) fn status(&self, r: &RouterConfig) -> BTreeMap<String, String> {
         files_of(r)
             .map(|(field, file_field, file)| {
                 let s = if !Path::new(file).is_file() {
-                    "missing"
+                    // REQ: API-002, T8.2 (ADR-181) — review round 2, correctness R7.
+                    if crate::secret_path::in_data_secrets(file, &self.data_dir) {
+                        "missing"
+                    } else {
+                        "file_missing"
+                    }
                 } else if self.usable(r, field, file_field, file) {
                     "saved"
                 } else {
