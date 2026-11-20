@@ -296,18 +296,32 @@ grafanaDashboard:
 upgradeHook:
   enabled: false
   # A Secret with an agent token (Settings → API tokens → for an AI agent, made by an admin)
-  # that has the scopes analytics:read and cluster:upgrade. Make it with an expiry
-  # (expires_in_days) and rotate it; the Secret must exist before the sync that runs the hook
-  # (under Argo CD a PreSync hook runs before the app's own resources).
+  # that has the scopes analytics:read and cluster:upgrade (analytics:read also reads every
+  # analytics route). The hook runs on every sync and reads the cluster first, so a token that
+  # expires (expires_in_days), is revoked, or stops working ([agents] enabled = false) fails
+  # EVERY sync from then on, a values-only change too: make it without an expiry for this narrow
+  # scope, or set a reminder to rotate it. A first install has no cluster to make the token in:
+  # leave the hook off until the token exists (or create the Secret with a placeholder, which
+  # the hook skips past only while nothing answers yet). A missing Secret fails the hook at
+  # once ("set TELLTALE_TOKEN"). Under Argo CD a PreSync hook runs before the app's own
+  # resources, so the Secret must not be one of them.
   tokenSecret:
     name: ""
     key: token
   # The API to ask. Default: this release's API Service, over plain HTTP inside the cluster; set
-  # an https:// URL when the API serves TLS ([api] tls).
+  # an https:// URL when the API serves TLS ([api] tls), and with a self-signed certificate
+  # name a Secret holding it in caSecret (otherwise the hook can't trust it and fails).
   url: ""
+  # A Secret with the PEM certificate the API's https:// URL must be checked against (its `key`,
+  # default ca.crt), mounted into the hook and given to ctl as --ca-file.
+  caSecret:
+    name: ""
+    key: ca.crt
   # How long each node may take to install the version and come back in sync.
   timeout: 10m
-  # Leave nodes that are down, or that can't take a request now, out instead of failing.
+  # Leave nodes that are down out instead of failing. A node that is up but can't take the
+  # request (its update service off, another channel, an update running there) still fails the
+  # hook: that is set up wrong, not down.
   skipDown: false
   # When a native node can't fetch the image's edge build any more (main has published a newer
   # one): `fail` keeps the sync blocked until the pin moves to the newest edge build or a

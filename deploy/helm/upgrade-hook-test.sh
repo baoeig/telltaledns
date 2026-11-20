@@ -26,7 +26,24 @@ sts=$(render "${on[@]}" --set image.tag=sha-abc1234 --show-only templates/statef
 grep -q '"helm.sh/hook": pre-upgrade' <<<"$job" && ok "a pre-upgrade hook" || bad "not a pre-upgrade hook"
 grep -q -- '- --to-self' <<<"$job" && grep -q -- '- --skip-if-unreachable' <<<"$job" \
   && ok "ctl upgrade --to-self --skip-if-unreachable" || bad "args: $job"
-grep -q 'secretKeyRef: { name: tt-upgrade, key: token }' <<<"$job" && ok "the token from the Secret" || bad "token"
+# REQ: OPS-014 (ADR-182) — optional: a missing Secret starts the pod, and ctl fails at once
+# ("set TELLTALE_TOKEN") instead of the pod waiting for it until activeDeadlineSeconds.
+grep -q 'secretKeyRef: { name: tt-upgrade, key: token, optional: true }' <<<"$job" \
+  && ok "the token from the Secret (optional: a missing one fails fast)" || bad "token"
+# The Job (and its log, with any skip warning) stays until the next run's hook replaces it.
+grep -q '"helm.sh/hook-delete-policy": before-hook-creation$' <<<"$job" \
+  && ok "the Job's log is kept after a run that succeeded" || bad "delete policy: $(grep delete-policy <<<"$job")"
+# REQ: OPS-014 (ADR-182) — caSecret: the API's certificate for an https:// url, as --ca-file.
+grep -q -- '--ca-file' <<<"$job" && bad "--ca-file without caSecret" || ok "no CA by default"
+ca=$(render "${on[@]}" --set upgradeHook.url=https://tt.example:8053 --set upgradeHook.caSecret.name=tt-api-ca \
+  --show-only templates/upgrade-hook.yaml)
+grep -A1 -- '- --ca-file' <<<"$ca" | grep -q -- '- /etc/telltale-hook-ca/ca.crt' \
+  && grep -q 'secretName: tt-api-ca' <<<"$ca" && grep -q 'mountPath: /etc/telltale-hook-ca' <<<"$ca" \
+  && ok "caSecret mounts the certificate and passes --ca-file" || bad "caSecret: $ca"
+ca=$(render "${on[@]}" --set upgradeHook.caSecret.name=tt-api-ca --set upgradeHook.caSecret.key=api.pem \
+  --show-only templates/upgrade-hook.yaml)
+grep -q -- '- /etc/telltale-hook-ca/api.pem' <<<"$ca" && grep -q 'key: api.pem' <<<"$ca" \
+  && ok "caSecret.key names the file" || bad "caSecret.key"
 grep -q '"http://up-telltale-api.default.svc:8053"' <<<"$job" && ok "the release's API Service" || bad "url"
 img_job=$(grep -m1 'image:' <<<"$job" | awk '{print $2}')
 img_sts=$(grep -m1 'image:' <<<"$sts" | awk '{print $2}')

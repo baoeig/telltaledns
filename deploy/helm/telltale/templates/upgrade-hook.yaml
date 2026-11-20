@@ -5,7 +5,9 @@ REQ: OPS-014, CLU-010 (ADR-182) — before the chart's pods roll, upgrade the cl
 the upgrade, so the pods keep their version. Helm runs it before an upgrade; Argo CD as a
 PreSync hook on every sync (nothing to do when every node already runs the version, and nothing
 answering yet on a first install). With `whenUnavailable: skip`, a node that can't fetch the
-image's edge build any more is left on its version (loudly) instead of failing the hook.
+image's edge build any more is left on its version (loudly) instead of failing the hook. The Job
+stays after a run that succeeded (deleted only before the next one), so a skip's warning can be
+read until the next sync. A missing token Secret fails the run at once (`set TELLTALE_TOKEN`).
 */}}
 {{- $h := .Values.upgradeHook }}
 {{- if $h.enabled }}
@@ -21,7 +23,7 @@ metadata:
   annotations:
     "helm.sh/hook": pre-upgrade
     "helm.sh/hook-weight": "0"
-    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    "helm.sh/hook-delete-policy": before-hook-creation
 spec:
   backoffLimit: 0
   activeDeadlineSeconds: {{ $h.activeDeadlineSeconds }}
@@ -68,12 +70,31 @@ spec:
             {{- if eq ($h.whenUnavailable | default "fail") "skip" }}
             - --skip-unavailable
             {{- end }}
+            {{- with $h.caSecret }}{{ if .name }}
+            - --ca-file
+            - /etc/telltale-hook-ca/{{ .key | default "ca.crt" }}
+            {{- end }}{{ end }}
           env:
             - name: TELLTALE_TOKEN
               valueFrom:
-                secretKeyRef: { name: {{ $h.tokenSecret.name }}, key: {{ $h.tokenSecret.key }} }
+                secretKeyRef: { name: {{ $h.tokenSecret.name }}, key: {{ $h.tokenSecret.key }}, optional: true }
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           resources:
             {{- toYaml $h.resources | nindent 12 }}
+          {{- with $h.caSecret }}{{ if .name }}
+          volumeMounts:
+            - name: api-ca
+              mountPath: /etc/telltale-hook-ca
+              readOnly: true
+          {{- end }}{{ end }}
+      {{- with $h.caSecret }}{{ if .name }}
+      volumes:
+        - name: api-ca
+          secret:
+            secretName: {{ .name }}
+            items:
+              - key: {{ .key | default "ca.crt" }}
+                path: {{ .key | default "ca.crt" }}
+      {{- end }}{{ end }}
 {{- end }}

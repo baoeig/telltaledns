@@ -429,6 +429,19 @@
         "url": {
           "type": "string"
         },
+        "caSecret": {
+          "type": "object",
+          "description": "REQ: OPS-014 (ADR-182) \u2014 the Secret with the PEM certificate an https:// upgradeHook.url is checked against (ctl --ca-file).",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "key": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
         "timeout": {
           "type": "string",
           "pattern": "^[0-9]+[smhd]?$"
