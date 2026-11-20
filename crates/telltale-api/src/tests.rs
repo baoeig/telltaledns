@@ -4065,3 +4065,65 @@ async fn api_002_a_change_whose_task_fails_answers_a_fixed_500() {
         "{v}"
     );
 }
+
+// ---- Review round 3.
+
+/// REQ: AGT-007, AGT-003 (ADR-181) — review round 3 (F3): an MCP `apply_plan` that finds the node
+/// busy (every place for a change taken: 503) or the plan's first apply still running (409
+/// `change_in_progress`) doesn't spend the plan: it is `ready` again and the agent is told to
+/// apply it again. Once the node is free, the plan is applied.
+#[tokio::test]
+async fn agt_007_a_busy_apply_leaves_the_plan_to_apply_again() {
+    let backend = Arc::new(GatedBackend::new(false));
+    let app = app_over(Arc::clone(&backend) as Shared);
+    let agent = agent_token(&app, "planner", &["config:write:records"]).await;
+    let made = mcp_call(
+        &app,
+        &agent,
+        "plan_set_local_name",
+        serde_json::json!({"name": "nas.home.arpa", "records": [{"type": "A", "value": "192.168.1.10"}],
+            "reason": "a test of a busy apply"}),
+    )
+    .await;
+    assert_eq!(made["result"]["isError"], false, "{made}");
+    let id = made["result"]["structuredContent"]["planId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let apply = || {
+        mcp_call(
+            &app,
+            &agent,
+            "apply_plan",
+            serde_json::json!({"planId": id}),
+        )
+    };
+    let busy = |v: &serde_json::Value, why: &str| {
+        assert_eq!(v["result"]["isError"], true, "{why}: {v}");
+        assert_eq!(
+            v["result"]["structuredContent"]["state"], "ready",
+            "{why}: {v}"
+        );
+        assert!(
+            v["result"]["structuredContent"]["hint"]
+                .as_str()
+                .is_some_and(|h| h.contains("again")),
+            "{why}: {v}"
+        );
+    };
+    // Every place taken.
+    let all = app.auth.write_gate().take_every_place().unwrap();
+    busy(&apply().await, "503");
+    drop(all);
+    // The plan's first apply still running (its Idempotency-Key is the plan's ID).
+    let root = app.auth.state().user_by_name("root").unwrap().unwrap();
+    let key = format!("{}:{id}", root.id);
+    app.auth.write_gate().hold_key(&key, true);
+    busy(&apply().await, "409");
+    app.auth.write_gate().hold_key(&key, false);
+    // Free: applied.
+    backend.gate.add_permits(1);
+    let v = apply().await;
+    assert_eq!(v["result"]["isError"], false, "{v}");
+    assert_eq!(v["result"]["structuredContent"]["state"], "applied", "{v}");
+}

@@ -4307,7 +4307,7 @@ export interface components {
          * @description Stable error codes.
          * @enum {string}
          */
-        Code: "invalid_parameter" | "not_found" | "unsupported_scope" | "unavailable" | "internal" | "unauthorized" | "totp_required" | "forbidden" | "csrf_rejected" | "conflict" | "version_conflict" | "invalid_config" | "rate_limited" | "gitops_managed" | "maintenance_too_long" | "maintenance_invalid" | "node_unreachable" | "node_unknown" | "simulation_busy" | "simulation_window" | "cluster_pinned" | "no_rollout" | "version_unknown" | "version_blobs_missing" | "annotation_text" | "annotation_time" | "method_not_allowed" | "heatmap_window" | "privacy_level" | "kubernetes_disabled" | "drill_refused" | "drill_active" | "drill_targets" | "node_is_primary" | "node_is_up";
+        Code: "invalid_parameter" | "not_found" | "unsupported_scope" | "unavailable" | "internal" | "unauthorized" | "totp_required" | "forbidden" | "csrf_rejected" | "conflict" | "version_conflict" | "invalid_config" | "rate_limited" | "gitops_managed" | "maintenance_too_long" | "maintenance_invalid" | "node_unreachable" | "node_unknown" | "simulation_busy" | "simulation_window" | "cluster_pinned" | "no_rollout" | "version_unknown" | "version_blobs_missing" | "annotation_text" | "annotation_time" | "method_not_allowed" | "heatmap_window" | "privacy_level" | "kubernetes_disabled" | "drill_refused" | "drill_active" | "drill_targets" | "node_is_primary" | "node_is_up" | "change_in_progress";
         /** @description What a change to local names or forwarded domains did (or would do, with `dryRun`). */
         ConfigChange: {
             /** @description The entry after (absent after a delete). */
@@ -8283,7 +8283,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -8366,7 +8366,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -8467,7 +8467,7 @@ export interface operations {
                     "application/json": components["schemas"]["ConfigChange"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -8550,7 +8550,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -8974,7 +8974,7 @@ export interface operations {
                     "application/json": components["schemas"]["ConfigChange"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -9057,7 +9057,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -10103,7 +10103,7 @@ export interface operations {
                     "application/json": components["schemas"]["ClientChange"];
                 };
             };
-            /** @description Defined in the config files, or an Idempotency-Key reused for another request; or the Idempotency-Key's first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description Defined in the config files, or an Idempotency-Key reused for another request; or the Idempotency-Key's first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -10186,7 +10186,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Defined in the config files; or the Idempotency-Key's first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description Defined in the config files; or the Idempotency-Key's first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -10532,7 +10532,7 @@ export interface operations {
                     "application/json": components["schemas"]["ConfigChange"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -10612,7 +10612,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -11080,7 +11080,7 @@ export interface operations {
                     "application/json": components["schemas"]["ConfigChange"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -11160,7 +11160,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -11281,7 +11281,7 @@ export interface operations {
                     "application/json": components["schemas"]["ConfigChange"];
                 };
             };
-            /** @description Conflicts with the current state: problem+json says what to change; or the Idempotency-Key's first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description Conflicts with the current state: problem+json says what to change; or the Idempotency-Key's first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -11364,7 +11364,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Conflicts with the current state: problem+json says what to change; or the Idempotency-Key's first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description Conflicts with the current state: problem+json says what to change; or the Idempotency-Key's first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -11453,7 +11453,7 @@ export interface operations {
                     "application/json": components["schemas"]["ConfigChange"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -11536,7 +11536,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -11659,7 +11659,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -11742,7 +11742,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -11903,7 +11903,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -11986,7 +11986,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -12580,7 +12580,7 @@ export interface operations {
                     "application/json": components["schemas"]["ConfigChange"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -12660,7 +12660,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -12740,7 +12740,7 @@ export interface operations {
                     "application/json": components["schemas"]["ConfigChange"];
                 };
             };
-            /** @description Defined in the config files, or an Idempotency-Key reused; or the Idempotency-Key's first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description Defined in the config files, or an Idempotency-Key reused; or the Idempotency-Key's first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -12823,7 +12823,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Conflicts with the current state: problem+json says what to change; or the Idempotency-Key's first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description Conflicts with the current state: problem+json says what to change; or the Idempotency-Key's first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -12901,7 +12901,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -12993,7 +12993,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -13073,7 +13073,7 @@ export interface operations {
                     "application/json": components["schemas"]["ConfigChange"];
                 };
             };
-            /** @description Defined in the config files, or an Idempotency-Key reused; or the Idempotency-Key's first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description Defined in the config files, or an Idempotency-Key reused; or the Idempotency-Key's first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -13156,7 +13156,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Defined in the config files; or the Idempotency-Key's first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description Defined in the config files; or the Idempotency-Key's first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -13225,7 +13225,7 @@ export interface operations {
                     "application/json": components["schemas"]["ConfigChange"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -13308,7 +13308,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -13436,7 +13436,7 @@ export interface operations {
                     "application/json": components["schemas"]["ConfigChange"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -13516,7 +13516,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -14307,7 +14307,7 @@ export interface operations {
                     "application/json": components["schemas"]["ConfigChange"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -14390,7 +14390,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -14488,7 +14488,7 @@ export interface operations {
                     "application/json": components["schemas"]["ConfigChange"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -14571,7 +14571,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The Idempotency-Key was used for another request, or its first request is still running (`Retry-After`: retry shortly for its answer). */
+            /** @description The Idempotency-Key was used for another request, or its first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer). */
             409: {
                 headers: {
                     [name: string]: unknown;
