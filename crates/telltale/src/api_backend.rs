@@ -2471,6 +2471,7 @@ impl Backend for ApiBackend {
     fn alert_test(
         &self,
         name: &str,
+        by_admin: bool,
     ) -> telltale_api::BoxFuture<Result<telltale_api::model::AlertTest, Problem>> {
         let cfg = self.src.config.load_full();
         let d = cfg
@@ -2496,6 +2497,15 @@ impl Backend for ApiBackend {
                 Some(why) => Err(why.clone()),
                 None => crate::alerts::send_test(&d, &node).await,
             };
+            // REQ: OBS-010 (ADR-180) — what went wrong reading the private CA file (a line of it,
+            // whether it is there) is an administrator's to see; the node's log has it.
+            let r = r.map_err(|e| match &d.tls_ca {
+                Some(ca) if !by_admin && e.contains(ca.as_str()) => {
+                    tracing::info!(destination = %d.name, error = %e, "test send: the private CA file couldn't be used");
+                    "the private CA file (`tls_ca`) couldn't be used; an administrator sees why, and the node's log says".to_owned()
+                }
+                _ => e,
+            });
             Ok(telltale_api::model::AlertTest {
                 ok: r.is_ok(),
                 error: r.err(),
@@ -2507,9 +2517,10 @@ impl Backend for ApiBackend {
     fn check_upstream(
         &self,
         body: serde_json::Value,
+        by_admin: bool,
     ) -> telltale_api::BoxFuture<Result<telltale_api::model::CheckResult, Problem>> {
         let cfg = self.src.config.load_full();
-        Box::pin(async move { crate::checks::upstream(&cfg, body).await })
+        Box::pin(async move { crate::checks::upstream(&cfg, body, by_admin).await })
     }
 
     // REQ: API-002 (T9.12) — a draft list downloaded (or its rules taken) and parsed.
@@ -2527,6 +2538,7 @@ impl Backend for ApiBackend {
         &self,
         config: serde_json::Value,
         opts: telltale_api::SimulateOpts,
+        by_admin: bool,
     ) -> telltale_api::BoxFuture<Result<telltale_api::model::Simulation, Problem>> {
         let src = Arc::clone(&self.src);
         let mut config = config;
@@ -2550,6 +2562,11 @@ impl Backend for ApiBackend {
                         "Send the shared sections as JSON, as a Git commit's shared TOML becomes.",
                     )
                 })?;
+            // REQ: OBS-024 (ADR-180) — below admin, refused before anything is read.
+            if !by_admin && let Some(field) = crate::simulate::new_local_name(&current, &candidate)
+            {
+                return Err(crate::simulate::local_name_refused(&field));
+            }
             crate::simulate::simulate(&src, current, Arc::new(candidate), &opts)
                 .await
                 .map(Option::unwrap_or_default)
@@ -4663,6 +4680,34 @@ fn plugin_field_of(body: &serde_json::Value) -> Option<&'static str> {
     )
 }
 
+/// REQ: FLT-004, API-002 (ADR-180) — a list made through the API that reads a local file
+/// (`path`) is pointed at that file only by an administrator: the server reads it on every
+/// refresh, so which file is read is for someone trusted with the node. `current` is the file
+/// the list in effect reads, if any: a write that keeps it (another setting changed) needs only
+/// the operator role, as do URL lists, inline rules, and deletes. Dry runs and writes forwarded
+/// from another node are checked the same way.
+fn local_file_guard(w: &ManagedWrite, current: Option<&str>) -> Result<(), Problem> {
+    if w.by_admin {
+        return Ok(());
+    }
+    let Some(after) = w
+        .body
+        .as_ref()
+        .and_then(|b| b.get("path"))
+        .filter(|p| !p.is_null())
+    else {
+        return Ok(());
+    };
+    if after.as_str().is_some_and(|p| Some(p) == current) {
+        return Ok(());
+    }
+    Err(Problem::new(
+        Code::Forbidden,
+        "a list's `path` (a local file) is set or changed only by an administrator",
+    )
+    .hint("Setting or changing a list's local file needs an administrator. A URL list, inline rules, a change that keeps the list's file, or deleting it, need only the operator role."))
+}
+
 /// REQ: OBS-010, API-002 (ADR-179) — the credential-file fields an alert destination (as JSON)
 /// names.
 fn credential_fields(d: &serde_json::Value) -> Vec<&'static str> {
@@ -4757,6 +4802,17 @@ fn plan_override(
         && let Some(field) = w.body.as_ref().and_then(plugin_field_of)
     {
         return Err(plugin_refused(field));
+    }
+    // REQ: FLT-004, API-002 (ADR-180) — likewise first: a list's local file is an
+    // administrator's to choose.
+    if w.kind == ManagedKind::List {
+        let current = before_cfg
+            .list
+            .iter()
+            .find(|l| l.name() == name)
+            .and_then(|l| l.path.as_ref())
+            .map(ToString::to_string);
+        local_file_guard(w, current.as_deref())?;
     }
     // REQ: API-002 (T9.22) — removing an upstream also takes it out of its upstream groups.
     // A DELETE that reverts an override of the files' entry (or un-hides it) brings the
@@ -5143,16 +5199,8 @@ impl ApiBackend {
                 // Other writes needn't wait for the replay.
                 drop(one_at_a_time);
                 if let Some(opts) = &w.simulate {
-                    let baseline = Arc::new(
-                        crate::managed::merge(
-                            &src.file_config.load_full(),
-                            &crate::managed::entries(&state),
-                        )
-                        .map_err(|errs| Problem::internal(errs.join("; ")))?,
-                    );
-                    let candidate = Arc::new(plan.candidate.clone());
                     out.simulation =
-                        crate::simulate::simulate(&src, baseline, candidate, opts).await?;
+                        dry_run_simulation(&src, &state, &plan.candidate, opts, w.by_admin).await?;
                 }
                 return Ok(out);
             }
@@ -5204,6 +5252,32 @@ impl ApiBackend {
             Ok(change(true, version))
         })
     }
+}
+
+/// REQ: OBS-024 — a dry run's `simulate`: what `candidate` (the planned configuration) would have
+/// done to the logged queries, against the configuration the API's entries make now.
+async fn dry_run_simulation(
+    src: &Arc<Sources>,
+    state: &telltale_store::state::State,
+    candidate: &telltale_config::Config,
+    opts: &telltale_api::SimulateOpts,
+    by_admin: bool,
+) -> Result<Option<telltale_api::model::Simulation>, Problem> {
+    let baseline = Arc::new(
+        crate::managed::merge(
+            &src.file_config.load_full(),
+            &crate::managed::entries(state),
+        )
+        .map_err(|errs| Problem::internal(errs.join("; ")))?,
+    );
+    let candidate = Arc::new(candidate.clone());
+    // REQ: OBS-024 (ADR-180) — the rule of `POST /api/v1/simulate`, before anything is read:
+    // here the plan still answers, and its simulation says it wasn't run.
+    let asked = !opts.auto || src.config.load().simulate.plans_by_default;
+    if asked && !by_admin && crate::simulate::new_local_name(&baseline, &candidate).is_some() {
+        return Ok(Some(crate::simulate::local_name_unavailable()));
+    }
+    crate::simulate::simulate(src, baseline, candidate, opts).await
 }
 
 /// REQ: OBS-033 — the change about to be applied came from `by` and is configuration
@@ -6237,3 +6311,8 @@ mod cred_file_tests;
 #[cfg(test)]
 #[path = "api_backend_local_access_tests.rs"]
 mod local_access_tests;
+
+// REQ: FLT-004, OBS-024, OBS-010, API-002 (ADR-180) — local files named through the API.
+#[cfg(test)]
+#[path = "api_backend_local_file_tests.rs"]
+mod local_file_tests;

@@ -75,7 +75,8 @@ export interface paths {
          * Send a test alert to one destination (OBS-010, T9.6).
          * @description Sends a message marked as a test, from this node, and answers with what happened: `ok`, or
          *     the destination's error (a wrong password, an unreachable server). Nothing is stored, but
-         *     the test is audited. Needs the operator role.
+         *     the test is audited. Needs the operator role. When the private CA file (`tls_ca`) can't be
+         *     used, only an administrator is told why; anyone else gets that it couldn't be (ADR-180).
          */
         post: operations["test_alert_destination"];
         delete?: never;
@@ -919,7 +920,8 @@ export interface paths {
          *     doesn't match, a timeout). Nothing is saved; the check is audited. Needs the operator role
          *     (agents: `config:write:upstreams`). A plugin draft (`exec://`, `unix://`, `args`) is refused
          *     before anything is built, for everyone: plugin upstreams are defined in the config file
-         *     (ADR-180).
+         *     (ADR-180). When a TLS file the draft names (`tls_ca`, `tls_client_cert`, `tls_client_key`)
+         *     can't be used, only an administrator is told why; anyone else gets that it couldn't be.
          */
         post: operations["check_upstream"];
         delete?: never;
@@ -1813,7 +1815,8 @@ export interface paths {
          * Filter lists and their download state.
          * @description Every configured list with its kind (block/allow), source, download state (`ok`, `failed`,
          *     `pending`) and last error, size, and how many names it contributes to the active snapshot.
-         *     `hits` adds up every node's in a cluster.
+         *     `hits` adds up every node's in a cluster. For a list read from a local file, the error is
+         *     shown in full to an administrator; anyone else sees a generic reason (ADR-180).
          */
         get: operations["lists"];
         put?: never;
@@ -1838,7 +1841,10 @@ export interface paths {
          *     e.g. `{"url": "https://example.com/hosts.txt"}`. A name the config files use is overridden: this definition replaces theirs
          *     until it's deleted again (`GET /api/v1/config/overrides` lists such changes). The whole
          *     configuration is checked before anything is stored. On a node whose configuration comes from
-         *     Git, the response's `toml` says what to add to the repository to keep the change.
+         *     Git, the response's `toml` says what to add to the repository to keep the change. A list read
+         *     from a local file (`path`) is added, or pointed at another file, only by an administrator (an
+         *     admin's sign-in or API token; no agent token); the operator role covers URL lists, inline
+         *     rules, a file list's other settings, and deleting any list (ADR-180).
          */
         put: operations["put_list"];
         post?: never;
@@ -2265,7 +2271,10 @@ export interface paths {
          *     allowed, a changed route, a changed answer, by name, device, and group. In a cluster every
          *     node replays its own log (and the logs shipped to it) and the counts are summed; nodes that
          *     didn't answer are in `missingNodes`. Nothing changes and nothing is audited. Needs the
-         *     viewer role (agents: `config:read` and `querylog:read`).
+         *     viewer role (agents: `config:read` and `querylog:read`). A caller who isn't an administrator
+         *     can name only the local files (a list's `path`, a zone's `file`, `[local] hosts_files`, an
+         *     upstream's TLS files) and plugin upstreams that the configuration in effect names: anything
+         *     else is refused before it's read (422, ADR-180).
          */
         post: operations["simulate"];
         delete?: never;
@@ -11526,6 +11535,15 @@ export interface operations {
                     "application/json": components["schemas"]["ConfigChange"];
                 };
             };
+            /** @description The list names a local file (`path`) it didn't read before, and the caller isn't an administrator. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
             /** @description The configuration changed since the If-Match version: re-read it and retry. */
             412: {
                 headers: {
@@ -12706,7 +12724,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The configuration isn't valid, or the window isn't a duration of at most 7 days (`simulation_window`). */
+            /** @description The configuration isn't valid, the window isn't a duration of at most 7 days (`simulation_window`), or a caller below admin named a new local file, program or socket. */
             422: {
                 headers: {
                     [name: string]: unknown;

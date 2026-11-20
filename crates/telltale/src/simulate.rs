@@ -421,6 +421,77 @@ pub(crate) fn unavailable(reason: &str) -> Simulation {
     }
 }
 
+/// REQ: OBS-024 (ADR-180) — the first field of `candidate` that names a local file, a program or
+/// a local socket that `current` doesn't name in the same field: a list's `path`, a zone's
+/// `file`, a hosts file, an upstream's TLS file, or a plugin upstream (`exec://`, `unix://`,
+/// with its `args`). A simulation run by someone below admin can't name one: it would read that
+/// file on their behalf, and its errors or counts would tell them what is in it, or whether it is
+/// there. What the configuration in effect already names is the administrator's choice.
+pub(crate) fn new_local_name(current: &Config, candidate: &Config) -> Option<String> {
+    type Tls = fn(&telltale_config::Upstream) -> Option<&telltale_config::SafeString>;
+    for (i, l) in candidate.list.iter().enumerate() {
+        if let Some(p) = &l.path
+            && !current.list.iter().any(|c| c.path.as_ref() == Some(p))
+        {
+            return Some(format!("list[{i}].path"));
+        }
+    }
+    for (i, z) in candidate.zone.iter().enumerate() {
+        if let Some(f) = &z.file
+            && !current.zone.iter().any(|c| c.file.as_ref() == Some(f))
+        {
+            return Some(format!("zone[{i}].file"));
+        }
+    }
+    for (i, f) in candidate.local.hosts_files.iter().enumerate() {
+        if !current.local.hosts_files.contains(f) {
+            return Some(format!("local.hosts_files[{i}]"));
+        }
+    }
+    let tls: [(&str, Tls); 3] = [
+        ("tls_ca", |u| u.tls_ca.as_ref()),
+        ("tls_client_cert", |u| u.tls_client_cert.as_ref()),
+        ("tls_client_key", |u| u.tls_client_key.as_ref()),
+    ];
+    for (i, u) in candidate.upstream.iter().enumerate() {
+        for (field, get) in &tls {
+            if let Some(p) = get(u)
+                && !current.upstream.iter().any(|c| get(c) == Some(p))
+            {
+                return Some(format!("upstream[{i}].{field}"));
+            }
+        }
+        if crate::managed::is_plugin_url(u.url.as_str())
+            && !current
+                .upstream
+                .iter()
+                .any(|c| c.url == u.url && c.args == u.args)
+        {
+            return Some(format!("upstream[{i}].url"));
+        }
+    }
+    None
+}
+
+/// REQ: OBS-024 (ADR-180) — `POST /api/v1/simulate`'s refusal of a [`new_local_name`]: the same
+/// whatever is, or isn't, at the path.
+pub(crate) fn local_name_refused(field: &str) -> Problem {
+    Problem::new(
+        Code::InvalidConfig,
+        format!(
+            "`{field}`: a simulation run by someone who isn't an administrator names only the local files, programs and sockets that the configuration in effect names"
+        ),
+    )
+    .hint("An administrator can run this simulation; anyone else can simulate the change without the new file, program or socket.")
+}
+
+/// REQ: OBS-024 (ADR-180) — a dry run's simulation that [`new_local_name`] keeps from running: the
+/// plan still answers.
+pub(crate) fn local_name_unavailable() -> Simulation {
+    stats().unavailable.fetch_add(1, Ordering::Relaxed);
+    unavailable("local_file")
+}
+
 /// An answer for a change that can't affect a decision.
 pub(crate) fn not_applicable() -> Simulation {
     Simulation {
