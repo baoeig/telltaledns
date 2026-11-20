@@ -2254,7 +2254,8 @@ A cluster whose nodes run outside Kubernetes (installed with `install.sh`) can u
 you, one at a time, in the order a cluster needs: **replicas first, the primary last**, each back
 on the new version, ready, and in sync before the next one starts. With the Helm chart's
 `upgradeHook`, bumping the chart (or merging the Renovate pull request in a GitOps repository)
-upgrades the native nodes first and the pods after them.
+upgrades the native nodes first and the pods after them. It is off by default on both sides;
+treat it as experimental until you have watched it upgrade (and roll back) a node of yours.
 
 **How it works.** The node's service runs as the `telltale` user in a sandbox and can't replace
 its own binary, so it doesn't: asked for a version, it writes
@@ -2264,30 +2265,68 @@ second, root unit installed next to it, `telltale-update.path`, sees the file an
 it may write only that `update/` folder:
 1. it reads the request (a small regular file written by `telltale`, opened without following a
    link or waiting on it) and removes it;
-2. it refuses anything but a release or edge build **newer** than the one installed, on the
-   node's own channel (a node on releases takes only a release; an edge node takes an edge build
-   or a newer release), and a request more than an hour old;
-3. it downloads the version, checks the release signature and the checksum (the release's
+2. it refuses anything but a release or edge build **newer** than the one installed and on the
+   node's **channel** (below), a request more than an hour old, and a version that was rolled
+   back or failed on this node in the last 24 hours;
+3. it checks that the binary sits where only root can write (owned by root, and neither it nor
+   any folder above it writable by a group or others), and that the health check's address in
+   its unit is one of this host's;
+4. it downloads the version, checks the release signature and the checksum (the release's
    signed `releases.json` must be of the version's channel, name that version and list the same
-   checksum), test-runs it, and swaps it in, keeping the old binary as `telltale.old`;
-4. it restarts the node and waits up to a minute for it to be healthy (`telltale health` on
-   `/readyz?startup=1`). If it isn't, it puts `telltale.old` back and restarts once more;
-5. it records the outcome in `/var/lib/telltale-update/result.json`: `installing`, `updated`,
-   `up_to_date`, `rolled_back` (with why), `unavailable` (an edge build no longer served),
-   `failed`, or `refused`, with the error. `journalctl -u telltale-update` has its lines.
+   checksum), test-runs it, and swaps it in, keeping the old binary as `telltale.old`. All the
+   downloads together get eight minutes; past that nothing is installed;
+5. it restarts the node and waits up to **two minutes** for it to answer ready twice in a row
+   (`/readyz?startup=1`) at the address `install.sh` wrote into its unit (below). If it doesn't,
+   it puts `telltale.old` back and restarts once more: `rolled_back`;
+6. it records the outcome in `/var/lib/telltale-update/result.json`: `installing`, `updated` (with
+   how its health was checked), `up_to_date`, `rolled_back` (with why), `unavailable` (an edge
+   build no longer served), `failed`, or `refused`, with the error. `journalctl -u
+   telltale-update` has its lines. Who asked (`by`) is the node's word for it: the update service
+   can't check it, and says so.
 
 So what anyone who can write that file can do is have the node restarted on a newer signed build
-of its own channel. The cluster never moves a node backwards or onto another channel: to go back,
-or to move a node to edge builds, run `sudo telltale self-update --to <version> --restart` (or
-`--channel edge`) on the node.
+of its channel. The whole run fits in the unit's 15-minute limit with room to spare, so systemd
+never stops it between the install and the check.
+
+**The channel.** `install.sh` writes the node's update channel into its unit and the update
+service's: `edge` when you install with `--edge`, otherwise the channel of the version it
+installed (it prints which). A node on the **stable** channel takes only releases; a node on the
+**edge** channel takes edge builds and newer releases, and stays on edge after a release (the next
+edge build is still taken). The cluster never moves a node to the edge channel or backwards: to go
+back, run `sudo telltale self-update --to <version> --restart` on the node; to move a node to
+edge builds, run `sudo telltale self-update --channel edge --restart`, then
+`sudo sh install.sh --edge --cluster-updates`. Without `--edge`, `install.sh` installs the newest
+**release** and sets the stable channel, so on an edge node always give it `--edge`.
+
+**The health check's address.** `install.sh` writes it into the update service's unit
+(`TELLTALE_UPDATE_HEALTH_URL`) from the config's `[api]`: the `listen` address and port, with a
+wildcard (`0.0.0.0`, `[::]`) asked at loopback. The request never names one. Two things make every
+update roll back, so `install.sh --cluster-updates` checks the address answers before it turns
+the feature on: an `[access] allowed_networks` that leaves out this host's own address (loopback
+for a wildcard listen), and an API that isn't up. With the API off (`[api] enabled = false`) there
+is no check at all: `updated` says `not checked: the API is off`, and such a node is never rolled
+back. A node that takes longer than two minutes to come up (very large lists on an SD card) is
+rolled back; upgrade such a node by hand.
+
+**`rolled_back` is an incident.** It means the new build didn't answer ready in time, so the
+previous one was put back. That can be the build, but it can also be the node's side: the node's
+own process answers the check, and any local user can occupy the port first. `ctl upgrade` stops
+at it; look at the node (`journalctl -u telltale -u telltale-update`) before you ask again. The
+node refuses the same version for 24 hours (`update_failed_recently`); `sudo telltale self-update
+--to <version> --restart` by hand isn't held back.
 
 **Turning it on.** The update service is installed and **off**. On each native node:
 ```sh
-sudo systemctl enable --now telltale-update.path     # or: sudo sh install.sh --cluster-updates
+sudo sh install.sh --cluster-updates          # on an edge node: sudo sh install.sh --edge --cluster-updates
 ```
-A node installed before this feature gets the units by running `install.sh` again (after
-upgrading it by hand once to a build that has the feature). `install.sh` writes the node's data
-directory into the units; it must be a plain absolute path.
+It writes the units for the node's data directory, channel and API address, and turns them on
+once the node answers at that address (it prints the address it tried). It refuses, and on an
+existing install changes nothing, when the binary's folder isn't root's alone (a `TELLTALE_PREFIX`
+others can write), or the data directory is under `/home` or `/root` or in a folder that isn't
+root's. A node installed before this feature needs one upgrade by hand first, on its own channel
+(`sudo telltale self-update --restart`, with `--channel edge` on an edge node), then
+`install.sh` as above. (`sudo systemctl enable --now telltale-update.path` also turns it on, but
+skips the check.)
 
 **Upgrading.** From anywhere with an admin's token (or an agent token with `analytics:read` and
 `cluster:upgrade`):
@@ -2298,17 +2337,24 @@ telltale ctl --url https://dns.example.com upgrade --to 0.8.0
 - It reads the Cluster page's view and leaves alone Kubernetes pods (the chart's), witnesses
   (they only vote: upgrade them by hand), containers (pull the new image), and nodes already on the
   version or newer.
-- Before it asks any node it reads each one's update state. A node that is down or unreachable,
-  has its update service off, has a request waiting or an update running, or runs releases while
-  you ask for an edge build stops it there, with nothing asked and every such node named
-  (`--skip-down` leaves them out instead).
-- Then it asks each node in turn and waits (`--timeout`, 10 minutes each by default). A node that
-  fails, is rolled back, or refuses stops it: the nodes after it keep their version, and the
-  error is the node's own. One node: `--node dns-02`.
+- Before it asks any node it reads each one's update state. A node that is up but can't take the
+  request (its update service off, a request waiting or an update running, on the stable channel
+  while you ask for an edge build, or refusing the version for a day after a rollback) stops it
+  there, with nothing asked and every such node named, with why and how to fix it. A node that is
+  down stops it too; `--skip-down` leaves out nodes that are down, and only those.
+- Then it asks each node in turn and waits (`--timeout`, 10 minutes each by default) until the
+  node's update service has recorded `updated` for that request **and** the node is back on the
+  version, ready and in sync. A node that fails, is rolled back, or refuses stops it: the nodes
+  after it keep their version, and the error is the node's own. One node: `--node dns-02`.
+- Each request says why, for the audit log (`X-Telltale-Reason`; `--reason`, default
+  `telltale ctl upgrade --to <version>`): an agent token must.
 - The same call for one node is `POST /api/v1/nodes/{id}/update {"to": "0.8.0"}` (admin;
   `?dryRun=true` checks without asking), and `GET` on the same path shows the node's version,
-  whether its update service is on, a request it hasn't picked up yet, and the latest outcome. One
-  request at a time per node: another gets `update_in_progress` until the first is done.
+  channel, whether its update service is on, a request it hasn't picked up yet, and the latest
+  outcome. One request at a time per node: another gets `update_in_progress` until the first is
+  done. The problems a node answers with: `update_unsupported` (a container, a pod, or a local
+  build), `update_not_enabled`, `update_invalid`, `update_downgrade`, `update_channel`,
+  `update_in_progress`, `update_failed_recently`.
 - **No maintenance window.** The node restarts without one, so a `node_down` alert can fire for
   the few seconds it takes; put the node in maintenance first if that matters to you.
 
@@ -2322,6 +2368,8 @@ then lost for that node in that run).
 on the chart's hook: a Job that runs before the pods roll (`helm.sh/hook: pre-upgrade`, a
 PreSync hook in Argo CD), from the **new** image, with `telltale ctl upgrade --to-self`:
 ```yaml
+image:
+  tag: sha-1a2b3c4             # pin the build (the default tag, edge, can run an older cached image)
 upgradeHook:
   enabled: true
   tokenSecret:
@@ -2330,12 +2378,23 @@ upgradeHook:
 ```
 - It upgrades every native node to the image's version and waits for each; only then does Helm
   (or Argo CD) roll the pods. A node that fails fails the hook, and the pods keep their version.
+  The Job stays after a run (until the next one replaces it), so its log can be read: `kubectl
+  logs job/<release>-telltale-upgrade`.
+- **The image.** `--to-self` upgrades the nodes to the version of the image the hook runs. Pin
+  `image.tag` to a build (`sha-…`, or a version): with the chart's default tag (`edge`) and
+  `IfNotPresent`, a node can run an older cached `:edge` image.
 - **The token.** Make it in Settings → API tokens (for an AI agent) as an admin, with the scopes
-  `analytics:read` and `cluster:upgrade` and an expiry (`expires_in_days`); rotate it before it
-  expires (a new token in the Secret, then revoke the old one). It reaches only the update route.
-  An OAuth sign-in for MCP never gets `cluster:upgrade`.
+  `analytics:read` and `cluster:upgrade`. `cluster:upgrade` reaches only the update route;
+  `analytics:read` reads every analytics route too. The hook reads the cluster on every sync, so a
+  token that expires, is revoked, or stops working (`[agents] enabled = false`) fails **every**
+  sync from then on, a values-only `helm upgrade` too: make it without an expiry for this narrow
+  scope, or set yourself a reminder to rotate it (a new token in the Secret, then revoke the old
+  one). A missing Secret fails the hook at once ("set TELLTALE_TOKEN"). An OAuth sign-in for MCP
+  never gets `cluster:upgrade`.
 - **https.** The hook asks the release's API Service over plain HTTP inside the cluster; when the
-  API serves TLS (`[api] tls`), set `upgradeHook.url` to its `https://` address.
+  API serves TLS (`[api] tls`), set `upgradeHook.url` to its `https://` address, and with a
+  self-signed certificate put the certificate in a Secret and name it in `upgradeHook.caSecret`
+  (`name`, and `key`, default `ca.crt`): without it the hook can't trust the API and fails.
 - **Timeouts.** Helm waits for a hook only `--timeout` (5 minutes by default), while the hook allows
   10 minutes per node and 30 in all (`activeDeadlineSeconds: 1800`): run `helm upgrade --timeout 30m`.
 - A NetworkPolicy that limits the API (`networkPolicy.apiFrom`) gets a rule that lets the hook in
@@ -2347,25 +2406,31 @@ upgradeHook:
 **With Argo CD (GitOps).** Argo CD runs the hook as a PreSync hook on every sync:
 - **Pinned to a release:** the first sync after the bump upgrades each native node behind it,
   then rolls the pods. Every later sync finds the nodes on it and asks nothing (no request, no
-  download).
+  download). A node on the edge channel stays on it and takes the next edge pin.
 - **Pinned to an edge build:** the same while it is the newest edge build. Once main has
   published a newer one, a native node still behind the pin can't fetch it: with
   `whenUnavailable: fail` (the default) the sync stays blocked until you pin the newest edge
   build or a release; with `skip` that node stays on its version (the hook says so loudly) and the
   pods roll. Nodes already on the pin or newer are never asked, so a pin that has gone stale
   blocks only while a node is behind it. Pin a release, or set `skip`, if you don't want a sync
-  to wait on that.
-- **The first install:** PreSync runs before anything of the app exists, so nothing answers; the
-  hook succeeds and says so. The token Secret must exist before that sync (a PreSync hook runs
-  before the app's own resources): create it outside the app, or with an ExternalSecret or
-  SealedSecret that is applied before it (an earlier sync wave of another app, or a PreSync
-  resource with a lower `argocd.argoproj.io/hook-weight`).
+  to wait on that. A node on the stable channel stops the sync at an edge pin (said in full).
+- **The first install:** there is no cluster yet to make the token in. Keep the hook off until
+  the token exists, or create the Secret with a placeholder value: PreSync runs before anything of
+  the app exists, so nothing answers (the API Service's name doesn't resolve, or nothing listens)
+  and the hook succeeds and says so. Only that is skipped: a timeout, a TLS failure, packets a
+  policy drops, or a refused token fail the hook. The real Secret must exist before the first
+  sync that needs it (a PreSync hook runs before the app's own resources): create it outside the
+  app, or with an ExternalSecret or SealedSecret that is applied before it (an earlier sync wave
+  of another app, or a PreSync resource with a lower `argocd.argoproj.io/hook-weight`).
 - **A node down:** the hook fails before asking any node (the pods keep their version) unless
-  `skipDown: true`.
+  `skipDown: true`. For the first 90 seconds after the node that answers starts, a native node
+  that hasn't connected since isn't listed at all, so a hook run then can pass without it.
+- **A node rolled back:** every sync stops at it for 24 hours (the node refuses that version)
+  unless the pin moves on. Look at the node; upgrade it by hand when it is fixed.
 
 **What it doesn't do.** It doesn't upgrade containers or Compose installs (pull the new image),
 it doesn't choose a version for you (that's your chart bump, or `--to`), it never downgrades or
-changes a node's channel, and it doesn't put the node in maintenance.
+moves a node to edge builds, and it doesn't put the node in maintenance.
 
 ## Taking a node down for maintenance
 Swapping a Pi's SD card, moving a box, or upgrading a node by hand: put the node in maintenance
