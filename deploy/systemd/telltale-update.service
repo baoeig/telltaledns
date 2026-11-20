@@ -8,8 +8,9 @@
 # small regular file the telltale user wrote, removes it, and acts only on a release or edge
 # build newer than the one installed and on the node's own channel (a stable node takes only a
 # release). It installs only a binary that the release key signed, under the version its signed
-# index names, then restarts the node. The outcome goes to /var/lib/telltale-update/result.json,
-# which the node reads.
+# index names, then restarts the node and waits up to a minute for it to be healthy; if it isn't,
+# it puts the previous binary back and restarts once more. The outcome goes to
+# /var/lib/telltale-update/result.json, which the node reads.
 [Unit]
 Description=TelltaleDNS: install a version the cluster asked for
 Documentation=https://github.com/paimonsoror/telltaledns/blob/main/docs/running.md#upgrading-from-the-cluster
@@ -21,7 +22,8 @@ Type=oneshot
 ExecStart=/usr/local/bin/telltale self-update --request /var/lib/telltale/update/request.json --restart
 Environment=TELLTALE_INSTALL=native
 Environment=TELLTALE_LOG=info
-# The downloads (each has its own five-minute limit) and the restart.
+# The downloads (each has its own five-minute limit), the restart, a minute for the new build to
+# be healthy, and one rollback.
 TimeoutStartSec=900
 StateDirectory=telltale-update
 StateDirectoryMode=0755

@@ -19,6 +19,47 @@ fn here(dir: &Path, install: &str, version: &str, enabled: bool) -> Here {
     }
 }
 
+/// A test's install: what the signed self-update would return for a version.
+type Install<'a> = Box<dyn FnOnce(&str) -> Result<Outcome, String> + 'a>;
+
+/// The install a test gives the update service, with a node that restarts and is healthy.
+struct Installs<'a>(Option<Install<'a>>);
+
+impl Host for Installs<'_> {
+    fn install(&mut self, to: &str) -> Result<Outcome, String> {
+        self.0
+            .take()
+            .map_or_else(|| Err("asked twice".to_owned()), |f| f(to))
+    }
+    fn restart(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    fn healthy(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    fn restore(&mut self, _: &Path) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// The update service's run with `install`, for a node that restarts and comes up healthy.
+fn serve<'a>(
+    request: &Path,
+    result: &Path,
+    current: &str,
+    now: u64,
+    install: impl FnOnce(&str) -> Result<Outcome, String> + 'a,
+) -> Served {
+    serve_request(
+        request,
+        result,
+        current,
+        now,
+        true,
+        &mut Installs(Some(Box::new(install))),
+    )
+}
+
 fn code(r: Result<NodeUpdate, Problem>) -> Code {
     r.unwrap_err().code
 }
@@ -133,7 +174,7 @@ fn ops_014_the_update_service_installs_a_newer_version_once_and_records_it() {
     let h = here(d.path(), "native", "0.7.0", true);
     let asked = request(&h, "0.8.0", "alice", NOW).unwrap().pending.unwrap();
     let calls = Cell::new(0);
-    let served = serve_request(&h.request_path(), &h.result, "0.7.0", NOW + 1000, |to| {
+    let served = serve(&h.request_path(), &h.result, "0.7.0", NOW + 1000, |to| {
         calls.set(calls.get() + 1);
         assert_eq!(to, "0.8.0");
         // While it installs, the node sees `installing`.
@@ -145,8 +186,7 @@ fn ops_014_the_update_service_installs_a_newer_version_once_and_records_it() {
     assert_eq!(
         served,
         Served::Done {
-            state: "updated".into(),
-            restart: true
+            state: "updated".into()
         }
     );
     assert_eq!(calls.get(), 1);
@@ -163,7 +203,7 @@ fn ops_014_the_update_service_installs_a_newer_version_once_and_records_it() {
         (asked.id.as_str(), "updated", "0.7.0", "0.8.0")
     );
     // Run again: nothing to do.
-    let again = serve_request(
+    let again = serve(
         &h.request_path(),
         &h.result,
         "0.8.0",
@@ -178,19 +218,28 @@ fn ops_014_a_failed_install_is_recorded_and_does_not_restart() {
     let d = tempfile::tempdir().unwrap();
     let h = here(d.path(), "native", "0.7.0-edge.400", true);
     request(&h, "0.8.0-edge.393", "alice", NOW).unwrap();
-    let served = serve_request(&h.request_path(), &h.result, "0.7.0-edge.400", NOW, |_| {
-        Err("the edge channel now serves 0.8.0-edge.394".into())
-    });
+    let mut host = Scripted {
+        install: Some(Err("SHA256SUMS: the signature does not verify".into())),
+        ..Scripted::default()
+    };
+    let served = serve_request(
+        &h.request_path(),
+        &h.result,
+        "0.7.0-edge.400",
+        NOW,
+        true,
+        &mut host,
+    );
     assert_eq!(
         served,
         Served::Done {
-            state: "failed".into(),
-            restart: false
+            state: "failed".into()
         }
     );
+    assert_eq!(host.calls, ["install 0.8.0-edge.393"], "never restarted");
     let last = status(&h).last.unwrap();
     assert_eq!(last.state, "failed");
-    assert!(last.error.unwrap().contains("edge.394"));
+    assert!(last.error.unwrap().contains("does not verify"));
 }
 
 /// Writes `body` as the request file, as the node's user would.
@@ -226,12 +275,11 @@ fn ops_014_the_update_service_trusts_nothing_in_the_request() {
         ("not json".to_owned(), "expected shape"),
     ] {
         plant(&h, &body);
-        let served = serve_request(&h.request_path(), &h.result, "0.7.0", NOW, never);
+        let served = serve(&h.request_path(), &h.result, "0.7.0", NOW, never);
         assert_eq!(
             served,
             Served::Done {
-                state: "refused".into(),
-                restart: false
+                state: "refused".into()
             },
             "{body}"
         );
@@ -247,22 +295,20 @@ fn ops_014_the_update_service_trusts_nothing_in_the_request() {
     }
     // A local build never installs from a request.
     plant(&h, &ok("1a-2b", "0.8.0", NOW));
-    let served = serve_request(&h.request_path(), &h.result, "dev", NOW, never);
+    let served = serve(&h.request_path(), &h.result, "dev", NOW, never);
     assert_eq!(
         served,
         Served::Done {
-            state: "refused".into(),
-            restart: false
+            state: "refused".into()
         }
     );
     // The same version: up to date, nothing installed.
     plant(&h, &ok("1a-2b", "0.7.0", NOW));
-    let served = serve_request(&h.request_path(), &h.result, "0.7.0", NOW, never);
+    let served = serve(&h.request_path(), &h.result, "0.7.0", NOW, never);
     assert_eq!(
         served,
         Served::Done {
-            state: "up_to_date".into(),
-            restart: false
+            state: "up_to_date".into()
         }
     );
 }
@@ -281,12 +327,11 @@ fn ops_014_the_update_service_reads_no_symlink_or_large_file() {
     .unwrap();
     std::fs::create_dir_all(h.request_path().parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(&secret, h.request_path()).unwrap();
-    let served = serve_request(&h.request_path(), &h.result, "0.7.0", NOW, never);
+    let served = serve(&h.request_path(), &h.result, "0.7.0", NOW, never);
     assert_eq!(
         served,
         Served::Done {
-            state: "refused".into(),
-            restart: false
+            state: "refused".into()
         }
     );
     assert!(secret.exists(), "the link is removed, not its target");
@@ -295,22 +340,20 @@ fn ops_014_the_update_service_reads_no_symlink_or_large_file() {
     assert!(last.error.unwrap().contains("regular file"));
     // A hard link to another file (two names) is refused as well.
     std::fs::hard_link(&secret, h.request_path()).unwrap();
-    let served = serve_request(&h.request_path(), &h.result, "0.7.0", NOW, never);
+    let served = serve(&h.request_path(), &h.result, "0.7.0", NOW, never);
     assert_eq!(
         served,
         Served::Done {
-            state: "refused".into(),
-            restart: false
+            state: "refused".into()
         }
     );
     // And anything over 4 KiB.
     plant(&h, &" ".repeat(5000));
-    let served = serve_request(&h.request_path(), &h.result, "0.7.0", NOW, never);
+    let served = serve(&h.request_path(), &h.result, "0.7.0", NOW, never);
     assert_eq!(
         served,
         Served::Done {
-            state: "refused".into(),
-            restart: false
+            state: "refused".into()
         }
     );
     // A symlink planted where the result goes is replaced, not written through.
@@ -323,7 +366,7 @@ fn ops_014_the_update_service_reads_no_symlink_or_large_file() {
         &h,
         r#"{"id":"1a","to":"0.7.0","by":"a","requestedMs":1795000000000}"#,
     );
-    serve_request(&h.request_path(), &h.result, "0.7.0", NOW, never);
+    serve(&h.request_path(), &h.result, "0.7.0", NOW, never);
     assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
     assert!(
         !std::fs::symlink_metadata(&h.result)
@@ -340,7 +383,6 @@ const NOT_A_REQUEST: &str = "the request isn't a small regular file written by t
 fn refused() -> Served {
     Served::Done {
         state: "refused".into(),
-        restart: false,
     }
 }
 
@@ -361,7 +403,7 @@ fn serve_bounded(h: &Here, current: &'static str) -> Served {
     let (request, result) = (h.request_path(), h.result.clone());
     let (tx, rx) = std::sync::mpsc::channel();
     drop(std::thread::spawn(move || {
-        let _ = tx.send(serve_request(&request, &result, current, NOW, |_| {
+        let _ = tx.send(serve(&request, &result, current, NOW, |_| {
             Err("must not install".to_owned())
         }));
     }));
@@ -451,7 +493,7 @@ fn ops_014_a_padded_or_unparseable_version_is_refused() {
         let body = serde_json::json!({"id": "1a-2b", "to": to, "by": "alice", "requestedMs": NOW});
         plant(&h, &body.to_string());
         let asked = Cell::new(false);
-        let served = serve_request(&h.request_path(), &h.result, "0.8.0", NOW, |_| {
+        let served = serve(&h.request_path(), &h.result, "0.8.0", NOW, |_| {
             asked.set(true);
             Err("not here".to_owned())
         });
@@ -521,7 +563,7 @@ fn ops_014_a_request_never_moves_a_stable_node_to_edge() {
         serde_json::json!({"id": "1a-2b", "to": "0.9.0-edge.1", "by": "alice", "requestedMs": NOW});
     plant(&stable, &body.to_string());
     let asked = Cell::new(false);
-    let served = serve_request(&stable.request_path(), &stable.result, "0.8.0", NOW, |_| {
+    let served = serve(&stable.request_path(), &stable.result, "0.8.0", NOW, |_| {
         asked.set(true);
         Err("not here".to_owned())
     });
@@ -720,6 +762,175 @@ fn ops_014_a_dry_run_writes_nothing() {
         dry_run(&h, "0.8.1", NOW).unwrap_err().code,
         Code::UpdateInProgress
     );
+}
+
+/// A host whose steps are scripted: the install's outcome, each health check's answer in turn,
+/// and whether the previous binary can be put back. `calls` has every step, in order.
+#[derive(Default)]
+struct Scripted {
+    install: Option<Result<Outcome, String>>,
+    health: Vec<Result<(), String>>,
+    restore_fails: bool,
+    calls: Vec<String>,
+}
+
+impl Host for Scripted {
+    fn install(&mut self, to: &str) -> Result<Outcome, String> {
+        self.calls.push(format!("install {to}"));
+        self.install
+            .take()
+            .unwrap_or_else(|| Err("asked twice".into()))
+    }
+    fn restart(&mut self) -> Result<(), String> {
+        self.calls.push("restart".into());
+        Ok(())
+    }
+    fn healthy(&mut self) -> Result<(), String> {
+        self.calls.push("healthy".into());
+        if self.health.is_empty() {
+            Ok(())
+        } else {
+            self.health.remove(0)
+        }
+    }
+    fn restore(&mut self, previous: &Path) -> Result<(), String> {
+        self.calls.push(format!("restore {}", previous.display()));
+        if self.restore_fails {
+            Err("no such file".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// The install's outcome when it swapped the new build in.
+fn installed() -> Outcome {
+    Outcome::Updated {
+        previous: PathBuf::from("/usr/local/bin/telltale.old"),
+    }
+}
+
+/// REQ: OPS-014 (ADR-182) — the health gate: after the restart the new build must come up
+/// healthy. One that doesn't is rolled back once: the previous binary put back, the node restarted
+/// and checked again, and the run recorded as `rolled_back` with why (`ctl` stops on it, and
+/// systemd sees a failed run). A healthy one is `updated` with no rollback.
+#[test]
+fn ops_014_a_build_that_does_not_come_up_is_rolled_back() {
+    let d = tempfile::tempdir().unwrap();
+    let h = here(d.path(), "native", "0.7.0", true);
+    let asked = request(&h, "0.8.0", "alice", NOW).unwrap().pending.unwrap();
+    let mut host = Scripted {
+        install: Some(Ok(installed())),
+        health: vec![Err("status 503".into()), Ok(())],
+        ..Scripted::default()
+    };
+    let served = serve_request(&h.request_path(), &h.result, "0.7.0", NOW, true, &mut host);
+    assert_eq!(
+        served,
+        Served::Done {
+            state: "rolled_back".into()
+        }
+    );
+    assert_eq!(
+        host.calls,
+        [
+            "install 0.8.0",
+            "restart",
+            "healthy",
+            "restore /usr/local/bin/telltale.old",
+            "restart",
+            "healthy"
+        ]
+    );
+    let last = status(&h).last.unwrap();
+    assert_eq!(
+        (last.id.as_str(), last.state.as_str()),
+        (asked.id.as_str(), "rolled_back")
+    );
+    let why = last.error.unwrap();
+    assert!(
+        why.contains("status 503") && why.contains("0.7.0 is back"),
+        "{why}"
+    );
+    assert!(!served_ok("rolled_back"), "systemd sees a failed run");
+    // Healthy at once: updated, nothing put back.
+    request(&h, "0.8.0", "alice", NOW).unwrap();
+    let mut host = Scripted {
+        install: Some(Ok(installed())),
+        ..Scripted::default()
+    };
+    let served = serve_request(&h.request_path(), &h.result, "0.7.0", NOW, true, &mut host);
+    assert_eq!(
+        served,
+        Served::Done {
+            state: "updated".into()
+        }
+    );
+    assert_eq!(host.calls, ["install 0.8.0", "restart", "healthy"]);
+    assert!(served_ok("updated") && served_ok("refused"));
+}
+
+/// REQ: OPS-014 (ADR-182) — one attempt only: if the rolled-back node isn't healthy either, or
+/// the previous binary can't be put back, the run records `failed` with both reasons and stops
+/// (no second rollback, no loop, no restart onto a binary that isn't there).
+#[test]
+fn ops_014_a_failed_rollback_is_recorded_and_stops() {
+    let d = tempfile::tempdir().unwrap();
+    let h = here(d.path(), "native", "0.7.0", true);
+    request(&h, "0.8.0", "alice", NOW).unwrap();
+    let mut host = Scripted {
+        install: Some(Ok(installed())),
+        health: vec![Err("status 503".into()), Err("connection refused".into())],
+        ..Scripted::default()
+    };
+    let served = serve_request(&h.request_path(), &h.result, "0.7.0", NOW, true, &mut host);
+    assert_eq!(
+        served,
+        Served::Done {
+            state: "failed".into()
+        }
+    );
+    assert_eq!(
+        host.calls,
+        [
+            "install 0.8.0",
+            "restart",
+            "healthy",
+            "restore /usr/local/bin/telltale.old",
+            "restart",
+            "healthy"
+        ]
+    );
+    let why = status(&h).last.unwrap().error.unwrap();
+    assert!(
+        why.contains("status 503") && why.contains("connection refused"),
+        "{why}"
+    );
+    // The previous binary can't be put back: failed, with no restart after it.
+    request(&h, "0.8.0", "alice", NOW).unwrap();
+    let mut host = Scripted {
+        install: Some(Ok(installed())),
+        health: vec![Err("status 503".into())],
+        restore_fails: true,
+        ..Scripted::default()
+    };
+    let served = serve_request(&h.request_path(), &h.result, "0.7.0", NOW, true, &mut host);
+    assert_eq!(
+        served,
+        Served::Done {
+            state: "failed".into()
+        }
+    );
+    assert_eq!(
+        host.calls,
+        [
+            "install 0.8.0",
+            "restart",
+            "healthy",
+            "restore /usr/local/bin/telltale.old"
+        ]
+    );
+    assert!(!served_ok("failed"));
 }
 
 #[test]

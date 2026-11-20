@@ -561,8 +561,28 @@ pub(crate) fn handle(
 pub(crate) enum Served {
     /// No request file.
     Nothing,
-    /// The state written, and whether the node should be restarted.
-    Done { state: String, restart: bool },
+    /// The state recorded (`refused`, `up_to_date`, `updated`, `rolled_back`, `failed`).
+    Done { state: String },
+}
+
+/// REQ: OPS-014 (ADR-182) — whether a run ends well for systemd: a refusal is the service doing
+/// its job (recorded, exit 0, so refusals don't fail the unit); an install that failed or was
+/// rolled back is a failure.
+pub(crate) fn served_ok(state: &str) -> bool {
+    !matches!(state, "failed" | "rolled_back")
+}
+
+/// REQ: OPS-014 (ADR-182) — what the update service does on its host, beyond reading the request
+/// and recording the result: injected, so every step and its order can be tested.
+pub(crate) trait Host {
+    /// Installs `to` (the signed, pinned self-update in production).
+    fn install(&mut self, to: &str) -> Result<crate::selfupdate::Outcome, String>;
+    /// Restarts the node (`systemctl restart telltale`).
+    fn restart(&mut self) -> Result<(), String>;
+    /// Waits, bounded, for the restarted node to be healthy; `Err` says how it wasn't.
+    fn healthy(&mut self) -> Result<(), String>;
+    /// Puts `previous` (the binary the install kept) back in place.
+    fn restore(&mut self, previous: &Path) -> Result<(), String>;
 }
 
 /// REQ: OPS-014 (ADR-182) — what the update service records for anything at the request that
@@ -716,15 +736,18 @@ fn check_request(
     Ok(r)
 }
 
-/// REQ: OPS-014 — the update service's run: reads and removes the request at `request`, checks
-/// it, records `installing` and then the outcome in `result`, and installs with `install` (the
-/// signed self-update in production). `current` is the installed version.
+/// REQ: OPS-014 (ADR-182) — the update service's run: reads and removes the request at
+/// `request`, checks it, records `installing` and then the outcome in `result`, and installs with
+/// `host`. With `restart`, it then restarts the node and waits for it to be healthy; if it isn't,
+/// it puts the previous binary back and restarts once more (one attempt: `rolled_back`, or
+/// `failed` if that isn't healthy either). `current` is the installed version.
 pub(crate) fn serve_request(
     request: &Path,
     result: &Path,
     current: &str,
     now: u64,
-    install: impl FnOnce(&str) -> Result<crate::selfupdate::Outcome, String>,
+    restart: bool,
+    host: &mut impl Host,
 ) -> Served {
     let record = |r: &RequestFile, state: &str, error: Option<String>| {
         let out = ResultFile {
@@ -758,7 +781,7 @@ pub(crate) fn serve_request(
         Err(e) => {
             warn!("update: {e}");
             record(&blank, "refused", Some(e));
-            return done("refused", false);
+            return done("refused");
         }
     };
     let r = match check_request(&body, current, now) {
@@ -766,37 +789,73 @@ pub(crate) fn serve_request(
         Err((r, why)) => {
             warn!("update: refused: {why}");
             record(&r, "refused", Some(why));
-            return done("refused", false);
+            return done("refused");
         }
     };
     if version_key(&r.to) == version_key(current) {
         record(&r, "up_to_date", None);
-        return done("up_to_date", false);
+        return done("up_to_date");
     }
     info!(to = %r.to, by = %r.by, "update: installing {} (was {current})", r.to);
     record(&r, "installing", None);
-    match install(&r.to) {
-        Ok(crate::selfupdate::Outcome::Updated { .. }) => {
-            info!("update: installed {}; restarting the node", r.to);
-            record(&r, "updated", None);
-            done("updated", true)
-        }
+    let previous = match host.install(&r.to) {
+        Ok(crate::selfupdate::Outcome::Updated { previous }) => previous,
         Ok(_) => {
             record(&r, "up_to_date", None);
-            done("up_to_date", false)
+            return done("up_to_date");
         }
         Err(e) => {
             warn!("update: {} not installed: {e}", r.to);
             record(&r, "failed", Some(e));
-            done("failed", false)
+            return done("failed");
+        }
+    };
+    if !restart {
+        info!("update: installed {}; restart the node to run it", r.to);
+        record(&r, "updated", None);
+        return done("updated");
+    }
+    // REQ: OPS-014 (ADR-182) — the health gate: the new build must come up healthy.
+    info!("update: installed {}; restarting the node", r.to);
+    let Err(why) = host.restart().and_then(|()| host.healthy()) else {
+        info!("update: {} is running and healthy", r.to);
+        record(&r, "updated", None);
+        return done("updated");
+    };
+    warn!(
+        "update: {} isn't healthy after the restart ({why}): putting {current} back",
+        r.to
+    );
+    // One rollback, no loop: the previous binary, one more restart, one more check.
+    match host
+        .restore(&previous)
+        .and_then(|()| host.restart())
+        .and_then(|()| host.healthy())
+    {
+        Ok(()) => {
+            let e = format!(
+                "{} wasn't healthy after the restart ({why}); {current} is back and running",
+                r.to
+            );
+            warn!("update: rolled back: {e}");
+            record(&r, "rolled_back", Some(e));
+            done("rolled_back")
+        }
+        Err(back) => {
+            let e = format!(
+                "{} wasn't healthy after the restart ({why}), and putting {current} back didn't bring the node back either ({back})",
+                r.to
+            );
+            warn!("update: {e}");
+            record(&r, "failed", Some(e));
+            done("failed")
         }
     }
 }
 
-fn done(state: &str, restart: bool) -> Served {
+fn done(state: &str) -> Served {
     Served::Done {
         state: state.to_owned(),
-        restart,
     }
 }
 

@@ -1390,23 +1390,84 @@ fn run_self_update(
     ExitCode::SUCCESS
 }
 
-/// REQ: OPS-014 — `telltale self-update --request`: the root update service's run.
+/// REQ: OPS-014 (ADR-182) — the root update service on this host: the signed self-update, the
+/// node's restart, its health, and putting the previous binary back.
+struct RootHost {
+    /// The installed binary (this one), resolved before anything is replaced.
+    exe: Option<PathBuf>,
+}
+
+/// How long the update service waits for the restarted node to be healthy.
+const HEALTH_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl node_update::Host for RootHost {
+    fn install(&mut self, to: &str) -> Result<selfupdate::Outcome, String> {
+        selfupdate::run(&selfupdate::Options {
+            channel: node_update::channel_for(to),
+            check: false,
+            restart: false,
+            to: Some(to.to_owned()),
+            base_url: None,
+            exe: None,
+        })
+    }
+
+    fn restart(&mut self) -> Result<(), String> {
+        selfupdate::restart_node()
+    }
+
+    /// The node's own health check (`telltale health`), on its readiness for a start
+    /// (`/readyz?startup=1`: maintenance doesn't count), passing twice in a row, 2 s apart,
+    /// within [`HEALTH_WAIT`].
+    fn healthy(&mut self) -> Result<(), String> {
+        let url = "http://127.0.0.1:8053/readyz?startup=1";
+        let started = std::time::Instant::now();
+        let mut passed = 0;
+        let mut last = String::from("no answer yet");
+        while started.elapsed() < HEALTH_WAIT {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            match health(url) {
+                Ok(()) => {
+                    passed += 1;
+                    if passed >= 2 {
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    passed = 0;
+                    last = e;
+                }
+            }
+        }
+        Err(format!(
+            "not healthy within {} s ({url}: {last})",
+            HEALTH_WAIT.as_secs()
+        ))
+    }
+
+    fn restore(&mut self, previous: &Path) -> Result<(), String> {
+        let exe = self
+            .exe
+            .as_ref()
+            .ok_or("the installed binary's path isn't known")?;
+        std::fs::rename(previous, exe)
+            .map_err(|e| format!("can't put {} back: {e}", previous.display()))
+    }
+}
+
+/// REQ: OPS-014 (ADR-182) — `telltale self-update --request`: the root update service's run.
 fn run_update_request(request: &Path, result: &Path, restart: bool) -> ExitCode {
+    // Resolved now: once the new binary is in place, this process's own path names it.
+    let mut host = RootHost {
+        exe: std::env::current_exe().and_then(std::fs::canonicalize).ok(),
+    };
     let served = node_update::serve_request(
         request,
         result,
         build_info::VERSION,
         node_update_now(),
-        |to| {
-            selfupdate::run(&selfupdate::Options {
-                channel: node_update::channel_for(to),
-                check: false,
-                restart: false,
-                to: Some(to.to_owned()),
-                base_url: None,
-                exe: None,
-            })
-        },
+        restart,
+        &mut host,
     );
     let out = |m: String| {
         let _ = writeln!(io::stdout().lock(), "{m}");
@@ -1416,28 +1477,15 @@ fn run_update_request(request: &Path, result: &Path, restart: bool) -> ExitCode 
             out(format!("No update request at {}.", request.display()));
             ExitCode::SUCCESS
         }
-        node_update::Served::Done {
-            state,
-            restart: due,
-        } => {
-            // REQ: OPS-014 (ADR-182) — a refusal is the service doing its job, and it is
-            // recorded in the result: exit 0, so a refused request is no failed unit. A failed
-            // install is a failure.
-            let ok = state != "failed";
+        node_update::Served::Done { state } => {
             out(format!(
                 "Update request: {state} (recorded in {}).",
                 result.display()
             ));
-            let restarted = if due && restart {
-                selfupdate::restart_node()
-            } else {
-                Ok(())
-            };
-            if let Err(e) = restarted {
-                eprintln!("error: installed, but {e}");
-                return ExitCode::FAILURE;
-            }
-            if ok {
+            // REQ: OPS-014 (ADR-182) — a refusal is the service doing its job, and it is
+            // recorded in the result: exit 0, so a refused request is no failed unit. An install
+            // that failed, was rolled back, or couldn't be fetched is a failure.
+            if node_update::served_ok(&state) {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE

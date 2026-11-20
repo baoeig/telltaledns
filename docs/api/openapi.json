@@ -5423,7 +5423,7 @@
           "system"
         ],
         "summary": "A node's version and update state.",
-        "description": "The version it runs, how it was installed, whether its root update service\n(`telltale-update.path`) is enabled, a request it hasn't picked up yet, and the service's\nlatest run (`installing`, `updated`, `up_to_date`, `failed`, or `refused`, with the error).\n`id` is `local` (the node answering) or a cluster node's ID, site, or pod name: the read goes\nto that node over the cluster channel.",
+        "description": "The version it runs, how it was installed, whether its root update service\n(`telltale-update.path`) is enabled, a request it hasn't picked up yet, and the service's\nlatest run (`installing`, `updated`, `up_to_date`, `rolled_back`, `failed`, or `refused`, with\nthe error): after a restart the new build must come up healthy, or the previous one is put\nback (`rolled_back`). `id` is `local` (the node answering) or a cluster node's ID, site, or pod\nname: the read goes\nto that node over the cluster channel.",
         "operationId": "node_update_status",
         "parameters": [
           {
@@ -18467,7 +18467,7 @@
               "string",
               "null"
             ],
-            "description": "What went wrong, for `failed` and `refused`."
+            "description": "What went wrong, for `failed`, `rolled_back` and `refused`."
           },
           "from": {
             "type": "string",
@@ -18480,7 +18480,7 @@
           },
           "state": {
             "type": "string",
-            "description": "`installing`, `updated` (the service then restarts the node), `up_to_date`, `failed`, or\n`refused` (the request was stale, malformed, or older than the node's version).",
+            "description": "`installing` (also while the restarted node is checked), `updated` (installed, restarted,\nand healthy), `up_to_date`, `rolled_back` (the new build wasn't healthy after the restart:\nthe previous binary is back and running), `failed` (not installed, or rolled back and\nstill not healthy), or `refused` (the request was stale, malformed, older than the node's\nversion, or on another channel). REQ: OPS-014 (ADR-182).",
             "example": "updated"
           },
           "to": {

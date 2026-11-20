@@ -1445,7 +1445,8 @@ async fn upgrade(api: &Api, a: UpgradeArgs) -> Result<Value, String> {
                 let last = &u["last"];
                 if !id.is_empty() && s(last, "id") == id {
                     match s(last, "state").as_str() {
-                        "failed" | "refused" => {
+                        // REQ: OPS-014 (ADR-182) — a rollback is a failure: the run stops.
+                        "failed" | "refused" | "rolled_back" => {
                             return Err(format!(
                                 "{}: {} {to}: {}",
                                 st.label,
