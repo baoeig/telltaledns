@@ -529,11 +529,8 @@ fn observe(
             .into_iter()
             .filter(|l| l.enabled && l.error.is_some())
             .map(|l| {
-                let s = format!(
-                    "list {} fails to update: {}",
-                    l.name,
-                    l.error.as_deref().unwrap_or("unknown error")
-                );
+                // REQ: FLT-004 (ADR-180) — a local file's error stays on the node.
+                let s = crate::health::list_failing_summary(&l);
                 (l.name, s)
             })
             .collect(),
