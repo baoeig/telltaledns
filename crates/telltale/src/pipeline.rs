@@ -578,6 +578,10 @@ pub(crate) struct Pipeline {
     /// REQ: CLU-002 (ADR-125) — the names other nodes' routers and mDNS know (after this
     /// node's own).
     pub(crate) peer_names: arc_swap::ArcSwap<crate::devices::Names>,
+    /// REQ: FLT-006, CLU-002 (ADR-183) — the address-to-MAC bindings the other full members'
+    /// routers report (from answers that carry `vetted`, at most 15 minutes old), and the
+    /// addresses they withhold. Written by the `devices` task, read by the MAC table task.
+    pub(crate) peer_router_macs: arc_swap::ArcSwap<crate::devices::PeerMacs>,
     /// REQ: CLU-013 — while the cluster is pinned, the snapshot the primary serves: no other
     /// snapshot (a list refresh's) may replace it. Never read on the query path.
     pub(crate) filter_pin: ArcSwapOption<std::path::PathBuf>,
@@ -666,6 +670,7 @@ impl Pipeline {
             router_leases: Arc::default(),
             mdns_names: Arc::default(),
             peer_names: arc_swap::ArcSwap::default(),
+            peer_router_macs: arc_swap::ArcSwap::default(),
             filter_pin: ArcSwapOption::empty(),
             flights: Singleflight::new(),
             seed: rand::random(),

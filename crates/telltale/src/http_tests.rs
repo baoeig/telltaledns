@@ -581,6 +581,7 @@ fn clu_002_device_names_fall_back_to_the_peers() {
     src.pipeline.peer_names.store(Arc::new(Names {
         routers: [(ip, lease("k8s"))].into(),
         mdns: std::collections::HashMap::new(),
+        vetted: false,
     }));
     assert_eq!(name().as_deref(), Some("k8s"));
     src.pipeline

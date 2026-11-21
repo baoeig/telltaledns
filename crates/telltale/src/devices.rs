@@ -2,7 +2,7 @@
 //! the routers (`[[router]]`) and the names devices announce over mDNS, by IPv4 address.
 //! TelltaleDNS doesn't hand out addresses itself (ADR-091): the router's DHCP does.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 
 use serde::{Deserialize, Serialize};
@@ -41,9 +41,6 @@ pub(crate) type Leases = HashMap<Ipv4Addr, Lease>;
 /// (not offline), its binding is not `unsure`, and the MAC parses (`aa:bb:..` or `aa-bb-..`),
 /// isn't all zero, and is unicast. Locally administered ("private") MACs count. MACs are
 /// compared as parsed bytes, never as text.
-// The members' bindings (`keep_answers`) and the table (`router_bindings`) use it from the next
-// commits on; until then only the tests do.
-#[allow(dead_code)]
 pub(crate) fn eligible(l: &Lease) -> Option<[u8; 6]> {
     if l.offline || l.unsure {
         return None;
@@ -60,6 +57,12 @@ pub(crate) fn eligible(l: &Lease) -> Option<[u8; 6]> {
 pub(crate) struct Names {
     pub(crate) routers: Leases,
     pub(crate) mdns: Leases,
+    /// REQ: FLT-006, CLU-010 (ADR-183) — written (true) by a node that marks its router bindings
+    /// the way ADR-183 says (`unsure`, silence, one MAC at several addresses): another node
+    /// takes MAC bindings only from an answer that carries it. An answer from an older node
+    /// has no such field, so its lists name devices but identify none. Not written when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) vetted: bool,
 }
 
 /// The cluster call that asks a peer for its own device names.
@@ -68,15 +71,116 @@ pub(crate) const KIND: &str = "devices.names";
 const EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 /// How long a peer has to answer.
 const DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+/// REQ: CLU-002 (ADR-183) — until a full member has answered, a node asks again this often,
+/// for at most [`RETRY_FOR_S`] seconds after it started, so a new pod or a restarted node
+/// doesn't wait a minute for the first answer.
+const RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long after start the quick retry lasts.
+const RETRY_FOR_S: u64 = 120;
+/// REQ: FLT-006, CLU-002 (ADR-183) — how long a member's last answer keeps identifying devices
+/// here (monotonic seconds). With the router's own 15-minute bound, a stale binding lives about
+/// 30 minutes plus one exchange: a node passes on only what its own routers said.
+pub(crate) const PEER_MACS_FOR_S: u64 = 900;
 
 /// What this node answers: only the names it learned itself, never ones it got from peers
-/// (a name a router forgot doesn't keep circulating between nodes).
+/// (a name a router forgot doesn't keep circulating between nodes). REQ: FLT-006 (ADR-183) —
+/// marked `vetted`: its router bindings follow the rules of ADR-183.
 pub(crate) fn own(pipeline: &crate::pipeline::Pipeline) -> Result<Vec<u8>, String> {
     let names = Names {
         routers: (**pipeline.router_leases.load()).clone(),
         mdns: (**pipeline.mdns_names.load()).clone(),
+        vetted: true,
     };
     serde_json::to_vec(&names).map_err(|e| e.to_string())
+}
+
+/// REQ: FLT-006, CLU-002 (ADR-183) — what the other full members' routers say, as this node uses it
+/// to identify devices: an address to a MAC they agree on, the addresses any of them marks
+/// `unsure` or that two of them disagree on (tombstones: no lower source fills them), and how many
+/// that is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PeerMacs {
+    pub(crate) macs: HashMap<Ipv4Addr, [u8; 6]>,
+    pub(crate) tombstones: HashSet<Ipv4Addr>,
+    pub(crate) dropped: usize,
+}
+
+/// Each full member's last vetted answer, as the bindings it gave (an address to `Some(mac)`, or
+/// `None` for an `unsure` lease) and when it came (monotonic seconds).
+pub(crate) type MemberBindings = HashMap<String, (HashMap<Ipv4Addr, Option<[u8; 6]>>, u64)>;
+
+/// REQ: FLT-006, CLU-002, CLU-010 (ADR-183) — keeps, per member, the bindings of its last answer
+/// at `now`: only from answers that carry `vetted` and come from a full member (`full`: in the
+/// registry and not ephemeral), as `eligible` gives them, with `None` for a connected `unsure`
+/// lease (offline ones are skipped). Then forgets every member that is no longer full or hasn't
+/// answered for more than [`PEER_MACS_FOR_S`] seconds. Saturating: a time in the future is not
+/// old.
+pub(crate) fn keep_answers(
+    last: &mut MemberBindings,
+    answers: &[(String, Names)],
+    now: u64,
+    full: impl Fn(&str) -> bool,
+) {
+    for (peer, names) in answers {
+        if !names.vetted || !full(peer) {
+            continue;
+        }
+        let bindings = names
+            .routers
+            .iter()
+            .filter_map(|(ip, l)| {
+                if l.offline {
+                    None
+                } else if l.unsure {
+                    Some((*ip, None))
+                } else {
+                    eligible(l).map(|mac| (*ip, Some(mac)))
+                }
+            })
+            .collect();
+        last.insert(peer.clone(), (bindings, now));
+    }
+    last.retain(|peer, (_, at)| full(peer) && now.saturating_sub(*at) <= PEER_MACS_FOR_S);
+}
+
+/// REQ: FLT-006, CLU-002 (ADR-183) — the bindings the members agree on: an address that any
+/// member gives as `None`, or that two members give different MACs for, is a tombstone and is
+/// counted in `dropped`. The result doesn't depend on the order of the members.
+pub(crate) fn peer_macs(last: &MemberBindings) -> PeerMacs {
+    let mut agreed: HashMap<Ipv4Addr, [u8; 6]> = HashMap::new();
+    let mut tombstones: HashSet<Ipv4Addr> = HashSet::new();
+    for (bindings, _) in last.values() {
+        for (ip, mac) in bindings {
+            match (mac, agreed.get(ip)) {
+                (None, _) => {
+                    tombstones.insert(*ip);
+                }
+                (Some(m), Some(other)) if other != m => {
+                    tombstones.insert(*ip);
+                }
+                (Some(m), None) => {
+                    agreed.insert(*ip, *m);
+                }
+                (Some(_), Some(_)) => {}
+            }
+        }
+    }
+    agreed.retain(|ip, _| !tombstones.contains(ip));
+    PeerMacs {
+        macs: agreed,
+        dropped: tombstones.len(),
+        tombstones,
+    }
+}
+
+/// REQ: CLU-002 (ADR-183) — how long to wait before asking the members again: [`RETRY`] while no
+/// full member has answered and the node is under [`RETRY_FOR_S`] seconds old, else a minute.
+pub(crate) fn next_wait(full_member_answered: bool, since_start_s: u64) -> std::time::Duration {
+    if !full_member_answered && since_start_s < RETRY_FOR_S {
+        RETRY
+    } else {
+        EVERY
+    }
 }
 
 /// The peers' answers as one table: the primary's first, then by node ID; the first node to
@@ -101,7 +205,9 @@ fn merge(mut answers: Vec<(String, Names)>, primary: Option<&str>) -> Names {
 
 /// The task: every minute, ask every reachable peer for its device names. Off the DNS path;
 /// a peer that doesn't answer (or is on an older build, "unknown call") is skipped, and when
-/// none answer the last table stays.
+/// none answer the last table stays. REQ: CLU-002, FLT-006 (ADR-183) — until a full member has
+/// answered, and for the first two minutes at most, every 5 seconds; and each round, answered
+/// or not, the members' MAC bindings are brought up to date (a silent member's age out).
 pub(crate) async fn run(
     sources: std::sync::Arc<crate::http::Sources>,
     mut stop: tokio::sync::watch::Receiver<bool>,
@@ -109,12 +215,15 @@ pub(crate) async fn run(
     let Some(cluster) = sources.cluster.clone() else {
         return;
     };
-    let mut tick = tokio::time::interval(EVERY);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Time for the bindings is this task's monotonic clock, never the wall clock.
+    let started = std::time::Instant::now();
+    let mut last = MemberBindings::new();
+    let mut answered = false;
+    let mut wait = std::time::Duration::ZERO;
     loop {
         tokio::select! {
             _ = stop.changed() => return,
-            _ = tick.tick() => {}
+            () = tokio::time::sleep(wait) => {}
         }
         let answers: Vec<(String, Names)> = cluster
             .call_all(KIND, &[], DEADLINE)
@@ -125,6 +234,20 @@ pub(crate) async fn run(
                 serde_json::from_slice(&body).ok().map(|n| (peer, n))
             })
             .collect();
+        // A full member: in the registry and not ephemeral (as `rpc_handler` decides).
+        let registry = cluster.identity.registry();
+        let full = |p: &str| registry.iter().any(|n| n.node_id == p && !n.ephemeral);
+        answered |= answers.iter().any(|(p, _)| full(p));
+        let now = started.elapsed().as_secs();
+        keep_answers(&mut last, &answers, now, full);
+        let macs = peer_macs(&last);
+        if **sources.pipeline.peer_router_macs.load() != macs {
+            sources
+                .pipeline
+                .peer_router_macs
+                .store(std::sync::Arc::new(macs));
+        }
+        wait = next_wait(answered, now);
         if answers.is_empty() {
             continue;
         }
@@ -158,6 +281,7 @@ mod tests {
         Names {
             routers: routers.iter().map(|l| (l.ip, l.clone())).collect(),
             mdns: mdns.iter().map(|l| (l.ip, l.clone())).collect(),
+            vetted: false,
         }
     }
 
@@ -281,5 +405,303 @@ mod tests {
         ] {
             assert_eq!(eligible(&with(mac, offline, unsure)), None, "{why}");
         }
+    }
+
+    const MAC_A: [u8; 6] = [0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x01];
+    const MAC_B: [u8; 6] = [0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x02];
+
+    fn at(last: u8) -> Ipv4Addr {
+        Ipv4Addr::new(10, 0, 0, last)
+    }
+
+    /// A connected client at 10.0.0.`last` with `mac`.
+    fn bound(last: u8, mac: &str, unsure: bool) -> Lease {
+        Lease {
+            mac: mac.into(),
+            unsure,
+            ..lease([10, 0, 0, last], "x")
+        }
+    }
+
+    /// A node's answer: its router leases, marked `vetted`.
+    fn vetted(leases: &[Lease]) -> Names {
+        Names {
+            vetted: true,
+            ..names(leases, &[])
+        }
+    }
+
+    fn from_nodes(answers: Vec<(&str, Names)>) -> Vec<(String, Names)> {
+        answers
+            .into_iter()
+            .map(|(p, n)| (p.to_owned(), n))
+            .collect()
+    }
+
+    fn members(last: &MemberBindings) -> Vec<&str> {
+        let mut m: Vec<&str> = last.keys().map(String::as_str).collect();
+        m.sort_unstable();
+        m
+    }
+
+    // REQ: FLT-006, CLU-002 (ADR-183) — a member's bindings count only from a full member (the
+    // registry lists it, it isn't ephemeral): a resolver pod or a node the registry doesn't list
+    // can send what it likes, and gives none. Its mDNS names, its offline clients and a lease
+    // whose MAC can't identify give none either.
+    #[test]
+    fn clu_002_peer_router_macs_come_only_from_full_members() {
+        let full = |p: &str| p == "pi" || p == "k8s";
+        let mut last = MemberBindings::new();
+        let answers = from_nodes(vec![
+            (
+                "pi",
+                vetted(&[
+                    bound(5, "aa:bb:cc:00:00:01", false),
+                    bound(6, "AA-BB-CC-00-00-02", false),
+                ]),
+            ),
+            ("pod-1", vetted(&[bound(7, "aa:bb:cc:00:00:03", false)])),
+            ("ghost", vetted(&[bound(8, "aa:bb:cc:00:00:04", false)])),
+        ]);
+        keep_answers(&mut last, &answers, 10, full);
+        assert_eq!(members(&last), ["pi"]);
+        let m = peer_macs(&last);
+        assert_eq!(m.macs, HashMap::from([(at(5), MAC_A), (at(6), MAC_B)]));
+        assert!(m.tombstones.is_empty());
+        assert_eq!(m.dropped, 0);
+
+        let mut n = vetted(&[bound(9, "aa:bb:cc:00:00:05", false)]);
+        n.mdns = names(&[], &[bound(10, "aa:bb:cc:00:00:06", false)]).mdns;
+        for l in [
+            Lease {
+                offline: true,
+                ..bound(11, "aa:bb:cc:00:00:07", false)
+            },
+            bound(12, "", false),
+            bound(13, "01:00:5e:00:00:01", false),
+            bound(14, "00:00:00:00:00:00", false),
+        ] {
+            n.routers.insert(l.ip, l);
+        }
+        keep_answers(&mut last, &from_nodes(vec![("pi", n)]), 20, full);
+        let m = peer_macs(&last);
+        assert_eq!(
+            m.macs,
+            HashMap::from([(at(9), [0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x05])])
+        );
+        assert!(m.tombstones.is_empty(), "no binding is not a tombstone");
+    }
+
+    // REQ: FLT-006, CLU-002 (ADR-183) — a member that isn't sure of an address (its lease is
+    // `unsure`) withdraws it for this node as well: the other members' binding for it is dropped
+    // and the address is a tombstone, so no lower source fills it.
+    #[test]
+    fn clu_002_a_peers_unsure_lease_counts_as_a_disagreement() {
+        let full = |p: &str| matches!(p, "pi" | "k8s" | "nas");
+        let mut last = MemberBindings::new();
+        let answers = from_nodes(vec![
+            (
+                "pi",
+                vetted(&[
+                    bound(5, "aa:bb:cc:00:00:01", false),
+                    bound(6, "aa:bb:cc:00:00:02", false),
+                ]),
+            ),
+            (
+                "k8s",
+                vetted(&[
+                    bound(5, "aa:bb:cc:00:00:01", true),
+                    bound(7, "aa:bb:cc:00:00:01", false),
+                ]),
+            ),
+        ]);
+        keep_answers(&mut last, &answers, 10, full);
+        let m = peer_macs(&last);
+        assert!(!m.macs.contains_key(&at(5)), "{m:?}");
+        assert_eq!(m.tombstones, HashSet::from([at(5)]));
+        assert_eq!(m.dropped, 1);
+        assert_eq!(m.macs[&at(6)], MAC_B);
+        assert_eq!(m.macs[&at(7)], MAC_A);
+
+        // An unsure lease with no other member's binding is a tombstone all the same.
+        let mut alone = MemberBindings::new();
+        keep_answers(
+            &mut alone,
+            &from_nodes(vec![(
+                "nas",
+                vetted(&[bound(9, "aa:bb:cc:00:00:01", true)]),
+            )]),
+            10,
+            full,
+        );
+        let m = peer_macs(&alone);
+        assert!(m.macs.is_empty());
+        assert_eq!((m.tombstones, m.dropped), (HashSet::from([at(9)]), 1));
+    }
+
+    // REQ: FLT-006, CLU-002 (ADR-183) — two members that give an address different MACs both
+    // lose it; one they agree on stays. What comes out doesn't depend on which answered first.
+    #[test]
+    fn clu_002_peers_disagreeing_on_an_address_drop_it() {
+        let full = |_: &str| true;
+        let pi = vetted(&[
+            bound(5, "aa:bb:cc:00:00:01", false),
+            bound(6, "aa:bb:cc:00:00:01", false),
+        ]);
+        let k8s = vetted(&[
+            bound(5, "aa:bb:cc:00:00:02", false),
+            bound(6, "aa-bb-cc-00-00-01", false),
+        ]);
+        let mut results = Vec::new();
+        for order in [["pi", "k8s"], ["k8s", "pi"]] {
+            let mut last = MemberBindings::new();
+            for (i, who) in order.iter().enumerate() {
+                let names = if *who == "pi" {
+                    pi.clone()
+                } else {
+                    k8s.clone()
+                };
+                keep_answers(
+                    &mut last,
+                    &from_nodes(vec![(*who, names)]),
+                    10 + i as u64,
+                    full,
+                );
+            }
+            results.push(peer_macs(&last));
+        }
+        assert_eq!(results[0], results[1]);
+        let m = &results[0];
+        assert!(!m.macs.contains_key(&at(5)));
+        assert_eq!(m.tombstones, HashSet::from([at(5)]));
+        assert_eq!(m.dropped, 1);
+        assert_eq!(
+            m.macs[&at(6)],
+            MAC_A,
+            "the same MAC written two ways is agreement"
+        );
+    }
+
+    // REQ: FLT-006, CLU-002 (ADR-183) — a member's last answer is used for 900 seconds (on the
+    // monotonic clock), then forgotten; at once when the member leaves the registry; an answer
+    // renews it; a time in the future (a clock that stepped) is not old, and nothing panics.
+    #[test]
+    fn clu_002_a_silent_member_is_dropped_after_15_minutes() {
+        let full = |p: &str| p == "pi";
+        let mut last = MemberBindings::new();
+        let answer = from_nodes(vec![(
+            "pi",
+            vetted(&[bound(5, "aa:bb:cc:00:00:01", false)]),
+        )]);
+        keep_answers(&mut last, &answer, 100, full);
+        for (now, kept) in [
+            (100, true),
+            (100 + PEER_MACS_FOR_S - 1, true),
+            (100 + PEER_MACS_FOR_S, true),
+            (100 + PEER_MACS_FOR_S + 1, false),
+            (u64::MAX, false),
+        ] {
+            let mut l = last.clone();
+            keep_answers(&mut l, &[], now, full);
+            assert_eq!(!l.is_empty(), kept, "at {now}");
+            assert_eq!(peer_macs(&l).macs.len(), usize::from(kept), "at {now}");
+        }
+        let mut l = last.clone();
+        keep_answers(&mut l, &[], 101, |_| false);
+        assert!(l.is_empty(), "a member the registry no longer lists");
+        let mut l = last.clone();
+        keep_answers(&mut l, &[], 5, full);
+        assert!(!l.is_empty(), "now before the answer: not old, no panic");
+        // A new answer renews the time.
+        let mut l = last.clone();
+        keep_answers(&mut l, &answer, 1_000, full);
+        keep_answers(&mut l, &[], 1_000 + PEER_MACS_FOR_S, full);
+        assert!(!l.is_empty());
+        keep_answers(&mut l, &[], 1_000 + PEER_MACS_FOR_S + 1, full);
+        assert!(l.is_empty());
+        // An answer that isn't vetted doesn't renew it either.
+        let mut l = last.clone();
+        let unvetted = from_nodes(vec![(
+            "pi",
+            names(&[bound(5, "aa:bb:cc:00:00:01", false)], &[]),
+        )]);
+        keep_answers(&mut l, &unvetted, 500, full);
+        keep_answers(&mut l, &[], 100 + PEER_MACS_FOR_S + 1, full);
+        assert!(l.is_empty());
+    }
+
+    // REQ: FLT-006, CLU-010 (ADR-183) — an answer from a member on an earlier build (no `vetted`)
+    // gives no bindings, since its lists have none of the rules, but it still names devices (the
+    // display merge is unchanged). `vetted` is written only when true: the form is the old one
+    // plus that field, which an older node ignores, and this node's own answer carries it.
+    #[test]
+    fn clu_010_bindings_from_an_older_member_are_not_used() {
+        // What the previous version's answer looks like: the same fields, none for `vetted`.
+        #[derive(Debug, Deserialize)]
+        struct PreviousNames {
+            routers: Leases,
+            mdns: Leases,
+        }
+        let older = r#"{"routers":{"10.0.0.5":{"mac":"aa:bb:cc:00:00:01","ip":"10.0.0.5","hostname":"desk","expires":0}},"mdns":{}}"#;
+        let n: Names = serde_json::from_str(older).unwrap();
+        assert!(!n.vetted);
+        let answers = vec![("pi".to_owned(), n)];
+        let mut last = MemberBindings::new();
+        keep_answers(&mut last, &answers, 10, |_| true);
+        assert!(last.is_empty());
+        assert_eq!(peer_macs(&last), PeerMacs::default());
+        let merged = merge(answers, None);
+        assert_eq!(
+            merged.routers[&at(5)].hostname.as_deref(),
+            Some("desk"),
+            "display names are unchanged"
+        );
+
+        // The wire form.
+        let plain = names(&[bound(5, "aa:bb:cc:00:00:01", false)], &[]);
+        let text = serde_json::to_string(&plain).unwrap();
+        assert!(!text.contains("vetted"), "{text}");
+        let marked = Names {
+            vetted: true,
+            ..plain.clone()
+        };
+        let marked_text = serde_json::to_string(&marked).unwrap();
+        assert!(marked_text.contains("\"vetted\":true"), "{marked_text}");
+        let mut with_field: serde_json::Value = serde_json::from_str(&marked_text).unwrap();
+        with_field.as_object_mut().unwrap().remove("vetted");
+        assert_eq!(
+            with_field,
+            serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            "the old form plus the one field"
+        );
+        let prev: PreviousNames = serde_json::from_str(&marked_text).unwrap();
+        assert_eq!((prev.routers.len(), prev.mdns.len()), (1, 0));
+        assert!(serde_json::from_str::<Names>(&marked_text).unwrap().vetted);
+
+        // This node's own answer carries it (and keeps `unsure`).
+        let p = crate::pipeline::tests_support::pipeline_from(&telltale_config::Config::default());
+        p.router_leases.store(std::sync::Arc::new(HashMap::from([(
+            at(6),
+            bound(6, "aa:bb:cc:00:00:02", true),
+        )])));
+        let mine: Names = serde_json::from_slice(&own(&p).unwrap()).unwrap();
+        assert!(mine.vetted);
+        assert!(mine.routers[&at(6)].unsure);
+    }
+
+    // REQ: CLU-002 (ADR-183) — until a full member has answered, a node asks again every 5
+    // seconds for the first two minutes (a new pod or a restarted node doesn't wait a minute);
+    // after that, or once one has answered, every minute.
+    #[test]
+    fn clu_002_names_are_asked_again_soon_until_a_full_member_answers() {
+        use std::time::Duration;
+        let soon = Duration::from_secs(5);
+        let minute = Duration::from_secs(60);
+        assert_eq!(next_wait(false, 0), soon);
+        assert_eq!(next_wait(false, 119), soon);
+        assert_eq!(next_wait(false, 120), minute, "the retry is bounded");
+        assert_eq!(next_wait(false, u64::MAX), minute);
+        assert_eq!(next_wait(true, 0), minute);
+        assert_eq!(next_wait(true, 60), minute);
     }
 }
