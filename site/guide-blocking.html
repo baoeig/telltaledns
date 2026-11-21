@@ -134,7 +134,7 @@ ede_text = true             # name the list in the EDE text (false hides list na
 
     <div class="panel" id="quick-ui"><h3>Web UI</h3>
       <ul>
-        <li>In the <b>query log</b>, press <b>Why?</b> on a query and use <b>Make a quick rule</b>. The site is filled in, and so is who it's for: the device you've named if the address is one, otherwise the address itself. For a Kubernetes workload the rule starts for its group only when an operator placed the workload in one (a pod or namespace label, or a rule); otherwise it starts from the pod's address, and <b>Add to group…</b> on the workload's name puts all its pods in a group first.</li>
+        <li>In the <b>query log</b>, press <b>Why?</b> on a query and use <b>Make a quick rule</b>. The site is filled in, and so is who it's for: the device you've named if the address is one (a name in the log that only matches another device's name doesn't count), otherwise the address itself. For a Kubernetes workload the rule starts for its group, as it is now, only when an operator placed the workload in one (a pod or namespace label, or a rule); otherwise it starts from the pod's address, and <b>Add to group…</b> on the workload's name puts all its pods in a group first.</li>
         <li>Or open the <b>Quick rules</b> page (Filtering &amp; DNS). It also lists the rules in effect with a countdown, who made each, and Edit and Remove buttons.</li>
       </ul>
     </div>
