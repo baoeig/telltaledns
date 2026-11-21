@@ -77,6 +77,7 @@
   let live = $state(false);
   let why = $state<S['QueryRow'] | null>(null);
   let explained = $state<S['Explanation'] | null>(null);
+  let configured = $state<S['ClientInfo'][]>([]);
   let whyError = $state<unknown>(null);
 
   function query(): Record<string, string> {
@@ -222,10 +223,42 @@
     explained = null;
     whyError = null;
     try {
-      explained = await api.explain({ name: r.name, client: r.client, qtype: r.qtype });
+      const [x, devices] = await Promise.all([
+        api.explain({ name: r.name, client: r.client, qtype: r.qtype }),
+        // The configured devices: the log's name can be one this node's explanation doesn't know (the
+        // node that answered recognized the device, this one can't), and prefillOf needs to tell.
+        api
+          .clients()
+          .then((c) => c.items)
+          .catch(() => [] as S['ClientInfo'][]),
+      ]);
+      configured = devices;
+      explained = x;
     } catch (e) {
       whyError = e;
     }
+  }
+
+  /**
+   * REQ: FLT-005, FLT-017 (issue #73) — what the quick rule form starts with. A rule can name a
+   * configured device, an IP, or a CIDR; never a name a router or mDNS gives an address, nor a pod's
+   * `namespace/kind/name`. So, in order: for a pod, its address (the form decides on its group from
+   * where it came from); a configured device the log names (the row may come from another node
+   * that recognized it, as this node's explanation can't); the device this node's explanation
+   * recognized; the address. What the log shows for an address that is no configured device's is a
+   * label, not the value.
+   */
+  function prefillOf(row: S['QueryRow'], x: S['Explanation'], devices: S['ClientInfo'][]) {
+    const pod = x.client.workload ?? undefined;
+    const logged = row.clientName ?? '';
+    const named = pod ? undefined : devices.find((d) => d.name.toLowerCase() === logged.toLowerCase())?.name;
+    const device = pod ? row.client : (named ?? x.client.device ?? row.client);
+    return {
+      device,
+      seenAs: !pod && device === row.client && logged && !named ? logged : '',
+      workload: pod?.name ?? '',
+      workloadFrom: pod?.groupFrom ?? '',
+    };
   }
 
   const maxMs = $derived(Math.max(1, ...rows.map((r) => r.totalMs)));
@@ -389,19 +422,18 @@
       </p>
       <ExplainView x={explained} />
       {#if can('operator')}
+        {@const pre = prefillOf(why, explained, configured)}
         <!-- REQ: FLT-005 (T6.12) — act on it: a quick rule for this device or its group. -->
         <section class="card quick-card">
           <h2>Make a quick rule<HelpButton id="quick-rules" /></h2>
-          <!-- REQ: FLT-005, FLT-017 (issue #73) — what a rule can name: the configured device the address is
-               recognized as, else the address. The log's name for it (a router's, mDNS) is a label, not
-               the value. A pod's `device` is its workload's name, which no rule can name: its group is
-               the scope. -->
+          <!-- REQ: FLT-005, FLT-017 (issue #73) — what a rule can name; see prefillOf. -->
           <QuickRuleForm
             domain={why.name}
-            device={explained.client.workload ? why.client : (explained.client.device ?? why.client)}
+            device={pre.device}
             address={why.client}
-            seenAs={why.clientName ?? ''}
-            workload={explained.client.workload?.name ?? ''}
+            seenAs={pre.seenAs}
+            workload={pre.workload}
+            workloadFrom={pre.workloadFrom}
             group={why.group ?? ''}
           />
         </section>

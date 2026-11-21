@@ -4041,9 +4041,11 @@ test('api_005 the UI is served gzipped, and plain to a client that does not acce
 
 // REQ: FLT-005, FLT-017 (GitHub issue #73) — the quick rule form offers what a rule can use. A rule
 // names a configured device, an IP, or a CIDR, never a name a router or a device gives an address,
-// so the Why? drawer fills in the device the address is recognized as, else the address, and shows
-// the discovered name beside it as a label. The names here are announced over mDNS (the test port)
-// or come from the Kubernetes fixture; every address is loopback.
+// so the Why? drawer fills in the configured device the row is (by the log's name, or by the
+// explanation), else the address, and shows the discovered name beside it as a label (never as the
+// value). A Kubernetes pod starts as a rule for its group only where an operator placed the
+// workload in one. The names here are announced over mDNS (the test port) or come from the
+// Kubernetes fixture; every address is loopback.
 async function announceMdns(host: string, ip: [number, number, number, number]) {
   const { createSocket } = await import('node:dgram');
   const label = (s: string) => [Buffer.from([s.length]), Buffer.from(s)];
@@ -4058,15 +4060,16 @@ async function announceMdns(host: string, ip: [number, number, number, number]) 
   sock.close();
 }
 
-/** A blocked query from `client` is in the log (showing `shows`); the Why? drawer is open. */
-async function whyDrawerFor(client: string, shows: string) {
+/** A query from `client` for `name` (blocked or local: answered at once) is in the log, showing `shows`; the Why? drawer is open. */
+async function whyDrawerFor(client: string, shows: string, name = 'ads.e2e.test') {
   await page.setViewportSize({ width: 1280, height: 800 });
   // The blocklist compiles in the background after start (DNS never waits for it).
   await expect
     .poll(async () => (await (await page.request.get('/api/v1/system/info')).json()).filterSnapshot ?? null, { timeout: 30_000 })
     .not.toBeNull();
-  expect(await query('ads.e2e.test', 1, 15354, client)).toBe(0);
-  await page.goto(`/#/queries?client=${client}&name=ads.e2e.test&match=exact`);
+  // (A group's answer settings may change the answer; the row in the log is what matters here.)
+  await query(name, 1, 15354, client).catch(() => -1);
+  await page.goto(`/#/queries?client=${client}&name=${name}&match=exact`);
   await expect(async () => {
     await page.reload();
     await expect(page.getByRole('button', { name: 'Why?' }).first()).toBeVisible({ timeout: 2000 });
@@ -4081,63 +4084,150 @@ async function rulesNow() {
   const r = await page.request.get('/api/v1/rules');
   return (await r.json()).items as { id: string; devices: string[]; groups: string[]; action: string }[];
 }
+const csrfToken = async () => (await (await page.request.get('/api/v1/auth/status')).json()).csrfToken as string;
 async function removeRules() {
-  const csrf = (await (await page.request.get('/api/v1/auth/status')).json()).csrfToken as string;
+  const csrf = await csrfToken();
   for (const r of await rulesNow()) await page.request.delete(`/api/v1/rules/${encodeURIComponent(r.id)}`, { headers: { 'x-csrf-token': csrf } });
 }
+/** The form's own check (a dry run under `r-check-…`), answered with `status`; start waiting BEFORE the change that asks. */
+const checkAnswered = (status: number) =>
+  page.waitForResponse(
+    (r) => r.request().method() === 'PUT' && r.url().includes('/api/v1/rules/r-check-') && r.url().includes('dryRun=true') && r.status() === status,
+    { timeout: 15_000 },
+  );
+const deviceField = (form: ReturnType<Page['getByTestId']>) => form.getByRole('combobox', { name: 'Device', exact: true });
+const whySeen = (form: ReturnType<Page['getByTestId']>) => form.getByTestId('quick-rule-seen-as');
 
 test('flt_005_quick_rule_prefill_unnamed_device_uses_address', async () => {
   await announceMdns('lgwebostv-e2e', [127, 0, 0, 31]);
-  const form = await whyDrawerFor('127.0.0.31', 'lgwebostv-e2e');
-  // The log calls it by the name it announces; a rule can't name that, so the field holds the address.
-  await expect(form.getByRole('combobox', { name: 'Device', exact: true })).toHaveValue('127.0.0.31');
-  await expect(form.getByRole('combobox', { name: 'Device', exact: true })).toHaveAttribute('placeholder', 'named device, IP, or network');
-  const seen = form.getByTestId('quick-rule-seen-as');
-  await expect(seen).toContainText('127.0.0.31 (lgwebostv-e2e, as your router or the device names it).');
-  await expect(seen).toContainText('A rule for an address stops matching when the address changes.');
-  await expect(seen).toContainText('Name this device to make rules follow it.');
-  // No refusal is shown, and Save works.
-  await expect(form.getByTestId('quick-rule-check').getByRole('alert')).toHaveCount(0);
-  await form.getByRole('button', { name: 'Save rule' }).click();
-  await expect(page.getByTestId('quick-rule-saved')).toContainText('allowed for');
-  expect((await rulesNow()).map((r) => r.devices)).toEqual([['127.0.0.31']]);
-  await page.keyboard.press('Escape');
-  await removeRules();
+  // Every request the form makes to check a rule, from now on.
+  const checks: string[] = [];
+  const watch = (r: { method(): string; url(): string }) => {
+    if (r.method() === 'PUT' && r.url().includes('/api/v1/rules/r-check-')) checks.push(r.url());
+  };
+  page.on('request', watch);
+  try {
+    const form = await whyDrawerFor('127.0.0.31', 'lgwebostv-e2e');
+    // The log calls it by the name it announces; a rule can't name that, so the field holds the address.
+    await expect(deviceField(form)).toHaveValue('127.0.0.31');
+    await expect(deviceField(form)).toHaveAttribute('placeholder', 'named device, IP, or network');
+    const seen = whySeen(form);
+    await expect(seen).toContainText('127.0.0.31 (shown in the log as lgwebostv-e2e).');
+    await expect(seen).toContainText(
+      'A rule for an address stops matching when the address changes: reserve the address in your router, or name the device so you change one place, not every rule.',
+    );
+    // The label makes no claim about where the name comes from, nor that naming the device keeps a rule working.
+    await expect(seen).not.toContainText('as your router');
+    await expect(seen).not.toContainText('make rules follow');
+    await expect(seen.locator('bdi')).toHaveText('lgwebostv-e2e');
+    // The pre-fill is valid by construction: opening the drawer asks the server for no check. (The
+    // check waits 400 ms after the last change; twice that, with no request, shows none is scheduled.
+    // This can miss a regression but cannot fail on a slow machine.)
+    await page.waitForTimeout(900);
+    expect(checks, 'no dry run on open').toEqual([]);
+    await form.getByRole('button', { name: 'Save rule' }).click();
+    await expect(page.getByTestId('quick-rule-saved')).toContainText('allowed for');
+    expect((await rulesNow()).map((r) => r.devices)).toEqual([['127.0.0.31']]);
+    await page.keyboard.press('Escape');
+  } finally {
+    page.off('request', watch);
+    await removeRules();
+  }
+});
+
+test('flt_005_quick_rule_prefill_address_without_a_name_has_no_dangling_sentence', async () => {
+  const form = await whyDrawerFor('127.0.0.36', '127.0.0.36');
+  await expect(deviceField(form)).toHaveValue('127.0.0.36');
+  // Nothing to say about a name: the label starts with the point, not with an address and a full stop.
+  await expect(whySeen(form)).toHaveText(/^\s*A rule for an address stops matching when the address changes: reserve the address in your router/);
+  await expect(whySeen(form)).not.toContainText('shown in the log as');
 });
 
 test('flt_005_quick_rule_prefill_named_device_uses_name', async () => {
-  const csrf = (await (await page.request.get('/api/v1/auth/status')).json()).csrfToken as string;
+  const csrf = await csrfToken();
   const put = await page.request.put('/api/v1/clients/e2e-lg-tv', {
     headers: { 'x-csrf-token': csrf },
     data: { match: ['127.0.0.32'], groups: ['lab'] },
   });
   expect(put.status()).toBe(200);
-  const form = await whyDrawerFor('127.0.0.32', 'e2e-lg-tv');
-  // A configured device is what a rule names: the field holds its name, not the address.
-  await expect(form.getByRole('combobox', { name: 'Device', exact: true })).toHaveValue('e2e-lg-tv');
-  await expect(form.getByTestId('quick-rule-seen-as')).toContainText('127.0.0.32 is recognized as the device “e2e-lg-tv”.');
-  await expect(form.getByTestId('quick-rule-seen-as')).not.toContainText('stops matching');
-  await form.getByRole('button', { name: 'Save rule' }).click();
-  await expect(page.getByTestId('quick-rule-saved')).toContainText('allowed for');
-  expect((await rulesNow()).map((r) => r.devices)).toEqual([['e2e-lg-tv']]);
-  await page.keyboard.press('Escape');
-  await removeRules();
-  expect((await page.request.delete('/api/v1/clients/e2e-lg-tv', { headers: { 'x-csrf-token': csrf } })).status()).toBe(200);
+  try {
+    const form = await whyDrawerFor('127.0.0.32', 'e2e-lg-tv');
+    // A configured device is what a rule names: the field holds its name, not the address.
+    await expect(deviceField(form)).toHaveValue('e2e-lg-tv');
+    await expect(whySeen(form)).toContainText('127.0.0.32 is your device “e2e-lg-tv”.');
+    await expect(whySeen(form)).not.toContainText('stops matching');
+    await form.getByRole('button', { name: 'Save rule' }).click();
+    await expect(page.getByTestId('quick-rule-saved')).toContainText('allowed for');
+    expect((await rulesNow()).map((r) => r.devices)).toEqual([['e2e-lg-tv']]);
+    await page.keyboard.press('Escape');
+  } finally {
+    await removeRules();
+    expect((await page.request.delete('/api/v1/clients/e2e-lg-tv', { headers: { 'x-csrf-token': csrf } })).status()).toBe(200);
+  }
+});
+
+// Review F1 (cluster): the explanation comes from the node serving the UI, the row's name from the
+// node that answered it. A device that node recognized by a MAC address its neighbors table holds
+// (here: an explanation with no device, as a node that can't see the LAN gives) is still the
+// configured device the log names: the field holds that name, never the address with a router label.
+// This stub test proves the form's decision for such an explanation; two real nodes are not run here.
+test('flt_005_quick_rule_prefill_configured_name_from_the_log_when_explain_has_no_device', async () => {
+  const csrf = await csrfToken();
+  const put = await page.request.put('/api/v1/clients/e2e-mac-tv', {
+    headers: { 'x-csrf-token': csrf },
+    data: { match: ['127.0.0.35'], groups: ['lab'] },
+  });
+  expect(put.status()).toBe(200);
+  let stubbed = 0;
+  await page.route('**/api/v1/explain**', async (route) => {
+    const real = await route.fetch();
+    const body = await real.json();
+    delete body.client.device; // what a node that doesn't recognize the device says
+    stubbed++;
+    await route.fulfill({ status: 200, contentType: 'application/json', json: body });
+  });
+  try {
+    const form = await whyDrawerFor('127.0.0.35', 'e2e-mac-tv');
+    await expect(form).toBeVisible(); // the form comes once the explanation has loaded
+    expect(stubbed, 'the explanation was the stubbed one').toBeGreaterThan(0);
+    await expect(deviceField(form)).toHaveValue('e2e-mac-tv');
+    await expect(whySeen(form)).toContainText('127.0.0.35 is your device “e2e-mac-tv”.');
+    await expect(whySeen(form)).not.toContainText('shown in the log as');
+    await expect(whySeen(form)).not.toContainText('router');
+    await form.getByRole('button', { name: 'Save rule' }).click();
+    await expect(page.getByTestId('quick-rule-saved')).toContainText('allowed for');
+    expect((await rulesNow()).map((r) => r.devices)).toEqual([['e2e-mac-tv']]);
+    await page.keyboard.press('Escape');
+  } finally {
+    await page.unroute('**/api/v1/explain**');
+    await removeRules();
+    await page.request.delete('/api/v1/clients/e2e-mac-tv', { headers: { 'x-csrf-token': csrf } });
+  }
 });
 
 test('flt_017_quick_rule_prefill_workload_uses_group', async () => {
-  // A pod's address changes whenever it restarts, and the form must not offer `ns/kind/name` as a
-  // device (a rule can't name it): the scope is the workload's group, in a rule that blocks what
-  // the list already blocks, so nothing changes if the cleanup is missed.
+  // postgres: its pods carry the group label (`lab`), a group an operator placed it in. A pod's
+  // address changes whenever it restarts, and the form must not offer `ns/kind/name` as a device (a
+  // rule can't name it): the scope is the workload's group, in a rule that blocks what the list
+  // already blocks, so nothing changes if the cleanup is missed. (`lab` is also the network group of
+  // every e2e client: the label's "set by a label on its pods" and the next two tests are what tell
+  // a placed group from a network's.)
+  const e = await (await page.request.get('/api/v1/explain?name=ads.e2e.test&client=127.0.0.83')).json();
+  expect(e.client.workload.groupFrom).toBe('pod_label');
   const form = await whyDrawerFor('127.0.0.83', 'db/sts/postgres');
   await expect(form.getByRole('combobox', { name: 'Applies to' })).toHaveValue('group');
   await expect(form.getByRole('combobox', { name: 'Group' })).toHaveValue('lab');
-  await expect(form.getByRole('combobox', { name: 'Device', exact: true })).toHaveCount(0);
-  await expect(form.getByTestId('quick-rule-seen-as')).toContainText('db/sts/postgres is a Kubernetes workload');
-  await expect(form.getByTestId('quick-rule-seen-as')).toContainText('this rule is for its group, lab');
+  await expect(deviceField(form)).toHaveCount(0);
+  await expect(whySeen(form)).toContainText('db/sts/postgres is a Kubernetes workload');
+  await expect(whySeen(form)).toContainText('its group, lab (set by a label on its pods): every device in it.');
+  // The text follows the group actually chosen.
+  await form.getByRole('combobox', { name: 'Group' }).selectOption('default');
+  await expect(whySeen(form)).toContainText('whose group is lab. This rule is for default: every device in it.');
+  await expect(whySeen(form)).not.toContainText('its group, default');
+  await form.getByRole('combobox', { name: 'Group' }).selectOption('lab');
   // Choosing a device offers the pod's address, still not the workload's name.
   await form.getByRole('combobox', { name: 'Applies to' }).selectOption('device');
-  await expect(form.getByRole('combobox', { name: 'Device', exact: true })).toHaveValue('127.0.0.83');
+  await expect(deviceField(form)).toHaveValue('127.0.0.83');
   await form.getByRole('combobox', { name: 'Applies to' }).selectOption('group');
   await form.getByRole('button', { name: 'Block' }).click();
   await form.getByRole('button', { name: 'Save rule' }).click();
@@ -4147,6 +4237,54 @@ test('flt_017_quick_rule_prefill_workload_uses_group', async () => {
   await page.keyboard.press('Escape');
   await removeRules();
   expect(await query('ads.e2e.test')).toBe(0); // still blocked by the list
+});
+
+// Review F2: a workload with no group of its own falls to its network's group (or `default`): a rule
+// for that group is a rule for every device there, so the form starts from the pod's address and
+// points at "Add to group…" instead. jellyfin has no label; the earlier flt_017 test gave it a map
+// rule, which this test takes away first (and the next one puts back and removes).
+test('flt_017_quick_rule_prefill_ungrouped_workload_uses_address', async () => {
+  const csrf = await csrfToken();
+  const gone = await page.request.delete('/api/v1/kubernetes/map/media/deploy/jellyfin', { headers: { 'x-csrf-token': csrf } });
+  expect([200, 404]).toContain(gone.status());
+  await expect
+    .poll(async () => (await (await page.request.get('/api/v1/explain?name=ads.e2e.test&client=127.0.0.81')).json()).client.workload?.groupFrom, { timeout: 20_000 })
+    .toBe('none');
+  const form = await whyDrawerFor('127.0.0.81', 'media/deploy/jellyfin');
+  // Not the group: neither its network's (`lab`) nor `default`.
+  await expect(form.getByRole('combobox', { name: 'Applies to' })).toHaveValue('device');
+  await expect(deviceField(form)).toHaveValue('127.0.0.81');
+  await expect(form.getByRole('combobox', { name: 'Group' })).toHaveCount(0);
+  await expect(whySeen(form)).toContainText('127.0.0.81 is one pod of media/deploy/jellyfin');
+  await expect(whySeen(form)).toContainText('To cover all its pods, put the workload in a group first: click its name in the log, then Add to group…');
+  await expect(whySeen(form)).not.toContainText('every device in it');
+  await expect(form.getByRole('combobox', { name: 'Duration' })).toHaveValue('60');
+  await form.getByRole('button', { name: 'Block' }).click();
+  await form.getByRole('button', { name: 'Save rule' }).click();
+  await expect(page.getByTestId('quick-rule-saved')).toContainText('blocked for');
+  expect((await rulesNow()).map((r) => [r.action, r.devices, r.groups])).toEqual([['block', ['127.0.0.81'], []]]);
+  await page.keyboard.press('Escape');
+  await removeRules();
+});
+
+// Review F2: a workload an operator put in a group with a rule (`map`) starts as a rule for that
+// group, and the group is not its network's (`lab`): the label says a rule set it.
+test('flt_017_quick_rule_prefill_workload_placed_by_a_rule_uses_its_group', async () => {
+  const csrf = await csrfToken();
+  const put = await page.request.put('/api/v1/kubernetes/map/media/deploy/jellyfin', { headers: { 'x-csrf-token': csrf }, data: { group: 'ipv6only' } });
+  expect(put.status()).toBe(200);
+  try {
+    await expect
+      .poll(async () => (await (await page.request.get('/api/v1/explain?name=nas.e2e.test&client=127.0.0.81')).json()).client.workload?.groupFrom, { timeout: 20_000 })
+      .toBe('map');
+    const form = await whyDrawerFor('127.0.0.81', 'media/deploy/jellyfin', 'nas.e2e.test');
+    await expect(form.getByRole('combobox', { name: 'Applies to' })).toHaveValue('group');
+    await expect(form.getByRole('combobox', { name: 'Group' })).toHaveValue('ipv6only');
+    await expect(whySeen(form)).toContainText('its group, ipv6only (set by a rule): every device in it.');
+    await page.keyboard.press('Escape');
+  } finally {
+    await page.request.delete('/api/v1/kubernetes/map/media/deploy/jellyfin', { headers: { 'x-csrf-token': csrf } });
+  }
 });
 
 test('flt_005_quick_rule_refusal_shows_before_save', async () => {
@@ -4159,27 +4297,55 @@ test('flt_005_quick_rule_refusal_shows_before_save', async () => {
   await page.setViewportSize({ width: 1280, height: 800 });
   await page.goto('/#/rules');
   const form = page.getByTestId('quick-rule-form');
+  const device = deviceField(form);
+  const check = form.getByTestId('quick-rule-check');
   await form.getByRole('textbox', { name: 'Domain' }).fill('scan.e2e.test');
   await form.getByRole('combobox', { name: 'Applies to' }).selectOption('device');
-  const refusal = form.getByTestId('quick-rule-check').getByRole('alert');
-  // The browser logs each 422; they're the answers this test is after, not page problems.
+  // The browser logs each 422; they're the answers this test is after, not page problems. Each step
+  // below waits for the server's answer to the check it caused before it asserts, and the last wait
+  // is for a 200, which comes after every 422's console message.
   expectedRefusal = /status of 422/;
   try {
-    await form.getByRole('combobox', { name: 'Device', exact: true }).fill('tv-lounge-e2e');
-    await expect(refusal).toContainText("`tv-lounge-e2e` isn't a named device (`[[client]]`), an IP, or a CIDR");
-    await expect(refusal).toContainText('`tv-lounge-e2e` is what 127.0.0.34 calls itself.');
-    await expect(refusal).toContainText('Use the address, or name the device first (Clients → Name this device…) so rules follow it.');
-    // The address is accepted: the refusal goes away (the preview ran again).
-    await form.getByRole('combobox', { name: 'Device', exact: true }).fill('127.0.0.34');
-    await expect(refusal).toHaveCount(0);
+    let answered = checkAnswered(422);
+    await device.fill('tv-lounge-e2e');
+    await answered;
+    await expect(check).toContainText("`tv-lounge-e2e` isn't a named device (`[[client]]`), an IP, or a CIDR");
+    await expect(check).toContainText('`tv-lounge-e2e` is what 127.0.0.34 calls itself.');
+    await expect(check).toContainText('Use the address, or name the device first (Clients → its address → Name this device…) and use that name.');
+    // A polite live region tied to the field, not an alert that is inserted again on each pause.
+    await expect(check).toHaveAttribute('role', 'status');
+    await expect(form.getByRole('alert')).toHaveCount(0);
+    await expect(device).toHaveAttribute('aria-invalid', 'true');
+    const described = await check.getAttribute('id');
+    expect(described).toBeTruthy();
+    await expect(device).toHaveAttribute('aria-describedby', described as string);
+    // The address is accepted: the server answers 200 and the refusal is gone.
+    answered = checkAnswered(200);
+    await device.fill('127.0.0.34');
+    await answered;
+    await expect(check).toHaveText('');
+    await expect(device).not.toHaveAttribute('aria-invalid', 'true');
     // And a string no table knows is refused with the plain hint.
-    await form.getByRole('combobox', { name: 'Device', exact: true }).fill('no-such-device');
-    await expect(refusal).toContainText("`no-such-device` isn't a named device");
-    await expect(refusal).not.toContainText('calls itself');
-    await form.getByRole('combobox', { name: 'Device', exact: true }).fill('127.0.0.34');
-    await expect(refusal).toHaveCount(0);
+    answered = checkAnswered(422);
+    await device.fill('no-such-device');
+    await answered;
+    await expect(check).toContainText("`no-such-device` isn't a named device");
+    await expect(check).not.toContainText('calls itself');
+    // A refusal at Save shows where it is, and correcting the value clears it (not at the next Save).
+    const saveRefused = page.waitForResponse(
+      (r) => r.request().method() === 'PUT' && r.url().includes('/api/v1/rules/r-') && !r.url().includes('dryRun=true') && r.status() === 422,
+      { timeout: 15_000 },
+    );
+    await form.getByRole('button', { name: 'Save rule' }).click();
+    await saveRefused;
+    await expect(form.getByRole('alert')).toContainText("`no-such-device` isn't a named device");
+    answered = checkAnswered(200);
+    await device.fill('127.0.0.34');
+    await expect(form.getByRole('alert')).toHaveCount(0);
+    await answered;
+    await expect(check).toHaveText('');
   } finally {
     expectedRefusal = null;
   }
-  expect(await rulesNow()).toEqual([]); // checking saves nothing
+  expect(await rulesNow()).toEqual([]); // checking saves nothing, and the refused Save saved nothing
 });
