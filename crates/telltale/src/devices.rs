@@ -23,10 +23,34 @@ pub(crate) struct Lease {
     /// which doesn't know the field, reads the same form as before.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) offline: bool,
+    /// REQ: FLT-006, CLU-002 (ADR-183) — a connected client whose binding of this address to this
+    /// MAC can't be trusted to identify a device: the routers disagree on the address, one MAC
+    /// sits at several addresses (a range extender), UniFi gave the address from its last-known
+    /// one, or the router that said so hasn't answered for 15 minutes. It still names the
+    /// address (display), but it never identifies, and no lower source fills the address.
+    /// Not written when false, so a node on an older build, which doesn't know the field, reads
+    /// the same form as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) unsure: bool,
 }
 
 /// Devices by address.
 pub(crate) type Leases = HashMap<Ipv4Addr, Lease>;
+
+/// REQ: FLT-006 (ADR-183) — the MAC a lease can identify a device by: its client is connected
+/// (not offline), its binding is not `unsure`, and the MAC parses (`aa:bb:..` or `aa-bb-..`),
+/// isn't all zero, and is unicast. Locally administered ("private") MACs count. MACs are
+/// compared as parsed bytes, never as text.
+// The members' bindings (`keep_answers`) and the table (`router_bindings`) use it from the next
+// commits on; until then only the tests do.
+#[allow(dead_code)]
+pub(crate) fn eligible(l: &Lease) -> Option<[u8; 6]> {
+    if l.offline || l.unsure {
+        return None;
+    }
+    let mac = crate::identify::oui::parse_mac(&l.mac)?;
+    (mac != [0; 6] && mac[0] & 1 == 0).then_some(mac)
+}
 
 /// REQ: CLU-002, API-010 (ADR-125) — the device names other nodes know: the ones their
 /// routers and mDNS saw. Only one node usually reads the router (the one holding its API
@@ -126,6 +150,7 @@ mod tests {
             hostname: Some(name.into()),
             expires: 0,
             offline: false,
+            unsure: false,
         }
     }
 
@@ -180,5 +205,81 @@ mod tests {
         assert_eq!(serde_json::from_str::<Lease>(&text).unwrap(), gone);
         let older = r#"{"mac":"","ip":"10.0.0.2","hostname":"k8s","expires":0}"#;
         assert!(!serde_json::from_str::<Lease>(older).unwrap().offline);
+    }
+
+    // REQ: FLT-006, CLU-002, CLU-010 (ADR-183) — the unsure mark travels to nodes that know it and
+    // costs nothing on the wire for a sure binding: its form is what older nodes already read; an
+    // answer from an older node (no field) is a sure binding; an older node, which has no such
+    // field, reads the new form and ignores it.
+    #[test]
+    fn flt_006_unsure_mark_is_compatible_on_the_wire() {
+        // What the previous version's `Lease` looks like: the same fields, none for `unsure`.
+        #[derive(Debug, PartialEq, Deserialize)]
+        struct PreviousLease {
+            mac: String,
+            ip: Ipv4Addr,
+            #[serde(default)]
+            hostname: Option<String>,
+            expires: u64,
+            #[serde(default)]
+            offline: bool,
+        }
+        let sure = serde_json::to_string(&lease([10, 0, 0, 2], "k8s")).unwrap();
+        assert!(!sure.contains("unsure"), "{sure}");
+        let doubtful = Lease {
+            unsure: true,
+            mac: "aa:bb:cc:00:00:01".into(),
+            ..lease([10, 0, 0, 3], "tv")
+        };
+        let text = serde_json::to_string(&doubtful).unwrap();
+        assert!(text.contains("\"unsure\":true"), "{text}");
+        assert_eq!(serde_json::from_str::<Lease>(&text).unwrap(), doubtful);
+        let older = r#"{"mac":"aa:bb:cc:00:00:01","ip":"10.0.0.2","hostname":"k8s","expires":0}"#;
+        assert!(!serde_json::from_str::<Lease>(older).unwrap().unsure);
+        let old: PreviousLease = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            old,
+            PreviousLease {
+                mac: "aa:bb:cc:00:00:01".into(),
+                ip: Ipv4Addr::new(10, 0, 0, 3),
+                hostname: Some("tv".into()),
+                expires: 0,
+                offline: false,
+            }
+        );
+    }
+
+    // REQ: FLT-006 (ADR-183) — only a connected client whose binding is sure, with a MAC that
+    // parses (either separator, any case), isn't all zero and is unicast, can identify a device.
+    // A locally administered ("private") MAC can.
+    #[test]
+    fn flt_006_offline_and_unsure_leases_never_identify() {
+        let with = |mac: &str, offline: bool, unsure: bool| Lease {
+            mac: mac.into(),
+            offline,
+            unsure,
+            ..lease([10, 0, 0, 2], "x")
+        };
+        let desk = Some([0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x01]);
+        assert_eq!(eligible(&with("aa:bb:cc:00:00:01", false, false)), desk);
+        assert_eq!(eligible(&with("AA-BB-CC-00-00-01", false, false)), desk);
+        assert_eq!(
+            eligible(&with("02:00:00:00:00:01", false, false)),
+            Some([0x02, 0, 0, 0, 0, 0x01]),
+            "a private MAC counts"
+        );
+        for (mac, offline, unsure, why) in [
+            ("aa:bb:cc:00:00:01", true, false, "offline"),
+            ("aa:bb:cc:00:00:01", false, true, "unsure"),
+            ("aa:bb:cc:00:00:01", true, true, "both"),
+            ("", false, false, "no MAC (mDNS)"),
+            ("zz:bb:cc:00:00:01", false, false, "unparsable"),
+            ("aa:bb:cc:00:01", false, false, "too short"),
+            ("00:00:00:00:00:00", false, false, "all zero"),
+            ("01:00:5e:00:00:01", false, false, "multicast"),
+            ("ff:ff:ff:ff:ff:ff", false, false, "broadcast"),
+        ] {
+            assert_eq!(eligible(&with(mac, offline, unsure)), None, "{why}");
+        }
     }
 }

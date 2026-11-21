@@ -603,6 +603,7 @@ fn t8_2_offline_router_clients_are_not_announced_as_seen() {
         hostname: Some("x".into()),
         expires: 0,
         offline,
+        unsure: false,
     };
     let table = |ls: &[crate::devices::Lease]| -> crate::devices::Leases {
         ls.iter().map(|l| (l.ip, l.clone())).collect()
