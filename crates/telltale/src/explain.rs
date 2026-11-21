@@ -108,11 +108,13 @@ pub(crate) struct RouteInfo {
     pub(crate) routed: bool,
 }
 
-fn source_name(s: IdSource) -> &'static str {
+pub(crate) fn source_name(s: IdSource) -> &'static str {
     match s {
         IdSource::ClientId => "client_id",
         IdSource::EdnsMac => "edns_mac",
         IdSource::NeighborMac => "neighbor_mac",
+        // REQ: FLT-006 (ADR-183) — the MAC a router reported for the address.
+        IdSource::RouterMac => "router_mac",
         IdSource::Workload => "kubernetes",
         IdSource::Ip => "ip",
         IdSource::Cidr => "cidr",
