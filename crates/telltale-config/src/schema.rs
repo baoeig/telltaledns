@@ -1589,6 +1589,24 @@ pub struct ClientsConfig {
     pub mdns: bool,
     /// The mDNS port (5353; shared with avahi or the OS responder).
     pub mdns_port: u16,
+    /// REQ: FLT-006 (ADR-183) — recognize a device named by its MAC address (`[[client]]`
+    /// `match = ["aa:bb:cc:dd:ee:ff"]`) from the client lists of the routers (`[[router]]`) as
+    /// well as from this host's neighbor table: the MAC a router reports for an address, on this
+    /// node and on the cluster's other full members. That is what lets a device named by its MAC
+    /// keep its name, groups and rules when its address changes, also in a Docker bridge, a
+    /// Kubernetes pod or another VLAN, where the neighbor table sees nothing. On by default;
+    /// `false` keeps to the neighbor table and trusted EDNS MACs. The cluster shares it, so every
+    /// node identifies devices the same way, and it is not written while it is on: set it to
+    /// `false` only once every node runs this version (an older node refuses the key).
+    #[serde(skip_serializing_if = "is_default_router_macs")]
+    pub router_macs: bool,
+}
+
+// REQ: FLT-006, CLU-010 (ADR-183) — not written while it is on, so a node that doesn't know the
+// key (a rolling upgrade; the section refuses unknown fields) still reads the shared config.
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's `skip_serializing_if` takes a reference
+const fn is_default_router_macs(on: &bool) -> bool {
+    *on
 }
 
 impl Default for ClientsConfig {
@@ -1600,6 +1618,7 @@ impl Default for ClientsConfig {
             infrastructure: Vec::new(),
             mdns: false,
             mdns_port: 5353,
+            router_macs: true,
         }
     }
 }

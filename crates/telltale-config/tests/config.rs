@@ -1489,3 +1489,47 @@ fn api_004_config_check_warns_on_an_empty_break_glass_list() {
         "with the flag off the list is not used"
     );
 }
+
+/// REQ: FLT-006, CLU-010 (ADR-183) — `[clients] router_macs`: on unless set, `false` is read and
+/// written, and the default is not written back, so a node on an older build (the section
+/// refuses fields it doesn't know) still reads the shared configuration.
+#[test]
+fn flt_006_router_macs_default_on_and_not_written() {
+    let clients = |toml: &str| load_str(toml).unwrap().config.clients;
+    let written = |c: &telltale_config::ClientsConfig| serde_json::to_value(c).unwrap();
+
+    let default = clients("");
+    assert!(default.router_macs);
+    assert!(
+        written(&default).get("router_macs").is_none(),
+        "{default:?}"
+    );
+    assert!(
+        serde_json::to_value(Config::default()).unwrap()["clients"]
+            .get("router_macs")
+            .is_none()
+    );
+
+    // Other `[clients]` settings leave it on, and still don't write it.
+    let other = clients("[clients]\nmdns = true\n");
+    assert!(other.router_macs);
+    assert!(written(&other).get("router_macs").is_none());
+    let on = clients("[clients]\nrouter_macs = true\n");
+    assert!(on.router_macs);
+    assert!(
+        written(&on).get("router_macs").is_none(),
+        "on is the default"
+    );
+
+    // Off is written, and reads back as off.
+    let off = clients("[clients]\nrouter_macs = false\n");
+    assert!(!off.router_macs);
+    let text = written(&off);
+    assert_eq!(text["router_macs"], false);
+    let back: telltale_config::ClientsConfig = serde_json::from_value(text).unwrap();
+    assert!(!back.router_macs);
+
+    // A typo is still an error with its path.
+    let errs = load_str("[clients]\nrouter_mac = false\n").unwrap_err();
+    assert_eq!(errs.len(), 1, "{errs:?}");
+}
