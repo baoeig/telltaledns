@@ -276,8 +276,14 @@ async fn flt_005_rule_hint_names_the_configured_device_behind_a_discovered_name(
         lease_mac([192, 168, 1, 20], "Pixel-7", "aa:bb:cc:dd:ee:20"),
         lease_mac([192, 168, 1, 21], "Galaxy", "aa:bb:cc:dd:ee:21"),
         lease_mac([10, 0, 5, 30], "printer", "aa:bb:cc:dd:ee:30"),
+        lease_mac([192, 168, 1, 22], "Tab", "aa:bb:cc:dd:ee:22"),
     ]));
     for (path, body) in [
+        // One address written as a network of one.
+        (
+            "/api/v1/clients/Kid%20tablet",
+            serde_json::json!({ "match": ["192.168.1.22/32"] }),
+        ),
         (
             "/api/v1/clients/Mom%20phone",
             serde_json::json!({ "match": ["AA:BB:CC:DD:EE:20"] }),
@@ -294,7 +300,11 @@ async fn flt_005_rule_hint_names_the_configured_device_behind_a_discovered_name(
         let (s, v) = n.put(path, &n.admin, false, body).await;
         assert_eq!(s, StatusCode::OK, "{path}: {v}");
     }
-    let cases: [(&str, String); 3] = [
+    let cases: [(&str, String); 4] = [
+        (
+            "Tab",
+            "`Tab` is what your router calls 192.168.1.22, which is the device “Kid tablet”: use its name.".to_owned(),
+        ),
         (
             "Pixel-7",
             "`Pixel-7` is what your router calls 192.168.1.20, which is the device “Mom phone”: use its name.".to_owned(),
@@ -330,7 +340,7 @@ async fn flt_005_rule_mac_typed_into_device_gets_mac_wording() {
         assert_eq!(
             text(&v, "hint"),
             format!(
-                "`{mac}` is a MAC address, and a rule can't name one. Name the device with that MAC in its match list (a `[[client]]` in the config file, or `PUT /api/v1/clients/{{name}}`), then use that name."
+                "`{mac}` is a MAC address, and a rule can't name one. Name the device with that MAC in its match list (a `[[client]]` in the config file, or `PUT /api/v1/clients/{{name}}`), then use that name. MAC addresses are recognized only where TelltaleDNS can see them."
             ),
             "{v}"
         );
@@ -354,7 +364,7 @@ async fn flt_017_rule_hint_for_a_workload_name_points_at_its_group() {
     assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
     let hint = text(&v, "hint");
     assert!(
-        hint.starts_with("`media/deploy/jellyfin` is a Kubernetes workload, and its pods' addresses change with every restart."),
+        hint.starts_with("`media/deploy/jellyfin` looks like a Kubernetes workload's name, and a pod's address changes with every restart."),
         "{hint}"
     );
     assert!(hint.contains("Add to group…"), "{hint}");
@@ -494,4 +504,68 @@ async fn agt_004_rule_hint_without_querylog_names_no_address() {
         );
         assert_eq!(all.contains("192.168.1.102"), sees, "{who}: {all}");
     }
+}
+
+/// REQ: FLT-005, AGT-004 (issue #73, round-2 S2) — the plain hint fails CLOSED across versions. The
+/// refusal the primary sends over the cluster channel has the plain text in the `hint` an older
+/// replica reads (it ignores fields it doesn't know), and the address text only in an extra field;
+/// so an older node, which can't tell an agent without `querylog:read` from anyone else, never has
+/// the address to show. (The node that answers the caller gives the fuller text to whoever may see
+/// it: `simulate_api`'s `agt_004_the_address_hint_goes_only_to_those_who_may_see_it`.)
+#[tokio::test]
+async fn flt_005_an_older_node_reading_the_primarys_refusal_sees_only_the_plain_hint() {
+    use super::{ApiBackend, ManagedKind, ManagedWrite};
+    use telltale_api::Backend as _;
+
+    // What an older node's own `WireProblem` has: the code, the detail, the hint, the diff.
+    #[derive(serde::Deserialize)]
+    struct Older {
+        detail: String,
+        hint: Option<String>,
+    }
+
+    let n = node_with_router_tv();
+    let backend = ApiBackend {
+        src: Arc::clone(&n.src),
+    };
+    let write = |device: &str| ManagedWrite {
+        kind: ManagedKind::Rule,
+        name: "x".into(),
+        body: Some(rule(&[device])),
+        dry_run: true,
+        expect: None,
+        by: "tests".into(),
+        simulate: None,
+        by_admin: false,
+    };
+    let primary_answers = |p: telltale_api::problem::Problem| {
+        serde_json::to_value(crate::forward::WireProblem::from(p)).unwrap()
+    };
+
+    let p = backend.write_managed(write("LGwebOSTV")).await.unwrap_err();
+    let wire = primary_answers(p);
+    let older: Older = serde_json::from_value(wire.clone()).unwrap();
+    assert!(
+        older.detail.contains("`LGwebOSTV` isn't a named device"),
+        "{wire}"
+    );
+    assert_eq!(older.hint.as_deref(), Some(WHAT_TO_DO), "{wire}");
+    assert!(
+        !serde_json::to_string(&older.hint)
+            .unwrap()
+            .contains("192.168.1.102"),
+        "an older node has no address to show: {wire}"
+    );
+    // The fuller text is there for a node that knows the field, beside it.
+    assert!(
+        wire["fuller_hint"].as_str().is_some_and(|f| f
+            .contains("what your router calls 192.168.1.102")
+            && f.ends_with(WHAT_TO_DO)),
+        "{wire}"
+    );
+    // A refusal that says nothing of this node's tables sends no extra field at all.
+    let p = backend.write_managed(write("fridge")).await.unwrap_err();
+    let wire = primary_answers(p);
+    assert!(wire.get("fuller_hint").is_none(), "{wire}");
+    assert_eq!(wire["hint"], WHAT_TO_DO);
 }

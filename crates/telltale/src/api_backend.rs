@@ -3901,8 +3901,10 @@ enum DeviceHint {
 /// device that is if it is one; a MAC address gets words about MACs. Words only: whether a device
 /// is accepted is the validator's answer, from the configuration alone, so every node gives the
 /// same one; this reads node-local tables, off the DNS path, and only once a rule was refused, for
-/// the first few devices, each once. The hint without what the tables told it (`plain_hint`) is what
-/// a caller who may not read every device's queries is given instead.
+/// the first few devices, each once. `hint` is the text without what the tables told it, and the
+/// text with it travels beside it (`fuller_hint`): the node that answers the caller gives the
+/// fuller one only to a caller who may read every device's queries, and a node that doesn't know
+/// the field shows the plain one.
 fn rule_device_hint(
     src: &Sources,
     file: &telltale_config::Config,
@@ -3958,7 +3960,7 @@ fn rule_device_hint(
     if plain == full {
         refusal.hint(full)
     } else {
-        refusal.hint(full).plain_hint(plain)
+        refusal.hint(plain).fuller_hint(full)
     }
 }
 
@@ -3973,7 +3975,7 @@ fn device_hint(
         Ok(telltale_config::MatchKey::Mac(_))
     ) {
         return DeviceHint::Plain(format!(
-            "`{device}` is a MAC address, and a rule can't name one. Name the device with that MAC in its match list (a `[[client]]` in the config file, or `PUT /api/v1/clients/{{name}}`), then use that name."
+            "`{device}` is a MAC address, and a rule can't name one. Name the device with that MAC in its match list (a `[[client]]` in the config file, or `PUT /api/v1/clients/{{name}}`), then use that name. MAC addresses are recognized only where TelltaleDNS can see them."
         ));
     }
     // What the query log calls a pod: `namespace/kind/name`. Its address is not a good thing to
@@ -3986,7 +3988,7 @@ fn device_hint(
         && !name.is_empty()
     {
         return DeviceHint::Plain(format!(
-            "`{device}` is a Kubernetes workload, and its pods' addresses change with every restart. A rule can be for the group an operator placed it in (click its name in the query log, then Add to group…), or, for a short time, for one pod's address."
+            "`{device}` looks like a Kubernetes workload's name, and a pod's address changes with every restart. A rule can be for the group an operator placed it in (click its name in the query log, then Add to group…), or, for a short time, for one pod's address."
         ));
     }
     let found = discovered_addresses(src, device);
@@ -4087,6 +4089,8 @@ fn configured_device_at(
                 .iter()
                 .any(|k| match MatchKey::parse(k.as_str()) {
                     Ok(MatchKey::Ip(a)) => a == std::net::IpAddr::V4(ip),
+                    // `192.168.1.20/32` is one address too.
+                    Ok(MatchKey::Cidr(c)) => c.prefix == 32 && c.addr == std::net::IpAddr::V4(ip),
                     Ok(m @ MatchKey::Mac(_)) => mac.as_ref() == Some(&m),
                     _ => false,
                 })

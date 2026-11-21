@@ -98,10 +98,12 @@ pub(crate) struct WireProblem {
     /// REQ: CLU-013 — a `cluster_pinned` refusal's diff (absent from older primaries).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     diff: Option<Box<serde_json::Value>>,
-    /// REQ: FLT-005, AGT-004 (issue #73) — the hint without what the primary's own tables told it
-    /// (absent from older primaries, and when the hint says nothing of them).
+    /// REQ: FLT-005, AGT-004 (issue #73) — `hint` with what the primary's own tables told it, for
+    /// the node that answers the caller to give to whoever may see it. `hint` is the plain text, so
+    /// a node that doesn't know this field (an older one: an unknown field is ignored) shows only
+    /// that. Absent from older primaries, and when the hint says nothing of the tables.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    plain_hint: Option<String>,
+    fuller_hint: Option<String>,
 }
 
 impl From<Problem> for WireProblem {
@@ -111,7 +113,7 @@ impl From<Problem> for WireProblem {
             detail: p.detail,
             hint: p.hint,
             diff: p.diff,
-            plain_hint: p.plain_hint.map(|b| *b),
+            fuller_hint: p.fuller_hint.map(|b| *b),
         }
     }
 }
@@ -121,7 +123,7 @@ impl From<WireProblem> for Problem {
         let mut p = Problem::new(w.code, w.detail);
         p.hint = w.hint;
         p.diff = w.diff;
-        p.plain_hint = w.plain_hint.map(Box::new);
+        p.fuller_hint = w.fuller_hint.map(Box::new);
         p
     }
 }
@@ -418,35 +420,36 @@ mod tests {
         assert_eq!(p.hint.as_deref(), Some("re-read"));
     }
 
-    // REQ: FLT-005, AGT-004 (issue #73) — a refusal's plain hint (what it says without this node's
-    // device tables) crosses the channel with it, so the entry node can give it to a caller who
-    // may not see those tables; a hint with none sends nothing extra (an older node reads it as
-    // before), and an older primary's answer has no plain hint.
+    // REQ: FLT-005, AGT-004 (issue #73) — a refusal's fuller hint (what it says with the refusing
+    // node's device tables) crosses the channel beside the plain `hint`, so the node that answers
+    // the caller can give it to whoever may see it; a refusal with none sends nothing extra (an
+    // older node reads it as before), and an older primary's answer has no fuller hint.
     #[test]
-    fn flt_005_a_plain_hint_crosses_the_channel_with_the_refusal() {
+    fn flt_005_a_fuller_hint_crosses_the_channel_beside_the_plain_one() {
         let p = Problem::new(Code::InvalidConfig, "no")
-            .hint("`tv` is what your router calls 192.168.1.2. Use the address.")
-            .plain_hint("Use the address.");
+            .hint("Use the address.")
+            .fuller_hint("`tv` is what your router calls 192.168.1.2. Use the address.");
         let wire = serde_json::to_string(&Answer::Err(p.into())).unwrap();
-        assert!(wire.contains("plain_hint"), "{wire}");
+        assert!(wire.contains("fuller_hint"), "{wire}");
         let Answer::Err(w) = serde_json::from_str(&wire).unwrap() else {
             panic!("expected an error")
         };
         let p: Problem = w.into();
-        assert_eq!(
-            p.plain_hint.as_deref().map(String::as_str),
-            Some("Use the address.")
+        assert_eq!(p.hint.as_deref(), Some("Use the address."));
+        assert!(
+            p.fuller_hint
+                .as_deref()
+                .is_some_and(|h| h.contains("192.168.1.2"))
         );
-        assert!(p.hint.as_deref().is_some_and(|h| h.contains("192.168.1.2")));
 
-        // No plain hint: nothing extra on the wire, which is also what an older primary sends.
+        // No fuller hint: nothing extra on the wire, which is also what an older primary sends.
         let none =
             serde_json::to_string(&Answer::Err(Problem::new(Code::Conflict, "x").into())).unwrap();
-        assert!(!none.contains("plain_hint"), "{none}");
+        assert!(!none.contains("fuller_hint"), "{none}");
         let Answer::Err(w) = serde_json::from_str(&none).unwrap() else {
             panic!("expected an error")
         };
-        assert_eq!(Problem::from(w).plain_hint, None);
+        assert_eq!(Problem::from(w).fuller_hint, None);
     }
 
     // REQ: OBS-014 — an acknowledgement crosses the channel intact.
