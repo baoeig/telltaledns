@@ -3870,15 +3870,39 @@ fn rule_of(
     })
 }
 
-/// What every quick-rule device refusal's hint ends with (GitHub issue #73).
-const RULE_DEVICE_HINT: &str =
-    "Use the address, or name the device first (Clients → Name this device…) so rules follow it.";
+/// What a plain quick-rule device refusal's hint says (GitHub issue #73). It promises only what
+/// holds today: naming a device recognizes it by the address it has now, so a rule for the name
+/// stops matching when that address changes too (until the device's `match` list is changed, or it
+/// is recognized by its MAC address). It says to use the new name, not that rules then follow the
+/// device. Phase 1 (MAC addresses from the router) can say more.
+const RULE_DEVICE_HINT: &str = "Use the address, or name the device first (Clients → its address → Name this device…) and use that name.";
+
+/// How many refused devices of one rule a hint looks up (the others are refused all the same).
+const HINTED_DEVICES: usize = 4;
+
+/// What a hint says about one refused device.
+enum DeviceHint {
+    /// Words that need nothing of this node's tables and end the matter: a MAC address (how to
+    /// name the device by it), a Kubernetes workload's name (its pods' addresses change).
+    Plain(String),
+    /// The discovered name of an address that is a configured device. Learned from this node's
+    /// tables.
+    Configured(String),
+    /// A discovered name: which address(es). Learned from this node's tables; the plain sentence
+    /// still follows.
+    Discovered(String),
+    /// Nothing known about it: the plain sentence.
+    Unknown,
+}
 
 /// REQ: FLT-005 (GitHub issue #73) — what to do about a device a quick rule can't name. When the
 /// string is a name this node's router, mDNS, or the other nodes' tables give an address (what the
-/// query log shows for a device nobody named), the hint says which address. Words only: whether a
-/// device is accepted is the validator's answer, from the configuration alone, so every node gives
-/// the same one; this reads node-local tables, off the DNS path, and only once a rule was refused.
+/// query log shows for a device nobody named), the hint says which address, and which configured
+/// device that is if it is one; a MAC address gets words about MACs. Words only: whether a device
+/// is accepted is the validator's answer, from the configuration alone, so every node gives the
+/// same one; this reads node-local tables, off the DNS path, and only once a rule was refused, for
+/// the first few devices, each once. The hint without what the tables told it (`plain_hint`) is what
+/// a caller who may not read every device's queries is given instead.
 fn rule_device_hint(
     src: &Sources,
     file: &telltale_config::Config,
@@ -3886,45 +3910,141 @@ fn rule_device_hint(
     rule: &serde_json::Value,
     refusal: Problem,
 ) -> Problem {
-    let known: std::collections::HashSet<String> = file
-        .client
+    let clients: Vec<&telltale_config::ClientConfig> =
+        file.client.iter().chain(&entries.clients).collect();
+    let known: std::collections::HashSet<String> = clients
         .iter()
-        .chain(&entries.clients)
         .map(|c| c.name.as_str().to_ascii_lowercase())
         .collect();
+    let mut once = std::collections::HashSet::new();
     let refused: Vec<&str> = rule["devices"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(serde_json::Value::as_str)
         .filter(|d| !telltale_config::rule_device_known(&known, d))
+        .filter(|d| once.insert(d.to_ascii_lowercase()))
+        .take(HINTED_DEVICES)
         .collect();
     if refused.is_empty() {
         return refusal; // refused for another reason
     }
-    let mut hint = String::new();
+    let (mut full, mut plain) = (Vec::new(), Vec::new());
+    let (mut full_ends_plain, mut plain_ends_plain) = (false, false);
     for device in refused {
-        if let Some(says) = discovered_name_says(src, device) {
-            hint.push_str(&says);
-            hint.push(' ');
+        match device_hint(src, &clients, device) {
+            DeviceHint::Plain(says) => {
+                full.push(says.clone());
+                plain.push(says);
+            }
+            DeviceHint::Configured(says) => {
+                full.push(says);
+                plain_ends_plain = true;
+            }
+            DeviceHint::Discovered(says) => {
+                full.push(says);
+                (full_ends_plain, plain_ends_plain) = (true, true);
+            }
+            DeviceHint::Unknown => (full_ends_plain, plain_ends_plain) = (true, true),
         }
     }
-    hint.push_str(RULE_DEVICE_HINT);
-    refusal.hint(hint)
+    if full_ends_plain {
+        full.push(RULE_DEVICE_HINT.to_owned());
+    }
+    if plain_ends_plain {
+        plain.push(RULE_DEVICE_HINT.to_owned());
+    }
+    let (full, plain) = (full.join(" "), plain.join(" "));
+    if plain == full {
+        refusal.hint(full)
+    } else {
+        refusal.hint(full).plain_hint(plain)
+    }
 }
 
-/// A sentence naming the addresses `name` is the discovered name of (any case): this node's
-/// router, then its mDNS, then the other nodes' routers and mDNS, as the query log reads them.
-fn discovered_name_says(src: &Sources, name: &str) -> Option<String> {
-    /// How many addresses a sentence lists before "and N more".
-    const SHOWN: usize = 4;
+/// What the hint says about one refused `device`.
+fn device_hint(
+    src: &Sources,
+    clients: &[&telltale_config::ClientConfig],
+    device: &str,
+) -> DeviceHint {
+    if matches!(
+        telltale_config::MatchKey::parse(device),
+        Ok(telltale_config::MatchKey::Mac(_))
+    ) {
+        return DeviceHint::Plain(format!(
+            "`{device}` is a MAC address, and a rule can't name one. Name the device with that MAC in its match list (a `[[client]]` in the config file, or `PUT /api/v1/clients/{{name}}`), then use that name."
+        ));
+    }
+    // What the query log calls a pod: `namespace/kind/name`. Its address is not a good thing to
+    // name: it changes with every restart.
+    let mut parts = device.split('/');
+    if let (Some(ns), Some(kind), Some(name), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+        && !ns.is_empty()
+        && !kind.is_empty()
+        && !name.is_empty()
+    {
+        return DeviceHint::Plain(format!(
+            "`{device}` is a Kubernetes workload, and its pods' addresses change with every restart. A rule can be for the group an operator placed it in (click its name in the query log, then Add to group…), or, for a short time, for one pod's address."
+        ));
+    }
+    let found = discovered_addresses(src, device);
+    match found.len() {
+        0 => DeviceHint::Unknown,
+        1 => {
+            let Some((&ip, by)) = found.iter().next() else {
+                return DeviceHint::Unknown;
+            };
+            if let Some(named) = configured_device_at(clients, ip, &by.mac) {
+                let who = if by.router {
+                    format!("your router calls {ip}")
+                } else {
+                    format!("{ip} calls itself")
+                };
+                DeviceHint::Configured(format!(
+                    "`{device}` is what {who}, which is the device “{named}”: use its name."
+                ))
+            } else if by.router {
+                DeviceHint::Discovered(format!("`{device}` is what your router calls {ip}."))
+            } else {
+                DeviceHint::Discovered(format!("`{device}` is what {ip} calls itself."))
+            }
+        }
+        n => {
+            /// How many addresses a sentence lists before "and N more".
+            const SHOWN: usize = 4;
+            let mut list: Vec<String> = found.keys().take(SHOWN).map(ToString::to_string).collect();
+            if n > SHOWN {
+                list.push(format!("and {} more", n - SHOWN));
+            }
+            DeviceHint::Discovered(format!(
+                "`{device}` is the name of more than one device here ({}), so pick the address of the one you mean.",
+                list.join(", ")
+            ))
+        }
+    }
+}
+
+/// Who gave an address a name: a router (not the device itself over mDNS), and its MAC if known.
+#[derive(Debug, Clone)]
+struct NamedBy {
+    router: bool,
+    mac: String,
+}
+
+/// The addresses `name` is the discovered name of (any case): this node's router, then its mDNS,
+/// then the other nodes' routers and mDNS, as the query log reads them (the first table to know an
+/// address names it).
+fn discovered_addresses(
+    src: &Sources,
+    name: &str,
+) -> std::collections::BTreeMap<std::net::Ipv4Addr, NamedBy> {
     let routers = src.pipeline.router_leases.load();
     let mdns = src.pipeline.mdns_names.load();
     let peers = src.pipeline.peer_names.load();
-    // Address -> named by a router (not by the device itself over mDNS); the first table to know
-    // an address names it, as for the query log.
-    let mut found = std::collections::BTreeMap::<std::net::Ipv4Addr, bool>::new();
-    for (table, by_router) in [
+    let mut found = std::collections::BTreeMap::<std::net::Ipv4Addr, NamedBy>::new();
+    for (table, router) in [
         (&**routers, true),
         (&**mdns, false),
         (&peers.routers, true),
@@ -3936,30 +4056,42 @@ fn discovered_name_says(src: &Sources, name: &str) -> Option<String> {
                 .as_deref()
                 .is_some_and(|h| h.eq_ignore_ascii_case(name))
             {
-                found.entry(*ip).or_insert(by_router);
+                let by = found.entry(*ip).or_insert_with(|| NamedBy {
+                    router,
+                    mac: String::new(),
+                });
+                if by.mac.is_empty() {
+                    by.mac.clone_from(&lease.mac);
+                }
             }
         }
     }
-    match found.len() {
-        0 => None,
-        1 => found.iter().next().map(|(ip, by_router)| {
-            if *by_router {
-                format!("`{name}` is what your router calls {ip}.")
-            } else {
-                format!("`{name}` is what {ip} calls itself.")
-            }
-        }),
-        n => {
-            let mut list: Vec<String> = found.keys().take(SHOWN).map(ToString::to_string).collect();
-            if n > SHOWN {
-                list.push(format!("and {} more", n - SHOWN));
-            }
-            Some(format!(
-                "`{name}` is the name of more than one device here ({}), so pick the address of the one you mean.",
-                list.join(", ")
-            ))
-        }
-    }
+    found
+}
+
+/// The configured device that is exactly this address: it names the address, or the MAC the lease
+/// reports, in its `match` list. (A device that is a network, a CIDR, isn't "the device".)
+fn configured_device_at(
+    clients: &[&telltale_config::ClientConfig],
+    ip: std::net::Ipv4Addr,
+    mac: &str,
+) -> Option<String> {
+    use telltale_config::MatchKey;
+    let mac = MatchKey::parse(mac)
+        .ok()
+        .filter(|k| matches!(k, MatchKey::Mac(_)));
+    clients
+        .iter()
+        .find(|c| {
+            c.match_keys
+                .iter()
+                .any(|k| match MatchKey::parse(k.as_str()) {
+                    Ok(MatchKey::Ip(a)) => a == std::net::IpAddr::V4(ip),
+                    Ok(m @ MatchKey::Mac(_)) => mac.as_ref() == Some(&m),
+                    _ => false,
+                })
+        })
+        .map(|c| c.name.to_string())
 }
 
 /// AGT-002 impact of a quick rule: recent queries for its domain (or names under it) and a

@@ -93,7 +93,16 @@ pub(crate) async fn simulate(
 
 /// REQ: OBS-024, AGT-009 — what an agent sees of a simulation that couldn't download a list:
 /// that it couldn't, not why (the node would otherwise probe URLs on the agent's behalf).
-pub(crate) fn sanitize_problem(p: &crate::auth::Principal, e: Problem) -> Problem {
+pub(crate) fn sanitize_problem(p: &crate::auth::Principal, mut e: Problem) -> Problem {
+    // REQ: FLT-005, AGT-004 (GitHub issue #73) — a hint that says which address a device name
+    // belongs to is a lookup over every device, like reading the query log: an agent that may not
+    // simulate (no `querylog:read`, or limited to a group) gets the plain hint.
+    if p.agent.is_some()
+        && agent_may_simulate(p, None).is_err()
+        && let Some(plain) = e.plain_hint.take()
+    {
+        e.hint = Some(*plain);
+    }
     if p.agent.is_some() && e.detail.contains("to simulate it") {
         return Problem::new(
             e.code,

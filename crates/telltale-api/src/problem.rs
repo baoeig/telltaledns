@@ -287,6 +287,15 @@ pub struct Problem {
     /// Seconds to wait, sent as `Retry-After` (rate limits).
     #[serde(skip)]
     pub retry_after: Option<u64>,
+    /// REQ: FLT-005, AGT-004 (GitHub issue #73) — what `hint` says without anything it learned
+    /// from this node's own tables (which address a device name belongs to). Never sent: a caller
+    /// who may not read every device's queries (an agent token without `querylog:read`) gets this
+    /// in place of `hint` (`simulate_api::sanitize_problem`).
+    /// (Boxed: `Problem` is the error of most of the API, and a bigger one makes every `Result`
+    /// that carries it large, which clippy refuses past 128 bytes.)
+    #[serde(skip)]
+    #[allow(clippy::box_collection)] // a `Box<String>` is 8 bytes; a `String` is 24
+    pub plain_hint: Option<Box<String>>,
 }
 
 impl Problem {
@@ -300,7 +309,16 @@ impl Problem {
             hint: None,
             diff: None,
             retry_after: None,
+            plain_hint: None,
         }
+    }
+
+    /// Gives the hint a plain form for callers who may not see what it learned from this node's
+    /// tables (see [`Problem::plain_hint`]).
+    #[must_use]
+    pub fn plain_hint(mut self, plain: impl Into<String>) -> Self {
+        self.plain_hint = Some(Box::new(plain.into()));
+        self
     }
 
     /// Attaches the diff a `cluster_pinned` problem shows.
