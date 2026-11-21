@@ -30,6 +30,7 @@
     seenAs = '',
     workload = '',
     workloadFrom = '',
+    known,
     rule,
     onsaved,
     oncancel,
@@ -46,6 +47,8 @@
     workload?: string;
     /** Where the workload's group came from (`pod_label`, `namespace_label`, `map`, `default_group`, `none`). */
     workloadFrom?: string;
+    /** The configured devices, when the page has them already (the Why? drawer): the form doesn't ask again. */
+    known?: S['ClientInfo'][];
     rule?: S['RuleInfo'];
     onsaved?: (message: string) => void;
     oncancel?: () => void;
@@ -56,13 +59,22 @@
   // The check's note, which the Device field points at.
   const checkDomId = `${listId}-check`;
 
-  /** A group an operator put the workload in (not a network's group, not `default`, not none). */
+  /** A group an operator put the workload in. */
   const placedBy: Record<string, string> = {
     pod_label: 'set by a label on its pods',
     namespace_label: 'set by a label on its namespace',
     map: 'set by a rule',
   };
-  const placed = $derived(!!workload && !!group && workloadFrom in placedBy);
+  /** Where any other group of a workload comes from. */
+  const otherGroup: Record<string, string> = {
+    default_group: 'the default group for workloads',
+    none: "its network's group",
+  };
+  /** The words for a workload's group, whichever it is. */
+  const origin = (from: string) => (Object.hasOwn(placedBy, from) ? placedBy[from] : (otherGroup[from] ?? 'its group'));
+  // Only a group an operator placed the workload in starts a pod's rule, and never `default`: that is
+  // every device nothing else claims. (`group` is today's group of the workload, not the row's.)
+  const placed = $derived(!!workload && !!group && group !== 'default' && Object.hasOwn(placedBy, workloadFrom));
 
   let action = $state<'allow' | 'block'>('allow');
   let name = $state('');
@@ -96,7 +108,7 @@
   });
   $effect(() => {
     api.groups().then((g) => (groups = g.items)).catch(() => {});
-    api.clients().then((c) => (devices = c.items)).catch(() => {});
+    if (!known) api.clients().then((c) => (devices = c.items)).catch(() => {});
   });
 
   const durations = [
@@ -221,7 +233,7 @@
         aria-describedby={checkError ? checkDomId : undefined}
         required
       />
-      <datalist id={listId}>{#each devices as d (d.name)}<option value={d.name}></option>{/each}</datalist>
+      <datalist id={listId}>{#each known ?? devices as d (d.name)}<option value={d.name}></option>{/each}</datalist>
     {:else if scope === 'group'}
       <select aria-label="Group" bind:value={whichGroup} onchange={touch} required>
         {#each groups as g (g.name)}<option value={g.name}>{g.name}</option>{/each}
@@ -245,10 +257,12 @@
       <p class="muted small seen" data-testid="quick-rule-seen-as">
         {#if whichGroup === group}
           <bdi>{workload}</bdi> is a Kubernetes workload and its pods come and go, so this rule is for its group, <bdi>{whichGroup}</bdi>
-          ({placedBy[workloadFrom] ?? 'its group'}): every device in it. For one address instead, choose “a device”.
-        {:else}
+          ({origin(workloadFrom)}): every device in it. For one address instead, choose “a device”.
+        {:else if group}
           <bdi>{workload}</bdi> is a Kubernetes workload whose group is <bdi>{group}</bdi>. This rule is for <bdi>{whichGroup}</bdi>: every
           device in it.
+        {:else}
+          This rule is for <bdi>{whichGroup}</bdi>: every device in it.
         {/if}
       </p>
     {:else if scope === 'device' && workload && who.trim() === address}
