@@ -1427,7 +1427,7 @@ A quick rule allows or blocks a site, and everything under it, for one device, a
 - allow something a list blocks by mistake while you report it.
 
 **Making one:**
-- In the **query log**, press **Why?** on a query and use **Make a quick rule**. The site is filled in, and so is who it's for (see below): the device you've named if the address is one, otherwise the address itself. For a Kubernetes workload the rule starts for the workload's group, because its pods' addresses change.
+- In the **query log**, press **Why?** on a query and use **Make a quick rule**. The site is filled in, and so is who it's for (see below): the device you've named if the address is one, otherwise the address itself. For a Kubernetes workload the rule starts for its group only when an operator placed the workload in one (a pod or namespace label, or a rule: the form says which); a workload that falls to its network's group or `default` starts from the pod's address instead, because a rule for that group would cover every device in it. Put the workload in a group first (click its name, then **Add to group…**) to make a rule for all its pods.
 - On the **Quick rules** page (Filtering & DNS), which also lists what's in effect with a countdown, who made each rule, and Edit and Remove buttons.
 
 **Who a rule can be for:**
@@ -1435,7 +1435,7 @@ A quick rule allows or blocks a site, and everything under it, for one device, a
 - an **IP address**, or a **network** such as `192.168.1.0/24`;
 - a **group**, or everyone.
 
-The name the query log shows for a device nobody named here (for example `LGwebOSTV`) is what your router's DHCP or the device itself over mDNS calls it. It's good for recognizing the device, but it isn't a device TelltaleDNS knows, so a rule can't be for it: the form fills in the address and shows that name beside it, and the API refuses it (422) with a hint that names the address. The check doesn't depend on a node's own router or mDNS tables: every node gives the same answer.
+The name the query log shows for a device nobody named here (for example `LGwebOSTV`) is what your router's DHCP or the device itself over mDNS calls it. It's good for recognizing the device, but it isn't a device TelltaleDNS knows, so a rule can't be for it: the form fills in the address and shows that name beside it ("shown in the log as …"), and the API refuses it (422) with a hint that names the address, or, when that address is a device you named, says to use its name. A MAC address typed as the device gets words of its own: name the device with that MAC in its `match` list, then use the name. Whether a rule is accepted never depends on a node's own router or mDNS tables, so every node gives the same answer; only the hint reads them (an agent token without `querylog:read` gets the plain hint).
 
 A rule for an address stops matching when the address changes (a new lease, a phone's private Wi-Fi address). Two ways to keep it:
 - give the device a fixed address in your router (a DHCP reservation);
