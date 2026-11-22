@@ -742,7 +742,8 @@ async fn ds_signed(
     let cut = r
         .authorities
         .iter()
-        .any(|a| a.proof == Proof::Secure && denies_ds_at_cut(a, apex));
+        .any(|a| a.proof == Proof::Secure && denies_ds_at_cut(a, apex))
+        || denies_ds_by_opt_out(&r.authorities, apex);
     match (has_ds, other, verdict(&r)) {
         (true, _, Verdict::Secure) => Some(true),
         (false, false, Verdict::Secure) if cut => Some(false),
@@ -773,6 +774,68 @@ fn denies_ds_at_cut(rec: &Record, apex: &Name) -> bool {
                     })
         }
         _ => false,
+    }
+}
+
+/// REQ: DNS-011 (ADR-098) — an unsigned delegation in an NSEC3 Opt-Out zone (most of `.com`,
+/// `.org`, ...) has no NSEC3 of its own, so [`denies_ds_at_cut`] never matches it. RFC 5155
+/// §8.6: a DS NODATA without a matching NSEC3 still proves the delegation unsigned when the
+/// response carries the closest-encloser proof — a secure NSEC3 matching the parent (the
+/// closest encloser) — and the secure NSEC3 covering `apex` (the next closer name) has the
+/// Opt-Out bit. Safe for the same reason as the matching case: a signed delegation always
+/// has its own NSEC3 (RFC 5155 §7.1), so no Opt-Out span can cover one.
+///
+/// Seen with names below parked domains (e.g. `www.smithsonianmag.org`), whose servers answer
+/// an SOA for every name: hickory looks for a cut at `www`, fails, and the unsigned-zone proof
+/// has to rescue the answer from the opt-out denial at `smithsonianmag.org`.
+fn denies_ds_by_opt_out(authorities: &[Record], apex: &Name) -> bool {
+    use hickory_net::proto::dnssec::rdata::NSEC3;
+    if apex.is_root() {
+        return false;
+    }
+    let parent = apex.base_name();
+    let nsec3s: Vec<(&Record, &NSEC3)> = authorities
+        .iter()
+        .filter(|r| r.proof == Proof::Secure)
+        .filter_map(|r| match &r.data {
+            RData::DNSSEC(DNSSECRData::NSEC3(n)) => Some((r, n)),
+            _ => None,
+        })
+        .collect();
+    let owner_hash = |r: &Record| {
+        r.name
+            .iter()
+            .next()
+            .map(|l| String::from_utf8_lossy(l).to_ascii_lowercase())
+    };
+    let hashed = |n: &NSEC3, name: &Name| {
+        n.hash_algorithm()
+            .hash(n.salt(), name, n.iterations())
+            .ok()
+            .map(|h| base32hex(h.as_ref()))
+    };
+    let encloser = nsec3s
+        .iter()
+        .any(|(r, n)| hashed(n, &parent).is_some_and(|h| owner_hash(r).is_some_and(|o| o == h)));
+    let covered = nsec3s.iter().any(|(r, n)| {
+        n.opt_out()
+            && match (owner_hash(r), hashed(n, apex)) {
+                (Some(owner), Some(h)) => {
+                    hash_range_covers(&owner, &base32hex(n.next_hashed_owner_name()), &h)
+                }
+                _ => false,
+            }
+    });
+    encloser && covered
+}
+
+/// `h` lies strictly between an NSEC3's owner hash and its next hashed owner (base32hex keeps
+/// the byte order). The last NSEC3 of a chain wraps around to the first.
+fn hash_range_covers(owner: &str, next: &str, h: &str) -> bool {
+    if owner < next {
+        owner < h && h < next
+    } else {
+        h > owner || h < next
     }
 }
 
@@ -1056,6 +1119,102 @@ mod depth_tests {
         assert!(
             !denies_ds_at_cut(&nsec3(&wrong, &[NS, T_NSEC3]), &apex),
             "another name's hash"
+        );
+    }
+
+    /// REQ: DNS-011 (ADR-098) — RFC 5155 §8.6: in an Opt-Out zone, a DS NODATA with the
+    /// closest-encloser proof (parent matched) and an Opt-Out NSEC3 covering the apex proves an
+    /// unsigned delegation; every part of that proof is required.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn dns_011_ds_denial_by_nsec3_opt_out() {
+        use RecordType::{NS, NSEC3 as T_NSEC3, RRSIG, SOA};
+        use hickory_net::proto::dnssec::Nsec3HashAlgorithm;
+        use hickory_net::proto::dnssec::rdata::NSEC3;
+        let salt: &[u8] = b"";
+        let apex = Name::from_ascii("smithsonianmag.org.").unwrap();
+        let parent = Name::from_ascii("org.").unwrap();
+        let h = |n: &Name| Nsec3HashAlgorithm::SHA1.hash(salt, n, 0).unwrap();
+        let (apex_h, parent_h) = (h(&apex), h(&parent));
+        // A raw hash next to `apex`'s, one step either way (the span that covers it).
+        let step = |d: &[u8], up: bool| {
+            let mut v = d.to_vec();
+            for b in v.iter_mut().rev() {
+                if up {
+                    *b = b.wrapping_add(1);
+                    if *b != 0 {
+                        break;
+                    }
+                } else {
+                    *b = b.wrapping_sub(1);
+                    if *b != 0xff {
+                        break;
+                    }
+                }
+            }
+            v
+        };
+        let rec = |owner_hash: &[u8], next: Vec<u8>, opt_out: bool, types: &[RecordType], proof| {
+            let n = NSEC3::new(
+                Nsec3HashAlgorithm::SHA1,
+                opt_out,
+                0,
+                salt.to_vec(),
+                next,
+                types.iter().copied(),
+            );
+            let owner = Name::from_ascii(format!("{}.org.", base32hex(owner_hash))).unwrap();
+            let mut r = Record::from_rdata(owner, 300, RData::DNSSEC(DNSSECRData::NSEC3(n)));
+            r.proof = proof;
+            r
+        };
+        let below = step(apex_h.as_ref(), false);
+        let above = step(apex_h.as_ref(), true);
+        let encloser = rec(
+            parent_h.as_ref(),
+            vec![0; 20],
+            true,
+            &[NS, SOA, RRSIG, T_NSEC3],
+            Proof::Secure,
+        );
+        let covering = |opt_out, proof| rec(&below, above.clone(), opt_out, &[NS], proof);
+
+        assert!(
+            denies_ds_by_opt_out(&[encloser.clone(), covering(true, Proof::Secure)], &apex),
+            "closest encloser + opt-out span: an unsigned delegation"
+        );
+        assert!(
+            !denies_ds_by_opt_out(&[encloser.clone(), covering(false, Proof::Secure)], &apex),
+            "a covering NSEC3 without Opt-Out proves the name doesn't exist, not an unsigned cut"
+        );
+        assert!(
+            !denies_ds_by_opt_out(&[covering(true, Proof::Secure)], &apex),
+            "no closest-encloser proof"
+        );
+        assert!(
+            !denies_ds_by_opt_out(&[encloser.clone(), covering(true, Proof::Bogus)], &apex),
+            "the span must validate"
+        );
+        let elsewhere = rec(&above, step(&above, true), true, &[NS], Proof::Secure);
+        assert!(
+            !denies_ds_by_opt_out(&[encloser.clone(), elsewhere], &apex),
+            "an opt-out span that doesn't cover the apex"
+        );
+        assert!(
+            !denies_ds_by_opt_out(
+                &[encloser, covering(true, Proof::Secure)],
+                &Name::from_ascii("other.org.").unwrap()
+            ),
+            "another name's span"
+        );
+        // The chain's last NSEC3 wraps around to the first.
+        assert!(hash_range_covers("v0", "10", "v5"));
+        assert!(hash_range_covers("v0", "10", "05"));
+        assert!(!hash_range_covers("v0", "10", "50"));
+        assert!(hash_range_covers("10", "v0", "50"));
+        assert!(
+            !hash_range_covers("10", "v0", "10"),
+            "the owner itself isn't covered"
         );
     }
 

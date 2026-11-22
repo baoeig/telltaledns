@@ -1757,9 +1757,12 @@ negative_trust_anchors = ["corp.example"]   # internal zones that aren't signed
   answer is fetched again without validation and served without AD, in both modes.
 - **Unsigned zones:** before refusing an answer, TelltaleDNS proves whether its zone is
   simply unsigned (the parent's signed denial of the zone's DS, which must also show that
-  the name is a delegation: NS present, SOA and DS absent), and if so serves it as
-  insecure. This corrects the validation library's verdict on CNAME chains in unsigned zones
-  (`www.netflix.com`, `www.amazon.com`); proven zones are remembered for 15 minutes (ADR-098).
+  the name is a delegation: NS present, SOA and DS absent; or, in an NSEC3 Opt-Out zone
+  such as `.com` or `.org`, the closest-encloser proof with an Opt-Out record covering the
+  name), and if so serves it as insecure. This corrects the validation library's verdict on
+  CNAME chains in unsigned zones (`www.netflix.com`, `www.amazon.com`) and on names below
+  parked domains whose servers answer an SOA for every name (`www.smithsonianmag.org`);
+  proven zones are remembered for 15 minutes (ADR-098).
   The whole validation, proof included, ends within twice the query budget (4 s by default),
   at most 8 proofs run at once, and a name that couldn't be proven isn't tried again for a
   minute: when it can't be proven, the answer stays bogus (or, with no answer at all, stale
