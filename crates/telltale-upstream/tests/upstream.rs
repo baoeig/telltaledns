@@ -34,6 +34,13 @@ enum Fake {
     SlowName {
         delay: Duration,
     },
+    /// Answers A 192.0.2.<tag> after `base`, and names whose first label is `slow` after
+    /// `slow`: a public resolver with its own cached-answer latency.
+    Paced {
+        tag: u8,
+        base: Duration,
+        slow: Duration,
+    },
 }
 
 fn answer(req: &[u8], rc: u16, tag: u8, tc: bool) -> Option<Vec<u8>> {
@@ -105,6 +112,11 @@ async fn fake(kind: Fake) -> SocketAddr {
                             tokio::time::sleep(delay).await;
                         }
                         answer(&req, rcode::NOERROR, 1, false)
+                    }
+                    Fake::Paced { tag, base, slow } => {
+                        let slow_name = req.get(12..17) == Some(b"\x04slow".as_slice());
+                        tokio::time::sleep(if slow_name { slow } else { base }).await;
+                        answer(&req, rcode::NOERROR, tag, false)
                     }
                 };
                 if let Some(r) = resp {
@@ -409,6 +421,71 @@ async fn ups_006_last_healthy_member_waits_for_a_slow_answer() {
         ans.upstream_id, 2,
         "the first member was cut off at its adaptive timeout"
     );
+}
+
+/// REQ: UPS-005, UPS-006 (ADR-165) — `parallel` starts its members together, so none has
+/// anyone to hand over to: the faster one isn't cut off at its adaptive timeout on a name it has
+/// to resolve itself (its answer would be thrown away, the client would wait for the slower
+/// member, and a timeout would be counted against an upstream that was only resolving).
+#[tokio::test]
+async fn ups_005_parallel_members_each_wait_for_a_slow_answer() {
+    use telltale_upstream::health::Outcome;
+    let timeouts = |u: &Upstream| {
+        let s = u.health.snapshot();
+        Outcome::FAILURES
+            .iter()
+            .zip(s.failures_by_kind)
+            .find(|(x, _)| **x == Outcome::Timeout)
+            .map_or(0, |(_, n)| n)
+    };
+    // Like two public resolvers: the faster answers cached names at once and a cold one in
+    // 300 ms; the other answers 20 ms later and the cold name in 700 ms.
+    let fast = upstream_default(
+        1,
+        fake(Fake::Paced {
+            tag: 1,
+            base: Duration::ZERO,
+            slow: Duration::from_millis(300),
+        })
+        .await,
+    );
+    let slower = upstream_default(
+        2,
+        fake(Fake::Paced {
+            tag: 2,
+            base: Duration::from_millis(20),
+            slow: Duration::from_millis(700),
+        })
+        .await,
+    );
+    let g = Group::new(
+        "p",
+        vec![Arc::clone(&fast), Arc::clone(&slower)],
+        Strategy::Parallel { fanout: 2 },
+    );
+    warm(&g).await;
+    assert!(
+        fast.attempt_timeout() < Duration::from_millis(300),
+        "the adaptive timeout is below the cold answer: {:?}",
+        fast.attempt_timeout()
+    );
+    let before = timeouts(&fast);
+    let t = Instant::now();
+    let ans = g
+        .resolve(question("slow.example"), Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert_eq!(
+        ans.upstream_id, 1,
+        "the faster member's answer was used, not cut off at its adaptive timeout"
+    );
+    assert_eq!(answer_tag(&ans.bytes), 1);
+    assert!(
+        t.elapsed() < Duration::from_millis(600),
+        "did not wait for the slower member: {:?}",
+        t.elapsed()
+    );
+    assert_eq!(timeouts(&fast), before, "no timeout counted against it");
 }
 
 fn p99(mut v: Vec<Duration>) -> Duration {
