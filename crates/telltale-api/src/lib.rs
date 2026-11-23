@@ -1911,9 +1911,20 @@ async fn queries(
     responses((status = 200, body = Explanation, description = "The result."), (status = 400, body = Problem, description = "Invalid request: problem+json says which parameter and how to fix it.")))]
 async fn explain(
     State(b): State<Shared>,
+    ext: axum::http::Extensions,
     Query(p): Query<ExplainParams>,
 ) -> Result<Json<Explanation>, Problem> {
-    blocking(move || b.explain(&p)).await.map(Json)
+    // REQ: AGT-004, FLT-013 (ADR-183) — the kernel's neighbor table is read on every node, so the
+    // MAC of the client is known whether or not a device is named by its MAC: it goes only to a
+    // caller who may read the devices, or who gave it themselves.
+    let shows_macs =
+        auth::routes::principal(&ext).is_ok_and(|who| auth::agent::may_read_clients(&who));
+    let gave_mac = p.mac.is_some();
+    let mut e = blocking(move || b.explain(&p)).await?;
+    if !shows_macs && !gave_mac {
+        e.client.mac = None;
+    }
+    Ok(Json(e))
 }
 
 /// Filter lists and their download state.

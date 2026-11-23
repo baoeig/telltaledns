@@ -6712,3 +6712,8 @@ mod router_tests;
 #[cfg(test)]
 #[path = "api_backend_rule_device_tests.rs"]
 mod rule_device_tests;
+
+// REQ: AGT-004, FLT-013 (ADR-183) — explain's MAC is for those who may read the devices.
+#[cfg(test)]
+#[path = "api_backend_explain_mac_tests.rs"]
+mod explain_mac_tests;
