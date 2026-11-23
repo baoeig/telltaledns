@@ -12,6 +12,7 @@
 //! the naming falls back to (after configured device names and TelltaleDNS's own DHCP).
 //! Never on the DNS path; a router that's down keeps its last answer and is logged.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -533,22 +534,41 @@ fn unsure_addresses(
     stale: &HashSet<String>,
 ) -> HashSet<Ipv4Addr> {
     use crate::identify::oui::parse_mac;
-    // A MAC that doesn't parse counts as its own text, so it still disagrees with another MAC.
-    let mut macs_at: HashMap<Ipv4Addr, HashSet<Result<[u8; 6], String>>> = HashMap::new();
-    let mut addrs_of: HashMap<[u8; 6], HashSet<Ipv4Addr>> = HashMap::new();
+    let fresh = || order.iter().filter(|n| !stale.contains(n.as_str()));
+    // Per address: the first MAC reported (one that doesn't parse counts as its own text, so it
+    // still disagrees with another MAC) and whether a different one was reported too. Per MAC: its
+    // first address and whether it was reported at another. One small entry each, not a set.
+    let mut at: HashMap<Ipv4Addr, (Result<[u8; 6], String>, bool)> = HashMap::new();
+    let mut of: HashMap<[u8; 6], (Ipv4Addr, bool)> = HashMap::new();
     let mut unsure = HashSet::new();
-    for name in order.iter().filter(|n| !stale.contains(n.as_str())) {
+    for name in fresh() {
         let p = &parts[*name];
         let not_current: HashSet<[u8; 6]> =
             p.not_current.iter().filter_map(|m| parse_mac(m)).collect();
         for d in &p.now {
             let parsed = parse_mac(&d.0);
-            macs_at
-                .entry(d.1)
-                .or_default()
-                .insert(parsed.ok_or_else(|| d.0.trim().to_ascii_lowercase()));
+            let key = parsed.ok_or_else(|| d.0.trim().to_ascii_lowercase());
+            match at.entry(d.1) {
+                Entry::Occupied(mut e) => {
+                    if e.get().0 != key {
+                        e.get_mut().1 = true;
+                    }
+                }
+                Entry::Vacant(e) => {
+                    e.insert((key, false));
+                }
+            }
             if let Some(mac) = parsed {
-                addrs_of.entry(mac).or_default().insert(d.1);
+                match of.entry(mac) {
+                    Entry::Occupied(mut e) => {
+                        if e.get().0 != d.1 {
+                            e.get_mut().1 = true;
+                        }
+                    }
+                    Entry::Vacant(e) => {
+                        e.insert((d.1, false));
+                    }
+                }
                 if not_current.contains(&mac) {
                     unsure.insert(d.1);
                 }
@@ -556,15 +576,27 @@ fn unsure_addresses(
         }
     }
     unsure.extend(
-        macs_at
-            .into_iter()
-            .filter(|(_, macs)| macs.len() > 1)
-            .map(|(ip, _)| ip),
+        at.iter()
+            .filter(|(_, (_, differs))| *differs)
+            .map(|(ip, _)| *ip),
     );
-    for addrs in addrs_of.into_values().filter(|a| a.len() > 1) {
-        unsure.extend(addrs);
+    for name in fresh() {
+        for d in &parts[*name].now {
+            if parse_mac(&d.0).is_some_and(|mac| of.get(&mac).is_some_and(|(_, many)| *many)) {
+                unsure.insert(d.1);
+            }
+        }
     }
     unsure
+}
+
+/// REQ: FLT-006 (ADR-183) — how many of a router's rows carry a MAC that can't identify a device
+/// (empty, all zero, multicast, or in a form that isn't read): such an address is withheld from
+/// identification, and the device falls back to its address, by design.
+pub(crate) fn unusable_macs(seen: &Seen) -> usize {
+    seen.iter()
+        .filter(|d| crate::devices::usable_mac(&d.0).is_none())
+        .count()
 }
 
 /// The leases view from every router's last answer. REQ: T8.2 (ADR-166) — an offline client
@@ -637,6 +669,7 @@ pub(crate) async fn run(
     let mut failing: HashMap<String, bool> = HashMap::new();
     let mut held: HashMap<String, String> = HashMap::new();
     let mut warned_tls: HashSet<String> = HashSet::new();
+    let mut warned_junk: HashSet<String> = HashSet::new();
     // REQ: API-002, T8.2 (ADR-181) — F5: the routers the last sweep of key files saw.
     let mut swept_for: Option<Vec<RouterConfig>> = None;
     // The routers last read: one removed, or now pointing at another device (type, address,
@@ -748,6 +781,15 @@ pub(crate) async fn run(
                             && warned_tls.insert(r.name.to_string())
                         {
                             warn!(router = %r.name, "router integration: this router's certificate isn't checked (tls_insecure_skip_verify), and its client list now decides which named device an address is, so anything posing as it could give a device another's rules; set tls_ca (and tls_server_name), or `[clients] router_macs = false`");
+                        }
+                    }
+                    // REQ: FLT-006 (ADR-183) — rows whose MAC can't identify a device withhold
+                    // their address: said once per router, so the fallback can be explained.
+                    if feeds_identification(&sources) && !warned_junk.contains(r.name.as_str()) {
+                        let unusable = unusable_macs(&seen.now);
+                        if unusable > 0 {
+                            warned_junk.insert(r.name.to_string());
+                            info!(router = %r.name, rows = unusable, of = seen.now.len(), "router integration: some devices have a MAC address that can't identify a device (empty, all zero, multicast, or in a form TelltaleDNS doesn't read); those addresses are not recognized by MAC, by design: a device there is recognized by its address or network instead");
                         }
                     }
                     parts.insert(r.name.to_string(), seen);
@@ -1402,5 +1444,23 @@ mod tests {
             at(&view_of(&p, &["udm"]), [10, 0, 0, 5]),
             (Some("Desk".into()), true, false)
         );
+    }
+
+    /// REQ: FLT-006 (ADR-183) — a router's rows whose MAC can't identify a device (empty, all zero,
+    /// multicast, a form that isn't read) are counted, for the log line that says once per router
+    /// why those addresses fall back.
+    #[test]
+    fn flt_006_rows_whose_mac_cannot_identify_are_counted() {
+        let rows = vec![
+            dev("aa:bb:cc:00:00:01", [10, 0, 0, 5], "ok"),
+            dev("AA-BB-CC-00-00-02", [10, 0, 0, 6], "ok too"),
+            dev("", [10, 0, 0, 7], "empty"),
+            dev("00:00:00:00:00:00", [10, 0, 0, 8], "zero"),
+            dev("01:00:5e:00:00:01", [10, 0, 0, 9], "multicast"),
+            dev("aabb.ccdd.eeff", [10, 0, 0, 10], "dotted"),
+        ];
+        assert_eq!(unusable_macs(&rows), 4);
+        assert_eq!(unusable_macs(&rows[..2]), 0);
+        assert_eq!(unusable_macs(&Seen::new()), 0);
     }
 }

@@ -3544,8 +3544,30 @@ groups = ["default"]
         );
         assert_eq!(
             ads_from(&p, "10.0.0.80"),
+            rcode::REFUSED,
+            "the member puts the same MAC at .79 and .80, and this node's router at .79: a MAC at two addresses, wherever one of them is withheld"
+        );
+        assert_eq!(
+            (
+                p.neighbors.router_len(),
+                p.neighbors.peer_len(),
+                p.neighbors.unsure_len()
+            ),
+            (0, 0, 2),
+            "one tombstone and one shared address"
+        );
+        // With the member's binding for .80 alone, it is the member's.
+        fill_mac_table(
+            &p,
+            &[],
+            &[router_lease(79, "aa:bb:cc:dd:ee:09", true)],
+            &[(79, STRANGER_MAC), (80, TABLET_MAC)],
+        );
+        assert_eq!(ads_from(&p, "10.0.0.79"), rcode::REFUSED);
+        assert_eq!(
+            ads_from(&p, "10.0.0.80"),
             rcode::NXDOMAIN,
-            "an address this node has no doubt about is the member's (its binding for .79 never counted, so the MAC is at one address)"
+            "an address this node has no doubt about is the member's"
         );
     }
 

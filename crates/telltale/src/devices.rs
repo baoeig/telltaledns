@@ -45,7 +45,13 @@ pub(crate) fn eligible(l: &Lease) -> Option<[u8; 6]> {
     if l.offline || l.unsure {
         return None;
     }
-    let mac = crate::identify::oui::parse_mac(&l.mac)?;
+    usable_mac(&l.mac)
+}
+
+/// REQ: FLT-006 (ADR-183) — a MAC (as text) that can identify a device: it parses (`aa:bb:..` or
+/// `aa-bb-..`), isn't all zero and is unicast.
+pub(crate) fn usable_mac(mac: &str) -> Option<[u8; 6]> {
+    let mac = crate::identify::oui::parse_mac(mac)?;
     (mac != [0; 6] && mac[0] & 1 == 0).then_some(mac)
 }
 
@@ -95,14 +101,13 @@ pub(crate) fn own(pipeline: &crate::pipeline::Pipeline) -> Result<Vec<u8>, Strin
 }
 
 /// REQ: FLT-006, CLU-002 (ADR-183) — what the other full members' routers say, as this node uses it
-/// to identify devices: an address to a MAC they agree on, the addresses any of them marks
-/// `unsure` or that two of them disagree on (tombstones: no lower source fills them), and how many
-/// that is.
+/// to identify devices: an address to a MAC they agree on, and the addresses any of them withholds
+/// (a connected lease that is `unsure` or whose MAC can't identify) or that two of them disagree on
+/// (tombstones: no lower source fills them).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PeerMacs {
     pub(crate) macs: HashMap<Ipv4Addr, [u8; 6]>,
     pub(crate) tombstones: HashSet<Ipv4Addr>,
-    pub(crate) dropped: usize,
 }
 
 /// Each full member's last vetted answer, as the bindings it gave (an address to `Some(mac)`, or
@@ -111,8 +116,10 @@ pub(crate) type MemberBindings = HashMap<String, (HashMap<Ipv4Addr, Option<[u8; 
 
 /// REQ: FLT-006, CLU-002, CLU-010 (ADR-183) — keeps, per member, the bindings of its last answer
 /// at `now`: only from answers that carry `vetted` and come from a full member (`full`: in the
-/// registry and not ephemeral), as `eligible` gives them, with `None` for a connected `unsure`
-/// lease (offline ones are skipped). Then forgets every member that is no longer full or hasn't
+/// registry and not ephemeral), as `eligible` gives them, with `None` for any other connected
+/// lease (`unsure`, or a MAC that can't identify: empty, all zero, multicast or unparsable): such a
+/// lease withholds its address, as this node's own does. Offline ones are skipped. Then forgets
+/// every member that is no longer full or hasn't
 /// answered for more than [`PEER_MACS_FOR_S`] seconds. Saturating: a time in the future is not
 /// old.
 pub(crate) fn keep_answers(
@@ -128,15 +135,8 @@ pub(crate) fn keep_answers(
         let bindings = names
             .routers
             .iter()
-            .filter_map(|(ip, l)| {
-                if l.offline {
-                    None
-                } else if l.unsure {
-                    Some((*ip, None))
-                } else {
-                    eligible(l).map(|mac| (*ip, Some(mac)))
-                }
-            })
+            .filter(|(_, l)| !l.offline)
+            .map(|(ip, l)| (*ip, eligible(l)))
             .collect();
         last.insert(peer.clone(), (bindings, now));
     }
@@ -144,8 +144,8 @@ pub(crate) fn keep_answers(
 }
 
 /// REQ: FLT-006, CLU-002 (ADR-183) — the bindings the members agree on: an address that any
-/// member gives as `None`, or that two members give different MACs for, is a tombstone and is
-/// counted in `dropped`. The result doesn't depend on the order of the members.
+/// member gives as `None`, or that two members give different MACs for, is a tombstone. The result
+/// doesn't depend on the order of the members.
 pub(crate) fn peer_macs(last: &MemberBindings) -> PeerMacs {
     let mut agreed: HashMap<Ipv4Addr, [u8; 6]> = HashMap::new();
     let mut tombstones: HashSet<Ipv4Addr> = HashSet::new();
@@ -168,7 +168,6 @@ pub(crate) fn peer_macs(last: &MemberBindings) -> PeerMacs {
     agreed.retain(|ip, _| !tombstones.contains(ip));
     PeerMacs {
         macs: agreed,
-        dropped: tombstones.len(),
         tombstones,
     }
 }
@@ -181,59 +180,75 @@ pub(crate) struct Bindings {
     pub(crate) own: HashMap<Ipv4Addr, [u8; 6]>,
     /// The members' bindings, for addresses this node has no binding or tombstone for.
     pub(crate) peer: HashMap<Ipv4Addr, [u8; 6]>,
-    /// Addresses no router or member entry fills: this node's `unsure` ones and the members'.
+    /// Addresses no router or member entry fills, and that this node has no binding of its own
+    /// for: this node's connected leases that are `unsure` or whose MAC can't identify, and the
+    /// members' (a tombstone a member gives for an address this node binds itself is not one).
     pub(crate) tombstones: HashSet<Ipv4Addr>,
-    /// The addresses of a MAC that sits at two or more addresses, with that MAC: it identifies
-    /// a device at none of them.
+    /// The addresses of a MAC that sits at two or more addresses (counted over every binding and
+    /// withheld lease, tombstoned addresses included), with that MAC: it identifies a device at
+    /// none of them. Not also tombstones.
     pub(crate) shared: HashMap<Ipv4Addr, [u8; 6]>,
-    /// How many bindings were withheld: this node's `unsure` leases, the addresses the members
-    /// dropped, and the shared ones (the metric `telltale_router_macs_unsure`).
+    /// How many addresses are withheld, each once: the tombstones and the shared addresses (the
+    /// metric `telltale_router_macs_unsure`).
     pub(crate) unsure: usize,
 }
 
 /// REQ: FLT-006, CLU-002 (ADR-183) — what this node's routers (`own`) and the other full members'
-/// (`peers`) say about which MAC is at an address, as far as identifying a device goes:
-/// 1. this node's sure bindings (`eligible`); a connected `unsure` lease is a tombstone;
-/// 2. the members' bindings, for addresses that are neither this node's binding nor a tombstone
-///    (this node's or the members');
-/// 3. then every MAC at two or more addresses over both moves its addresses to `shared`.
+/// (`peers`) say about which MAC is at an address, as far as identifying a device goes. The table
+/// and `recognize()` (the identity's `recognition`) both read this one function's answer.
+/// 1. this node's connected leases: a sure one binds its address (`eligible`); any other (`unsure`,
+///    or a MAC that can't identify) withholds it (a tombstone); offline ones are skipped;
+/// 2. the members' tombstones join, except for addresses this node binds itself; the members'
+///    bindings fill the addresses that are neither this node's binding nor a tombstone;
+/// 3. every MAC that is at two or more addresses, counted over this node's bindings and `unsure`
+///    leases and every member binding (tombstoned addresses included, so a MAC-sharing extender
+///    can't hide behind an address one node withholds), moves its addresses from the bindings to
+///    `shared`;
+/// 4. `unsure` is the number of tombstones plus shared addresses.
 pub(crate) fn router_bindings(own: &Leases, peers: &PeerMacs) -> Bindings {
     let mut b = Bindings::default();
-    let mut own_unsure = 0;
+    // Per MAC: its first address, and whether it has been seen at another.
+    let mut at: HashMap<[u8; 6], (Ipv4Addr, bool)> = HashMap::new();
+    let mut count = |ip: Ipv4Addr, mac: [u8; 6]| {
+        at.entry(mac)
+            .and_modify(|(first, many)| *many |= *first != ip)
+            .or_insert((ip, false));
+    };
     for (ip, l) in own {
         if l.offline {
             continue;
         }
-        if l.unsure {
-            b.tombstones.insert(*ip);
-            own_unsure += 1;
-        } else if let Some(mac) = eligible(l) {
+        if let Some(mac) = eligible(l) {
             b.own.insert(*ip, mac);
+            count(*ip, mac);
+        } else {
+            b.tombstones.insert(*ip);
+            if let Some(mac) = usable_mac(&l.mac) {
+                count(*ip, mac);
+            }
         }
     }
+    for (ip, mac) in &peers.macs {
+        count(*ip, *mac);
+    }
     b.tombstones.extend(peers.tombstones.iter().copied());
+    b.tombstones.retain(|ip| !b.own.contains_key(ip));
     for (ip, mac) in &peers.macs {
         if !b.own.contains_key(ip) && !b.tombstones.contains(ip) {
             b.peer.insert(*ip, *mac);
         }
     }
-    let mut at: HashMap<[u8; 6], usize> = HashMap::new();
-    for mac in b.own.values().chain(b.peer.values()) {
-        *at.entry(*mac).or_default() += 1;
-    }
     let mut shared = HashMap::new();
-    let mut sure = |map: &mut HashMap<Ipv4Addr, [u8; 6]>| {
+    for map in [&mut b.own, &mut b.peer] {
         map.retain(|ip, mac| {
-            let alone = at.get(mac).is_none_or(|n| *n < 2);
-            if !alone {
+            let many = at.get(mac).is_some_and(|(_, many)| *many);
+            if many {
                 shared.insert(*ip, *mac);
             }
-            alone
+            !many
         });
-    };
-    sure(&mut b.own);
-    sure(&mut b.peer);
-    b.unsure = own_unsure + peers.dropped + shared.len();
+    }
+    b.unsure = b.tombstones.len() + shared.len();
     b.shared = shared;
     b
 }
@@ -581,7 +596,6 @@ mod tests {
         let m = peer_macs(&last);
         assert_eq!(m.macs, HashMap::from([(at(5), MAC_A), (at(6), MAC_B)]));
         assert!(m.tombstones.is_empty());
-        assert_eq!(m.dropped, 0);
 
         let mut n = vetted(&[bound(9, "aa:bb:cc:00:00:05", false)]);
         n.mdns = names(&[], &[bound(10, "aa:bb:cc:00:00:06", false)]).mdns;
@@ -602,7 +616,11 @@ mod tests {
             m.macs,
             HashMap::from([(at(9), [0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x05])])
         );
-        assert!(m.tombstones.is_empty(), "no binding is not a tombstone");
+        assert_eq!(
+            m.tombstones,
+            HashSet::from([at(12), at(13), at(14)]),
+            "a connected lease whose MAC can't identify withholds its address; an offline one doesn't"
+        );
     }
 
     // REQ: FLT-006, CLU-002 (ADR-183) — a member that isn't sure of an address (its lease is
@@ -632,7 +650,6 @@ mod tests {
         let m = peer_macs(&last);
         assert!(!m.macs.contains_key(&at(5)), "{m:?}");
         assert_eq!(m.tombstones, HashSet::from([at(5)]));
-        assert_eq!(m.dropped, 1);
         assert_eq!(m.macs[&at(6)], MAC_B);
         assert_eq!(m.macs[&at(7)], MAC_A);
 
@@ -649,7 +666,7 @@ mod tests {
         );
         let m = peer_macs(&alone);
         assert!(m.macs.is_empty());
-        assert_eq!((m.tombstones, m.dropped), (HashSet::from([at(9)]), 1));
+        assert_eq!(m.tombstones, HashSet::from([at(9)]));
     }
 
     // REQ: FLT-006, CLU-002 (ADR-183) — two members that give an address different MACs both
@@ -687,7 +704,6 @@ mod tests {
         let m = &results[0];
         assert!(!m.macs.contains_key(&at(5)));
         assert_eq!(m.tombstones, HashSet::from([at(5)]));
-        assert_eq!(m.dropped, 1);
         assert_eq!(
             m.macs[&at(6)],
             MAC_A,
@@ -865,5 +881,148 @@ mod tests {
         assert_eq!(next_wait(answered, 5), Duration::from_secs(5));
         answered |= ask(vec![("primary", vetted(&[leased(5)]))], Some("primary"));
         assert_eq!(next_wait(answered, 10), Duration::from_secs(60));
+    }
+
+    fn leases_of(l: &[Lease]) -> Leases {
+        l.iter().map(|l| (l.ip, l.clone())).collect()
+    }
+
+    /// What the members agree on, as the task makes it from their answers.
+    fn peers_of(answers: Vec<(&str, Names)>) -> PeerMacs {
+        let mut last = MemberBindings::new();
+        keep_answers(&mut last, &from_nodes(answers), 10, |_| true);
+        peer_macs(&last)
+    }
+
+    // REQ: FLT-006 (ADR-183) — an address this node binds itself (its router is sure) isn't withheld
+    // because a member isn't sure of it: this node's binding wins, so it is no tombstone, and it
+    // isn't counted as withheld. (`recognize()` and the table share `router_bindings`, so they
+    // can't disagree about it.)
+    #[test]
+    fn flt_006_a_binding_this_node_has_is_not_withheld_by_a_members_tombstone() {
+        let own = leases_of(&[bound(5, "aa:bb:cc:00:00:01", false)]);
+        let peers = peers_of(vec![("pi", vetted(&[bound(5, "aa:bb:cc:00:00:02", true)]))]);
+        let b = router_bindings(&own, &peers);
+        assert_eq!(b.own, HashMap::from([(at(5), MAC_A)]));
+        assert!(b.tombstones.is_empty(), "{b:?}");
+        assert_eq!(b.unsure, 0, "nothing is withheld");
+        assert!(b.peer.is_empty() && b.shared.is_empty());
+    }
+
+    // REQ: FLT-006 (ADR-183) — an address is counted as withheld once: this node's own `unsure`
+    // lease and a member's tombstone for the same address are one address, and `unsure` is the
+    // number of tombstones plus the shared addresses.
+    #[test]
+    fn flt_006_a_withheld_address_is_counted_once() {
+        let own = leases_of(&[
+            bound(5, "aa:bb:cc:00:00:01", true),
+            bound(6, "aa:bb:cc:00:00:02", false),
+        ]);
+        let peers = peers_of(vec![
+            (
+                "pi",
+                vetted(&[
+                    bound(5, "aa:bb:cc:00:00:01", true),
+                    bound(7, "aa:bb:cc:00:00:03", true),
+                ]),
+            ),
+            ("k8s", vetted(&[bound(8, "aa:bb:cc:00:00:04", false)])),
+        ]);
+        let b = router_bindings(&own, &peers);
+        assert_eq!(b.tombstones, HashSet::from([at(5), at(7)]));
+        assert_eq!(b.own, HashMap::from([(at(6), MAC_B)]));
+        assert_eq!(
+            b.peer,
+            HashMap::from([(at(8), [0xaa, 0xbb, 0xcc, 0, 0, 0x04])])
+        );
+        assert_eq!(b.unsure, 2, "{b:?}");
+    }
+
+    // REQ: FLT-006 (ADR-183) — the shared-MAC rule counts a MAC over everything that says where it
+    // is, the addresses this node withholds included: this node's router is unsure about X (two MACs
+    // there, one of them m), and a member reports m at Y (a MAC-sharing extender does this): m is at
+    // two addresses, so Y identifies nobody, and both are counted.
+    #[test]
+    fn flt_006_a_mac_at_a_withheld_address_still_counts_toward_sharing() {
+        let own = leases_of(&[bound(5, "aa:bb:cc:00:00:01", true)]);
+        let peers = peers_of(vec![(
+            "pi",
+            vetted(&[bound(6, "aa:bb:cc:00:00:01", false)]),
+        )]);
+        let b = router_bindings(&own, &peers);
+        assert!(
+            b.peer.is_empty(),
+            "m is at X and Y: Y doesn't identify: {b:?}"
+        );
+        assert_eq!(b.shared, HashMap::from([(at(6), MAC_A)]));
+        assert_eq!(b.tombstones, HashSet::from([at(5)]));
+        assert_eq!(b.unsure, 2);
+        // A member's own binding at the withheld address counts as well.
+        let peers = peers_of(vec![
+            ("pi", vetted(&[bound(5, "aa:bb:cc:00:00:01", false)])),
+            ("k8s", vetted(&[bound(6, "aa:bb:cc:00:00:01", false)])),
+        ]);
+        let b = router_bindings(&leases_of(&[bound(5, "aa:bb:cc:00:00:09", true)]), &peers);
+        assert!(b.peer.is_empty() && b.tombstones.contains(&at(5)), "{b:?}");
+        assert_eq!(b.shared, HashMap::from([(at(6), MAC_A)]));
+    }
+
+    // REQ: FLT-006, CLU-002 (ADR-183) — a connected lease whose MAC can't identify a device (empty,
+    // all zero, multicast, in a form `parse_mac` rejects) withholds its address, this node's and a
+    // member's: a member's binding for it doesn't fill it, which is the same fail-closed rule as for
+    // an `unsure` lease (two sites reusing a range). An offline lease with such a MAC doesn't.
+    #[test]
+    fn flt_006_a_connected_lease_that_cannot_identify_withholds_its_address() {
+        let member = |junk: &str| {
+            peers_of(vec![
+                (
+                    "pi",
+                    vetted(&[
+                        bound(5, "aa:bb:cc:00:00:01", false),
+                        bound(6, "aa:bb:cc:00:00:02", false),
+                    ]),
+                ),
+                ("k8s", vetted(&[bound(5, junk, false)])),
+            ])
+        };
+        for junk in [
+            "",
+            "00:00:00:00:00:00",
+            "01:00:5e:00:00:01",
+            "aabb.ccdd.eeff",
+            "zz:zz:zz:zz:zz:zz",
+        ] {
+            // This node's own router has the junk MAC; a member binds the address.
+            let own = leases_of(&[bound(5, junk, false)]);
+            let peers = peers_of(vec![(
+                "pi",
+                vetted(&[
+                    bound(5, "aa:bb:cc:00:00:01", false),
+                    bound(6, "aa:bb:cc:00:00:02", false),
+                ]),
+            )]);
+            let b = router_bindings(&own, &peers);
+            assert!(b.tombstones.contains(&at(5)), "own `{junk}`: {b:?}");
+            assert!(!b.peer.contains_key(&at(5)), "own `{junk}`");
+            assert_eq!(b.peer[&at(6)], MAC_B);
+            assert_eq!(b.unsure, 1, "own `{junk}`");
+            // A member's router has the junk MAC, another member binds it.
+            let m = member(junk);
+            assert!(m.tombstones.contains(&at(5)), "member `{junk}`: {m:?}");
+            assert!(!m.macs.contains_key(&at(5)), "member `{junk}`");
+            assert_eq!(m.macs[&at(6)], MAC_B);
+        }
+        // Offline: skipped, as before: the member's binding fills the address.
+        let off = Lease {
+            offline: true,
+            ..bound(5, "", false)
+        };
+        let peers = peers_of(vec![(
+            "pi",
+            vetted(&[bound(5, "aa:bb:cc:00:00:01", false)]),
+        )]);
+        let b = router_bindings(&leases_of(&[off]), &peers);
+        assert_eq!(b.peer, HashMap::from([(at(5), MAC_A)]));
+        assert!(b.tombstones.is_empty());
     }
 }
