@@ -1756,13 +1756,21 @@ negative_trust_anchors = ["corp.example"]   # internal zones that aren't signed
 - **Indeterminate** (validation couldn't finish, such as the validator's depth limit): the
   answer is fetched again without validation and served without AD, in both modes.
 - **Unsigned zones:** before refusing an answer, TelltaleDNS proves whether its zone is
-  simply unsigned (the parent's signed denial of the zone's DS, which must also show that
-  the name is a delegation: NS present, SOA and DS absent; or, in an NSEC3 Opt-Out zone
-  such as `.com` or `.org`, the closest-encloser proof with an Opt-Out record covering the
-  name), and if so serves it as insecure. This corrects the validation library's verdict on
-  CNAME chains in unsigned zones (`www.netflix.com`, `www.amazon.com`) and on names below
-  parked domains whose servers answer an SOA for every name (`www.smithsonianmag.org`);
-  proven zones are remembered for 15 minutes (ADR-098).
+  simply unsigned, and if so serves it as insecure. The proof is the parent's signed denial
+  of the zone's DS, made only of records of the parent zone (or of an unsigned top-level
+  domain), which must also show that the name is a delegation: the record at the name lists
+  NS and neither SOA nor DS; or, in an NSEC3 Opt-Out zone such as `.com` or `.org`, the
+  record of the name's parent (which must not itself be a delegation) and an Opt-Out record
+  covering the name. This corrects the validation library's verdict on CNAME chains in
+  unsigned zones (`www.netflix.com`, `www.amazon.com`) and on names below parked domains
+  whose servers answer an SOA for every name (`www.smithsonianmag.org`). From v0.3.0 to
+  v0.7.0 the proof didn't succeed under NSEC3 Opt-Out parents. Proven zones are remembered
+  per upstream group, as long as the proof's records' TTL allows and at most 15 minutes
+  (ADR-098, ADR-184). A name queried while TelltaleDNS hasn't cached its parent zone's keys
+  yet (right after a start, say) can still fail for up to a minute, and works again after
+  that minute; and
+  a parent zone whose NSEC3 records use more than 100 iterations can't prove its unsigned
+  zones.
   The whole validation, proof included, ends within twice the query budget (4 s by default),
   at most 8 proofs run at once, and a name that couldn't be proven isn't tried again for a
   minute: when it can't be proven, the answer stays bogus (or, with no answer at all, stale

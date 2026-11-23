@@ -28,7 +28,7 @@ use std::time::Duration;
 use futures_util::StreamExt as _;
 use futures_util::stream::{self, Stream};
 use hickory_net::dnssec::DnssecDnsHandle;
-use hickory_net::proto::dnssec::rdata::DNSSECRData;
+use hickory_net::proto::dnssec::rdata::{DNSSECRData, NSEC3};
 use hickory_net::proto::dnssec::{Proof, TrustAnchors};
 use hickory_net::proto::op::{
     DnsRequest, DnsRequestOptions, DnsResponse, Edns, Message, OpCode, Query, ResponseCode,
@@ -152,9 +152,11 @@ pub struct Validator {
     nsec: Mutex<HashMap<usize, crate::nsec::Ranges>>,
     /// Use them (RFC 8198; `[dnssec] aggressive_nsec`).
     aggressive: bool,
-    /// REQ: DNS-011 (T10.9, ADR-098) — zones proven unsigned (a validated denial of their DS
-    /// at the parent), lowercase without the trailing dot, until when the proof is trusted.
-    insecure: Mutex<HashMap<String, std::time::Instant>>,
+    /// REQ: DNS-011 (T10.9, ADR-098, ADR-184) — zones proven unsigned (a validated denial of
+    /// their DS at the parent), by upstream group (its address) and zone (lowercase, without
+    /// the trailing dot), until when the proof is trusted: the smallest TTL of the records that
+    /// proved it, at most `INSECURE_FOR`.
+    insecure: Mutex<HashMap<(usize, String), std::time::Instant>>,
     /// REQ: DNS-011, NFR-004 (review 03-05) — bounds on the unsigned-zone proof.
     proofs: ProofGate,
     pub stats: Arc<Stats>,
@@ -289,7 +291,7 @@ impl Validator {
         // REQ: DNS-011 (T10.9) — a name in a zone already proven unsigned isn't validated again
         // (hickory can loop on some of them); the pipeline fetches it unvalidated.
         let qkey = zone_key(&name);
-        if self.known_insecure(&qkey) {
+        if self.known_insecure(group_key, &qkey) {
             self.stats.count(Verdict::Insecure);
             return Ok(insecure_unfetched());
         }
@@ -435,7 +437,8 @@ pub fn bogus_reason(msg: &[u8], now: u32) -> u16 {
 
 /// How many zone levels the unsigned-zone check looks at below the top-level domain.
 const MAX_ZONE_LEVELS: usize = 6;
-/// How long a proof that a zone is unsigned is trusted.
+/// How long a proof that a zone is unsigned is trusted at most (less when the TTLs of the
+/// records that proved it are shorter).
 const INSECURE_FOR: Duration = Duration::from_mins(15);
 /// Zones remembered as unsigned (the map is cleared beyond this).
 const MAX_INSECURE_ZONES: usize = 4096;
@@ -585,21 +588,50 @@ impl Validator {
         true
     }
 
-    /// REQ: DNS-011 (T10.9) — `name` is in a zone already proven unsigned.
-    fn known_insecure(&self, name: &str) -> bool {
-        let now = std::time::Instant::now();
-        let zones = self.insecure.lock();
-        zone_candidates(name)
-            .iter()
-            .any(|z| zones.get(z).is_some_and(|until| *until > now))
+    /// REQ: DNS-011 (T10.9, ADR-184) — `name` is in a zone already proven unsigned through the
+    /// upstream group at address `group`.
+    fn known_insecure(&self, group: usize, name: &str) -> bool {
+        self.known_insecure_at(group, name, std::time::Instant::now())
     }
 
-    /// REQ: DNS-011 (T10.9, ADR-098) — whether `name` is in an unsigned zone, proven the way a
-    /// resolver proves it: walking down from the top, the first zone apex whose DS the parent
-    /// validly denies (secure NSEC, or NSEC3 opt-out, which validates as insecure) is unsigned,
-    /// and so is everything below it. Whether a name is an apex (it has its own SOA) comes from
-    /// an ordinary query; that's safe because the DS denial is what's trusted, and a signed
-    /// zone's DS can't be denied validly. Anything that can't be proven: `false`.
+    /// [`Self::known_insecure`] at `now`.
+    fn known_insecure_at(&self, group: usize, name: &str, now: std::time::Instant) -> bool {
+        let zones = self.insecure.lock();
+        zone_candidates(name)
+            .into_iter()
+            .any(|z| zones.get(&(group, z)).is_some_and(|until| *until > now))
+    }
+
+    /// REQ: DNS-011 (T10.9, ADR-184) — `zone` was proven unsigned through the upstream group at
+    /// address `group`, by records that hold for `ttl`: names under it, through that group,
+    /// aren't validated again until then (`INSECURE_FOR` at most).
+    fn remember_insecure(&self, group: usize, zone: String, ttl: Duration) {
+        self.remember_insecure_at(group, zone, ttl, std::time::Instant::now());
+    }
+
+    /// [`Self::remember_insecure`] at `now`.
+    fn remember_insecure_at(
+        &self,
+        group: usize,
+        zone: String,
+        ttl: Duration,
+        now: std::time::Instant,
+    ) {
+        let mut zones = self.insecure.lock();
+        if zones.len() >= MAX_INSECURE_ZONES {
+            zones.clear();
+        }
+        zones.insert((group, zone), now + ttl.min(INSECURE_FOR));
+    }
+
+    /// REQ: DNS-011 (T10.9, ADR-098, ADR-184) — whether `name` is in an unsigned zone, proven
+    /// the way a resolver proves it: walking down from the top, the first zone apex whose DS
+    /// the parent validly denies, with records of the parent zone that show a delegation there
+    /// ([`ds_denial_verdict`]: its NSEC or NSEC3 at the name, or an NSEC3 Opt-Out span below
+    /// a closest encloser that isn't a delegation), is unsigned, and so is everything below
+    /// it. Whether a name is an apex (it has its own SOA) comes from an ordinary query, only
+    /// to skip names that aren't: the DS denial is what's trusted. Anything that can't be
+    /// proven: `false`.
     ///
     /// REQ: NFR-004 (review 03-05) — bounded by `deadline` (what is left of the validation's
     /// two query budgets, not a fresh budget per step), by a handful of concurrent proofs,
@@ -612,7 +644,7 @@ impl Validator {
         budget: Duration,
         deadline: std::time::Instant,
     ) -> bool {
-        if self.known_insecure(name) {
+        if self.known_insecure(Arc::as_ptr(group) as usize, name) {
             return true;
         }
         let Some(_slot) = self.proofs.enter(name) else {
@@ -661,13 +693,9 @@ impl Validator {
             let ds = ds_signed(handle, &apex, budget.min(left(deadline))).await;
             tracing::debug!(%zone, ?ds, "DNSSEC: unsigned-zone proof: DS");
             match ds {
-                Some(true) => {}
-                Some(false) => {
-                    let mut zones = self.insecure.lock();
-                    if zones.len() >= MAX_INSECURE_ZONES {
-                        zones.clear();
-                    }
-                    zones.insert(zone, std::time::Instant::now() + INSECURE_FOR);
+                Some((true, _)) => {}
+                Some((false, ttl)) => {
+                    self.remember_insecure(Arc::as_ptr(group) as usize, zone, ttl);
                     return true;
                 }
                 None => return false,
@@ -701,137 +729,250 @@ async fn is_apex(plain: &GroupHandle, apex: &Name, budget: Duration) -> bool {
 }
 
 /// The validated DS answer for `apex`: `Some(true)` signed, `Some(false)` validly denied
-/// (unsigned), `None` unknown.
+/// (unsigned), `None` unknown; with how long the answer's records hold ([`proof_ttl`]).
 async fn ds_signed(
     handle: &DnssecDnsHandle<GroupHandle>,
     apex: &Name,
     budget: Duration,
-) -> Option<bool> {
+) -> Option<(bool, Duration)> {
     let mut s = handle.send(request(apex, RecordType::DS));
-    let r = match tokio::time::timeout(budget, s.next()).await {
-        Ok(Some(Ok(r))) => r,
-        // hickory returns a negative answer whose proof isn't secure as an error carrying
-        // the proof: for a DS, `Insecure` is NSEC3 opt-out (an unsigned delegation; a signed
-        // one needs its own NSEC3 record, so an opt-out span can't cover it).
+    match tokio::time::timeout(budget, s.next()).await {
+        Ok(Some(Ok(r))) => {
+            tracing::debug!(%apex, verdict = ?verdict(&r), answers = r.answers.len(), "DNSSEC: unsigned-zone proof: DS response");
+            ds_denial_verdict(DsAnswer::Response(&r), apex).map(|signed| (signed, proof_ttl(&r)))
+        }
         Ok(Some(Err(NetError::Dns(hickory_net::DnsError::Nsec {
             proof, response, ..
         })))) => {
-            let has_ds = response
-                .answers
-                .iter()
-                .any(|a| a.record_type() == RecordType::DS);
-            tracing::debug!(%apex, ?proof, has_ds, "DNSSEC: unsigned-zone proof: DS denial");
-            return (!has_ds && matches!(proof, Proof::Secure | Proof::Insecure)).then_some(false);
+            tracing::debug!(%apex, ?proof, "DNSSEC: unsigned-zone proof: DS denial");
+            ds_denial_verdict(
+                DsAnswer::Denial {
+                    proof,
+                    response: &response,
+                },
+                apex,
+            )
+            .map(|signed| (signed, proof_ttl(&response)))
         }
         other => {
             tracing::debug!(%apex, ?other, "DNSSEC: unsigned-zone proof: no DS answer");
+            None
+        }
+    }
+}
+
+/// REQ: DNS-011 (ADR-184) — how long the records of a DS answer hold: the smallest TTL in its
+/// authority section (hickory lowers a validated record's TTL to what its signature allows).
+fn proof_ttl(m: &Message) -> Duration {
+    Duration::from_secs(u64::from(
+        m.authorities.iter().map(|r| r.ttl).min().unwrap_or(0),
+    ))
+}
+
+/// What the validating handle returned for a DS question, as the unsigned-zone proof reads it.
+#[derive(Debug, Clone, Copy)]
+enum DsAnswer<'a> {
+    /// A response hickory accepted; each record carries its proof.
+    Response(&'a Message),
+    /// A negative answer whose proof isn't secure, which hickory returns as an error carrying
+    /// that proof (`DnsError::Nsec`).
+    Denial { proof: Proof, response: &'a Message },
+}
+
+/// REQ: DNS-011 (ADR-098, ADR-184) — what a DS answer for `apex` proves: `Some(true)` signed (a
+/// secure DS), `Some(false)` an unsigned delegation, `None` nothing. The decision part of
+/// [`ds_signed`], apart from the network so that answers can be built by hand in tests.
+fn ds_denial_verdict(answer: DsAnswer<'_>, apex: &Name) -> Option<bool> {
+    let r = match answer {
+        DsAnswer::Response(r) => r,
+        // REQ: DNS-011 (ADR-184) — hickory returns a negative answer whose proof isn't secure
+        // as an error carrying that proof; such an answer is no proof of an unsigned zone. An
+        // Opt-Out denial comes back as an ordinary response, above.
+        DsAnswer::Denial { proof, response } => {
+            tracing::debug!(%apex, ?proof, authorities = response.authorities.len(), "DNSSEC: unsigned-zone proof: a DS denial without a secure proof proves nothing");
             return None;
         }
     };
-    tracing::debug!(%apex, verdict = ?verdict(&r), answers = r.answers.len(), "DNSSEC: unsigned-zone proof: DS response");
     let has_ds = r.answers.iter().any(|a| a.record_type() == RecordType::DS);
     let other = r
         .answers
         .iter()
         .any(|a| !matches!(a.record_type(), RecordType::DS | RecordType::RRSIG));
-    // REQ: DNS-011 (ADR-098) — a secure denial of DS proves an unsigned delegation only when
-    // the record that denies it also shows a zone cut: NS present, SOA and DS absent (RFC 4035
-    // §5.2, RFC 5155 §8.9; what hickory's own insecure-delegation check asks for). Every name
-    // inside a signed zone has a secure DS denial too, and whether `apex` has an SOA came from
-    // an unvalidated answer, so the denial alone let a spoofed answer pass as insecure.
-    let cut = r
-        .authorities
-        .iter()
-        .any(|a| a.proof == Proof::Secure && denies_ds_at_cut(a, apex))
-        || denies_ds_by_opt_out(&r.authorities, apex);
-    match (has_ds, other, verdict(&r)) {
+    // REQ: DNS-011 (ADR-098, ADR-184) — a secure denial of DS proves an unsigned delegation
+    // only when its records, the parent zone's, also show that `apex` is a delegation: every
+    // name inside a signed zone has a secure DS denial too, and whether `apex` has an SOA came
+    // from an unvalidated answer.
+    let cut = denies_ds_at_cut(&r.authorities, apex) || denies_ds_by_opt_out(&r.authorities, apex);
+    match (has_ds, other, verdict(r)) {
         (true, _, Verdict::Secure) => Some(true),
         (false, false, Verdict::Secure) if cut => Some(false),
-        (false, false, Verdict::Insecure) => Some(false),
+        (false, false, Verdict::Insecure) if insecure_tld(&r.authorities, apex) => Some(false),
         _ => None,
     }
 }
 
-/// REQ: DNS-011 (ADR-098) — `rec` is an NSEC or NSEC3 that denies a DS at `apex` and shows it
-/// as a zone cut (NS, no SOA, no DS). An NSEC3 is matched by hashing `apex` the way its owner
-/// was hashed.
-fn denies_ds_at_cut(rec: &Record, apex: &Name) -> bool {
-    let cut = |types: &RecordTypeSet| {
-        types.contains(RecordType::NS)
-            && !types.contains(RecordType::SOA)
-            && !types.contains(RecordType::DS)
-    };
-    match &rec.data {
-        RData::DNSSEC(DNSSECRData::NSEC(n)) => rec.name == *apex && cut(n.type_set()),
-        RData::DNSSEC(DNSSECRData::NSEC3(n)) => {
-            cut(n.type_set())
-                && n.hash_algorithm()
-                    .hash(n.salt(), apex, n.iterations())
-                    .is_ok_and(|h| {
-                        rec.name.iter().next().is_some_and(|label| {
-                            label.eq_ignore_ascii_case(base32hex(h.as_ref()).as_bytes())
-                        })
-                    })
-        }
-        _ => false,
-    }
+/// REQ: DNS-011 (ADR-184) — an answer the validating handle found insecure proves that `apex`
+/// is unsigned only through an insecure record owned by an unsigned top-level domain: a
+/// one-label name that is `apex` itself or its top-level domain, whose status the root's
+/// signed chain decides. A zone with two or more labels above `apex` is a candidate the walk
+/// decides with the rest of this proof first. Every label counts, a leading `*` too (which
+/// `Name::num_labels` leaves out).
+fn insecure_tld(authorities: &[Record], apex: &Name) -> bool {
+    authorities
+        .iter()
+        .any(|a| a.proof == Proof::Insecure && a.name.iter().count() == 1 && a.name.zone_of(apex))
 }
 
-/// REQ: DNS-011 (ADR-098) — an unsigned delegation in an NSEC3 Opt-Out zone (most of `.com`,
-/// `.org`, ...) has no NSEC3 of its own, so [`denies_ds_at_cut`] never matches it. RFC 5155
-/// §8.6: a DS NODATA without a matching NSEC3 still proves the delegation unsigned when the
-/// response carries the closest-encloser proof — a secure NSEC3 matching the parent (the
-/// closest encloser) — and the secure NSEC3 covering `apex` (the next closer name) has the
-/// Opt-Out bit. Safe for the same reason as the matching case: a signed delegation always
-/// has its own NSEC3 (RFC 5155 §7.1), so no Opt-Out span can cover one.
+/// The type set of a delegation without a DS, as its parent's NSEC or NSEC3 lists it: NS, and
+/// neither SOA nor DS (RFC 4035 §5.2, RFC 5155 §8.9).
+fn shows_unsigned_cut(types: &RecordTypeSet) -> bool {
+    types.contains(RecordType::NS)
+        && !types.contains(RecordType::SOA)
+        && !types.contains(RecordType::DS)
+}
+
+/// REQ: DNS-011 (ADR-098, ADR-184) — the denial shows a delegation without a DS at `apex`: the
+/// secure NSEC owned by `apex`, or the NSEC3 matching `apex`'s hash among the parent zone's
+/// ([`parent_zone_nsec3s`]), lists NS and neither SOA nor DS.
+fn denies_ds_at_cut(authorities: &[Record], apex: &Name) -> bool {
+    let nsec = authorities.iter().any(|a| {
+        a.proof == Proof::Secure
+            && a.name == *apex
+            && matches!(&a.data, RData::DNSSEC(DNSSECRData::NSEC(n)) if shows_unsigned_cut(n.type_set()))
+    });
+    nsec || parent_zone_nsec3s(authorities, apex).is_some_and(|set| {
+        set.hash(apex).is_some_and(|target| {
+            set.records
+                .iter()
+                .any(|(owner, n)| *owner == target && shows_unsigned_cut(n.type_set()))
+        })
+    })
+}
+
+/// REQ: DNS-011 (ADR-098, ADR-184) — an unsigned delegation in an NSEC3 Opt-Out zone (most of
+/// `.com`, `.org`, ...) has no NSEC3 of its own: it lies inside an Opt-Out span. RFC 5155 §8.6:
+/// a DS NODATA with no NSEC3 matching `apex` proves it unsigned through the closest-encloser
+/// proof, here with records of the parent zone only ([`parent_zone_nsec3s`]):
+/// - no NSEC3 there matches `apex` (one that does decides on its own, in [`denies_ds_at_cut`]);
+/// - the NSEC3 matching the closest encloser, `apex`'s parent name, isn't a delegation's (not
+///   NS without SOA, not DNAME: such a record says nothing about the names below it, RFC 6840
+///   §4.1);
+/// - an Opt-Out NSEC3 covers `apex`'s hash (the next closer name).
 ///
-/// Seen with names below parked domains (e.g. `www.smithsonianmag.org`), whose servers answer
-/// an SOA for every name: hickory looks for a cut at `www`, fails, and the unsigned-zone proof
-/// has to rescue the answer from the opt-out denial at `smithsonianmag.org`.
+/// A closest encloser further up (an Opt-Out empty non-terminal between them) isn't accepted:
+/// not proven. Seen with names below parked domains (`www.smithsonianmag.org`), whose servers
+/// answer an SOA for every name, which the validation library judges bogus.
 fn denies_ds_by_opt_out(authorities: &[Record], apex: &Name) -> bool {
-    use hickory_net::proto::dnssec::rdata::NSEC3;
     if apex.is_root() {
         return false;
     }
-    let parent = apex.base_name();
-    let nsec3s: Vec<(&Record, &NSEC3)> = authorities
+    let Some(set) = parent_zone_nsec3s(authorities, apex) else {
+        return false;
+    };
+    let (Some(target), Some(encloser)) = (set.hash(apex), set.hash(&apex.base_name())) else {
+        return false;
+    };
+    if set.records.iter().any(|(owner, _)| *owner == target) {
+        return false;
+    }
+    let enclosers: Vec<&NSEC3> = set
+        .records
         .iter()
-        .filter(|r| r.proof == Proof::Secure)
-        .filter_map(|r| match &r.data {
-            RData::DNSSEC(DNSSECRData::NSEC3(n)) => Some((r, n)),
-            _ => None,
-        })
+        .filter(|(owner, _)| *owner == encloser)
+        .map(|(_, n)| *n)
         .collect();
-    let owner_hash = |r: &Record| {
-        r.name
-            .iter()
-            .next()
-            .map(|l| String::from_utf8_lossy(l).to_ascii_lowercase())
-    };
-    let hashed = |n: &NSEC3, name: &Name| {
-        n.hash_algorithm()
-            .hash(n.salt(), name, n.iterations())
-            .ok()
-            .map(|h| base32hex(h.as_ref()))
-    };
-    let encloser = nsec3s
-        .iter()
-        .any(|(r, n)| hashed(n, &parent).is_some_and(|h| owner_hash(r).is_some_and(|o| o == h)));
-    let covered = nsec3s.iter().any(|(r, n)| {
-        n.opt_out()
-            && match (owner_hash(r), hashed(n, apex)) {
-                (Some(owner), Some(h)) => {
-                    hash_range_covers(&owner, &base32hex(n.next_hashed_owner_name()), &h)
-                }
-                _ => false,
-            }
-    });
-    encloser && covered
+    !enclosers.is_empty()
+        && enclosers.iter().all(|n| !n.is_ancestor_delegation())
+        && set.records.iter().any(|(owner, n)| {
+            n.opt_out() && hash_range_covers(owner, n.next_hashed_owner_name(), &target)
+        })
 }
 
-/// `h` lies strictly between an NSEC3's owner hash and its next hashed owner (base32hex keeps
-/// the byte order). The last NSEC3 of a chain wraps around to the first.
-fn hash_range_covers(owner: &str, next: &str, h: &str) -> bool {
+/// REQ: DNS-011 (ADR-184) — the most NSEC3 iterations the proof hashes with (RFC 9276 §3.2): a
+/// parent zone whose NSEC3 records use more proves nothing here.
+const MAX_NSEC3_ITERATIONS: u16 = 100;
+
+/// The NSEC3 records of a DS denial that can speak for the delegation's parent
+/// ([`parent_zone_nsec3s`]), each with the hash its owner name encodes. They share one set of
+/// hash parameters, so a name is hashed once per proof.
+struct ParentNsec3s<'a> {
+    records: Vec<(Vec<u8>, &'a NSEC3)>,
+}
+
+impl ParentNsec3s<'_> {
+    /// `name` hashed with the set's parameters.
+    fn hash(&self, name: &Name) -> Option<Vec<u8>> {
+        self.records.first().and_then(|(_, n)| nsec3_hash(n, name))
+    }
+}
+
+/// REQ: DNS-011 (ADR-184) — the NSEC3 records of a DS denial for `apex`, when they can speak for
+/// `apex`'s parent: all owned under one zone, a proper ancestor of `apex` (the delegation's
+/// parent zone, or a zone above it), all validated, with one hash algorithm, salt and iteration
+/// count (at most [`MAX_NSEC3_ITERATIONS`]), and with no NSEC and no SOA of another zone beside
+/// them. `None` otherwise: the proof is made of one parent zone's records.
+fn parent_zone_nsec3s<'a>(authorities: &'a [Record], apex: &Name) -> Option<ParentNsec3s<'a>> {
+    let mut zone: Option<Name> = None;
+    let mut set = Vec::new();
+    for r in authorities {
+        match &r.data {
+            RData::DNSSEC(DNSSECRData::NSEC3(n)) => {
+                if r.proof != Proof::Secure {
+                    return None;
+                }
+                let owner_zone = r.name.base_name();
+                if *zone.get_or_insert_with(|| owner_zone.clone()) != owner_zone {
+                    return None;
+                }
+                set.push((r.name.iter().next().and_then(base32hex_decode)?, n));
+            }
+            RData::DNSSEC(DNSSECRData::NSEC(_)) => return None,
+            _ => {}
+        }
+    }
+    let zone = zone?;
+    if zone == *apex || !zone.zone_of(apex) {
+        return None;
+    }
+    if authorities
+        .iter()
+        .any(|r| r.record_type() == RecordType::SOA && r.name != zone)
+    {
+        return None;
+    }
+    let (_, first) = set.first()?;
+    let one_set = first.iterations() <= MAX_NSEC3_ITERATIONS
+        && set.iter().all(|(_, n)| {
+            n.hash_algorithm() == first.hash_algorithm()
+                && n.iterations() == first.iterations()
+                && n.salt() == first.salt()
+        });
+    one_set.then_some(ParentNsec3s { records: set })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: how many names [`nsec3_hash`] has hashed on this thread.
+    static NSEC3_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `name` hashed with an NSEC3's parameters.
+fn nsec3_hash(n: &NSEC3, name: &Name) -> Option<Vec<u8>> {
+    #[cfg(test)]
+    NSEC3_HASHES.with(|c| c.set(c.get() + 1));
+    n.hash_algorithm()
+        .hash(n.salt(), name, n.iterations())
+        .ok()
+        .map(|h| h.as_ref().to_vec())
+}
+
+/// `h` lies strictly between an NSEC3's owner hash and its next hashed owner, compared as
+/// bytes (hashes of one length; anything else covers nothing). The last NSEC3 of a chain wraps
+/// around to the first, so a chain of one record covers every hash but its own.
+fn hash_range_covers(owner: &[u8], next: &[u8], h: &[u8]) -> bool {
+    if owner.len() != h.len() || next.len() != h.len() {
+        return false;
+    }
     if owner < next {
         owner < h && h < next
     } else {
@@ -839,7 +980,9 @@ fn hash_range_covers(owner: &str, next: &str, h: &str) -> bool {
     }
 }
 
-/// Base32 with the extended hex alphabet, no padding (RFC 4648 §7): NSEC3 owner labels.
+/// Base32 with the extended hex alphabet, no padding (RFC 4648 §7): NSEC3 owner labels (the
+/// tests build them; the proof decodes them, [`base32hex_decode`]).
+#[cfg(test)]
 fn base32hex(data: &[u8]) -> String {
     const T: &[u8; 32] = b"0123456789abcdefghijklmnopqrstuv";
     let mut out = String::with_capacity(data.len().div_ceil(5) * 8);
@@ -853,6 +996,29 @@ fn base32hex(data: &[u8]) -> String {
         }
     }
     out
+}
+
+/// REQ: DNS-011 (ADR-184) — the bytes a base32hex label encodes (RFC 4648 §7, either case, no
+/// padding, unused trailing bits zero): an NSEC3 owner's hash, compared as bytes. `None` for
+/// anything else.
+fn base32hex_decode(label: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(label.len() * 5 / 8);
+    let (mut acc, mut bits) = (0u16, 0u8);
+    for &c in label {
+        let v = match c.to_ascii_lowercase() {
+            d @ b'0'..=b'9' => d - b'0',
+            l @ b'a'..=b'v' => l - b'a' + 10,
+            _ => return None,
+        };
+        acc = (acc << 5) | u16::from(v);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(u8::try_from(acc >> bits).ok()?);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    (acc == 0).then_some(out)
 }
 
 /// REQ: DNS-011 (ADR-098) — what a validation error says about the answer. Hitting the
@@ -1070,23 +1236,23 @@ mod depth_tests {
             r
         };
         assert!(denies_ds_at_cut(
-            &nsec("child.example.", &[NS, RRSIG, T_NSEC]),
+            &[nsec("child.example.", &[NS, RRSIG, T_NSEC])],
             &apex
         ));
         assert!(
-            !denies_ds_at_cut(&nsec("child.example.", &[A, RRSIG, T_NSEC]), &apex),
+            !denies_ds_at_cut(&[nsec("child.example.", &[A, RRSIG, T_NSEC])], &apex),
             "a name inside the zone, not a cut"
         );
         assert!(
-            !denies_ds_at_cut(&nsec("child.example.", &[NS, SOA, T_NSEC]), &apex),
+            !denies_ds_at_cut(&[nsec("child.example.", &[NS, SOA, T_NSEC])], &apex),
             "the child's own NSEC"
         );
         assert!(
-            !denies_ds_at_cut(&nsec("child.example.", &[NS, DS, T_NSEC]), &apex),
+            !denies_ds_at_cut(&[nsec("child.example.", &[NS, DS, T_NSEC])], &apex),
             "a signed delegation"
         );
         assert!(
-            !denies_ds_at_cut(&nsec("other.example.", &[NS, T_NSEC]), &apex),
+            !denies_ds_at_cut(&[nsec("other.example.", &[NS, T_NSEC])], &apex),
             "another owner"
         );
         // NSEC3: the owner is the hash of the apex.
@@ -1108,16 +1274,16 @@ mod depth_tests {
             r
         };
         assert!(denies_ds_at_cut(
-            &nsec3(&owner, &[NS, RRSIG, T_NSEC3]),
+            &[nsec3(&owner, &[NS, RRSIG, T_NSEC3])],
             &apex
         ));
         assert!(!denies_ds_at_cut(
-            &nsec3(&owner, &[A, RRSIG, T_NSEC3]),
+            &[nsec3(&owner, &[A, RRSIG, T_NSEC3])],
             &apex
         ));
         let wrong = Name::from_ascii("0123456789abcdefghijklmnopqrstuv.example.").unwrap();
         assert!(
-            !denies_ds_at_cut(&nsec3(&wrong, &[NS, T_NSEC3]), &apex),
+            !denies_ds_at_cut(&[nsec3(&wrong, &[NS, T_NSEC3])], &apex),
             "another name's hash"
         );
     }
@@ -1170,12 +1336,25 @@ mod depth_tests {
         };
         let below = step(apex_h.as_ref(), false);
         let above = step(apex_h.as_ref(), true);
+        // The parent's own NSEC3 (the closest encloser): without Opt-Out, and with a span that
+        // ends at the next hash, so that it covers neither name here whatever their hashes are.
+        let encloser_next = step(parent_h.as_ref(), true);
         let encloser = rec(
             parent_h.as_ref(),
-            vec![0; 20],
-            true,
+            encloser_next.clone(),
+            false,
             &[NS, SOA, RRSIG, T_NSEC3],
             Proof::Secure,
+        );
+        for name in [&apex, &Name::from_ascii("other.org.").unwrap()] {
+            assert!(
+                !hash_range_covers(parent_h.as_ref(), &encloser_next, h(name).as_ref()),
+                "the encloser alone covers {name}"
+            );
+        }
+        assert!(
+            !denies_ds_by_opt_out(std::slice::from_ref(&encloser), &apex),
+            "the encloser alone is no proof"
         );
         let covering = |opt_out, proof| rec(&below, above.clone(), opt_out, &[NS], proof);
 
@@ -1207,14 +1386,31 @@ mod depth_tests {
             ),
             "another name's span"
         );
-        // The chain's last NSEC3 wraps around to the first.
-        assert!(hash_range_covers("v0", "10", "v5"));
-        assert!(hash_range_covers("v0", "10", "05"));
-        assert!(!hash_range_covers("v0", "10", "50"));
-        assert!(hash_range_covers("10", "v0", "50"));
+    }
+
+    /// REQ: DNS-011 (ADR-098, ADR-184) — a span covers the hashes strictly between its owner's
+    /// and the next owner's, compared as bytes; the chain's last NSEC3 wraps around to the
+    /// first.
+    #[test]
+    fn dns_011_hash_range_covers() {
+        assert!(hash_range_covers(&[0xf0], &[0x10], &[0xf5]));
+        assert!(hash_range_covers(&[0xf0], &[0x10], &[0x05]));
+        assert!(!hash_range_covers(&[0xf0], &[0x10], &[0x50]));
+        assert!(hash_range_covers(&[0x10], &[0xf0], &[0x50]));
         assert!(
-            !hash_range_covers("10", "v0", "10"),
+            !hash_range_covers(&[0x10], &[0xf0], &[0x10]),
             "the owner itself isn't covered"
+        );
+        assert!(
+            !hash_range_covers(&[0x10], &[0xf0], &[0xf0]),
+            "nor the next owner"
+        );
+        // A chain of one record covers every hash but its own.
+        assert!(hash_range_covers(&[0x10], &[0x10], &[0x50]));
+        assert!(!hash_range_covers(&[0x10], &[0x10], &[0x10]));
+        assert!(
+            !hash_range_covers(&[0x10], &[0xf0], &[0x50, 0]),
+            "hashes of another length"
         );
     }
 
@@ -1228,6 +1424,594 @@ mod depth_tests {
         assert_eq!(
             error_verdict(&NetError::from("rrsig validation failed")),
             Verdict::Bogus
+        );
+    }
+}
+
+/// REQ: DNS-011 (ADR-098, ADR-184) — what a DS answer proves ([`ds_denial_verdict`]), on
+/// records built by hand. NSEC3 records use SHA-1 with no salt and no extra iterations (as
+/// `.com` and `.org` do) unless a test says otherwise; each carries the proof the validating
+/// handle would have given it.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod ds_proof_tests {
+    use super::*;
+    use RecordType::{A, DNSKEY, NS, NSEC3PARAM, RRSIG, SOA};
+    use hickory_net::proto::dnssec::Nsec3HashAlgorithm;
+    use hickory_net::proto::dnssec::rdata::NSEC3;
+
+    /// What an apex's own NSEC3 lists.
+    const APEX: &[RecordType] = &[NS, SOA, DNSKEY, NSEC3PARAM, RRSIG];
+
+    fn name(s: &str) -> Name {
+        Name::from_ascii(s).unwrap()
+    }
+
+    fn hash_with(n: &str, salt: &[u8], iterations: u16) -> Vec<u8> {
+        Nsec3HashAlgorithm::SHA1
+            .hash(salt, &name(n), iterations)
+            .unwrap()
+            .as_ref()
+            .to_vec()
+    }
+
+    fn h(n: &str) -> Vec<u8> {
+        hash_with(n, &[], 0)
+    }
+
+    /// The hash one step above or below `hash`.
+    fn step(hash: &[u8], up: bool) -> Vec<u8> {
+        let mut v = hash.to_vec();
+        for b in v.iter_mut().rev() {
+            if up {
+                *b = b.wrapping_add(1);
+                if *b != 0 {
+                    break;
+                }
+            } else {
+                *b = b.wrapping_sub(1);
+                if *b != 0xff {
+                    break;
+                }
+            }
+        }
+        v
+    }
+
+    /// A secure NSEC3 owned by `hash` under `zone`, with the given hash parameters.
+    fn nsec3_with(
+        zone: &str,
+        hash: &[u8],
+        next: Vec<u8>,
+        opt_out: bool,
+        types: &[RecordType],
+        (salt, iterations): (&[u8], u16),
+    ) -> Record {
+        let n = NSEC3::new(
+            Nsec3HashAlgorithm::SHA1,
+            opt_out,
+            iterations,
+            salt.to_vec(),
+            next,
+            types.iter().copied(),
+        );
+        let owner = name(&format!("{}.{zone}", base32hex(hash)));
+        let mut r = Record::from_rdata(owner, 300, RData::DNSSEC(DNSSECRData::NSEC3(n)));
+        r.proof = Proof::Secure;
+        r
+    }
+
+    fn nsec3(
+        zone: &str,
+        hash: &[u8],
+        next: Vec<u8>,
+        opt_out: bool,
+        types: &[RecordType],
+    ) -> Record {
+        nsec3_with(zone, hash, next, opt_out, types, (&[], 0))
+    }
+
+    /// The NSEC3 matching `owner` in `zone`; its span ends at the next hash, so it covers nothing.
+    fn matching(zone: &str, owner: &str, types: &[RecordType]) -> Record {
+        let hash = h(owner);
+        nsec3(zone, &hash, step(&hash, true), true, types)
+    }
+
+    /// An Opt-Out NSEC3 in `zone` whose span covers `n`'s hash and its neighbours only.
+    fn span(zone: &str, n: &str) -> Record {
+        let hash = h(n);
+        nsec3(zone, &step(&hash, false), step(&hash, true), true, &[NS])
+    }
+
+    fn soa(owner: &str, proof: Proof) -> Record {
+        let data = RData::SOA(hickory_net::proto::rr::rdata::SOA::new(
+            name("ns.example."),
+            name("admin.example."),
+            1,
+            1800,
+            900,
+            604_800,
+            300,
+        ));
+        let mut r = Record::from_rdata(name(owner), 300, data);
+        r.proof = proof;
+        r
+    }
+
+    /// A NOERROR answer to a DS question with nothing in the answer section.
+    fn nodata(authorities: Vec<Record>) -> Message {
+        let mut m = Message::response(1, OpCode::Query);
+        m.authorities = authorities;
+        m
+    }
+
+    /// What a response with these authority records proves about `apex`.
+    fn proves(authorities: Vec<Record>, apex: &str) -> Option<bool> {
+        ds_denial_verdict(DsAnswer::Response(&nodata(authorities)), &name(apex))
+    }
+
+    /// REQ: DNS-011 (ADR-184) — the `.org` shape: `org.`'s SOA, its apex NSEC3 (the closest
+    /// encloser of `smithsonianmag.org.`) and an Opt-Out NSEC3 covering the name's hash, all
+    /// `org.`'s, prove an unsigned delegation; so do the same without the SOA, one record
+    /// doing both jobs (the apex record's own span reaches past the name), and an ordinary
+    /// name of the parent zone as the closest encloser (`b.org.` for `a.b.org.`).
+    #[test]
+    fn dns_011_opt_out_accepts_parent_apex_and_span() {
+        let apex = "smithsonianmag.org.";
+        let encloser = matching("org.", "org.", APEX);
+        assert_eq!(
+            proves(
+                vec![
+                    soa("org.", Proof::Secure),
+                    encloser.clone(),
+                    span("org.", apex)
+                ],
+                apex
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            proves(vec![encloser, span("org.", apex)], apex),
+            Some(false),
+            "without the SOA"
+        );
+        let wide = nsec3("org.", &h("org."), step(&h(apex), true), true, APEX);
+        assert_eq!(
+            proves(vec![soa("org.", Proof::Secure), wide], apex),
+            Some(false),
+            "one record for both"
+        );
+        assert_eq!(
+            proves(
+                vec![
+                    soa("org.", Proof::Secure),
+                    matching("org.", "b.org.", &[A, RRSIG]),
+                    span("org.", "a.b.org.")
+                ],
+                "a.b.org."
+            ),
+            Some(false),
+            "an ordinary name as the closest encloser"
+        );
+    }
+
+    /// REQ: DNS-011 (ADR-184) — fails closed when the closest provable encloser is above the
+    /// delegation's parent name (RFC 5155 §8.6 allows that, through an Opt-Out empty
+    /// non-terminal): `b.org.` has no NSEC3 here, so `a.b.org.` isn't proven unsigned.
+    #[test]
+    fn dns_011_opt_out_closest_encloser_above_parent_is_not_proof() {
+        let apex = "a.b.org.";
+        let records = vec![
+            soa("org.", Proof::Secure),
+            matching("org.", "org.", APEX),
+            span("org.", "b.org."),
+            span("org.", apex),
+        ];
+        assert_eq!(proves(records, apex), None);
+    }
+
+    /// REQ: DNS-011 (ADR-184) — NSEC3 hashes: RFC 5155 Appendix A (salt `aabbccdd`, 12
+    /// iterations), and an owner label read back as the hash it encodes, in either case
+    /// (RFC 4648 §10's vectors too); anything that isn't base32hex is no hash.
+    #[test]
+    fn dns_011_nsec3_hash_rfc5155_vectors() {
+        let salt = [0xaa, 0xbb, 0xcc, 0xdd];
+        for (n, want) in [
+            ("example.", "0p9mhaveqvm6t7vbl5lop2u3t2rp3tom"),
+            ("a.example.", "35mthgpgcu1qg68fab165klnsnk3dpvl"),
+        ] {
+            let hash = hash_with(n, &salt, 12);
+            assert_eq!(base32hex(&hash), want, "H({n})");
+            assert_eq!(base32hex_decode(want.as_bytes()), Some(hash.clone()));
+            let upper = want.to_ascii_uppercase();
+            assert_eq!(base32hex_decode(upper.as_bytes()), Some(hash));
+        }
+        for (data, text) in [
+            (&b""[..], ""),
+            (b"f", "co"),
+            (b"fo", "cpng"),
+            (b"foo", "cpnmu"),
+            (b"foob", "cpnmuog"),
+            (b"fooba", "cpnmuoj1"),
+            (b"foobar", "cpnmuoj1e8"),
+        ] {
+            assert_eq!(
+                base32hex_decode(text.as_bytes()),
+                Some(data.to_vec()),
+                "{text}"
+            );
+        }
+        assert_eq!(base32hex_decode(b"0p9mhave-"), None, "not base32hex");
+        assert_eq!(base32hex_decode(b"0w"), None, "w isn't base32hex");
+        assert_eq!(base32hex_decode(b"cp"), None, "trailing bits set");
+    }
+
+    /// One case: what it is, the authority records, what they should prove.
+    type Case = (&'static str, Vec<Record>, Option<bool>);
+
+    /// The cases whose verdict for `apex` isn't what it should be (all of them are checked,
+    /// so a failure lists every case that is wrong).
+    fn wrong(apex: &str, cases: Vec<Case>) -> Vec<&'static str> {
+        cases
+            .into_iter()
+            .filter(|(_, records, want)| proves(records.clone(), apex) != *want)
+            .map(|(what, ..)| what)
+            .collect()
+    }
+
+    /// REQ: DNS-011 (ADR-184) — the NSEC3 matching the closest encloser must not be a
+    /// delegation's (NS without SOA, or DNAME; RFC 6840 §4.1): the parent's record at
+    /// `bank.test.` says only that `bank.test.` is delegated, nothing about names below it.
+    #[test]
+    fn dns_011_opt_out_rejects_delegation_nsec3_as_encloser() {
+        use RecordType::{DNAME, DS};
+        let apex = "www.bank.test.";
+        let with = |types: &[RecordType]| {
+            vec![
+                soa("test.", Proof::Secure),
+                matching("test.", "bank.test.", types),
+                span("test.", apex),
+            ]
+        };
+        let cases = vec![
+            ("an ordinary name: a proof", with(&[A, RRSIG]), Some(false)),
+            ("a signed delegation's record", with(&[NS, DS, RRSIG]), None),
+            ("an unsigned delegation's record", with(&[NS, RRSIG]), None),
+            ("a DNAME", with(&[DNAME, RRSIG]), None),
+        ];
+        assert_eq!(wrong(apex, cases), Vec::<&str>::new());
+    }
+
+    /// REQ: DNS-011 (ADR-184) — every NSEC3 of the proof is owned under one zone, a proper
+    /// ancestor of the delegation, with one set of hash parameters; an SOA in the answer is
+    /// that zone's.
+    #[test]
+    fn dns_011_opt_out_requires_one_parent_zone() {
+        let apex = "shop.example.";
+        let encloser = |zone: &str| {
+            let hash = h("example.");
+            nsec3(zone, &hash, step(&hash, true), true, APEX)
+        };
+        let soa_ex = || soa("example.", Proof::Secure);
+        let ok = vec![soa_ex(), encloser("example."), span("example.", apex)];
+        let mut extra = ok.clone();
+        extra.push(span("other.test.", "x.other.test."));
+        // A span around the name's hash as the other records compute it, but with another salt.
+        let salted = {
+            let hash = h(apex);
+            let (from, to) = (step(&hash, false), step(&hash, true));
+            nsec3_with("example.", &from, to, true, &[NS], (&[0xab], 0))
+        };
+        let cases = vec![
+            ("all of example.: a proof", ok, Some(false)),
+            (
+                "two zones",
+                vec![encloser("example."), span("other.test.", apex)],
+                None,
+            ),
+            (
+                "a zone that isn't above the name",
+                vec![encloser("other.test."), span("other.test.", apex)],
+                None,
+            ),
+            (
+                "under the name itself",
+                vec![encloser("shop.example."), span("shop.example.", apex)],
+                None,
+            ),
+            (
+                "another zone's SOA",
+                vec![
+                    soa("other.test.", Proof::Secure),
+                    encloser("example."),
+                    span("example.", apex),
+                ],
+                None,
+            ),
+            ("an NSEC3 of another zone besides", extra, None),
+            (
+                "two sets of hash parameters",
+                vec![soa_ex(), encloser("example."), salted],
+                None,
+            ),
+        ];
+        assert_eq!(wrong(apex, cases), Vec::<&str>::new());
+    }
+
+    /// REQ: DNS-011 (ADR-184) — when the parent zone has an NSEC3 matching the name itself,
+    /// that record alone decides (the cut test), whatever span claims to cover the same hash.
+    #[test]
+    fn dns_011_opt_out_rejected_when_apex_has_own_nsec3() {
+        use RecordType::DS;
+        let apex = "shop.example.";
+        let base = vec![
+            soa("example.", Proof::Secure),
+            matching("example.", "example.", APEX),
+            span("example.", apex),
+        ];
+        let with = |types: &[RecordType]| {
+            let mut v = base.clone();
+            v.push(matching("example.", apex, types));
+            v
+        };
+        let cases = vec![
+            ("without it: a proof", base.clone(), Some(false)),
+            ("an ordinary name", with(&[A, RRSIG]), None),
+            ("a signed delegation", with(&[NS, DS, RRSIG]), None),
+            ("an unsigned delegation", with(&[NS, RRSIG]), Some(false)),
+        ];
+        assert_eq!(wrong(apex, cases), Vec::<&str>::new());
+    }
+
+    /// REQ: DNS-011 (ADR-184) — the NSEC3 that shows the cut (NS, neither SOA nor DS, at the
+    /// name's hash) must be the parent zone's: not a record with that hash as its first label
+    /// under another zone, and not next to another zone's records.
+    #[test]
+    fn dns_011_cut_nsec3_must_be_in_parent_zone() {
+        let apex = "www.bank.test.";
+        let cut = |zone: &str| matching(zone, apex, &[NS, RRSIG]);
+        let cases = vec![
+            (
+                "the parent zone's record: a proof",
+                vec![soa("bank.test.", Proof::Secure), cut("bank.test.")],
+                Some(false),
+            ),
+            ("another zone's", vec![cut("other.test.")], None),
+            ("under the name itself", vec![cut("www.bank.test.")], None),
+            (
+                "an ordinary name's record, and a cut from another zone",
+                vec![
+                    matching("bank.test.", apex, &[A, RRSIG]),
+                    cut("other.test."),
+                ],
+                None,
+            ),
+            (
+                "another zone's SOA",
+                vec![soa("other.test.", Proof::Secure), cut("bank.test.")],
+                None,
+            ),
+        ];
+        assert_eq!(wrong(apex, cases), Vec::<&str>::new());
+    }
+
+    /// REQ: DNS-011 (ADR-184) — an answer the validating handle calls insecure proves an
+    /// unsigned zone only through an insecure record of an unsigned top-level domain: the
+    /// name's own top-level domain, or the name itself when it has one label.
+    #[test]
+    fn dns_011_insecure_denial_needs_unsigned_tld() {
+        let only = |owner: &str| vec![soa(owner, Proof::Insecure)];
+        let apex = "bank.test.";
+        let cases = vec![
+            ("the name's top-level domain", only("test."), Some(false)),
+            ("the name's own", only("bank.test."), None),
+            ("an unrelated zone's", only("other.example."), None),
+            ("an unrelated top-level domain's", only("other."), None),
+            ("a name below", only("www.bank.test."), None),
+            (
+                "an unrelated zone's, next to secure records",
+                vec![soa("other.example.", Proof::Insecure), span("test.", apex)],
+                None,
+            ),
+            (
+                "the top-level domain's signed SOA, next to an unrelated unsigned record",
+                vec![
+                    soa("test.", Proof::Secure),
+                    soa("other.example.", Proof::Insecure),
+                ],
+                None,
+            ),
+        ];
+        let deeper = vec![
+            (
+                "a deeper name: a two-label zone above it",
+                only("bank.test."),
+                None,
+            ),
+            (
+                "a deeper name: a three-label zone above it",
+                only("www.bank.test."),
+                None,
+            ),
+            (
+                "a deeper name: its top-level domain",
+                only("test."),
+                Some(false),
+            ),
+        ];
+        let tld = vec![("a top-level domain: its own", only("xx."), Some(false))];
+        let wildcard = vec![(
+            "a wildcard below a top-level domain: its own (two labels)",
+            only("*.com."),
+            None,
+        )];
+        let mut all = wrong(apex, cases);
+        all.extend(wrong("a.www.bank.test.", deeper));
+        all.extend(wrong("xx.", tld));
+        all.extend(wrong("*.com.", wildcard));
+        assert_eq!(all, Vec::<&str>::new());
+    }
+
+    /// REQ: DNS-011 (ADR-184) — a negative answer the validating handle returns as an error with
+    /// its proof (`DsAnswer::Denial`) proves nothing, whatever the proof and the records: that
+    /// arm returns `None` for every one.
+    #[test]
+    fn dns_011_ds_denial_returned_as_error_is_not_proof() {
+        let apex = name("shop.example.");
+        // Records that prove an unsigned delegation in an ordinary response.
+        let m = nodata(vec![
+            soa("example.", Proof::Secure),
+            matching("example.", "example.", APEX),
+            span("example.", "shop.example."),
+        ]);
+        let all = [
+            Proof::Secure,
+            Proof::Insecure,
+            Proof::Bogus,
+            Proof::Indeterminate,
+        ];
+        let wrong: Vec<_> = all
+            .into_iter()
+            .filter(|&proof| {
+                ds_denial_verdict(
+                    DsAnswer::Denial {
+                        proof,
+                        response: &m,
+                    },
+                    &apex,
+                )
+                .is_some()
+            })
+            .collect();
+        assert_eq!(wrong, Vec::<Proof>::new());
+    }
+
+    /// REQ: DNS-011 (ADR-184) — the proof reads NSEC3 records with at most 100 iterations
+    /// (RFC 9276 §3.2); records with more prove nothing, for the cut check and the Opt-Out rule
+    /// alike.
+    #[test]
+    fn dns_011_nsec3_iteration_cap_is_not_proof() {
+        let cut = |iterations: u16| {
+            let hash = hash_with("www.bank.test.", &[], iterations);
+            let next = step(&hash, true);
+            vec![
+                soa("bank.test.", Proof::Secure),
+                nsec3_with(
+                    "bank.test.",
+                    &hash,
+                    next,
+                    false,
+                    &[NS, RRSIG],
+                    (&[], iterations),
+                ),
+            ]
+        };
+        let cases = vec![
+            ("a cut, 100 iterations", cut(100), Some(false)),
+            ("a cut, 101 iterations", cut(101), None),
+        ];
+        let mut all = wrong("www.bank.test.", cases);
+        let opt_out = |iterations: u16| {
+            let (parent, apex) = (
+                hash_with("example.", &[], iterations),
+                hash_with("shop.example.", &[], iterations),
+            );
+            let params = (&[][..], iterations);
+            vec![
+                soa("example.", Proof::Secure),
+                nsec3_with("example.", &parent, step(&parent, true), true, APEX, params),
+                nsec3_with(
+                    "example.",
+                    &step(&apex, false),
+                    step(&apex, true),
+                    true,
+                    &[NS],
+                    params,
+                ),
+            ]
+        };
+        let cases = vec![
+            ("an Opt-Out span, 100 iterations", opt_out(100), Some(false)),
+            ("an Opt-Out span, 101 iterations", opt_out(101), None),
+        ];
+        all.extend(wrong("shop.example.", cases));
+        assert_eq!(all, Vec::<&str>::new());
+    }
+
+    /// REQ: DNS-011 (ADR-184) — the proof hashes each name once, however many NSEC3 records the
+    /// answer holds (they share one set of parameters): the name for the cut check, the name
+    /// and its parent for the Opt-Out rule.
+    #[test]
+    fn dns_011_proof_hashes_each_name_once() {
+        let apex = "www.bank.test.";
+        let hash = h(apex);
+        let mut records = vec![soa("bank.test.", Proof::Secure)];
+        for i in 0..40 {
+            records.push(span("bank.test.", &format!("n{i}.bank.test.")));
+        }
+        records.push(nsec3(
+            "bank.test.",
+            &hash,
+            step(&hash, true),
+            false,
+            &[NS, RRSIG],
+        ));
+        let count = |f: &dyn Fn() -> bool| {
+            NSEC3_HASHES.with(|c| c.set(0));
+            let proven = f();
+            (proven, NSEC3_HASHES.with(std::cell::Cell::get))
+        };
+        assert_eq!(
+            count(&|| denies_ds_at_cut(&records, &name(apex))),
+            (true, 1),
+            "the cut check"
+        );
+        assert_eq!(
+            count(&|| denies_ds_by_opt_out(&records, &name(apex))),
+            (false, 2),
+            "the Opt-Out rule (the name has an NSEC3 of its own: the cut check decides)"
+        );
+    }
+
+    /// REQ: DNS-011 (ADR-184) — a zone proven unsigned is remembered for the smallest TTL of the
+    /// records that proved it, 15 minutes at most, and for the group that proved it only.
+    #[test]
+    fn dns_011_proven_zone_is_remembered_for_its_proof_ttl() {
+        let v = Validator::new(&[], Arc::default());
+        let t0 = std::time::Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        v.remember_insecure_at(1, "u.test".into(), Duration::from_mins(5), t0);
+        assert!(
+            v.known_insecure_at(1, "www.u.test", at(299)),
+            "within its TTL"
+        );
+        assert!(
+            !v.known_insecure_at(1, "www.u.test", at(300)),
+            "not past it"
+        );
+        assert!(
+            !v.known_insecure_at(2, "www.u.test", at(1)),
+            "another group"
+        );
+        v.remember_insecure_at(1, "v.test".into(), Duration::from_hours(24), t0);
+        assert!(v.known_insecure_at(1, "www.v.test", at(899)), "a day's TTL");
+        assert!(
+            !v.known_insecure_at(1, "www.v.test", at(900)),
+            "capped at 15 minutes"
+        );
+        // The TTL is the smallest of the answer's authority records.
+        let with_ttl = |ttl| {
+            let mut r = soa("test.", Proof::Secure);
+            r.ttl = ttl;
+            r
+        };
+        let mut m = Message::response(1, OpCode::Query);
+        m.authorities = vec![with_ttl(900), with_ttl(300), with_ttl(3600)];
+        assert_eq!(proof_ttl(&m), Duration::from_mins(5));
+        assert_eq!(
+            proof_ttl(&Message::response(2, OpCode::Query)),
+            Duration::ZERO,
+            "no records: nothing to remember"
         );
     }
 }
