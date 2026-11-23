@@ -12,7 +12,13 @@
 //!   [`BEACON_HOURS`] consecutive hours, when it wasn't periodic while the device was learning.
 //! - **NXDOMAIN storm** (T7.14): in one minute, at least `nxdomain_per_minute` NXDOMAIN
 //!   answers and `nxdomain_percent` of the device's queries (absolute: no learning needed; at
-//!   most one finding per device per hour).
+//!   most one finding per device per hour). In a minute that is a sweep (next), it is judged on
+//!   the device's other names: the sweep's lookups leave both of its numbers.
+//! - **Sweep of private reverse names** (OBS-009, ADR-186): in one minute, the device's reverse
+//!   lookups of private addresses ([`crate::internal`]'s RFC 6303 check) alone clear the storm's
+//!   bar, over at least [`SWEEP_MIN_NAMES`] different names (a 256-bit map of them): a network
+//!   scan, or a TV or NAS naming its neighbours. Counted like a storm, at most one finding per
+//!   device per hour, on its own clock. One name retried stays a storm.
 //! - **DGA-like names** (T7.14): first-seen registrable domains whose label looks generated
 //!   ([`crate::dga::score`]); one finding per device per hour with at least
 //!   [`DGA_MIN_PER_HOUR`] of them.
@@ -61,6 +67,10 @@ pub const CHATTY_MIN_GAPS: u32 = 120;
 pub const CHATTY_SHARE_PCT: u32 = 80;
 /// ...and that bin between these (1–1.5 s up to 17–25 s).
 pub const CHATTY_BINS: std::ops::RangeInclusive<usize> = 1..=8;
+/// REQ: OBS-009 (ADR-186) — a sweep of private reverse names has at least this many different
+/// names in its minute (bits set in a 256-bit map): below what a sweep at the 30-answer bar has,
+/// above a DNS-SD browse (4 or 5 names) or a loop on a few.
+pub const SWEEP_MIN_NAMES: u32 = 16;
 
 /// REQ: OBS-031 — rhythm bins per tracked pair.
 pub const RHYTHM_BINS: usize = 24;
@@ -150,6 +160,7 @@ pub struct Settings {
     /// Registrable domains never reported (OS connectivity checks, NTP, ...).
     pub ignore_domains: Vec<String>,
     /// NXDOMAIN storm: answers per minute, and their share of the device's queries (percent).
+    /// A sweep of private reverse names takes the same bar over its own lookups (ADR-186).
     #[serde(default = "default_nx_per_minute")]
     pub nxdomain_per_minute: u32,
     #[serde(default = "default_nx_percent")]
@@ -188,10 +199,13 @@ pub enum Kind {
     Dga,
     /// REQ: OBS-036 — informational: shown, never counted as an anomaly.
     ChattyLoop,
+    /// REQ: OBS-009 (ADR-186) — a sweep of private reverse names. Last, so the others keep their
+    /// order (the totals' key order, a mute's sorted kinds).
+    ReverseSweep,
 }
 
 impl Kind {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::RateSpike,
         Self::DomainVolume,
         Self::Drift,
@@ -199,6 +213,7 @@ impl Kind {
         Self::NxdomainStorm,
         Self::Dga,
         Self::ChattyLoop,
+        Self::ReverseSweep,
     ];
     /// One bit per kind, for the mute table.
     const fn bit(self) -> u8 {
@@ -214,11 +229,12 @@ impl Kind {
             Self::NxdomainStorm => "nxdomain_storm",
             Self::Dga => "dga",
             Self::ChattyLoop => "chatty_loop",
+            Self::ReverseSweep => "reverse_sweep",
         }
     }
 
     /// REQ: OBS-036 — a finding to see, not an anomaly: kept out of the badge and the anomaly
-    /// alert rule.
+    /// alert rule. A sweep of private reverse names is counted (ADR-186).
     pub const fn informational(self) -> bool {
         matches!(self, Self::ChattyLoop)
     }
@@ -424,6 +440,20 @@ struct Client {
     nx_samples: Vec<String>,
     #[serde(default)]
     storm_hour: u64,
+    /// REQ: OBS-009 (ADR-186) — a sweep of private reverse names: this minute's reverse lookups
+    /// of private addresses and their NXDOMAIN answers (also counted in `min_total`/`min_nx`), a
+    /// 256-bit map of their names (bit `(fp ^ fp >> 32) & 255` of the name's FNV-1a), a few of
+    /// the NXDOMAIN names (`nx_samples` keeps the others), and the hour last reported.
+    #[serde(default)]
+    rev_total: u32,
+    #[serde(default)]
+    rev_nx: u32,
+    #[serde(default)]
+    rev_names: [u64; 4],
+    #[serde(default)]
+    rev_samples: Vec<String>,
+    #[serde(default)]
+    sweep_hour: u64,
     /// DGA-like new domains this hour, with a few of them and their scores.
     #[serde(default)]
     dga_hour: u32,
@@ -448,43 +478,128 @@ impl Client {
             min_nx: 0,
             nx_samples: Vec::new(),
             storm_hour: 0,
+            rev_total: 0,
+            rev_nx: 0,
+            rev_names: [0; 4],
+            rev_samples: Vec::new(),
+            sweep_hour: 0,
             dga_hour: 0,
             dga_samples: Vec::new(),
         }
     }
 
-    /// Closes the device's minute: an NXDOMAIN storm finding if it was one (once an hour).
-    fn close_minute(&mut self, key: [u8; 16], s: &Settings) -> Option<Finding> {
-        let (nx, total) = (self.min_nx, self.min_total);
+    /// Counts one query in the device's minute: the NXDOMAIN storm's numbers, and the private
+    /// reverse part of them. No allocation, beyond the minute's few sample names.
+    fn count_minute(&mut self, wire: &[u8], rcode: Option<u8>) {
+        let nx = rcode == Some(3);
+        self.min_total = self.min_total.saturating_add(1);
+        if nx {
+            self.min_nx = self.min_nx.saturating_add(1);
+        }
+        // REQ: OBS-009 (ADR-186) — the internal-names list's RFC 6303 check, once per event.
+        if crate::internal::is_private_reverse(wire) {
+            self.rev_total = self.rev_total.saturating_add(1);
+            let fp = span_fp(wire);
+            let bit = usize::try_from((fp ^ (fp >> 32)) & 255).unwrap_or(0);
+            self.rev_names[bit / 64] |= 1 << (bit % 64);
+            if nx {
+                self.rev_nx = self.rev_nx.saturating_add(1);
+                if self.rev_samples.len() < SAMPLES {
+                    let name = sample_text(wire);
+                    if !self.rev_samples.contains(&name) {
+                        self.rev_samples.push(name);
+                    }
+                }
+            }
+        } else if nx && self.nx_samples.len() < SAMPLES {
+            let mut name = crate::event::dotted(wire);
+            name.truncate(MAX_DOMAIN);
+            if !self.nx_samples.contains(&name) {
+                self.nx_samples.push(name);
+            }
+        }
+    }
+
+    /// Closes the device's minute: an NXDOMAIN storm and a sweep of private reverse names, each
+    /// if the minute was one (each at most once an hour), in that order.
+    fn close_minute(&mut self, key: [u8; 16], s: &Settings) -> [Option<Finding>; 2] {
         let minute = self.minute;
-        let samples = std::mem::take(&mut self.nx_samples);
+        let hour = minute / 60;
+        let (min_nx, min_total) = (self.min_nx, self.min_total);
+        let (rev_nx, rev_total) = (self.rev_nx, self.rev_total);
+        let names: u32 = self.rev_names.iter().copied().map(u64::count_ones).sum();
+        let mut samples = std::mem::take(&mut self.nx_samples);
+        let rev_samples = std::mem::take(&mut self.rev_samples);
         self.min_nx = 0;
         self.min_total = 0;
-        let hour = minute / 60;
-        let storm = total > 0
-            && nx >= s.nxdomain_per_minute
-            && u64::from(nx) * 100 >= u64::from(s.nxdomain_percent) * u64::from(total);
-        if !storm || self.storm_hour == hour {
-            return None;
+        self.rev_nx = 0;
+        self.rev_total = 0;
+        self.rev_names = [0; 4];
+        let over = |nx: u32, total: u32| {
+            total > 0
+                && nx >= s.nxdomain_per_minute
+                && u64::from(nx) * 100 >= u64::from(s.nxdomain_percent) * u64::from(total)
+        };
+        // REQ: OBS-009 (ADR-186) — a sweep: the private reverse part alone clears the storm's
+        // bar, over many names. Its lookups then leave both of the storm's numbers, whether or
+        // not the sweep is reported this hour or muted: a sweep never becomes a storm, and
+        // padding a storm with one can't dilute it. In any other minute everything counts
+        // toward the storm, as before.
+        let sweep = names >= SWEEP_MIN_NAMES && over(rev_nx, rev_total);
+        let (nx, total) = if sweep {
+            (
+                min_nx.saturating_sub(rev_nx),
+                min_total.saturating_sub(rev_total),
+            )
+        } else {
+            // Nothing taken out: the private reverse names are the storm's names too.
+            let room = SAMPLES.saturating_sub(samples.len());
+            samples.extend(rev_samples.iter().take(room).cloned());
+            (min_nx, min_total)
+        };
+        let mut out = [None, None];
+        if over(nx, total) && self.storm_hour != hour {
+            self.storm_hour = hour;
+            let pct = u64::from(nx) * 100 / u64::from(total);
+            out[0] = Some(Finding {
+                muted_by: None,
+                kind: Kind::NxdomainStorm,
+                client: key,
+                domain: None,
+                window_start_s: minute * 60,
+                window_s: 60,
+                observed: f64::from(nx),
+                baseline: f64::from(total),
+                spread: 0.0,
+                threshold: f64::from(s.nxdomain_per_minute),
+                detail: format!(
+                    "{nx} NXDOMAIN answers in a minute ({pct}% of {total} queries), e.g. {}",
+                    samples.join(", ")
+                ),
+            });
         }
-        self.storm_hour = hour;
-        let pct = u64::from(nx) * 100 / u64::from(total);
-        Some(Finding {
-            muted_by: None,
-            kind: Kind::NxdomainStorm,
-            client: key,
-            domain: None,
-            window_start_s: minute * 60,
-            window_s: 60,
-            observed: f64::from(nx),
-            baseline: f64::from(total),
-            spread: 0.0,
-            threshold: f64::from(s.nxdomain_per_minute),
-            detail: format!(
-                "{nx} NXDOMAIN answers in a minute ({pct}% of {total} queries), e.g. {}",
-                samples.join(", ")
-            ),
-        })
+        if sweep && self.sweep_hour != hour {
+            self.sweep_hour = hour;
+            let pct = u64::from(rev_nx) * 100 / u64::from(rev_total);
+            out[1] = Some(Finding {
+                muted_by: None,
+                kind: Kind::ReverseSweep,
+                client: key,
+                domain: None,
+                window_start_s: minute * 60,
+                window_s: 60,
+                observed: f64::from(rev_nx),
+                baseline: f64::from(rev_total),
+                spread: 0.0,
+                threshold: f64::from(s.nxdomain_per_minute),
+                detail: format!(
+                    "{rev_nx} NXDOMAIN answers to reverse lookups of private addresses in a \
+                     minute ({pct}% of {rev_total}; at least {names} different names), e.g. {}",
+                    rev_samples.join(", ")
+                ),
+            });
+        }
+        out
     }
 
     /// Drift: remembers the domain; counts it if it's new for the device (and says so).
@@ -751,6 +866,18 @@ fn span_text(span: &[u8]) -> String {
     out.chars().take(MAX_DOMAIN).collect()
 }
 
+/// A whole name as dotted text for a finding's samples: at most [`MAX_DOMAIN`] bytes, ending on
+/// a character.
+fn sample_text(wire: &[u8]) -> String {
+    let mut name = crate::event::dotted(wire);
+    let mut end = MAX_DOMAIN.min(name.len());
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name.truncate(end);
+    name
+}
+
 /// The fingerprint of a dotted domain (for `ignore_domains`), as [`span_fp`] computes it.
 fn text_fp(domain: &str) -> u64 {
     let mut wire = Vec::new();
@@ -839,6 +966,7 @@ impl Engine {
             c.learned.truncate(LEARNED);
             c.new_samples.truncate(SAMPLES);
             c.nx_samples.truncate(SAMPLES);
+            c.rev_samples.truncate(SAMPLES);
             c.dga_samples.truncate(SAMPLES);
         }
         if self.hour > u64::MAX / 86_400 {
@@ -966,26 +1094,16 @@ impl Engine {
             .or_insert_with(|| Client::new(ts_s));
         c.last_s = ts_s;
         c.hour_count = c.hour_count.saturating_add(1);
-        // NXDOMAIN storm, per minute.
+        // NXDOMAIN storm and sweeps of private reverse names, per minute.
         let minute = ts_s / 60;
-        let mut storm = None;
+        let mut closed = [None, None];
         if c.minute != minute {
             if c.min_total > 0 {
-                storm = c.close_minute(client, &self.settings);
+                closed = c.close_minute(client, &self.settings);
             }
             c.minute = minute;
         }
-        c.min_total = c.min_total.saturating_add(1);
-        if rcode == Some(3) {
-            c.min_nx = c.min_nx.saturating_add(1);
-            if c.nx_samples.len() < SAMPLES {
-                let mut name = crate::event::dotted(wire);
-                name.truncate(MAX_DOMAIN);
-                if !c.nx_samples.contains(&name) {
-                    c.nx_samples.push(name);
-                }
-            }
-        }
+        c.count_minute(wire, rcode);
         let learned = ts_s.saturating_sub(c.first_s) >= u64::from(learning) * 86_400;
         let past_first_day = ts_s.saturating_sub(c.first_s) >= 86_400;
         if let Some(span) = registrable_span(wire) {
@@ -1014,7 +1132,7 @@ impl Engine {
                 c.track(fp, span, ts_s, at_us / 1_000);
             }
         }
-        if let Some(f) = storm {
+        for f in closed.into_iter().flatten() {
             self.push(f);
         }
     }
@@ -1050,11 +1168,14 @@ impl Engine {
             let Some(client) = self.clients.get_mut(&key) else {
                 continue;
             };
-            // The minute that ends with the hour.
-            if client.min_total > 0
-                && let Some(f) = client.close_minute(key, &self.settings)
-            {
-                out.push(f);
+            // The minute that ends with the hour: its storm, then its sweep.
+            if client.min_total > 0 {
+                out.extend(
+                    client
+                        .close_minute(key, &self.settings)
+                        .into_iter()
+                        .flatten(),
+                );
             }
             if client.dga_hour >= DGA_MIN_PER_HOUR {
                 out.push(Self::dga_finding(

@@ -68,8 +68,10 @@ impl InternalNames {
 
 /// True for reverse names inside private/local address space, as the resolver's special-name
 /// handling defines it (RFC 6303: `10/8`, `172.16/12`, `192.168/16`, `100.64/10`, `169.254/16`,
-/// `127/8`, `0/8`; `fc00::/7`, `fe80::/10`, `::1`).
-fn is_private_reverse(name: &[u8]) -> bool {
+/// `127/8`, `0/8`; `fc00::/7`, `fe80::/10`, `::1`). Also what a sweep of private reverse names
+/// is made of (REQ: OBS-009, ADR-186: the anomaly engine calls it once per event); a test in the
+/// server keeps it equal to the resolver's copy.
+pub(crate) fn is_private_reverse(name: &[u8]) -> bool {
     let v4 = name.ends_with(IN_ADDR);
     if !v4 && !name.ends_with(IP6) {
         return false;

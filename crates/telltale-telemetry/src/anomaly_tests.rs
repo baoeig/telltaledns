@@ -678,3 +678,342 @@ fn obs_038_replay_is_deterministic_and_history_is_kept() {
     );
     assert!(c.findings().iter().any(|f| f.muted_by.is_some()));
 }
+
+/// REQ: OBS-009 (ADR-186) — a sweep like the one in GitHub issue #90: `client` looks up the
+/// reverse names of 10.0.20.1 to 10.0.20.254 in the minute that starts at `t`; 247 of them are
+/// answered NXDOMAIN, the last 7 NOERROR.
+fn private_sweep(e: &mut Engine, client: [u8; 16], t: u64) {
+    for i in 1..=254u64 {
+        let rc = if i <= 247 { 3 } else { 0 };
+        e.observe_answer(
+            t + i % 60,
+            client,
+            &wire(&format!("{i}.20.0.10.in-addr.arpa")),
+            Some(rc),
+        );
+    }
+}
+
+/// 40 NXDOMAIN of 50 queries for ordinary names (`q{i}.bad.example`) from `client` in the minute
+/// that starts at `t`.
+fn bad_names(e: &mut Engine, client: [u8; 16], t: u64) {
+    for i in 0..50u64 {
+        let rc = if i < 40 { 3 } else { 0 };
+        e.observe_answer(
+            t + i % 60,
+            client,
+            &wire(&format!("q{i}.bad.example")),
+            Some(rc),
+        );
+    }
+}
+
+/// Closes the hour `t` is in (a query from another device an hour later).
+fn close(e: &mut Engine, t: u64) {
+    e.observe_answer(t + 3600, ip(250), &wire("x.example"), Some(0));
+}
+
+/// The findings' kinds, oldest first.
+fn kinds(e: &Engine) -> Vec<&'static str> {
+    e.findings().iter().map(|f| f.kind.label()).collect()
+}
+
+/// The first finding of the kind labelled `label`.
+fn first<'a>(e: &'a Engine, label: &str) -> &'a Finding {
+    e.findings()
+        .iter()
+        .find(|f| f.kind.label() == label)
+        .unwrap_or_else(|| panic!("no {label} finding: {:#?}", e.findings()))
+}
+
+/// REQ: OBS-009 (ADR-186; GitHub issue #90) — the reporter's minute: 254 reverse lookups of
+/// private addresses (247 NXDOMAIN) and 7 ordinary queries are one `reverse_sweep`, with its
+/// evidence, and no NXDOMAIN storm.
+#[test]
+fn obs_009_a_sweep_of_254_private_reverse_names_is_a_reverse_sweep_not_a_storm() {
+    let mut e = Engine::new(Settings::default());
+    let t = DAY0 + 600;
+    private_sweep(&mut e, ip(TV), t);
+    for i in 0..7u64 {
+        e.observe_answer(
+            t + 50 + i,
+            ip(TV),
+            &wire(&format!("app{i}.vendor.example")),
+            Some(0),
+        );
+    }
+    close(&mut e, t);
+    assert_eq!(kinds(&e), ["reverse_sweep"], "{:#?}", e.findings());
+    let f = &e.findings()[0];
+    assert_eq!(
+        (
+            f.client,
+            f.observed,
+            f.baseline,
+            f.spread,
+            f.threshold,
+            f.window_start_s,
+            f.window_s,
+            f.domain.as_deref()
+        ),
+        (ip(TV), 247.0, 254.0, 0.0, 30.0, t, 60, None)
+    );
+    assert!(
+        f.detail.contains("97% of 254")
+            && f.detail.contains("different names")
+            && f.detail.contains("1.20.0.10.in-addr.arpa"),
+        "{}",
+        f.detail
+    );
+}
+
+/// REQ: OBS-009 (ADR-186) — a storm of other names is judged as before.
+#[test]
+fn obs_009_a_storm_of_other_names_is_still_a_storm() {
+    let mut e = Engine::new(Settings::default());
+    let t = DAY0 + 600;
+    bad_names(&mut e, ip(1), t);
+    close(&mut e, t);
+    assert_eq!(kinds(&e), ["nxdomain_storm"], "{:#?}", e.findings());
+    let f = &e.findings()[0];
+    assert_eq!((f.observed, f.baseline), (40.0, 50.0));
+    assert!(
+        f.detail.contains("80% of 50") && f.detail.contains("q0.bad.example"),
+        "{}",
+        f.detail
+    );
+}
+
+/// REQ: OBS-009 (ADR-186) — a storm can't hide in a sweep: in a sweep minute the sweep's lookups
+/// leave both of the storm's numbers, so the storm is judged on its own (40 of 50) and the sweep
+/// is reported beside it.
+#[test]
+fn obs_009_a_storm_padded_with_a_private_reverse_sweep_is_still_a_storm() {
+    let mut e = Engine::new(Settings::default());
+    let t = DAY0 + 600;
+    bad_names(&mut e, ip(1), t);
+    private_sweep(&mut e, ip(1), t);
+    close(&mut e, t);
+    assert_eq!(
+        kinds(&e),
+        ["nxdomain_storm", "reverse_sweep"],
+        "{:#?}",
+        e.findings()
+    );
+    let storm = first(&e, "nxdomain_storm");
+    assert_eq!((storm.observed, storm.baseline), (40.0, 50.0));
+    assert!(
+        storm.detail.contains("q0.bad.example") && !storm.detail.contains("in-addr.arpa"),
+        "the storm's samples are its own names: {}",
+        storm.detail
+    );
+    let sweep = first(&e, "reverse_sweep");
+    assert_eq!((sweep.observed, sweep.baseline), (247.0, 254.0));
+}
+
+/// REQ: OBS-009 (ADR-186) — an app retrying one private reverse name is not a sweep (one name,
+/// not many): it stays a storm, with the name as its sample.
+#[test]
+fn obs_009_a_loop_on_one_private_reverse_name_stays_a_storm() {
+    let mut e = Engine::new(Settings::default());
+    let t = DAY0 + 600;
+    for i in 0..60u64 {
+        e.observe_answer(t + i, ip(1), &wire("5.0.0.10.in-addr.arpa"), Some(3));
+    }
+    close(&mut e, t);
+    assert_eq!(kinds(&e), ["nxdomain_storm"], "{:#?}", e.findings());
+    let f = &e.findings()[0];
+    assert_eq!((f.observed, f.baseline), (60.0, 60.0));
+    assert!(f.detail.contains("5.0.0.10.in-addr.arpa"), "{}", f.detail);
+}
+
+/// REQ: OBS-009 (ADR-186) — reverse names of a public range are not private: a sweep of them
+/// stays a storm.
+#[test]
+fn obs_009_a_sweep_of_a_public_range_stays_a_storm() {
+    let mut e = Engine::new(Settings::default());
+    let t = DAY0 + 600;
+    for i in 1..=254u64 {
+        e.observe_answer(
+            t + i % 60,
+            ip(1),
+            &wire(&format!("{i}.113.0.203.in-addr.arpa")),
+            Some(3),
+        );
+    }
+    close(&mut e, t);
+    assert_eq!(kinds(&e), ["nxdomain_storm"], "{:#?}", e.findings());
+    assert_eq!(e.findings()[0].observed, 254.0);
+}
+
+/// REQ: OBS-009 (ADR-186) — a sweep is judged by the storm's bar on its own lookups: 35 NXDOMAIN
+/// of 40 names is one; 25 (under 30 a minute) is nothing, as it was before.
+#[test]
+fn obs_009_a_partial_sweep_is_a_sweep_only_over_the_bar() {
+    let mut e = Engine::new(Settings::default());
+    let t = DAY0 + 600;
+    for i in 1..=40u64 {
+        let rc = if i <= 35 { 3 } else { 0 };
+        e.observe_answer(
+            t + i,
+            ip(1),
+            &wire(&format!("{i}.20.0.10.in-addr.arpa")),
+            Some(rc),
+        );
+    }
+    for i in 1..=25u64 {
+        e.observe_answer(
+            t + i,
+            ip(2),
+            &wire(&format!("{i}.30.0.10.in-addr.arpa")),
+            Some(3),
+        );
+    }
+    close(&mut e, t);
+    assert_eq!(kinds(&e), ["reverse_sweep"], "{:#?}", e.findings());
+    let f = &e.findings()[0];
+    assert_eq!((f.client, f.observed, f.baseline), (ip(1), 35.0, 40.0));
+}
+
+/// REQ: OBS-009 (ADR-186) — reverse names of unique local IPv6 addresses (`fd00::/8`) make a
+/// sweep too.
+#[test]
+fn obs_009_private_ipv6_reverse_names_make_a_sweep() {
+    let mut e = Engine::new(Settings::default());
+    let t = DAY0 + 600;
+    for i in 0..40u64 {
+        // 32 nibbles, least significant first: two that differ, 28 zeros, then `d.f`.
+        let name = format!("{:x}.{:x}.{}d.f.ip6.arpa", i & 0xf, i >> 4, "0.".repeat(28));
+        e.observe_answer(t + i, ip(1), &wire(&name), Some(3));
+    }
+    close(&mut e, t);
+    assert_eq!(kinds(&e), ["reverse_sweep"], "{:#?}", e.findings());
+    assert_eq!(
+        (e.findings()[0].observed, e.findings()[0].baseline),
+        (40.0, 40.0)
+    );
+}
+
+/// REQ: OBS-009 (ADR-186) — once an hour: a second sweep in the hour isn't reported, and it
+/// doesn't turn into a storm either (the carve-out depends only on the minute being a sweep).
+#[test]
+fn obs_009_a_second_sweep_in_the_hour_is_neither_reported_nor_a_storm() {
+    let mut e = Engine::new(Settings::default());
+    let h = DAY0 + 3600;
+    private_sweep(&mut e, ip(TV), h + 14 * 60);
+    private_sweep(&mut e, ip(TV), h + 44 * 60);
+    close(&mut e, h);
+    assert_eq!(kinds(&e), ["reverse_sweep"], "{:#?}", e.findings());
+    assert_eq!(e.findings()[0].window_start_s, h + 14 * 60);
+}
+
+/// REQ: OBS-009 (ADR-186) — the two kinds are reported on their own clocks: a sweep at :14 and a
+/// storm of other names at :30 in the same hour are each reported.
+#[test]
+fn obs_009_a_sweep_and_a_storm_in_one_hour_are_each_reported() {
+    let mut e = Engine::new(Settings::default());
+    let h = DAY0 + 3600;
+    private_sweep(&mut e, ip(TV), h + 14 * 60);
+    bad_names(&mut e, ip(TV), h + 30 * 60);
+    close(&mut e, h);
+    assert_eq!(
+        kinds(&e),
+        ["reverse_sweep", "nxdomain_storm"],
+        "{:#?}",
+        e.findings()
+    );
+    assert_eq!(first(&e, "nxdomain_storm").observed, 40.0);
+}
+
+/// REQ: OBS-009, OBS-013 (ADR-186) — the same queries give the same engine and byte-identical
+/// findings, sweeps included.
+#[test]
+fn obs_009_sweep_replay_is_deterministic() {
+    let build = || {
+        let mut e = Engine::new(Settings::default());
+        let h = DAY0 + 3600;
+        private_sweep(&mut e, ip(TV), h + 14 * 60);
+        bad_names(&mut e, ip(TV), h + 30 * 60);
+        private_sweep(&mut e, ip(NAS), h + 30 * 60);
+        bad_names(&mut e, ip(NAS), h + 30 * 60);
+        for i in 0..60u64 {
+            e.observe_answer(
+                h + 3600 + 120 + i,
+                ip(PLUG),
+                &wire("5.0.0.10.in-addr.arpa"),
+                Some(3),
+            );
+        }
+        close(&mut e, h + 3600);
+        e
+    };
+    let (a, b) = (build(), build());
+    assert!(a.findings().len() >= 3, "{:#?}", a.findings());
+    assert_eq!(a, b);
+    assert_eq!(
+        serde_json::to_string(a.findings()).unwrap(),
+        serde_json::to_string(b.findings()).unwrap()
+    );
+}
+
+/// REQ: OBS-013, OBS-014 (ADR-186) — state saved by a version without the sweep counters loads:
+/// the old fields come back as they were, and the engine keeps running.
+#[test]
+fn obs_013_state_saved_before_the_split_still_loads() {
+    let fresh = run(true);
+    let mut v = serde_json::to_value(&fresh).unwrap();
+    for pair in v["clients"].as_array_mut().unwrap() {
+        let c = pair[1].as_object_mut().unwrap();
+        for k in [
+            "rev_total",
+            "rev_nx",
+            "rev_names",
+            "rev_samples",
+            "sweep_hour",
+        ] {
+            c.remove(k);
+        }
+    }
+    let mut e: Engine = serde_json::from_value(v).unwrap();
+    e.repair();
+    assert_eq!(e, fresh, "the old fields load as they were");
+    let n = e.clients();
+    let t = DAY0 + 15 * 86_400 + 600;
+    private_sweep(&mut e, ip(TV), t);
+    bad_names(&mut e, ip(TV), t + 60);
+    close(&mut e, t);
+    assert!(e.clients() >= n);
+    assert!(e.findings().len() > fresh.findings().len());
+}
+
+/// REQ: OBS-013 (ADR-186) — a sweep of a whole /16 (65,536 names, 256 a minute) touches the same
+/// 256 bits: the device's state stays within its budget, with at most 5 sample names.
+#[test]
+fn obs_013_a_sweep_of_a_whole_16_keeps_the_state_bounded() {
+    let mut e = Engine::new(Settings::default());
+    let start = DAY0 + 600;
+    for b in 0..256u64 {
+        let t = start + b * 60;
+        for a in 0..256u64 {
+            e.observe_answer(
+                t + a % 60,
+                ip(NAS),
+                &wire(&format!("{a}.{b}.168.192.in-addr.arpa")),
+                Some(3),
+            );
+        }
+    }
+    close(&mut e, start + 255 * 60);
+    let bytes = e.client_bytes(ip(NAS)).unwrap();
+    assert!(bytes <= 4096 + RHYTHM_BYTES, "{bytes} bytes");
+    let v = serde_json::to_value(&e).unwrap();
+    let key = serde_json::to_value(ip(NAS)).unwrap();
+    let c = &v["clients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p[0] == key)
+        .unwrap()[1];
+    let n = |k: &str| c[k].as_array().map_or(0, Vec::len);
+    assert!(n("rev_samples") <= 5 && n("nx_samples") <= 5, "{c}");
+}
