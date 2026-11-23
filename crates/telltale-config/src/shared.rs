@@ -224,6 +224,26 @@ name = \"pi\"
         assert_eq!(off.anomaly_mute, Vec::new());
     }
 
+    // REQ: CLU-010, OBS-038 (ADR-186) — a replica one version behind refuses a shared mute that
+    // names `reverse_sweep` (it doesn't know the kind), so nothing but such a mute writes the
+    // value: no mute, or one of `nxdomain_storm` alone, sends no `reverse_sweep`; one naming it does.
+    #[test]
+    fn clu_010_the_shared_part_names_reverse_sweep_only_when_a_mute_does() {
+        let shared = |kinds: &str| {
+            shared_part(&load(&format!(
+                "[[anomaly_mute]]\nname = \"tv\"\ndevices = [\"192.168.1.30\"]\nkinds = {kinds}\n"
+            )))
+            .to_string()
+        };
+        assert!(!shared_part(&load("")).to_string().contains("reverse_sweep"));
+        let storm_only = shared("[\"nxdomain_storm\"]");
+        assert!(
+            storm_only.contains("nxdomain_storm") && !storm_only.contains("reverse_sweep"),
+            "{storm_only}"
+        );
+        assert!(shared("[\"reverse_sweep\"]").contains("\"reverse_sweep\""));
+    }
+
     // REQ: CLU-013 — `[cluster.rollout]` travels with the shared part (the rest of `[cluster]`
     // doesn't); a replica takes the primary's, and the default when the primary sends none.
     #[test]

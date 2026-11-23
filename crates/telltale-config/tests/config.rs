@@ -1422,6 +1422,38 @@ note = "hourly reverse-DNS sweep"
     }
 }
 
+/// REQ: OBS-038 (ADR-186) — a mute may name `reverse_sweep` (a sweep of private reverse names is
+/// its own kind), and it resolves like any kind: listed after `nxdomain_storm`, whose order is
+/// unchanged.
+#[test]
+fn obs_038_a_mute_may_name_reverse_sweep() {
+    let load = |kinds: &str| {
+        telltale_config::Loader::new()
+            .toml_str(
+                "t.toml",
+                format!(
+                    "[[anomaly_mute]]\nname = \"lg-tv-reverse-sweep\"\ndevices = [\"192.168.1.30\"]\nkinds = {kinds}\nnote = \"hourly reverse-DNS sweep\"\n"
+                ),
+            )
+            .env(Vec::<(String, String)>::new())
+            .load()
+            .unwrap_or_else(|e| panic!("{kinds}: {e:?}"))
+    };
+    for (kinds, want) in [
+        ("[\"reverse_sweep\"]", vec!["reverse_sweep"]),
+        (
+            "[\"reverse_sweep\", \"nxdomain_storm\"]",
+            vec!["nxdomain_storm", "reverse_sweep"],
+        ),
+    ] {
+        let loaded = load(kinds);
+        let r = telltale_config::mute::resolve(&loaded.config);
+        assert_eq!(r.len(), 1, "{kinds}");
+        let labels: Vec<&str> = r[0].kinds.iter().map(|k| k.label()).collect();
+        assert_eq!(labels, want);
+    }
+}
+
 /// REQ: T8.2, CLU-003 (ADR-166) — `offline_days`: 30 unless set, 0 turns offline names off,
 /// more than a year is refused, and the default is not written back, so a node on an older
 /// build (the section refuses fields it doesn't know) still reads the shared configuration.

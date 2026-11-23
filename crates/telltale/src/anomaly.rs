@@ -56,6 +56,7 @@ const fn kind(k: AnomalyKind) -> Kind {
         AnomalyKind::NxdomainStorm => Kind::NxdomainStorm,
         AnomalyKind::Dga => Kind::Dga,
         AnomalyKind::ChattyLoop => Kind::ChattyLoop,
+        AnomalyKind::ReverseSweep => Kind::ReverseSweep,
     }
 }
 
@@ -257,6 +258,18 @@ mod tests {
         for level in [1, 2, 3] {
             cfg.telemetry.qlog.privacy_level = level;
             assert!(Anomalies::start(&cfg).is_none(), "level {level}");
+        }
+    }
+
+    // REQ: OBS-038 (ADR-186) — every kind the engine reports can be named in a mute, and the
+    // mute means that kind (the configuration and the engine each have their own enum).
+    #[test]
+    fn obs_038_config_and_engine_kinds_agree() {
+        for k in Kind::ALL {
+            let a: AnomalyKind = serde_json::from_value(serde_json::json!(k.label()))
+                .unwrap_or_else(|e| panic!("{}: {e}", k.label()));
+            assert_eq!(kind(a), k, "{}", k.label());
+            assert_eq!(a.label(), k.label());
         }
     }
 }

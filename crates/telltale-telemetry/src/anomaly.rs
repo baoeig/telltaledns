@@ -215,9 +215,9 @@ impl Kind {
         Self::ChattyLoop,
         Self::ReverseSweep,
     ];
-    /// One bit per kind, for the mute table.
-    const fn bit(self) -> u8 {
-        1 << (self as u8)
+    /// One bit per kind, for the mute table (REQ: OBS-038, ADR-186: 16 bits, room for 16 kinds).
+    const fn bit(self) -> u16 {
+        1 << (self as u16)
     }
 
     pub const fn label(self) -> &'static str {
@@ -239,6 +239,9 @@ impl Kind {
         matches!(self, Self::ChattyLoop)
     }
 }
+
+// REQ: OBS-038 (ADR-186) — a 17th kind would not fit the mute table's 16-bit mask.
+const _: () = assert!(Kind::ALL.len() <= 16);
 
 /// One anomaly, with its evidence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -263,6 +266,12 @@ pub struct Finding {
     /// and listed, but not counted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub muted_by: Option<String>,
+    /// REQ: OBS-038 (ADR-186) — on a counted `reverse_sweep`: the mute that covers the device for
+    /// `nxdomain_storm` but not for this kind. Before the split a sweep counted as a storm, so the
+    /// mute was probably made for it; the page and the API point it out. Decided when the
+    /// finding is created, as `muted_by` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storm_mute: Option<String>,
 }
 
 /// A registrable domain a device contacted for the first time (that the device's learned set
@@ -563,6 +572,7 @@ impl Client {
             let pct = u64::from(nx) * 100 / u64::from(total);
             out[0] = Some(Finding {
                 muted_by: None,
+                storm_mute: None,
                 kind: Kind::NxdomainStorm,
                 client: key,
                 domain: None,
@@ -583,6 +593,7 @@ impl Client {
             let pct = u64::from(rev_nx) * 100 / u64::from(rev_total);
             out[1] = Some(Finding {
                 muted_by: None,
+                storm_mute: None,
                 kind: Kind::ReverseSweep,
                 client: key,
                 domain: None,
@@ -712,7 +723,7 @@ struct MuteRule {
     name: String,
     /// `(network address, mask)` as 128-bit values over the v4-mapped form.
     nets: Vec<(u128, u128)>,
-    kinds: u8,
+    kinds: u16,
     expires_s: Option<u64>,
 }
 
@@ -1145,6 +1156,15 @@ impl Engine {
             *self.total_muted.entry(f.kind).or_insert(0) += 1;
         } else {
             *self.total.entry(f.kind).or_insert(0) += 1;
+            // REQ: OBS-038 (ADR-186) — kinds are explicit: a mute of `nxdomain_storm` doesn't
+            // cover a sweep. A counted sweep names such a mute, which was probably made for the
+            // sweep when it still counted as a storm.
+            if f.kind == Kind::ReverseSweep {
+                f.storm_mute = self
+                    .mutes
+                    .matching(f.client, Kind::NxdomainStorm, f.window_start_s)
+                    .map(str::to_owned);
+            }
         }
         if self.findings.len() >= MAX_FINDINGS {
             self.findings.remove(0);
@@ -1248,6 +1268,7 @@ impl Engine {
                 explained += x - t.volume.mean;
                 out.push(Finding {
                     muted_by: None,
+                    storm_mute: None,
                     kind: Kind::DomainVolume,
                     client: key,
                     domain: Some(t.domain.clone()),
@@ -1284,6 +1305,7 @@ impl Engine {
                     let (m, s) = mean_std(t.gaps());
                     out.push(Finding {
                         muted_by: None,
+                        storm_mute: None,
                         kind: Kind::Beacon,
                         client: key,
                         domain: Some(t.domain.clone()),
@@ -1320,6 +1342,7 @@ impl Engine {
                     };
                     out.push(Finding {
                         muted_by: None,
+                        storm_mute: None,
                         kind: Kind::ChattyLoop,
                         client: key,
                         domain: Some(t.domain.clone()),
@@ -1355,6 +1378,7 @@ impl Engine {
             .collect();
         Finding {
             muted_by: None,
+            storm_mute: None,
             kind: Kind::Dga,
             client: key,
             domain: client.dga_samples.first().map(|(d, _)| d.clone()),
@@ -1390,6 +1414,7 @@ impl Engine {
         if learned && r.n >= 3 && x >= 300.0 && x > thr && x >= 2.0 * r.mean {
             (explained < 0.5 * (x - r.mean)).then(|| Finding {
                 muted_by: None,
+                storm_mute: None,
                 kind: Kind::RateSpike,
                 client: key,
                 domain: None,
@@ -1431,6 +1456,7 @@ impl Engine {
             if learned && client.daily_new.n >= 3 && x >= 20.0 && x > thr {
                 out.push(Finding {
                     muted_by: None,
+                    storm_mute: None,
                     kind: Kind::Drift,
                     client: key,
                     domain: None,

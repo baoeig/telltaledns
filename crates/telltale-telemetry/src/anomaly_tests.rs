@@ -1017,3 +1017,114 @@ fn obs_013_a_sweep_of_a_whole_16_keeps_the_state_bounded() {
     let n = |k: &str| c[k].as_array().map_or(0, Vec::len);
     assert!(n("rev_samples") <= 5 && n("nx_samples") <= 5, "{c}");
 }
+
+/// Mutes by kind label (so they build on any version): `(name, device, labels)`.
+fn mutes_by_label(rules: &[(&str, [u8; 16], &[&str])]) -> MuteTable {
+    let mut m = MuteTable::default();
+    for (name, dev, labels) in rules {
+        let kinds: Vec<Kind> = Kind::ALL
+            .iter()
+            .copied()
+            .filter(|k| labels.contains(&k.label()))
+            .collect();
+        m.add(name, [(*dev, 128)], &kinds, None);
+    }
+    m
+}
+
+/// REQ: OBS-038 (ADR-186) — a mute of `reverse_sweep` mutes the device's sweeps and nothing else:
+/// a storm of other names from it still counts.
+#[test]
+fn obs_038_muting_reverse_sweep_keeps_nxdomain_storm_live() {
+    let mut e = Engine::new(Settings::default());
+    e.set_mutes(mutes_by_label(&[(
+        "lg-tv-reverse-sweep",
+        v4(192, 168, 1, 1),
+        &["reverse_sweep"],
+    )]));
+    let h = DAY0 + 600;
+    private_sweep(&mut e, ip(1), h);
+    storm(&mut e, 1, h + 3600);
+    close(&mut e, h + 3600);
+    let sweep = first(&e, "reverse_sweep");
+    assert_eq!(sweep.muted_by.as_deref(), Some("lg-tv-reverse-sweep"));
+    let storm = first(&e, "nxdomain_storm");
+    assert_eq!(storm.muted_by, None, "{storm:?}");
+    assert_eq!(
+        serde_json::to_value(&e.total).unwrap(),
+        serde_json::json!({"nxdomain_storm": 1}),
+        "the storm counts; the sweep doesn't"
+    );
+    assert_eq!(
+        serde_json::to_value(&e.total_muted).unwrap(),
+        serde_json::json!({"reverse_sweep": 1})
+    );
+}
+
+/// REQ: OBS-038 (ADR-186) — a mute that lists `nxdomain_storm` keeps meaning exactly that: it
+/// mutes the device's storms, not its sweeps. A sweep it would have covered counts, and names the
+/// mute (`storm_mute`) so the page can point it out; a sweep no such mute covers, or one a mute
+/// of its own kind matched, names nothing.
+#[test]
+fn obs_038_an_nxdomain_storm_mute_leaves_a_sweep_counted_and_names_itself_on_it() {
+    let mut e = Engine::new(Settings::default());
+    e.set_mutes(mutes_by_label(&[
+        ("lg-tv-ptr-sweep", v4(192, 168, 1, 1), &["nxdomain_storm"]),
+        (
+            "nas-both",
+            v4(192, 168, 1, 3),
+            &["nxdomain_storm", "reverse_sweep"],
+        ),
+    ]));
+    let h = DAY0 + 600;
+    private_sweep(&mut e, ip(1), h);
+    private_sweep(&mut e, ip(2), h);
+    private_sweep(&mut e, ip(3), h);
+    storm(&mut e, 1, h + 3600);
+    close(&mut e, h + 3600);
+    let of = |dev: u8, label: &str| {
+        e.findings()
+            .iter()
+            .find(|f| f.client == ip(dev) && f.kind.label() == label)
+            .unwrap_or_else(|| panic!("no {label} from {dev}: {:#?}", e.findings()))
+    };
+    let json = |f: &Finding| serde_json::to_value(f).unwrap();
+    let sweep = of(1, "reverse_sweep");
+    assert_eq!(sweep.muted_by, None, "a storm mute doesn't mute a sweep");
+    assert_eq!(json(sweep)["storm_mute"], "lg-tv-ptr-sweep");
+    let storm = of(1, "nxdomain_storm");
+    assert_eq!(storm.muted_by.as_deref(), Some("lg-tv-ptr-sweep"));
+    assert_eq!(json(storm).get("storm_mute"), None, "only a sweep names it");
+    assert_eq!(json(of(2, "reverse_sweep")).get("storm_mute"), None);
+    let both = of(3, "reverse_sweep");
+    assert_eq!(both.muted_by.as_deref(), Some("nas-both"));
+    assert_eq!(json(both).get("storm_mute"), None);
+    assert_eq!(
+        serde_json::to_value(&e.total).unwrap(),
+        serde_json::json!({"reverse_sweep": 2})
+    );
+    assert_eq!(
+        serde_json::to_value(&e.total_muted).unwrap(),
+        serde_json::json!({"nxdomain_storm": 1, "reverse_sweep": 1})
+    );
+}
+
+/// REQ: OBS-038 (ADR-186) — every kind has a bit of its own in the mute table: a mute of one kind
+/// matches that kind and no other.
+#[test]
+fn obs_038_every_kind_is_muted_by_itself_alone() {
+    let dev = v4(192, 168, 1, 1);
+    for k in Kind::ALL {
+        let mut m = MuteTable::default();
+        m.add("only", [(dev, 128)], &[k], None);
+        for other in Kind::ALL {
+            assert_eq!(
+                m.matching(dev, other, 0).is_some(),
+                other == k,
+                "a mute of {} for {}",
+                k.label(),
+                other.label()
+            );
+        }
+    }
+}
