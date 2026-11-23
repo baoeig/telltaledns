@@ -764,27 +764,46 @@ fn observe(
                 _ => Vec::new(),
             }
         }
-        // REQ: CLU-014 (owner 2026-10-19) — once per drill report, from every node, for reports
-        // that ended in the last 2 hours (a restart doesn't send old ones again).
-        AlertWhen::DrillReport => {
-            let Ok(h) = tokio::runtime::Handle::try_current() else {
-                return Vec::new();
-            };
-            let page = h.block_on(b.drills(20, 0)).unwrap_or_default();
-            let since = i64::try_from(now).unwrap_or(i64::MAX) - 2 * 3600;
-            page.items
-                .into_iter()
-                .filter(|d| d.status == "complete")
-                .filter(|d| {
-                    d.ended
-                        .as_deref()
-                        .and_then(telltale_config::parse_rfc3339)
-                        .is_some_and(|t| t >= since)
-                })
-                .map(|d| (d.id.clone(), drill_text(&d)))
-                .collect()
-        }
+        AlertWhen::DrillReport => drill_reports(b, now),
     }
+}
+
+/// REQ: CLU-004, CLU-014 (ADR-174) — how long the drill-report alert waits for the drill
+/// reports; the bridge adds its grace. The read's longest call is the primary relaying it to the
+/// nodes this one has no stream to: 2.5 s (`drill::via_primary`, its 2 s and a hop); half a second
+/// more.
+const DRILL_READ_DEADLINE: Duration = Duration::from_secs(3);
+
+/// REQ: CLU-014 (owner 2026-10-19) — the `drill_report` alert's subjects: once per drill report,
+/// from every node, for reports that ended in the last 2 hours (a restart doesn't send old ones
+/// again). Blocking: run it on a blocking-pool thread, as [`observe`] is.
+pub(crate) fn drill_reports(b: &dyn Backend, now: u64) -> Observed {
+    let Ok(h) = tokio::runtime::Handle::try_current() else {
+        return Vec::new();
+    };
+    // REQ: CLU-004 (ADR-174's known leftover; GitHub issue #7) — through the bridge, with a
+    // deadline of the operating system's, never `Handle::block_on`: a runtime that can't run the
+    // read costs this round its reports (each is sent once, so the next round sends it), never
+    // this thread for as long as the runtime is stuck.
+    let page = crate::federated::read_within(
+        &h,
+        "the drill reports",
+        b.drills(20, 0),
+        DRILL_READ_DEADLINE,
+    )
+    .unwrap_or_default();
+    let since = i64::try_from(now).unwrap_or(i64::MAX) - 2 * 3600;
+    page.items
+        .into_iter()
+        .filter(|d| d.status == "complete")
+        .filter(|d| {
+            d.ended
+                .as_deref()
+                .and_then(telltale_config::parse_rfc3339)
+                .is_some_and(|t| t >= since)
+        })
+        .map(|d| (d.id.clone(), drill_text(&d)))
+        .collect()
 }
 
 /// REQ: CLU-014 — a drill report in one sentence (the `drill_report` alert).

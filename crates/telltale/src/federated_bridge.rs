@@ -741,6 +741,35 @@ impl Pending {
     }
 }
 
+/// REQ: CLU-004, CLU-014 (ADR-174) — one of a backend's own async reads, waited for from
+/// synchronous code (the drill-report alert's, `alerts::drill_reports`, on a blocking-pool
+/// thread) by the rules above: `read` runs as a task on `rt`, sent as a federated read's one call
+/// is ([`start`], under the process's cap, [`WAITS`]), and this thread waits for it on a `std`
+/// channel for `timeout` and the [`GRACE`] at most, whatever the runtime is doing. Never
+/// `Handle::block_on`. The value comes back as JSON, as a peer's answer does, so it is weighed as
+/// one is ([`READ_BYTES`]). `None` when it wasn't asked, didn't answer in time, failed, or didn't
+/// read back. Like every bridge read it is for a thread that isn't a runtime worker (on a worker
+/// it costs its deadline: "What this does not do" above), and the guard's scan doesn't see it (it
+/// is called by path): its one caller runs inside `alerts::run`'s `spawn_blocking`.
+pub(crate) fn read_within<T>(
+    rt: &tokio::runtime::Handle,
+    what: &str,
+    read: telltale_api::BoxFuture<Result<T, telltale_api::problem::Problem>>,
+    timeout: Duration,
+) -> Option<T>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+{
+    let call = async move {
+        let value = read.await.map_err(|p| p.detail)?;
+        serde_json::to_vec(&value).map_err(|e| e.to_string())
+    };
+    let (_, answer) = start(&WAITS, rt, vec![(what.to_owned(), call)], timeout)
+        .wait()
+        .pop()?;
+    serde_json::from_slice(&answer.ok()?).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use std::pin::Pin;
