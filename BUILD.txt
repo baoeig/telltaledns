@@ -1,0 +1,3 @@
+TelltaleDNS GFWList native build
+Source: https://github.com/baoeig/telltaledns/commit/19ee14b86eeec9d56e5ca839f284f140e4b5a00f
+Build: Rust 1.99.0, Zig 0.15.2, cargo-zigbuild 0.23.4, bench-fast profile
