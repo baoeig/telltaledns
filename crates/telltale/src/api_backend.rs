@@ -3980,6 +3980,9 @@ fn forward_json(name: &str, f: &crate::managed::Forward) -> serde_json::Value {
     if let Some(url) = &f.subscription_url {
         v["subscriptionUrl"] = url.as_str().into();
     }
+    if let Some(group) = &f.upstream_group {
+        v["upstreamGroup"] = group.as_str().into();
+    }
     v
 }
 
@@ -3993,7 +3996,32 @@ fn forward_of(v: &serde_json::Value, name: &str) -> Result<crate::managed::Forwa
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
         .collect();
-    if servers.is_empty() {
+    let subscription_url = input
+        .subscription_url
+        .as_deref()
+        .map(str::trim)
+        .map(telltale_config::SafeString::new)
+        .transpose()
+        .map_err(|e| Problem::invalid(format!("subscriptionUrl: {e}")))?;
+    if subscription_url.is_some() && input.stub {
+        return Err(Problem::invalid(
+            "a route subscription cannot be a stub zone",
+        ));
+    }
+    let upstream_group = input
+        .upstream_group
+        .as_deref()
+        .map(str::trim)
+        .map(telltale_config::SafeString::new)
+        .transpose()
+        .map_err(|e| Problem::invalid(format!("upstreamGroup: {e}")))?;
+    // REQ: UPS-007 — a subscription can use the configuration's group by name.
+    if upstream_group.is_some() && (subscription_url.is_none() || !servers.is_empty()) {
+        return Err(Problem::invalid(
+            "upstreamGroup requires subscriptionUrl and no explicit servers",
+        ));
+    }
+    if servers.is_empty() && upstream_group.is_none() {
         return Err(Problem::new(
             Code::InvalidConfig,
             format!("`{name}`: give at least one server"),
@@ -4018,22 +4046,11 @@ fn forward_of(v: &serde_json::Value, name: &str) -> Result<crate::managed::Forwa
         )
         .hint("A stub zone's servers are the zone's own, by IP address (port 53), e.g. [\"10.0.0.53\"]."));
     }
-    let subscription_url = input
-        .subscription_url
-        .as_deref()
-        .map(str::trim)
-        .map(telltale_config::SafeString::new)
-        .transpose()
-        .map_err(|e| Problem::invalid(format!("subscriptionUrl: {e}")))?;
-    if subscription_url.is_some() && input.stub {
-        return Err(Problem::invalid(
-            "a route subscription cannot be a stub zone",
-        ));
-    }
     Ok(crate::managed::Forward {
         servers,
         stub: input.stub,
         subscription_url,
+        upstream_group,
     })
 }
 
@@ -4273,6 +4290,9 @@ fn plan_managed(
             }
             if let Some(url) = a["subscriptionUrl"].as_str() {
                 b["subscription_url"] = url.into();
+            }
+            if let Some(group) = a["upstreamGroup"].as_str() {
+                b["upstream_group"] = group.into();
             }
             Some(b.to_string())
         }
@@ -5321,6 +5341,7 @@ impl ApiBackend {
                     servers: servers.clone(),
                     stub,
                     subscription_url: None,
+                    upstream_group: None,
                     subscription_status: None,
                     source: source(d),
                 });
@@ -5335,6 +5356,8 @@ impl ApiBackend {
                     .collect(),
                 stub: false,
                 subscription_url: Some(s.url.to_string()),
+                upstream_group: (!s.upstream_group.starts_with("forward:"))
+                    .then(|| s.upstream_group.to_string()),
                 subscription_status: router.subscription_status(&s.name, &s.url).map(|status| {
                     telltale_api::model::RouteSubscriptionStatus {
                         names_used: status.names_used,
@@ -5684,6 +5707,11 @@ fn keep_in_git(
             format!("# Remove the [[{section}]] `{name}` from the configuration in Git.\n")
         };
     };
+    let body = if kind == ManagedKind::Forward {
+        after.unwrap_or(body)
+    } else {
+        body
+    };
     // Tables to render under `section`: one per record, the request's fields otherwise.
     let tables: Vec<(&str, serde_json::Value)> = match kind {
         ManagedKind::Record => body
@@ -5701,6 +5729,10 @@ fn keep_in_git(
                     .collect()
             })
             .unwrap_or_default(),
+        ManagedKind::Forward if body["upstreamGroup"].is_string() => vec![(
+            "route_subscription",
+            serde_json::json!({ "name": name, "url": body["subscriptionUrl"], "upstream_group": body["upstreamGroup"] }),
+        )],
         ManagedKind::Forward => {
             let group = crate::managed::forward_group(name);
             let servers: Vec<String> = body
@@ -6120,6 +6152,36 @@ mod keep_in_git_tests {
     }
 
     /// REQ: API-002 (T7.5) — the TOML that keeps an API change in Git.
+    #[test]
+    fn dns_017_grouped_subscription_exports_only_the_reference() {
+        let body = serde_json::json!({
+            "subscriptionUrl": "https://lists.example/gfwlist.txt",
+            "upstreamGroup": "overseas"
+        });
+        let forward = forward_of(&body, "gfwlist").unwrap();
+        assert!(forward.servers.is_empty());
+        let after = forward_json("gfwlist", &forward);
+        assert_eq!(after["upstreamGroup"], "overseas");
+        let config = keep_in_git(ManagedKind::Forward, "gfwlist", Some(&body), Some(&after));
+        let parsed: toml::Table = toml::from_str(&config).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed["route_subscription"][0]["upstream_group"].as_str(),
+            Some("overseas")
+        );
+
+        let mut mixed = body;
+        mixed["servers"] = serde_json::json!(["10.0.0.53"]);
+        assert!(forward_of(&mixed, "gfwlist").is_err());
+        assert!(
+            forward_of(
+                &serde_json::json!({"upstreamGroup": "overseas"}),
+                "corp.example"
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn api_002_keep_in_git_toml() {
         let up = keep_in_git(

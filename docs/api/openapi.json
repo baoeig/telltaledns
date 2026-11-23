@@ -13934,22 +13934,26 @@
               "null"
             ],
             "description": "Source URL for a GFWList/AutoProxy subscription."
+          },
+          "upstreamGroup": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "REQ: UPS-007 — configured group used by the subscription, when selected by name."
           }
         }
       },
       "ForwardInput": {
         "type": "object",
         "description": "The servers a domain is sent to (`PUT /api/v1/forwards/{domain}`).",
-        "required": [
-          "servers"
-        ],
         "properties": {
           "servers": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "Addresses (plain DNS) or `udp://`, `tcp://`, `tls://`, `https://` URLs, tried in order.\nFor a stub zone: the zone's own servers, as IP addresses (port 53).",
+            "description": "Addresses (plain DNS) or `udp://`, `tcp://`, `tls://`, `https://` URLs, tried in order.\nFor a stub zone: the zone's own servers, as IP addresses (port 53).\nOmit when selecting an upstream group for a subscription.",
             "example": [
               "10.0.0.53"
             ]
@@ -13964,6 +13968,13 @@
               "null"
             ],
             "description": "REQ: DNS-017, UPS-007 — subscribe to a GFWList/AutoProxy HTTPS URL. The path\nidentifies the subscription by name when this field is set."
+          },
+          "upstreamGroup": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "REQ: UPS-007 — an existing shared upstream group. Requires `subscriptionUrl`."
           }
         },
         "additionalProperties": false
@@ -15549,6 +15560,13 @@
                     "null"
                   ],
                   "description": "Source URL for a GFWList/AutoProxy subscription."
+                },
+                "upstreamGroup": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "REQ: UPS-007 — configured group used by the subscription, when selected by name."
                 }
               }
             }

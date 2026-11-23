@@ -258,9 +258,10 @@ upstream_group = "lan"</code></pre>
   <h2>Subscribe to a route list</h2>
   <ol class="guide">
     <li>Open <b>Filtering &amp; DNS → DNS Routes → Add a route subscription</b>.</li>
-    <li>Enter a name, paste a GFWList HTTPS URL, and enter the upstream DNS server for its domains.</li>
+    <li>Enter a name, paste a GFWList HTTPS URL, and choose a shared group configured in <b>Upstreams</b>.</li>
     <li>Save. TelltaleDNS fetches the list in the background and refreshes it daily.</li>
   </ol>
+  <p>The subscription uses the group's current servers and strategy. To move an older subscription to a group, open <b>Edit</b> on its row.</p>
   <p>The table shows the refresh state, <b>Names used</b> (forwarding suffixes) and <b>Exceptions</b> for the active copy on this node. If a refresh fails, <b>Using last good</b> marks the copy that stays active. The list controls DNS forwarding, while your network controls the connection to the website. See the <a href="https://github.com/paimonsoror/telltaledns/blob/main/docs/running.md#subscribe-to-gfwlist">file configuration and supported rule formats</a>.</p>
 </section>
 

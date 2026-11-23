@@ -11,14 +11,20 @@
   import StatusBadge from '../lib/components/StatusBadge.svelte';
 
   type Forward = S['ForwardInfo'];
+  type Editor = { name: string; url: string; upstreamGroup: string; originalServers?: string[]; editing: boolean };
   let subscriptions = $state<Forward[] | null>(null);
   let error = $state<unknown>(null);
-  let editor = $state<{ name: string; url: string; servers: string; editing: boolean } | null>(null);
+  let editor = $state<Editor | null>(null);
+  let groups = $state<string[] | null>(null);
+  let groupsError = $state<unknown>(null);
   let formError = $state<unknown>(null);
   let busy = $state(false);
   let saved = $state(false);
   let latestLoad = 0;
   const canEdit = $derived(session.user?.role === 'admin' || session.user?.role === 'operator');
+  const destinationReady = $derived(editor && (editor.upstreamGroup
+    ? groups?.includes(editor.upstreamGroup)
+    : !!editor.originalServers));
 
   async function load() {
     const request = ++latestLoad;
@@ -33,6 +39,21 @@
   }
   $effect(() => poll(load, 15000));
 
+  // REQ: UPS-007 — use the same definitions shown on Upstreams. Route subscriptions are shared.
+  $effect(() => {
+    if (!editor) return;
+    let open = true;
+    groups = null;
+    groupsError = null;
+    void api.configEntries('upstream_group').then(({ items }) => {
+      if (open) groups = items.filter(({ definition }) => definition && definition.node_only !== true)
+        .map(({ name }) => name);
+    }).catch((e) => {
+      if (open) groupsError = e;
+    });
+    return () => { open = false; };
+  });
+
   function listState(status: Forward['subscriptionStatus']) {
     if (status?.error) return status.namesUsed == null ? 'failed' : 'stale';
     return status?.namesUsed == null ? 'pending' : 'ok';
@@ -42,7 +63,8 @@
     editor = {
       name: forward?.domain ?? '',
       url: forward?.subscriptionUrl ?? '',
-      servers: forward?.servers.join(' ') ?? '',
+      upstreamGroup: forward?.upstreamGroup ?? '',
+      originalServers: forward && !forward.upstreamGroup ? forward.servers : undefined,
       editing: !!forward,
     };
     formError = null;
@@ -51,19 +73,24 @@
 
   async function save(event: SubmitEvent) {
     event.preventDefault();
-    if (!editor) return;
+    const draft = editor;
+    if (!draft || !destinationReady) return;
+    const { name, url, upstreamGroup, originalServers } = draft;
     busy = true;
     formError = null;
     saved = false;
     try {
-      await api.putForward(editor.name.trim(), {
-        servers: editor.servers.split(/[\s,]+/).filter(Boolean),
-        subscriptionUrl: editor.url.trim(),
+      await api.putForward(name.trim(), {
+        subscriptionUrl: url.trim(),
+        ...(upstreamGroup ? { upstreamGroup } : { servers: originalServers }),
       });
-      saved = true;
+      if (editor === draft) {
+        if (upstreamGroup) draft.originalServers = undefined;
+        saved = true;
+      }
       await load();
     } catch (e) {
-      formError = e;
+      if (editor === draft) formError = e;
     } finally {
       busy = false;
     }
@@ -96,7 +123,7 @@
     {:else}
       <div class="table-wrap">
         <table>
-          <thead><tr><th>List</th><th>State</th><th class="num">Names used</th><th class="num">Exceptions</th><th>DNS servers</th><th>Defined in</th><th></th></tr></thead>
+          <thead><tr><th>List</th><th>State</th><th class="num">Names used</th><th class="num">Exceptions</th><th>Upstream group</th><th>Defined in</th><th></th></tr></thead>
           <tbody>
             {#each subscriptions as forward (forward.domain)}
               {@const status = forward.subscriptionStatus}
@@ -110,7 +137,10 @@
                 <td><StatusBadge value={state} label={state === 'stale' ? 'Using last good' : undefined} /></td>
                 <td class="num">{status?.namesUsed == null ? '–' : num(status.namesUsed)}</td>
                 <td class="num">{status?.exceptions == null ? '–' : num(status.exceptions)}</td>
-                <td class="mono small">{forward.servers.join(', ')}</td>
+                <td>
+                  {#if forward.upstreamGroup}<strong>{forward.upstreamGroup}</strong>{/if}
+                  <div class="mono small source" class:muted={!!forward.upstreamGroup}>{forward.servers.join(', ')}</div>
+                </td>
                 <td class="small">{forward.source === 'api' ? 'the UI / API' : 'config file'}</td>
                 <td class="num nowrap">
                   {#if canEdit && forward.source === 'api'}
@@ -134,11 +164,22 @@
     <form class="stack" onsubmit={save}>
       <label>Subscription name <input bind:value={editor.name} placeholder="gfwlist" pattern="[a-z0-9_\-]+" maxlength="64" required readonly={editor.editing} /></label>
       <label>GFWList URL <input type="url" bind:value={editor.url} placeholder="https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt" required /></label>
-      <label>Server address <input bind:value={editor.servers} placeholder="https://cloudflare-dns.com/dns-query" required /></label>
-      <p class="muted small">Separate multiple servers with spaces. They are tried in order.</p>
+      <label>Upstream group
+        <select bind:value={editor.upstreamGroup} required={!editor.originalServers} disabled={groups === null}>
+          <option value="">{editor.originalServers ? 'Keep current servers' : 'Choose an upstream group'}</option>
+          {#each groups ?? [] as group (group)}<option value={group}>{group}</option>{/each}
+        </select>
+      </label>
+      {#if !editor.upstreamGroup && editor.originalServers}
+        <p class="mono muted small source">{editor.originalServers.join(', ')}</p>
+      {/if}
+      {#if groups?.length === 0}
+        <p class="muted small">Create a shared upstream group in <a href={href('/upstreams')}>Upstreams</a>.</p>
+      {/if}
+      <ErrorNote error={groupsError} />
       <ErrorNote error={formError} />
       {#if saved}<p class="notice ok" role="status">Subscription saved. The list will refresh in the background.</p>{/if}
-      <div class="row"><button type="submit" class="primary" disabled={busy}>{busy ? 'Saving…' : 'Save'}</button></div>
+      <div class="row"><button type="submit" class="primary" disabled={busy || !destinationReady}>{busy ? 'Saving…' : 'Save'}</button></div>
     </form>
   </Drawer>
 {/if}

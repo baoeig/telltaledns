@@ -1320,7 +1320,9 @@ pub struct LocalName {
 pub struct ForwardInput {
     /// Addresses (plain DNS) or `udp://`, `tcp://`, `tls://`, `https://` URLs, tried in order.
     /// For a stub zone: the zone's own servers, as IP addresses (port 53).
+    /// Omit when selecting an upstream group for a subscription.
     #[schema(example = json!(["10.0.0.53"]))]
+    #[serde(default)]
     pub servers: Vec<String>,
     /// REQ: DNS-022 — a stub zone (BIND's `static-stub`): the servers are authoritative only,
     /// so they're asked iteratively and the delegations they give to other servers are
@@ -1331,6 +1333,9 @@ pub struct ForwardInput {
     /// identifies the subscription by name when this field is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_url: Option<String>,
+    /// REQ: UPS-007 — an existing shared upstream group. Requires `subscriptionUrl`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_group: Option<String>,
 }
 
 /// REQ: DNS-006 (T6.13) — one node's cache counters.
@@ -1717,6 +1722,9 @@ pub struct ForwardInfo {
     /// Source URL for a GFWList/AutoProxy subscription.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription_url: Option<String>,
+    /// REQ: UPS-007 — configured group used by the subscription, when selected by name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_group: Option<String>,
     /// REQ: DNS-017, UPS-007 — this node's active subscription and latest refresh result.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription_status: Option<RouteSubscriptionStatus>,

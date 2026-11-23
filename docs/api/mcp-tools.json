@@ -1329,7 +1329,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Plans a change (nothing changes until apply_plan). Sends every question under a domain to other DNS servers (a work network, your router), e.g. corp.example → 10.0.0.53. Servers are IPs (plain DNS) or tls://, https:// addresses. With stub=true the servers are the zone's own authoritative servers (IPs): they're asked iteratively and the delegations they give to other servers are followed (a BIND stub zone). Needs the config:write:forwards scope.",
+    "description": "Plans a change (nothing changes until apply_plan). Sends every question under a domain to other DNS servers (a work network, your router), e.g. corp.example → 10.0.0.53. Servers are IPs (plain DNS) or tls://, https:// addresses. With subscriptionUrl, select an existing upstreamGroup or supply servers. With stub=true the servers are the zone's own authoritative servers (IPs): they're asked iteratively and the delegations they give to other servers are followed (a BIND stub zone). Needs the config:write:forwards scope.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -1342,7 +1342,7 @@
           "type": "string"
         },
         "servers": {
-          "description": "The servers, tried in order.",
+          "description": "The servers, tried in order. Omit if selecting an upstreamGroup.",
           "items": {
             "type": "string"
           },
@@ -1359,11 +1359,14 @@
         "subscriptionUrl": {
           "description": "HTTPS URL of a GFWList or AutoProxy list to refresh. Omit stub when subscribing.",
           "type": "string"
+        },
+        "upstreamGroup": {
+          "description": "An existing shared upstream group by name. Requires subscriptionUrl.",
+          "type": "string"
         }
       },
       "required": [
         "domain",
-        "servers",
         "reason"
       ],
       "type": "object"

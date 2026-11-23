@@ -1086,28 +1086,46 @@ pub fn write_tools() -> Vec<WriteTool> {
         },
         WriteTool {
             name: "plan_forward_domain",
-            description: "Plans a change (nothing changes until apply_plan). Sends every question under a domain to other DNS servers (a work network, your router), e.g. corp.example → 10.0.0.53. Servers are IPs (plain DNS) or tls://, https:// addresses. With stub=true the servers are the zone's own authoritative servers (IPs): they're asked iteratively and the delegations they give to other servers are followed (a BIND stub zone). Needs the config:write:forwards scope.",
+            description: "Plans a change (nothing changes until apply_plan). Sends every question under a domain to other DNS servers (a work network, your router), e.g. corp.example → 10.0.0.53. Servers are IPs (plain DNS) or tls://, https:// addresses. With subscriptionUrl, select an existing upstreamGroup or supply servers. With stub=true the servers are the zone's own authoritative servers (IPs): they're asked iteratively and the delegations they give to other servers are followed (a BIND stub zone). Needs the config:write:forwards scope.",
             input_schema: || {
                 json!({"type": "object", "properties": {
                 "domain": {"type": "string", "description": "The domain, e.g. corp.example, or the subscription name when subscriptionUrl is set."},
-                "servers": {"type": "array", "items": {"type": "string"}, "description": "The servers, tried in order."},
+                "servers": {"type": "array", "items": {"type": "string"}, "description": "The servers, tried in order. Omit if selecting an upstreamGroup."},
                 "stub": {"type": "boolean", "description": "A stub zone: the servers are authoritative only (IPs), asked iteratively, delegations followed. Default false."},
                 "subscriptionUrl": {"type": "string", "description": "HTTPS URL of a GFWList or AutoProxy list to refresh. Omit stub when subscribing."},
+                "upstreamGroup": {"type": "string", "description": "An existing shared upstream group by name. Requires subscriptionUrl."},
                 "reason": reason_schema()
-            }, "required": ["domain", "servers", "reason"], "additionalProperties": false})
+            }, "required": ["domain", "reason"], "additionalProperties": false})
             },
             effect: Effect::Plan,
             destructive: false,
             write: |a| {
                 let domain = need(a, "domain")?;
                 let servers = strings(a, "servers");
-                if servers.is_empty() {
-                    return Err("`servers` is required (at least one)".into());
-                }
                 // REQ: DNS-022
                 let stub = a.get("stub").and_then(Value::as_bool).unwrap_or(false);
                 let subscription = a.get("subscriptionUrl").and_then(Value::as_str);
-                let mut body = json!({"servers": servers, "stub": stub});
+                let group = s(a, "upstreamGroup");
+                if group.is_some() && (subscription.is_none() || !servers.is_empty()) {
+                    return Err(
+                        "`upstreamGroup` requires `subscriptionUrl` and no explicit `servers`"
+                            .into(),
+                    );
+                }
+                if servers.is_empty() && group.is_none() {
+                    return Err(
+                        "Give `servers` (at least one) or an `upstreamGroup` for a subscription"
+                            .into(),
+                    );
+                }
+                let mut body = json!({"stub": stub});
+                let target = if let Some(group) = group {
+                    body["upstreamGroup"] = group.as_str().into();
+                    format!("upstream group {group}")
+                } else {
+                    body["servers"] = json!(servers);
+                    servers.join(", ")
+                };
                 if let Some(url) = subscription {
                     body["subscriptionUrl"] = url.into();
                 }
@@ -1117,15 +1135,9 @@ pub fn write_tools() -> Vec<WriteTool> {
                     path: format!("/api/v1/forwards/{}", enc(&domain)),
                     body: Some(body),
                     summary: if subscription.is_some() {
-                        format!(
-                            "Forward names from subscription {domain} to {}",
-                            servers.join(", ")
-                        )
+                        format!("Forward names from subscription {domain} to {target}")
                     } else {
-                        format!(
-                            "Send questions under {domain} to {}{how}",
-                            servers.join(", ")
-                        )
+                        format!("Send questions under {domain} to {target}{how}")
                     },
                     merge: None,
                 })

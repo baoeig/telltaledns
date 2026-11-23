@@ -2979,3 +2979,9 @@ Compile whole-label suffixes separately from static routes. Support the decoded 
 **Decision.** Put the fork binaries and checksums on a separate distribution branch. Pin its full commit in the replacement script. Validate the staged binary as the existing service user, save the old binary and an application backup, and atomically rename the new executable in place. Restart the standard unit and put back the old binary if startup fails.
 
 **Consequences.** This path uses the existing service and data folder. The official signed update channel remains available through its own tools. The application backup excludes query logs, which stay in the live data folder.
+
+## ADR-185 — Select a shared upstream group for a route subscription (Proposed)
+
+**Context.** DNS-017 and UPS-007 allow TOML subscriptions to reference a shared group. The UI previously entered DNS URLs and made an upstream group for each subscription.
+
+**Decision.** New subscriptions in DNS Routes select a shared group from Upstreams. The forwarding API and its MCP planner accept `upstreamGroup` together with `subscriptionUrl`, or accept the existing `servers` form. Store the name so the subscription follows the configuration when the group changes. The merged configuration must validate before applying edits, including removal of a referenced group. Existing address-based subscriptions can keep their servers when edited or switch to a group.

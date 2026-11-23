@@ -4990,17 +4990,20 @@ export interface components {
             subscriptionStatus?: components["schemas"]["RouteSubscriptionStatus"] | null;
             /** @description Source URL for a GFWList/AutoProxy subscription. */
             subscriptionUrl?: string | null;
+            /** @description REQ: UPS-007 — configured group used by the subscription, when selected by name. */
+            upstreamGroup?: string | null;
         };
         /** @description The servers a domain is sent to (`PUT /api/v1/forwards/{domain}`). */
         ForwardInput: {
             /**
              * @description Addresses (plain DNS) or `udp://`, `tcp://`, `tls://`, `https://` URLs, tried in order.
              *     For a stub zone: the zone's own servers, as IP addresses (port 53).
+             *     Omit when selecting an upstream group for a subscription.
              * @example [
              *       "10.0.0.53"
              *     ]
              */
-            servers: string[];
+            servers?: string[];
             /**
              * @description REQ: DNS-022 — a stub zone (BIND's `static-stub`): the servers are authoritative only,
              *     so they're asked iteratively and the delegations they give to other servers are
@@ -5012,6 +5015,8 @@ export interface components {
              *     identifies the subscription by name when this field is set.
              */
             subscriptionUrl?: string | null;
+            /** @description REQ: UPS-007 — an existing shared upstream group. Requires `subscriptionUrl`. */
+            upstreamGroup?: string | null;
         };
         /** @description A client group. */
         GroupInfo: {
@@ -5633,6 +5638,8 @@ export interface components {
                 subscriptionStatus?: components["schemas"]["RouteSubscriptionStatus"] | null;
                 /** @description Source URL for a GFWList/AutoProxy subscription. */
                 subscriptionUrl?: string | null;
+                /** @description REQ: UPS-007 — configured group used by the subscription, when selected by name. */
+                upstreamGroup?: string | null;
             }[];
             /** @description Cluster nodes that couldn't be read, for federated reads (CLU-002). */
             missingNodes?: string[];

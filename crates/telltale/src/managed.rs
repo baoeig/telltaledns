@@ -135,6 +135,8 @@ pub(crate) struct Forward {
     pub(crate) stub: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) subscription_url: Option<SafeString>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) upstream_group: Option<SafeString>,
 }
 
 /// Everything stored through the API.
@@ -770,39 +772,58 @@ fn merge_forwards(
         {
             continue;
         }
-        let group = forward_group(domain);
-        let members = forward_upstreams(cfg, domain, &group, f, errs);
-        match (safe(&group), safe(domain)) {
-            (Ok(g), Ok(d)) => {
-                cfg.upstream_group.push(UpstreamGroup {
-                    name: g.clone(),
-                    members,
-                    strategy: telltale_config::Strategy::Failover,
-                    parallel_fanout: 2,
-                    node_only: false,
-                });
-                if let Some(url) = &f.subscription_url {
-                    // REQ: DNS-017, UPS-007 — the managed forward contributes a source,
-                    // which the router refreshes without a configuration write.
-                    cfg.route_subscription
-                        .push(telltale_config::RouteSubscription {
-                            name: d,
-                            url: url.clone(),
-                            upstream_group: g,
-                            refresh_secs: telltale_config::daily_route_refresh(),
-                        });
-                } else {
-                    cfg.route.push(Route {
-                        match_suffix: vec![d],
-                        match_group: Vec::new(),
-                        match_qtype: Vec::new(),
-                        upstream_group: g,
-                        dnssec_nta: true,
-                        node_only: false,
-                    });
-                }
+        let Ok(d) = safe(domain) else {
+            errs.push(format!("forward `{domain}`: invalid name"));
+            continue;
+        };
+        let g = if let Some(group) = &f.upstream_group {
+            // REQ: DNS-017, UPS-007 — preserve the existing group's members and strategy.
+            if f.subscription_url.is_none() || f.stub || !f.servers.is_empty() {
+                errs.push(format!("forward `{domain}`: an upstream group requires a subscription and no explicit servers"));
+                continue;
             }
-            _ => errs.push(format!("forward `{domain}`: invalid name")),
+            if group.starts_with("forward:") {
+                errs.push(format!(
+                    "forward `{domain}`: choose a configured upstream group"
+                ));
+                continue;
+            }
+            group.clone()
+        } else {
+            let group = forward_group(domain);
+            let Ok(g) = safe(&group) else {
+                errs.push(format!("forward `{domain}`: invalid name"));
+                continue;
+            };
+            let members = forward_upstreams(cfg, domain, &group, f, errs);
+            cfg.upstream_group.push(UpstreamGroup {
+                name: g.clone(),
+                members,
+                strategy: telltale_config::Strategy::Failover,
+                parallel_fanout: 2,
+                node_only: false,
+            });
+            g
+        };
+        if let Some(url) = &f.subscription_url {
+            // REQ: DNS-017, UPS-007 — the managed forward contributes a source,
+            // which the router refreshes without a configuration write.
+            cfg.route_subscription
+                .push(telltale_config::RouteSubscription {
+                    name: d,
+                    url: url.clone(),
+                    upstream_group: g,
+                    refresh_secs: telltale_config::daily_route_refresh(),
+                });
+        } else {
+            cfg.route.push(Route {
+                match_suffix: vec![d],
+                match_group: Vec::new(),
+                match_qtype: Vec::new(),
+                upstream_group: g,
+                dnssec_nta: true,
+                node_only: false,
+            });
         }
     }
 }
@@ -1094,6 +1115,7 @@ mod tests {
                     servers: vec!["10.0.0.53".into(), "tls://10.0.0.54".into()],
                     stub: false,
                     subscription_url: None,
+                    upstream_group: None,
                 },
             )],
             ..Entries::default()
@@ -1142,11 +1164,54 @@ mod tests {
                     servers: vec!["ftp://x".into()],
                     stub: false,
                     subscription_url: None,
+                    upstream_group: None,
                 },
             )],
             ..Entries::default()
         };
         assert!(merge(&base(), &bad_server).is_err());
+    }
+
+    #[test]
+    fn ups_007_dns_017_subscription_reuses_a_shared_group() {
+        let mut file = base();
+        file.upstream_group[0].strategy = telltale_config::Strategy::RoundRobin;
+        let forward: Forward = serde_json::from_str(
+            r#"{
+            "servers": [], "subscription_url": "https://lists.example/gfwlist.txt",
+            "upstream_group": "default"
+        }"#,
+        )
+        .unwrap();
+        let mut entries = Entries {
+            forwards: vec![("gfwlist".into(), forward)],
+            ..Entries::default()
+        };
+        let cfg = merge(&file, &entries).unwrap();
+        assert_eq!(cfg.upstream, file.upstream);
+        assert_eq!(cfg.upstream_group, file.upstream_group);
+        assert_eq!(cfg.route_subscription[0].upstream_group.as_str(), "default");
+
+        entries.forwards[0].1.upstream_group = Some("absent".into());
+        assert!(
+            merge(&file, &entries)
+                .unwrap_err()
+                .iter()
+                .any(|e| e.contains("must name a shared upstream group"))
+        );
+
+        entries.forwards[0].1 = serde_json::from_str(
+            r#"{
+            "servers": ["tls://10.0.0.9"], "subscription_url": "https://lists.example/gfwlist.txt"
+        }"#,
+        )
+        .unwrap();
+        let cfg = merge(&file, &entries).unwrap();
+        assert_eq!(cfg.upstream.last().unwrap().url.as_str(), "tls://10.0.0.9");
+        assert_eq!(
+            cfg.route_subscription[0].upstream_group.as_str(),
+            "forward:gfwlist"
+        );
     }
 
     /// REQ: DNS-022 — a stub forward becomes one `recursive://` upstream that starts at the
@@ -1160,6 +1225,7 @@ mod tests {
                     servers: vec!["10.0.0.53".into(), "udp://10.0.0.54".into()],
                     stub: true,
                     subscription_url: None,
+                    upstream_group: None,
                 },
             )],
             ..Entries::default()
@@ -1186,6 +1252,7 @@ mod tests {
                     servers: vec!["tls://10.0.0.53".into()],
                     stub: true,
                     subscription_url: None,
+                    upstream_group: None,
                 },
             )],
             ..Entries::default()
