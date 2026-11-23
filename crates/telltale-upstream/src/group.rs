@@ -89,9 +89,11 @@ impl Group {
 
     /// Attempt order: admitted members in strategy order (probes marked), then the rest
     /// least-recently-failed first as a last resort. Each entry: `(upstream, must_hedge)`.
-    /// Also the position of the last member with a closed breaker, whose attempt is patient
-    /// ([`Upstream::timeout_for`], ADR-165): `None` when every breaker is open or probing.
-    fn attempt_order(&self, now: Instant) -> (Vec<(Arc<Upstream>, bool)>, Option<usize>) {
+    /// Also, for each position, whether its attempt is patient ([`Upstream::timeout_for`],
+    /// ADR-165): the last member with a closed breaker, and for `parallel` every member with a
+    /// closed breaker among the first `fanout`, which start together. None is patient when every
+    /// breaker is open or probing.
+    fn attempt_order(&self, now: Instant) -> (Vec<(Arc<Upstream>, bool)>, Vec<bool>) {
         let mut ready = Vec::with_capacity(self.members.len());
         let mut rest = Vec::new();
         let mut closed = Vec::with_capacity(self.members.len());
@@ -131,7 +133,21 @@ impl Group {
             Strategy::Failover | Strategy::RoundRobin | Strategy::Weighted => {}
         }
         rest.sort_by_key(|&i| self.members[i].health.last_failure());
-        let patient = ready.iter().rposition(|(i, _)| closed.contains(i));
+        let last_closed = ready.iter().rposition(|(i, _)| closed.contains(i));
+        // REQ: UPS-005, UPS-006 (ADR-165) — the adaptive timeout is there to give up on one
+        // member and hand over to the next. `parallel` starts its first `fanout` members at
+        // once, so none of them has anyone to hand over to: cutting one off only throws away
+        // its answer (a name it had to resolve itself) while the other is still waiting.
+        let racing = match self.strategy {
+            Strategy::Parallel { fanout } => fanout.max(1),
+            _ => 0,
+        };
+        let patient = ready
+            .iter()
+            .enumerate()
+            .map(|(pos, (i, _))| closed.contains(i) && (pos < racing || Some(pos) == last_closed))
+            .chain(rest.iter().map(|_| false))
+            .collect();
         let order = ready
             .into_iter()
             .map(|(i, hedge)| (Arc::clone(&self.members[i]), hedge))
@@ -189,8 +205,9 @@ impl Group {
                       attempts: &mut u8|
          -> Option<(Duration, bool)> {
             let (up, hedge_now) = order.get(*next)?.clone();
-            // REQ: UPS-006 (ADR-165) — the last healthy member has nobody to hand over to.
-            let timeout = up.timeout_for(patient == Some(*next));
+            // REQ: UPS-006 (ADR-165) — the last healthy member, and `parallel`'s racing ones,
+            // have nobody to hand over to.
+            let timeout = up.timeout_for(patient.get(*next).copied().unwrap_or(false));
             *next += 1;
             *attempts = attempts.saturating_add(1);
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
