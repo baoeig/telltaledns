@@ -1267,8 +1267,8 @@ pub struct RouterConfig {
     pub tls_insecure_skip_verify: bool,
     /// Seconds between reads. While a device is named by its MAC address and `[clients]
     /// router_macs` is on, the MACs a router lists identify devices, so it is read at least
-    /// every 900 seconds whatever this says (a list older than that doesn't say who holds an
-    /// address).
+    /// every 600 seconds whatever this says (a list older than 900 seconds doesn't say who
+    /// holds an address, and a read that fails is asked again within that time).
     #[serde(default = "default_router_interval")]
     pub interval_secs: u32,
     /// UniFi: also name the clients that are offline now, if UniFi saw them within this many
