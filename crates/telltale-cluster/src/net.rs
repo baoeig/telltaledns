@@ -1416,6 +1416,19 @@ impl Cluster {
             .collect()
     }
 
+    /// REQ: CLU-002 (ADR-056) — the members that serve: [`Self::members`] without the witnesses.
+    /// A cluster-wide call that asks each node for its data, or to act on its own DNS state, and
+    /// lists the nodes that didn't (pausing blocking, the cache, drills, a support package, a
+    /// simulation), goes over these, so a witness is neither asked nor listed, up or down. What
+    /// reports on every member (the Cluster page, the node-down alert) keeps [`Self::members`].
+    pub fn serving_members(&self) -> Vec<Member> {
+        let witnesses = self.witnesses();
+        self.members()
+            .into_iter()
+            .filter(|m| !witnesses.contains(&m.node_id))
+            .collect()
+    }
+
     /// Calls `kind` on `peer` over its stream; fails fast when no stream is open, and after
     /// `timeout` when the peer doesn't answer (CLU-002: a dead node never hangs a read).
     pub async fn call(

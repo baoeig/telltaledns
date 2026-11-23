@@ -1129,7 +1129,13 @@ impl Federated {
                 for (l, v) in answered {
                     out.extend(label(v, &l));
                 }
-                for m in self.cluster.members().into_iter().filter(|m| m.connected) {
+                // REQ: CLU-002 (ADR-056) — a witness runs no DNS: it has nothing to pause.
+                for m in self
+                    .cluster
+                    .serving_members()
+                    .into_iter()
+                    .filter(|m| m.connected)
+                {
                     let l = self.label_of(&m.node_id);
                     if !names.contains(&l) {
                         out.push(failed(
@@ -2574,8 +2580,9 @@ impl Backend for Federated {
                     out.extend(label(v, &l));
                 }
                 // Labelled like the answers (pods by pod name, T6.14), so a pod that answered
-                // isn't also listed as unreachable.
-                for m in self.cluster.members() {
+                // isn't also listed as unreachable. REQ: CLU-002 (ADR-056) — a witness has no
+                // cache, up or down.
+                for m in self.cluster.serving_members() {
                     let l = self.label_of(&m.node_id);
                     if !names.contains(&l) {
                         out.push(CacheFlushNode {
@@ -2669,7 +2676,13 @@ impl Backend for Federated {
                 for (l, v) in answered {
                     out.extend(label(v, &l));
                 }
-                for m in self.cluster.members().into_iter().filter(|m| m.connected) {
+                // REQ: CLU-002 (ADR-056) — a witness has no cache.
+                for m in self
+                    .cluster
+                    .serving_members()
+                    .into_iter()
+                    .filter(|m| m.connected)
+                {
                     let l = self.label_of(&m.node_id);
                     if !names.contains(&l) {
                         out.push(failed(
@@ -3297,12 +3310,34 @@ mod bridge_tests {
 
     use super::*;
 
-    /// The replica's own node: nothing but a configuration version no peer has.
+    /// The asking node's own backend: nothing but a configuration version no peer has (and, for the
+    /// witness tests, a pause that pauses nothing and an empty support part).
     struct Local;
 
     impl Backend for Local {
         fn system_info(&self) -> SystemInfo {
             unreachable!("not read here")
+        }
+        fn blocking_pause(
+            &self,
+            _: Option<&str>,
+            _: u32,
+            _: Option<&str>,
+        ) -> Result<Vec<telltale_api::model::BlockingNode>, Problem> {
+            Ok(Vec::new())
+        }
+        fn blocking_resume(
+            &self,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<Vec<telltale_api::model::BlockingNode>, Problem> {
+            Ok(Vec::new())
+        }
+        fn support_part(
+            &self,
+            _: &telltale_api::model::SupportCollectRequest,
+        ) -> Result<Vec<u8>, Problem> {
+            Ok(empty_part("k8s"))
         }
         fn timeseries(&self, _: Step, _: u64, _: u64) -> Vec<TimeBucket> {
             Vec::new()
@@ -3891,5 +3926,444 @@ mod bridge_tests {
             .map(|r| ((*r).to_owned(), 1))
             .collect();
         assert_eq!(got, want);
+    }
+
+    // ---- a witness (ADR-056, GitHub issue #88) ----
+
+    /// A primary (site `k8s`) with a replica (`pi`) and a witness (`attic`) joined to it, as
+    /// `telltale cluster join` does: each with a token that may bring it, so the primary's registry
+    /// marks the witness at join. Both dialed in. The primary's federated backend is the one read;
+    /// the replica answers each read with one row ([`replica_answers`]) and the witness never
+    /// answers ([`slow_witness`]). The witness runs on a runtime of its own, so a test can take it
+    /// away. The primary answers its peers as a node does ([`rpc_handler`]: the drill relay).
+    struct Three {
+        rt: tokio::runtime::Runtime,
+        witness_rt: Option<tokio::runtime::Runtime>,
+        primary: Arc<Cluster>,
+        replica: Arc<Cluster>,
+        witness: String,
+        /// The calls the witness was given.
+        asked: Arc<std::sync::atomic::AtomicUsize>,
+        _stop: tokio::sync::watch::Sender<bool>,
+        _dirs: Vec<tempfile::TempDir>,
+    }
+
+    impl Three {
+        /// The primary's federated backend, with bounds of its own.
+        fn federated(&self, limiter: &'static bridge::Limiter) -> Federated {
+            Federated {
+                limiter,
+                ..Federated::new(Arc::new(Local), Arc::clone(&self.primary))
+            }
+        }
+
+        fn witness_asked(&self) -> usize {
+            self.asked.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// The witness's process ends, and the primary sees its stream end (it still knows it).
+        fn witness_gone(&mut self) {
+            if let Some(rt) = self.witness_rt.take() {
+                rt.shutdown_background();
+            }
+            let up = || {
+                self.primary
+                    .members()
+                    .iter()
+                    .any(|m| m.node_id == self.witness && m.connected)
+            };
+            let until = Instant::now() + Duration::from_secs(30);
+            while up() {
+                assert!(
+                    Instant::now() < until,
+                    "the primary never saw the witness go"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            assert!(
+                self.primary
+                    .members()
+                    .iter()
+                    .any(|m| m.node_id == self.witness),
+                "the primary knows the witness, as not connected"
+            );
+        }
+    }
+
+    /// An identity in `dir` for site `site`, joined to `primary` with a token that grants `grants`.
+    fn joined(
+        primary: &Identity,
+        dir: &std::path::Path,
+        site: &str,
+        grants: TokenGrants,
+    ) -> Identity {
+        let token = primary.create_token_for(60, None, grants).unwrap();
+        let key = pki::new_node_key().unwrap();
+        let answer = primary
+            .accept_join(
+                &JoinRequest {
+                    witness: grants.witness,
+                    ephemeral: false,
+                    secret: token.secret,
+                    csr_pem: key.csr_pem,
+                    advertise: vec![],
+                    site: site.into(),
+                    eligible: grants.eligible,
+                    version: "0.1.0".into(),
+                },
+                None,
+            )
+            .unwrap();
+        Identity::save_joined(dir, &key.key_pem, &answer, site, grants.eligible, vec![]).unwrap()
+    }
+
+    /// A support part of `node`'s with nothing in it.
+    fn empty_part(node: &str) -> Vec<u8> {
+        telltale_support::cluster::Part {
+            node: node.into(),
+            manifest: "{}".into(),
+            redactions: std::collections::BTreeMap::new(),
+            files: Vec::new(),
+        }
+        .to_wire()
+    }
+
+    /// The replica: one row for each read the witness tests make, an empty part, and no drills.
+    fn replica_answers() -> RpcHandler {
+        Arc::new(|_peer, kind, body| {
+            Box::pin(async move {
+                if kind == crate::drill::KIND {
+                    let op = serde_json::from_slice::<crate::drill::Op>(&body)
+                        .map_err(|e| e.to_string())?;
+                    return match op {
+                        crate::drill::Op::List => Ok(b"[]".to_vec()),
+                        crate::drill::Op::Report { .. } => Ok(b"null".to_vec()),
+                        _ => Err("a drill call these tests don't make".to_owned()),
+                    };
+                }
+                let read = serde_json::from_slice::<Read>(&body).map_err(|e| e.to_string())?;
+                let answer = match read {
+                    Read::Timeseries { from_s, .. } => serde_json::to_vec(&vec![TimeBucket {
+                        start_unix_seconds: from_s,
+                        total: 1,
+                        ..TimeBucket::default()
+                    }]),
+                    Read::Top { .. } => serde_json::to_vec(&vec![TopItem {
+                        key: "example.com".into(),
+                        name: None,
+                        count: 3,
+                        error_bound: 0,
+                        groups: Vec::new(),
+                        by_status: None,
+                    }]),
+                    Read::BlockingState
+                    | Read::BlockingPause { .. }
+                    | Read::BlockingResume { .. } => {
+                        serde_json::to_vec(&vec![telltale_api::model::BlockingNode::default()])
+                    }
+                    Read::CacheEntries { .. } => {
+                        serde_json::to_vec(&vec![telltale_api::model::CacheNodeEntries::default()])
+                    }
+                    Read::CacheFlush { .. } => {
+                        serde_json::to_vec(&vec![telltale_api::model::CacheFlushNode {
+                            node: None,
+                            removed: Some(2),
+                            error: None,
+                        }])
+                    }
+                    Read::SupportCollect { .. } => return Ok(empty_part("pi")),
+                    _ => return Err("a read these tests don't ask".to_owned()),
+                };
+                answer.map_err(|e| e.to_string())
+            })
+        })
+    }
+
+    /// A witness that is slow, or wedged: it counts each call and never answers. (`telltale cluster
+    /// witness` answers "a witness only votes" at once; either way it has nothing for a read, and
+    /// this one, asked, would hold a read to its deadline.)
+    fn slow_witness(asked: Arc<std::sync::atomic::AtomicUsize>) -> RpcHandler {
+        Arc::new(move |_peer, _kind, _body| {
+            let asked = Arc::clone(&asked);
+            Box::pin(async move {
+                asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::pending::<Result<Vec<u8>, String>>().await
+            })
+        })
+    }
+
+    fn three_nodes() -> Three {
+        let runtime = |workers: usize| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(workers)
+                .enable_all()
+                .build()
+                .unwrap()
+        };
+        let (rt, witness_rt) = (runtime(2), runtime(1));
+        let dirs: Vec<tempfile::TempDir> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let primary_id = Identity::init(
+            dirs[0].path(),
+            "home",
+            vec![format!("https://{addr}")],
+            "k8s",
+        )
+        .unwrap();
+        let replica_id = joined(
+            &primary_id,
+            dirs[1].path(),
+            "pi",
+            TokenGrants {
+                eligible: true,
+                witness: false,
+            },
+        );
+        // As `telltale cluster join --witness` does.
+        let mut witness_id = joined(
+            &primary_id,
+            dirs[2].path(),
+            "attic",
+            TokenGrants {
+                eligible: false,
+                witness: true,
+            },
+        );
+        witness_id.mark_witness().unwrap();
+        let primary = Cluster::new(primary_id, "0.1.0");
+        let replica = Cluster::new(replica_id, "0.1.0");
+        let witness = Cluster::new(witness_id, "0.1.0");
+        let primary_node = primary.identity.meta.node_id.clone();
+        let replica_node = replica.identity.meta.node_id.clone();
+        let witness_node = witness.identity.meta.node_id.clone();
+        let src = Arc::new(crate::http::tests::sources_in(dirs[3].path()));
+        primary.set_rpc_handler(rpc_handler(src, Arc::new(Local), Arc::clone(&primary)));
+        replica.set_rpc_handler(replica_answers());
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        witness.set_rpc_handler(slow_witness(Arc::clone(&asked)));
+        // The nodes' tasks run until their runtime is dropped (the sender stays in `Three`).
+        let (stop_tx, stop) = tokio::sync::watch::channel(false);
+        drop(rt.spawn(telltale_cluster::net::serve(
+            Arc::clone(&primary),
+            addr,
+            stop.clone(),
+        )));
+        drop(rt.spawn(telltale_cluster::net::dial(
+            Arc::clone(&replica),
+            stop.clone(),
+        )));
+        drop(witness_rt.spawn(telltale_cluster::net::dial(Arc::clone(&witness), stop)));
+        let mut both = vec![replica_node, witness_node.clone()];
+        both.sort();
+        let until = Instant::now() + Duration::from_secs(30);
+        loop {
+            let mut reachable = primary.reachable_peers();
+            reachable.sort();
+            let connected = primary.members().iter().filter(|m| m.connected).count();
+            if reachable == both
+                && connected == 2
+                && replica.reachable_primary().as_deref() == Some(primary_node.as_str())
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "the replica and the witness never both reached the primary"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        // What the primary decided at join, from the token (ADR-056): the witness is one.
+        assert_eq!(primary.witnesses(), [witness_node.clone()]);
+        Three {
+            rt,
+            witness_rt: Some(witness_rt),
+            primary,
+            replica,
+            witness: witness_node,
+            asked,
+            _stop: stop_tx,
+            _dirs: dirs,
+        }
+    }
+
+    // REQ: CLU-002 (ADR-056, GitHub issue #88) — a read that fans out over the cluster asks the
+    // nodes that serve reads, never a witness, which holds no data and answers only votes: it isn't
+    // in `missingNodes` (the page said "Partial results: attic didn't answer" on every view), and it
+    // costs the read nothing. This witness never answers, as one that is slow or wedged: asked, it
+    // would hold the read to its deadline. The read's budget has room for the replica's calls only,
+    // so calls to the witness would also have had the read refused. A witness that is gone isn't
+    // missing either. Before (pull request #89): the witness was asked for every window, and
+    // listed, up or down.
+    #[test]
+    fn clu_002_a_witness_is_never_asked_nor_listed_in_missing_nodes() {
+        let mut n = three_nodes();
+        let handle = n.rt.handle().clone();
+        let _in = handle.enter();
+        // Four windows of 240 seconds, and room for four calls at once: the replica's.
+        let limiter: &'static bridge::Limiter =
+            Box::leak(Box::new(bridge::Limiter::with_budget(8, 4)));
+        let fed = n.federated(limiter);
+        let from = 1_791_000_000;
+        let starts: Vec<u64> = fed
+            .timeseries(Step::Second, from, from + 4 * 240)
+            .iter()
+            .map(|b| b.start_unix_seconds)
+            .collect();
+        assert_eq!(
+            starts,
+            [from, from + 240, from + 480, from + 720],
+            "the replica's, every window"
+        );
+        assert_eq!(fed.missing_nodes(), Vec::<String>::new(), "a range of time");
+        let top: Vec<(String, u64)> = fed
+            .top(TopKind::Domains, Hour::Current, 10, None)
+            .into_iter()
+            .map(|t| (t.key, t.count))
+            .collect();
+        assert_eq!(top, [("example.com".to_owned(), 3)]);
+        assert_eq!(fed.missing_nodes(), Vec::<String>::new(), "a top list");
+        assert_eq!(n.witness_asked(), 0, "the witness was asked");
+        n.witness_gone();
+        let starts_now = fed.timeseries(Step::Second, from, from + 4 * 240).len();
+        assert_eq!(starts_now, 4, "the replica's, every window");
+        assert_eq!(
+            fed.missing_nodes(),
+            Vec::<String>::new(),
+            "with the witness gone"
+        );
+        let refused: Vec<(&str, u64)> = limiter
+            .refusals()
+            .iter()
+            .map(|&(why, count)| (why.label(), count))
+            .filter(|&(_, count)| count > 0)
+            .collect();
+        assert_eq!(refused, [], "nothing was refused");
+    }
+
+    // REQ: CLU-002, FLT-009, DNS-006 (ADR-056) — what every node is asked to do or to list, pausing
+    // blocking and the cache, goes to the nodes that serve DNS. A witness runs none: it is not
+    // listed as a node that "didn't answer (an older version can't pause)", nor as one whose cache
+    // is "not reachable: flush it when it's back" (said even of a witness that was up). The
+    // replica's rows are there. Before: each of these lists took every member.
+    #[test]
+    fn clu_002_cluster_wide_pause_and_cache_lists_skip_witnesses() {
+        let n = three_nodes();
+        let _in = n.rt.enter();
+        let fed = n.federated(Box::leak(Box::new(bridge::Limiter::new(8))));
+        let pi = || vec![(Some("pi".to_owned()), None::<String>)];
+        let state: Vec<_> = fed
+            .blocking_state()
+            .into_iter()
+            .map(|r| (r.node, r.error))
+            .collect();
+        assert_eq!(state, pi(), "the pause state");
+        let paused: Vec<_> = fed
+            .blocking_pause(None, 5, None)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.node, r.error))
+            .collect();
+        assert_eq!(paused, pi(), "a pause");
+        let resumed: Vec<_> = fed
+            .blocking_resume(None, None)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.node, r.error))
+            .collect();
+        assert_eq!(resumed, pi(), "a resume");
+        let entries: Vec<_> = fed
+            .cache_entries("hits", 10, None)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.node, r.error))
+            .collect();
+        assert_eq!(entries, pi(), "the cache's entries");
+        let flushed: Vec<_> = fed
+            .cache_flush(Some("example.com"), false, None)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.node, r.removed, r.error))
+            .collect();
+        assert_eq!(flushed, [(Some("pi".to_owned()), Some(2), None)], "a flush");
+        assert_eq!(n.witness_asked(), 0, "the witness was asked");
+    }
+
+    // REQ: CLU-014, CLU-002 (ADR-056) — the drills list and a report's "didn't answer" hint (the
+    // affinity view and a drill's parts ask the same way) go to the nodes that keep drills: a
+    // witness keeps none. Before: it was asked and listed, and a finished drill's report waited the
+    // full five minutes for the witness's part before listing it as missing.
+    #[test]
+    fn clu_002_the_drills_list_skips_witnesses() {
+        let n = three_nodes();
+        let fed = n.federated(Box::leak(Box::new(bridge::Limiter::new(8))));
+        let page = n.rt.block_on(fed.drills(50, 0)).expect("the drills page");
+        assert_eq!(page.missing_nodes, Vec::<String>::new());
+        let p =
+            n.rt.block_on(fed.drill_report("no-such-drill"))
+                .expect_err("there is no such drill");
+        assert_eq!(
+            p.hint.as_deref(),
+            Some("List them with GET /api/v1/drills."),
+            "{p:?}"
+        );
+        assert_eq!(n.witness_asked(), 0, "the witness was asked");
+    }
+
+    // REQ: CLU-014, CLU-002 (ADR-056) — a node with no stream to the witness (the replica here,
+    // which dialed the primary only; a resolver pod is another) asks the primary to pass a drill call
+    // on to the nodes it can't reach. The primary passes it to the nodes that keep drills, never the
+    // witness. Before: the primary asked the witness, and the caller listed it as missing.
+    #[test]
+    fn clu_002_a_drill_call_the_primary_relays_skips_witnesses() {
+        let n = three_nodes();
+        let (answers, missing) =
+            n.rt.block_on(crate::drill::ask_all(&n.replica, &crate::drill::Op::List));
+        let labels: Vec<&str> = answers.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, ["k8s"], "the primary's own answer");
+        assert_eq!(missing, Vec::<String>::new());
+        assert_eq!(n.witness_asked(), 0, "the witness was asked");
+    }
+
+    // REQ: OPS-011, CLU-002 (ADR-172, ADR-056) — a cluster support package is made of the parts of
+    // the nodes that serve: a witness makes none, so it is neither asked nor listed in the manifest
+    // as missing, whether it is up or gone. Before (pull request #89): a witness that was up was
+    // asked and listed as "did not answer"; after it, one that was down was still listed as "not
+    // connected".
+    #[test]
+    fn clu_002_a_cluster_support_package_skips_witnesses() {
+        let mut n = three_nodes();
+        let handle = n.rt.handle().clone();
+        let _in = handle.enter();
+        let fed = n.federated(Box::leak(Box::new(bridge::Limiter::new(8))));
+        let req = telltale_api::model::SupportPackageRequest {
+            level: Some("none".into()),
+            cluster: true,
+            ..telltale_api::model::SupportPackageRequest::default()
+        };
+        let rows = |fed: &Federated| -> Vec<(String, String)> {
+            let out = fed.support_package(&req, true).expect("a package");
+            let mut rows: Vec<(String, String)> = out.manifest["nodes"]
+                .as_array()
+                .expect("the manifest's nodes")
+                .iter()
+                .map(|r| {
+                    let field = |k: &str| r[k].as_str().unwrap_or_default().to_owned();
+                    (field("node"), field("status"))
+                })
+                .collect();
+            rows.sort();
+            rows
+        };
+        let both = [
+            ("k8s".to_owned(), "ok".to_owned()),
+            ("pi".to_owned(), "ok".to_owned()),
+        ];
+        assert_eq!(rows(&fed), both, "with the witness up");
+        n.witness_gone();
+        assert_eq!(rows(&fed), both, "with the witness gone");
+        assert_eq!(n.witness_asked(), 0, "the witness was asked");
     }
 }
