@@ -371,9 +371,7 @@ impl Validator {
         } else {
             0
         };
-        if !client_do {
-            strip_dnssec(&mut message, q.qtype);
-        }
+        tidy(&mut message, q.qtype, client_do, &qkey);
         message.metadata.authentic_data = verdict == Verdict::Secure && (client_do || client_ad);
         message.metadata.checking_disabled = false;
         let bytes = message.to_vec().map_err(|_| ResolveError::Empty)?;
@@ -1126,6 +1124,15 @@ fn synthesized(
     m.to_vec().ok()
 }
 
+/// The validated answer as it is served: DNSSEC records only for clients that asked (DO),
+/// records in resolution order.
+fn tidy(m: &mut Message, qtype: u16, client_do: bool, qkey: &str) {
+    if !client_do {
+        strip_dnssec(m, qtype);
+    }
+    chain_order(&mut m.answers, qkey);
+}
+
 /// Removes RRSIG, NSEC, and NSEC3 records a client didn't ask for (it sent no DO bit).
 fn strip_dnssec(m: &mut Message, qtype: u16) {
     let dnssec = |t: RecordType| {
@@ -1135,6 +1142,52 @@ fn strip_dnssec(m: &mut Message, qtype: u16) {
     m.answers.retain(|r| !dnssec(r.record_type()));
     m.authorities.retain(|r| !dnssec(r.record_type()));
     m.additionals.retain(|r| !dnssec(r.record_type()));
+}
+
+/// REQ: DNS-011 — puts the answer section back in resolution order. hickory's validating
+/// handle returns the validated record sets in no particular order, so an address could come
+/// before the CNAME that leads to it. Stub resolvers such as glibc's read a chain top-down and
+/// drop records whose owner isn't the current name yet, so those answers had no address at
+/// all for them. Order: a DNAME first (RFC 6672 §5.3.1), then from the question name each
+/// owner's CNAME, its other data, and its signatures, following CNAME targets; anything not on
+/// the chain keeps its place at the end. `qname` is lowercase, without the trailing dot
+/// ([`zone_key`]).
+fn chain_order(answers: &mut Vec<Record>, qname: &str) {
+    if answers.len() < 2 {
+        return;
+    }
+    let rank = |r: &Record| match r.record_type() {
+        RecordType::CNAME => 0,
+        RecordType::RRSIG => 2,
+        _ => 1,
+    };
+    let mut rest = std::mem::take(answers);
+    let (dname, others): (Vec<_>, Vec<_>) = rest
+        .into_iter()
+        .partition(|r| r.record_type() == RecordType::DNAME);
+    answers.extend(dname);
+    rest = others;
+    let mut owner = qname.to_owned();
+    // A chain is at most as long as the answer; the bound also ends a CNAME loop.
+    for _ in 0..=rest.len() {
+        let (mut here, others): (Vec<_>, Vec<_>) =
+            rest.into_iter().partition(|r| zone_key(&r.name) == owner);
+        rest = others;
+        if here.is_empty() {
+            break;
+        }
+        here.sort_by_key(rank);
+        let next = here.iter().find_map(|r| match &r.data {
+            RData::CNAME(c) => Some(zone_key(&c.0)),
+            _ => None,
+        });
+        answers.extend(here);
+        match next {
+            Some(n) if n != owner => owner = n,
+            _ => break,
+        }
+    }
+    answers.extend(rest);
 }
 
 /// The answer an upstream group gave, before validation existed (for callers that need the
@@ -2193,6 +2246,70 @@ mod tests {
             Verdict::Insecure,
             "nothing to prove anything with"
         );
+    }
+
+    // REQ: DNS-011 — the validator's record sets come back in any order; the answer is
+    // served in resolution order (glibc drops addresses that come before their CNAME).
+    #[test]
+    fn dns_011_answers_follow_the_cname_chain() {
+        let cname = |from: &str, to: &str| {
+            rec(
+                from,
+                RData::CNAME(rdata::CNAME(Name::from_ascii(to).unwrap())),
+                Proof::Insecure,
+            )
+        };
+        let addr = |owner: &str, last: u8| {
+            rec(
+                owner,
+                RData::A(rdata::A::new(192, 0, 2, last)),
+                Proof::Insecure,
+            )
+        };
+        let order = |v: &[Record]| -> Vec<(String, RecordType)> {
+            v.iter()
+                .map(|r| (r.name.to_ascii().to_ascii_lowercase(), r.record_type()))
+                .collect()
+        };
+        // Addresses first, chain links backwards, mixed case: put in order.
+        let mut v = vec![
+            addr("lb.example.net.", 1),
+            cname("cdn.example.com.", "LB.example.net."),
+            addr("lb.example.net.", 2),
+            cname("WWW.example.com.", "cdn.example.com."),
+        ];
+        chain_order(&mut v, "www.example.com");
+        assert_eq!(
+            order(&v),
+            vec![
+                ("www.example.com.".into(), RecordType::CNAME),
+                ("cdn.example.com.".into(), RecordType::CNAME),
+                ("lb.example.net.".into(), RecordType::A),
+                ("lb.example.net.".into(), RecordType::A),
+            ]
+        );
+        // The addresses keep their own order.
+        assert_eq!(v[2].data, RData::A(rdata::A::new(192, 0, 2, 1)));
+        // Records off the chain stay, at the end; a CNAME loop ends.
+        let mut v = vec![
+            addr("other.example.", 9),
+            cname("b.example.", "a.example."),
+            cname("a.example.", "b.example."),
+        ];
+        chain_order(&mut v, "a.example");
+        assert_eq!(
+            order(&v),
+            vec![
+                ("a.example.".into(), RecordType::CNAME),
+                ("b.example.".into(), RecordType::CNAME),
+                ("other.example.".into(), RecordType::A),
+            ]
+        );
+        // An answer already in order is unchanged.
+        let mut v = vec![cname("x.example.", "y.example."), addr("y.example.", 3)];
+        let before = v.clone();
+        chain_order(&mut v, "x.example");
+        assert_eq!(v, before);
     }
 
     #[test]
