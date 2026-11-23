@@ -47,6 +47,18 @@ pub enum ResolveError {
     Empty,
 }
 
+/// One position of a query's attempt order.
+#[derive(Clone, Debug)]
+struct Attempt {
+    up: Arc<Upstream>,
+    /// Start the next attempt at once rather than after this one's hedge delay: a probe, an
+    /// exploratory pick, a last resort, or a member whose last attempt failed.
+    hedge_now: bool,
+    /// REQ: UPS-006 (ADR-165) — no member to hand over to: the attempt may use the rest of the
+    /// query's budget ([`Upstream::timeout_for`]).
+    patient: bool,
+}
+
 /// A named set of upstreams with a strategy.
 #[derive(Debug)]
 pub struct Group {
@@ -87,13 +99,22 @@ impl Group {
         self.strategy
     }
 
+    /// REQ: UPS-005 — how many members `parallel` starts at once; none for the strategies that
+    /// try one member at a time.
+    fn racing(&self) -> usize {
+        match self.strategy {
+            Strategy::Parallel { fanout } => fanout.max(1),
+            _ => 0,
+        }
+    }
+
     /// Attempt order: admitted members in strategy order (probes marked), then the rest
-    /// least-recently-failed first as a last resort. Each entry: `(upstream, must_hedge)`.
-    /// Also, for each position, whether its attempt is patient ([`Upstream::timeout_for`],
-    /// ADR-165): the last member with a closed breaker, and for `parallel` every member with a
-    /// closed breaker among the first `fanout`, which start together. None is patient when every
-    /// breaker is open or probing.
-    fn attempt_order(&self, now: Instant) -> (Vec<(Arc<Upstream>, bool)>, Vec<bool>) {
+    /// least-recently-failed first as a last resort. An attempt is patient
+    /// ([`Upstream::timeout_for`], ADR-165) when its member's breaker is closed and it has no
+    /// member to hand over to: the last such member, and for `parallel` each one among the
+    /// first `fanout`, which start together. None is patient when every breaker is open or
+    /// probing.
+    fn attempt_order(&self, now: Instant) -> Vec<Attempt> {
         let mut ready = Vec::with_capacity(self.members.len());
         let mut rest = Vec::new();
         let mut closed = Vec::with_capacity(self.members.len());
@@ -138,25 +159,21 @@ impl Group {
         // member and hand over to the next. `parallel` starts its first `fanout` members at
         // once, so none of them has anyone to hand over to: cutting one off only throws away
         // its answer (a name it had to resolve itself) while the other is still waiting.
-        let racing = match self.strategy {
-            Strategy::Parallel { fanout } => fanout.max(1),
-            _ => 0,
-        };
-        let patient = ready
-            .iter()
-            .enumerate()
-            .map(|(pos, (i, _))| closed.contains(i) && (pos < racing || Some(pos) == last_closed))
-            .chain(rest.iter().map(|_| false))
-            .collect();
-        let order = ready
+        let racing = self.racing();
+        ready
             .into_iter()
-            .map(|(i, hedge)| (Arc::clone(&self.members[i]), hedge))
-            .chain(
-                rest.into_iter()
-                    .map(|i| (Arc::clone(&self.members[i]), true)),
-            )
-            .collect();
-        (order, patient)
+            .enumerate()
+            .map(|(pos, (i, hedge_now))| Attempt {
+                up: Arc::clone(&self.members[i]),
+                hedge_now,
+                patient: closed.contains(&i) && (pos < racing || Some(pos) == last_closed),
+            })
+            .chain(rest.into_iter().map(|i| Attempt {
+                up: Arc::clone(&self.members[i]),
+                hedge_now: true,
+                patient: false,
+            }))
+            .collect()
     }
 
     /// Smooth weighted round robin (nginx algorithm) over the admitted members.
@@ -188,7 +205,7 @@ impl Group {
     /// fallback while other members are tried.
     pub async fn resolve(&self, q: Question, budget: Duration) -> Result<Answer, ResolveError> {
         let start = Instant::now();
-        let (order, patient) = self.attempt_order(start);
+        let order = self.attempt_order(start);
         if order.is_empty() {
             return Err(ResolveError::Empty);
         }
@@ -204,10 +221,14 @@ impl Group {
                       next: &mut usize,
                       attempts: &mut u8|
          -> Option<(Duration, bool)> {
-            let (up, hedge_now) = order.get(*next)?.clone();
+            let Attempt {
+                up,
+                hedge_now,
+                patient,
+            } = order.get(*next)?.clone();
             // REQ: UPS-006 (ADR-165) — the last healthy member, and `parallel`'s racing ones,
             // have nobody to hand over to.
-            let timeout = up.timeout_for(patient.get(*next).copied().unwrap_or(false));
+            let timeout = up.timeout_for(patient);
             *next += 1;
             *attempts = attempts.saturating_add(1);
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -221,12 +242,9 @@ impl Group {
             Some((delay, hedge_now))
         };
 
-        // Initial launches: `fanout` members for parallel, else one (plus whatever follows a
+        // Initial launches: `parallel`'s racing members, else one (plus whatever follows a
         // must-hedge probe immediately).
-        let initial = match self.strategy {
-            Strategy::Parallel { fanout } => fanout.max(1),
-            _ => 1,
-        };
+        let initial = self.racing().max(1);
         for _ in 0..initial {
             if let Some((d, _)) = launch(&mut set, &mut next, &mut attempts) {
                 next_hedge = tokio::time::Instant::now() + d;
@@ -336,11 +354,9 @@ mod tests {
 
     /// `(member id, patient)` at each position of the attempt order.
     fn patience(g: &Group, now: Instant) -> Vec<(u16, bool)> {
-        let (order, patient) = g.attempt_order(now);
-        order
+        g.attempt_order(now)
             .iter()
-            .zip(patient)
-            .map(|((u, _), p)| (u.id, p))
+            .map(|a| (a.up.id, a.patient))
             .collect()
     }
 
