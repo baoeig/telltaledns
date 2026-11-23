@@ -1486,6 +1486,39 @@ test('api_011 names on my network: wizards, DNS, and the API', async () => {
   expect(await query('nas.home.arpa').catch(() => -1)).not.toBe(0);
 });
 
+// REQ: DNS-017, UPS-007 — the DNS Routes sidebar entry manages subscriptions.
+test('dns_017 DNS Routes manages subscriptions from the sidebar', async () => {
+  await page.goto('/#/local-dns');
+  await page.getByRole('link', { name: 'DNS Routes', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'DNS Routes' })).toBeVisible();
+  await page.getByRole('button', { name: 'Add a route subscription' }).click();
+  await page.getByLabel('Subscription name').fill('gfwlist-test');
+  await page.getByLabel('GFWList URL').fill('https://lists.invalid/gfwlist.txt');
+  await page.getByLabel('Server address').fill('tls://10.0.0.9');
+  await page.getByRole('button', { name: 'Save' }).click();
+  await expect(page.getByRole('status')).toContainText('Subscription saved');
+  await page.keyboard.press('Escape');
+  const row = page.getByRole('row').filter({ hasText: 'gfwlist-test' });
+  await expect(row).toContainText('https://lists.invalid/gfwlist.txt');
+
+  await page.getByRole('navigation').getByRole('link', { name: 'Names on my network', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Names on my network' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Send a domain to another server', exact: true })).toBeVisible();
+  await expect(page.getByRole('row').filter({ hasText: 'cache.e2e.test' })).toBeVisible();
+  await expect(row).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Add a route subscription' })).toHaveCount(0);
+
+  await page.getByRole('link', { name: 'DNS Routes', exact: true }).click();
+  await row.getByRole('button', { name: 'Edit' }).click();
+  await page.getByLabel('GFWList URL').fill('https://lists.invalid/updated.txt');
+  await page.getByRole('button', { name: 'Save' }).click();
+  await expect(page.getByRole('status')).toContainText('Subscription saved');
+  await page.keyboard.press('Escape');
+  await expect(row).toContainText('https://lists.invalid/updated.txt');
+  await row.getByRole('button', { name: 'Remove gfwlist-test' }).click();
+  await expect(row).toHaveCount(0);
+});
+
 // REQ: FLT-005 (T6.12, ADR-067) — a quick rule from "Why?": allow a blocked name for this
 // device for an hour; DNS stops blocking it at once, the Rules page shows it with its
 // countdown, and removing it blocks the name again. No list is recompiled.

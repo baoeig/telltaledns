@@ -1606,6 +1606,36 @@ upstream_group = "lan"
 ```
 The longest matching suffix wins; routes can also match `match_qtype = ["PTR"]`.
 
+### Subscribe to GFWList
+
+In **Filtering & DNS → DNS Routes → Add a route subscription**, enter a name such as `gfwlist`,
+paste the GFWList HTTPS URL and enter the DNS servers to use for its domains. Add or change
+entries through the same page. For example, use `https://cloudflare-dns.com/dns-query` as
+the upstream if your resolver can reach it. The subscription changes which DNS server
+answers a query. The connection to the website still follows your network's routing.
+
+For a file-managed subscription, point to an existing upstream group.
+
+```toml
+[[route_subscription]]
+name = "gfwlist"
+url = "https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt"
+upstream_group = "overseas"
+refresh_secs = 86400
+```
+
+The first fetch starts in the background. Each node refreshes the list daily by default,
+and retries after five minutes on failure. It keeps the last valid copy across restarts.
+Without a valid copy, queries follow normal routing. Clear-text and Base64 AutoProxy are
+supported. Domain suffixes include subdomains, and `@@` exceptions skip that subscription.
+URL rules apply to the whole hostname, including when they name a specific path. Leading
+`*.` also includes the bare suffix. Regular expressions, partial-label wildcards and IP
+literals are skipped. A hand-written route wins an equal-suffix tie.
+
+The management API uses `PUT /api/v1/forwards/{name}` with `subscriptionUrl` and
+`servers`. MCP clients can pass `subscriptionUrl` to `plan_forward_domain` and then use
+the same apply flow as other forwarding changes.
+
 ### Stub zones (the zone's own servers)
 Forwarding asks a server to look the name up for you (recursion desired). A zone's own
 **authoritative** servers won't: they answer only for their zones, refuse everything else,

@@ -1327,6 +1327,10 @@ pub struct ForwardInput {
     /// followed, instead of forwarding with recursion desired. Default `false`.
     #[serde(default)]
     pub stub: bool,
+    /// REQ: DNS-017, UPS-007 — subscribe to a GFWList/AutoProxy HTTPS URL. The path
+    /// identifies the subscription by name when this field is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_url: Option<String>,
 }
 
 /// REQ: DNS-006 (T6.13) — one node's cache counters.
@@ -1710,6 +1714,9 @@ pub struct ForwardInfo {
     /// REQ: DNS-022 — a stub zone: the servers are asked iteratively and their delegations
     /// followed.
     pub stub: bool,
+    /// Source URL for a GFWList/AutoProxy subscription.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_url: Option<String>,
     /// `file` (read-only here) or `api`.
     pub source: String,
 }

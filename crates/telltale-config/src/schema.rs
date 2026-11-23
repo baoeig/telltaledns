@@ -32,6 +32,8 @@ pub struct Config {
     pub upstream_group: Vec<UpstreamGroup>,
     /// Per-domain / per-group / per-qtype routing to upstream groups.
     pub route: Vec<Route>,
+    /// REQ: DNS-017, UPS-007 — remote `AutoProxy` lists for conditional forwarding.
+    pub route_subscription: Vec<RouteSubscription>,
     /// Local DNS records answered authoritatively (DNS-010).
     pub record: Vec<LocalRecord>,
     /// REQ: DNS-018 (T7.22) — authoritative zones, optionally per group (split horizon).
@@ -133,6 +135,7 @@ impl Default for Config {
             upstream: Vec::new(),
             upstream_group: Vec::new(),
             route: Vec::new(),
+            route_subscription: Vec::new(),
             record: Vec::new(),
             local: LocalConfig::default(),
             list: Vec::new(),
@@ -680,6 +683,21 @@ pub struct Route {
     /// other nodes answer these names as if the route weren't there.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub node_only: bool,
+}
+
+/// An HTTPS `AutoProxy` list refreshed in the background for DNS routing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RouteSubscription {
+    pub name: SafeString,
+    pub url: SafeString,
+    pub upstream_group: SafeString,
+    #[serde(default = "daily_route_refresh")]
+    pub refresh_secs: u32,
+}
+
+pub const fn daily_route_refresh() -> u32 {
+    86_400
 }
 
 /// A local DNS record (DNS-010). Value formats by type:

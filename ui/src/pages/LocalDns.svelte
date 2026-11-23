@@ -25,7 +25,7 @@
     Promise.all([api.localNames(), api.forwards()])
       .then(([n, f]) => {
         names = n.items;
-        forwards = f.items;
+        forwards = f.items.filter((forward) => !forward.subscriptionUrl);
         error = null;
       })
       .catch((e) => (error = e));
@@ -235,7 +235,7 @@
   <section class="card">
     <h2>Domains sent to other servers<HelpButton id="routes" /></h2>
     {#if forwards.length === 0}
-      <p class="empty">None: every name not on this page is asked of the public DNS servers.</p>
+      <p class="empty">No single-domain forwards configured.</p>
     {:else}
       <div class="table-wrap">
         <table>

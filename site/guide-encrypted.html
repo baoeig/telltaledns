@@ -254,6 +254,16 @@ upstream_group = "lan"</code></pre>
   </div>
 </section>
 
+<section id="route-subscriptions">
+  <h2>Subscribe to a route list</h2>
+  <ol class="guide">
+    <li>Open <b>Filtering &amp; DNS → DNS Routes → Add a route subscription</b>.</li>
+    <li>Enter a name, paste a GFWList HTTPS URL, and enter the upstream DNS server for its domains.</li>
+    <li>Save. TelltaleDNS fetches the list in the background and refreshes it daily.</li>
+  </ol>
+  <p>A failed refresh keeps the last valid copy. The list controls DNS forwarding, while your network controls the connection to the website. See the <a href="https://github.com/paimonsoror/telltaledns/blob/main/docs/running.md#subscribe-to-gfwlist">file configuration and supported rule formats</a>.</p>
+</section>
+
 <section id="stub">
   <h2>When the server only knows that domain (stub zones)</h2>
   <p>Sending a domain asks the server to look names up for you. A domain's own <b>authoritative</b> servers won't: they answer only for their domain, refuse other questions, and hand sub-domains to other servers instead of answering them. Forwarded to, they look broken (they're benched, and names in a handed-off sub-domain come back empty). Make the domain a <b>stub zone</b> instead, as BIND does: TelltaleDNS looks names under it up itself, starting at those servers and following their hand-offs.</p>

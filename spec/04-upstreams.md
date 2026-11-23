@@ -41,6 +41,17 @@ stub_zone = "lab.example"                     # starts at these servers, follows
 stub_servers = ["10.0.0.53", "10.0.0.54"]
 ```
 
+### Route subscriptions (DNS-017, UPS-007, OPS-009, ADR-183)
+
+A named `[[route_subscription]]` pairs an HTTPS AutoProxy list with an upstream group. Download
+and index suffixes off the DNS path, then publish them for the source in one swap. Cache the
+last successfully validated response on disk. A missing initial copy falls through to normal
+routing. Refresh failures leave an active copy in use.
+
+An AutoProxy exception suppresses routing from its own subscription. The longest eligible
+suffix wins between a subscription and a static route. On ties a static route wins, followed
+by subscription configuration order. See ADR-183 for format limits and cluster behavior.
+
 ## 2. URL schemes (UPS-001..003, UPS-010, UPS-011)
 | Scheme | Protocol | Notes |
 |---|---|---|

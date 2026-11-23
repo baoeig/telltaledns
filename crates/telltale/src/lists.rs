@@ -33,12 +33,12 @@ use crate::pipeline::Pipeline;
 /// `/etc/resolv.conf` at itself), fall back to the OS resolver, which then asks our own
 /// listeners. That's safe: a list download is an HTTP client, not a forwarder, so it can't
 /// loop, and the listeners are bound before the fetcher starts.
-struct ListResolver {
+pub(crate) struct ListResolver {
     bootstrap: Option<Bootstrap>,
 }
 
 impl ListResolver {
-    fn new(listen: &[SocketAddr]) -> Self {
+    pub(crate) fn new(listen: &[SocketAddr]) -> Self {
         let b = Bootstrap::system(listen);
         Self {
             bootstrap: (!b.servers().is_empty()).then_some(b),

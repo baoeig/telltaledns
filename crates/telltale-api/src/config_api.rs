@@ -1859,7 +1859,7 @@ pub(crate) async fn delete_records(
 /// answer first. Domains routed in the config files are read-only here (409). A server can't be a
 /// plugin (`exec://`, `unix://`): those are defined in the config file (422, ADR-180).
 #[utoipa::path(put, path = "/api/v1/forwards/{domain}", tag = "config",
-    params(("domain" = String, Path, description = "The domain, e.g. corp.example (its whole subtree is sent)."), DryRun),
+    params(("domain" = String, Path, description = "A domain suffix such as corp.example, or the subscription name when subscriptionUrl is set."), DryRun),
     request_body = ForwardInput,
     responses(
         (status = 200, body = ConfigChange, description = "Applied (or, with dryRun, what would change)."),

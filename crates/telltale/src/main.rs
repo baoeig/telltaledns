@@ -50,6 +50,7 @@ mod replay;
 mod replication;
 mod rollout;
 mod rollups;
+mod route_subscriptions;
 mod router_secrets;
 mod routers;
 mod secret_path;

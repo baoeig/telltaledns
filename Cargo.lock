@@ -3571,6 +3571,7 @@ dependencies = [
 name = "telltale-config"
 version = "0.8.0"
 dependencies = [
+ "http",
  "jiff",
  "schemars 1.2.3",
  "serde",
@@ -3731,6 +3732,7 @@ dependencies = [
 name = "telltale-upstream"
 version = "0.8.0"
 dependencies = [
+ "arc-swap",
  "bytes",
  "crypto_box",
  "ed25519-dalek",

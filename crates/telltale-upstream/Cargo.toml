@@ -12,6 +12,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+# REQ: UPS-007 — publish refreshed domain routes without locking the query path.
+arc-swap = "1.9.2"
 # REQ: DNS-004/UPS-002 (T7.8) — DoH over HTTP/3; `02` §7 names h3 and h3-quinn.
 h3 = "0.0.8"
 h3-quinn = { version = "0.0.10", default-features = false }

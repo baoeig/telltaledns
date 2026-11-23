@@ -3977,6 +3977,9 @@ fn forward_json(name: &str, f: &crate::managed::Forward) -> serde_json::Value {
     if f.stub {
         v["stub"] = true.into();
     }
+    if let Some(url) = &f.subscription_url {
+        v["subscriptionUrl"] = url.as_str().into();
+    }
     v
 }
 
@@ -4015,9 +4018,22 @@ fn forward_of(v: &serde_json::Value, name: &str) -> Result<crate::managed::Forwa
         )
         .hint("A stub zone's servers are the zone's own, by IP address (port 53), e.g. [\"10.0.0.53\"]."));
     }
+    let subscription_url = input
+        .subscription_url
+        .as_deref()
+        .map(str::trim)
+        .map(telltale_config::SafeString::new)
+        .transpose()
+        .map_err(|e| Problem::invalid(format!("subscriptionUrl: {e}")))?;
+    if subscription_url.is_some() && input.stub {
+        return Err(Problem::invalid(
+            "a route subscription cannot be a stub zone",
+        ));
+    }
     Ok(crate::managed::Forward {
         servers,
         stub: input.stub,
+        subscription_url,
     })
 }
 
@@ -4155,10 +4171,15 @@ fn plan_managed(
             .record
             .iter()
             .any(|r| r.name.eq_ignore_ascii_case(&name)),
-        ManagedKind::Forward => file
-            .route
-            .iter()
-            .any(|r| r.match_suffix.iter().any(|s| s.eq_ignore_ascii_case(&name))),
+        ManagedKind::Forward => {
+            file.route
+                .iter()
+                .any(|r| r.match_suffix.iter().any(|s| s.eq_ignore_ascii_case(&name)))
+                || file
+                    .route_subscription
+                    .iter()
+                    .any(|s| s.name.eq_ignore_ascii_case(&name))
+        }
         ManagedKind::Rule => file.rule.iter().any(|r| r.id.eq_ignore_ascii_case(&name)),
         _ => false,
     };
@@ -4246,9 +4267,12 @@ fn plan_managed(
         (ManagedKind::Record, Some(a)) => Some(a["records"].to_string()),
         (ManagedKind::Forward, Some(a)) => {
             let mut b = serde_json::json!({ "servers": a["servers"] });
-            // REQ: DNS-022 — the stored entry keeps its stub flag.
+            // REQ: DNS-022, DNS-017 — keep the stub flag or the subscription source.
             if a["stub"] == true {
                 b["stub"] = true.into();
+            }
+            if let Some(url) = a["subscriptionUrl"].as_str() {
+                b["subscription_url"] = url.into();
             }
             Some(b.to_string())
         }
@@ -4260,6 +4284,22 @@ fn plan_managed(
             .or(before.as_ref())
             .and_then(|v| serde_json::from_value::<telltale_config::RuleConfig>(v.clone()).ok());
         rule.map_or((0, String::new()), |r| rule_impact(src, &r, body.is_some()))
+    } else if before
+        .iter()
+        .chain(&after)
+        .any(|v| v["subscriptionUrl"].is_string())
+    {
+        (
+            0,
+            format!(
+                "{} route subscription `{name}`",
+                if after.is_some() {
+                    "Configure"
+                } else {
+                    "Remove"
+                }
+            ),
+        )
     } else {
         managed_impact(src, w.kind, &name, body.is_some())
     };
@@ -4639,7 +4679,12 @@ fn upstream_group_in_use(
         .route
         .iter()
         .filter(|r| r.upstream_group.as_str() == name)
-        .count();
+        .count()
+        + before_cfg
+            .route_subscription
+            .iter()
+            .filter(|s| s.upstream_group.as_str() == name)
+            .count();
     if groups.is_empty() && routes == 0 {
         return Ok(());
     }
@@ -5242,17 +5287,31 @@ impl ApiBackend {
                     }
                 })
         };
+        let group_servers = |group: &telltale_config::SafeString| {
+            cfg.upstream_group
+                .iter()
+                .find(|g| &g.name == group)
+                .map(|g| {
+                    g.members
+                        .iter()
+                        .filter_map(|m| servers_of(m))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let source = |name: &str| {
+            if api.iter().any(|a| a.eq_ignore_ascii_case(name)) {
+                "api".into()
+            } else {
+                "file".into()
+            }
+        };
         let mut out = Vec::new();
         for r in &cfg.route {
             if !r.match_group.is_empty() || !r.match_qtype.is_empty() {
                 continue; // per-group or per-type routes aren't "send this domain" routes
             }
-            let members: Vec<(Vec<String>, bool)> = cfg
-                .upstream_group
-                .iter()
-                .find(|g| g.name == r.upstream_group)
-                .map(|g| g.members.iter().filter_map(|m| servers_of(m)).collect())
-                .unwrap_or_default();
+            let members = group_servers(&r.upstream_group);
             let stub = !members.is_empty() && members.iter().all(|(_, s)| *s);
             let servers: Vec<String> = members.into_iter().flat_map(|(v, _)| v).collect();
             for d in &r.match_suffix {
@@ -5260,14 +5319,23 @@ impl ApiBackend {
                     domain: d.to_ascii_lowercase(),
                     servers: servers.clone(),
                     stub,
-                    source: if api.iter().any(|a| a.eq_ignore_ascii_case(d)) {
-                        "api".into()
-                    } else {
-                        "file".into()
-                    },
+                    subscription_url: None,
+                    source: source(d),
                 });
             }
         }
+        out.extend(cfg.route_subscription.iter().map(|s| {
+            ForwardInfo {
+                domain: s.name.to_string(),
+                servers: group_servers(&s.upstream_group)
+                    .into_iter()
+                    .flat_map(|(v, _)| v)
+                    .collect(),
+                stub: false,
+                subscription_url: Some(s.url.to_string()),
+                source: source(&s.name),
+            }
+        }));
         out
     }
 
@@ -5673,7 +5741,17 @@ fn keep_in_git(
                 "upstream_group",
                 serde_json::json!({ "name": group, "members": members, "strategy": "failover" }),
             ));
-            t.push(("route", serde_json::json!({ "match_suffix": [name], "upstream_group": group, "dnssec_nta": true })));
+            if let Some(url) = body
+                .get("subscriptionUrl")
+                .and_then(serde_json::Value::as_str)
+            {
+                t.push((
+                    "route_subscription",
+                    serde_json::json!({ "name": name, "url": url, "upstream_group": group }),
+                ));
+            } else {
+                t.push(("route", serde_json::json!({ "match_suffix": [name], "upstream_group": group, "dnssec_nta": true })));
+            }
             t
         }
         ManagedKind::Rule => after.map(|a| vec![("rule", a.clone())]).unwrap_or_default(),

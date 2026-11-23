@@ -313,6 +313,17 @@
       "docs": "routing-conditional-forwarding"
     },
     {
+      "id": "route-subscriptions",
+      "title": "Send a subscribed list to specific DNS servers",
+      "term": "DNS route subscriptions",
+      "summary": "Queries that match a domain in the list go to the DNS servers configured for that subscription.",
+      "when": "A maintained GFWList or AutoProxy list should use a dedicated DNS server.",
+      "example": "Subscribe to GFWList and send matching queries to a DNS-over-HTTPS server.",
+      "caution": "Refresh failures keep the last valid copy. Queries follow ordinary routing until a list first downloads successfully.",
+      "diagram": "route",
+      "docs": "subscribe-to-gfwlist"
+    },
+    {
       "id": "config-sources",
       "title": "Change upstreams, lists, and groups here",
       "term": "Configuration overrides",

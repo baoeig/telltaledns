@@ -344,6 +344,14 @@
         "$ref": "#/$defs/Route"
       }
     },
+    "route_subscription": {
+      "description": "REQ: DNS-017, UPS-007 — remote `AutoProxy` lists for conditional forwarding.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/RouteSubscription"
+      }
+    },
     "router": {
       "description": "REQ: T8.2 — routers whose DHCP names devices (UniFi, OPNsense).",
       "type": "array",
@@ -3164,6 +3172,36 @@
       },
       "additionalProperties": false,
       "required": [
+        "upstream_group"
+      ]
+    },
+    "RouteSubscription": {
+      "description": "An HTTPS `AutoProxy` list refreshed in the background for DNS routing.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
+        },
+        "refresh_secs": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 86400,
+          "minimum": 0
+        },
+        "upstream_group": {
+          "type": "string",
+          "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
+        },
+        "url": {
+          "type": "string",
+          "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "url",
         "upstream_group"
       ]
     },

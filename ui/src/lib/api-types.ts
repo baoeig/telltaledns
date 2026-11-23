@@ -4987,6 +4987,8 @@ export interface components {
              *     followed.
              */
             stub: boolean;
+            /** @description Source URL for a GFWList/AutoProxy subscription. */
+            subscriptionUrl?: string | null;
         };
         /** @description The servers a domain is sent to (`PUT /api/v1/forwards/{domain}`). */
         ForwardInput: {
@@ -5004,6 +5006,11 @@ export interface components {
              *     followed, instead of forwarding with recursion desired. Default `false`.
              */
             stub?: boolean;
+            /**
+             * @description REQ: DNS-017, UPS-007 — subscribe to a GFWList/AutoProxy HTTPS URL. The path
+             *     identifies the subscription by name when this field is set.
+             */
+            subscriptionUrl?: string | null;
         };
         /** @description A client group. */
         GroupInfo: {
@@ -5622,6 +5629,8 @@ export interface components {
                  *     followed.
                  */
                 stub: boolean;
+                /** @description Source URL for a GFWList/AutoProxy subscription. */
+                subscriptionUrl?: string | null;
             }[];
             /** @description Cluster nodes that couldn't be read, for federated reads (CLU-002). */
             missingNodes?: string[];
@@ -11415,7 +11424,7 @@ export interface operations {
             };
             header?: never;
             path: {
-                /** @description The domain, e.g. corp.example (its whole subtree is sent). */
+                /** @description A domain suffix such as corp.example, or the subscription name when subscriptionUrl is set. */
                 domain: string;
             };
             cookie?: never;

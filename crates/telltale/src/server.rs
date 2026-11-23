@@ -124,11 +124,7 @@ pub(crate) fn build_dynamic(
 ) -> Result<(Arc<Router>, Policy), Vec<String>> {
     let router = match reuse {
         Some(r) => r,
-        None => Arc::new(Router::from_config(cfg).map_err(|errs| {
-            errs.into_iter()
-                .map(|e| format!("upstreams: {e}"))
-                .collect::<Vec<_>>()
-        })?),
+        None => configured_router(cfg)?,
     };
     let (local, report) = LocalData::from_config(cfg);
     for w in &report.warnings {
@@ -156,11 +152,7 @@ pub(crate) fn build_dynamic(
 /// REQ: OBS-024 (T13.1) — the policy and router a configuration would run with, built without
 /// side effects or log lines (simulations build one per request, beside the serving state).
 pub(crate) fn build_candidate(cfg: &Config) -> Result<(Arc<Router>, Policy), Vec<String>> {
-    let router = Arc::new(Router::from_config(cfg).map_err(|errs| {
-        errs.into_iter()
-            .map(|e| format!("upstreams: {e}"))
-            .collect::<Vec<_>>()
-    })?);
+    let router = configured_router(cfg)?;
     let (local, report) = LocalData::from_config(cfg);
     if !report.errors.is_empty() {
         return Err(report
@@ -173,6 +165,16 @@ pub(crate) fn build_candidate(cfg: &Config) -> Result<(Arc<Router>, Policy), Vec
     let mut policy = Policy::from_config(cfg, local);
     policy.zones = Arc::new(zones);
     Ok((router, policy))
+}
+
+fn configured_router(cfg: &Config) -> Result<Arc<Router>, Vec<String>> {
+    let router = Router::from_config(cfg).map_err(|errs| {
+        errs.into_iter()
+            .map(|e| format!("upstreams: {e}"))
+            .collect::<Vec<_>>()
+    })?;
+    crate::route_subscriptions::restore(cfg, &router);
+    Ok(Arc::new(router))
 }
 
 /// REQ: DNS-018 (T7.22) — `[[zone]]`: each zone's file and records, most specific first.
@@ -1232,6 +1234,9 @@ pub(crate) async fn serve(files: Vec<PathBuf>, cfg: Config) -> io::Result<()> {
     sources
         .lists
         .store(lists.as_ref().map(|l| Arc::clone(&l.shared)));
+    // REQ: DNS-017, OPS-009 — remote routes load after DNS and the listeners are up.
+    let mut subscriptions =
+        crate::route_subscriptions::RefreshTasks::start(&cfg, &pipeline.current().router);
     if let Some(c) = &sources.cluster {
         crate::replication::start(
             c,
@@ -1247,10 +1252,10 @@ pub(crate) async fn serve(files: Vec<PathBuf>, cfg: Config) -> io::Result<()> {
         tokio::select! {
             _ = term.recv() => { info!(signal = "SIGTERM", "shutting down"); break; }
             _ = int.recv() => { info!(signal = "SIGINT", "shutting down"); break; }
-            _ = hup.recv() => { reload(&files, &mut current, &mut listeners, &mut health, &pipeline, &sources, &mut lists, false).await; }
+            _ = hup.recv() => { reload(&files, &mut current, &mut listeners, &mut health, &pipeline, &sources, &mut lists, &mut subscriptions, false).await; }
             // ADR-040 — a change made through the API: re-read files + state.db and apply.
             Some(done) = reload_rx.recv() => {
-                let ok = reload(&files, &mut current, &mut listeners, &mut health, &pipeline, &sources, &mut lists, true).await;
+                let ok = reload(&files, &mut current, &mut listeners, &mut health, &pipeline, &sources, &mut lists, &mut subscriptions, true).await;
                 let _ = done.send(ok);
             }
             _ = usr1.recv() => {
@@ -1263,6 +1268,7 @@ pub(crate) async fn serve(files: Vec<PathBuf>, cfg: Config) -> io::Result<()> {
             }
         }
     }
+    subscriptions.stop().await;
 
     // REQ: OPS-007 — not ready first (load balancers stop sending), stop taking new TCP
     // connections, let in-flight upstream lookups finish (bounded), then stop UDP workers.
@@ -1411,6 +1417,7 @@ async fn reload(
     pipeline: &Arc<Pipeline>,
     sources: &http::Sources,
     lists: &mut Option<Lists>,
+    subscriptions: &mut crate::route_subscriptions::RefreshTasks,
     from_api: bool,
 ) -> bool {
     if from_api {
@@ -1435,6 +1442,8 @@ async fn reload(
     let same_upstreams = current.upstream == new.upstream
         && current.upstream_group == new.upstream_group
         && current.route == new.route
+        && current.route_subscription == new.route_subscription
+        && (new.route_subscription.is_empty() || current.node.data_dir == new.node.data_dir)
         && current.listen == new.listen;
     let reuse = same_upstreams.then(|| Arc::clone(&pipeline.current().router));
     let (router, policy) = match build_dynamic(&new, reuse) {
@@ -1454,6 +1463,10 @@ async fn reload(
     if !same_upstreams {
         health.abort();
         *health = spawn_health_checks(&router);
+        subscriptions.stop().await;
+        // A fetch might have completed while the replacement was being built.
+        crate::route_subscriptions::restore(&new, &router);
+        *subscriptions = crate::route_subscriptions::RefreshTasks::start(&new, &router);
     }
     pipeline.reload(router, policy);
     pipeline.set_dnssec(&new);

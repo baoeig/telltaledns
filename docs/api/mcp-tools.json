@@ -1334,7 +1334,7 @@
       "additionalProperties": false,
       "properties": {
         "domain": {
-          "description": "The domain, e.g. corp.example.",
+          "description": "The domain, e.g. corp.example, or the subscription name when subscriptionUrl is set.",
           "type": "string"
         },
         "reason": {
@@ -1355,6 +1355,10 @@
         "stub": {
           "description": "A stub zone: the servers are authoritative only (IPs), asked iteratively, delegations followed. Default false.",
           "type": "boolean"
+        },
+        "subscriptionUrl": {
+          "description": "HTTPS URL of a GFWList or AutoProxy list to refresh. Omit stub when subscribing.",
+          "type": "string"
         }
       },
       "required": [

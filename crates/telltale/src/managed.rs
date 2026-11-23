@@ -133,6 +133,8 @@ pub(crate) struct Forward {
     /// iteratively, and the delegations they give are followed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) stub: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) subscription_url: Option<SafeString>,
 }
 
 /// Everything stored through the API.
@@ -738,17 +740,38 @@ pub(crate) fn merge(file: &Config, e: &Entries) -> Result<Config, Vec<String>> {
             }
         }
     }
-    for (domain, f) in &e.forwards {
+    merge_forwards(file, &mut cfg, &e.forwards, &mut errs);
+    if let Err(v) = telltale_config::validate_config(&cfg) {
+        errs.extend(v.iter().map(ToString::to_string));
+    }
+    let (_, report) = telltale_policy::LocalData::from_config(&cfg);
+    errs.extend(report.errors);
+    if errs.is_empty() { Ok(cfg) } else { Err(errs) }
+}
+
+/// Add either the static route or the subscription and the corresponding upstream group.
+fn merge_forwards(
+    file: &Config,
+    cfg: &mut Config,
+    forwards: &[(String, Forward)],
+    errs: &mut Vec<String>,
+) {
+    for (domain, f) in forwards {
         let taken = file.route.iter().any(|r| {
             r.match_suffix
                 .iter()
                 .any(|s| s.eq_ignore_ascii_case(domain))
         });
-        if taken {
+        if taken
+            || file
+                .route_subscription
+                .iter()
+                .any(|s| s.name.eq_ignore_ascii_case(domain))
+        {
             continue;
         }
         let group = forward_group(domain);
-        let members = forward_upstreams(&mut cfg, domain, &group, f, &mut errs);
+        let members = forward_upstreams(cfg, domain, &group, f, errs);
         match (safe(&group), safe(domain)) {
             (Ok(g), Ok(d)) => {
                 cfg.upstream_group.push(UpstreamGroup {
@@ -758,24 +781,30 @@ pub(crate) fn merge(file: &Config, e: &Entries) -> Result<Config, Vec<String>> {
                     parallel_fanout: 2,
                     node_only: false,
                 });
-                cfg.route.push(Route {
-                    match_suffix: vec![d],
-                    match_group: Vec::new(),
-                    match_qtype: Vec::new(),
-                    upstream_group: g,
-                    dnssec_nta: true,
-                    node_only: false,
-                });
+                if let Some(url) = &f.subscription_url {
+                    // REQ: DNS-017, UPS-007 — the managed forward contributes a source,
+                    // which the router refreshes without a configuration write.
+                    cfg.route_subscription
+                        .push(telltale_config::RouteSubscription {
+                            name: d,
+                            url: url.clone(),
+                            upstream_group: g,
+                            refresh_secs: telltale_config::daily_route_refresh(),
+                        });
+                } else {
+                    cfg.route.push(Route {
+                        match_suffix: vec![d],
+                        match_group: Vec::new(),
+                        match_qtype: Vec::new(),
+                        upstream_group: g,
+                        dnssec_nta: true,
+                        node_only: false,
+                    });
+                }
             }
             _ => errs.push(format!("forward `{domain}`: invalid name")),
         }
     }
-    if let Err(v) = telltale_config::validate_config(&cfg) {
-        errs.extend(v.iter().map(ToString::to_string));
-    }
-    let (_, report) = telltale_policy::LocalData::from_config(&cfg);
-    errs.extend(report.errors);
-    if errs.is_empty() { Ok(cfg) } else { Err(errs) }
 }
 
 /// Adds the upstreams a forwarded domain becomes to `cfg` and returns their names: one per
@@ -1064,6 +1093,7 @@ mod tests {
                 Forward {
                     servers: vec!["10.0.0.53".into(), "tls://10.0.0.54".into()],
                     stub: false,
+                    subscription_url: None,
                 },
             )],
             ..Entries::default()
@@ -1111,6 +1141,7 @@ mod tests {
                 Forward {
                     servers: vec!["ftp://x".into()],
                     stub: false,
+                    subscription_url: None,
                 },
             )],
             ..Entries::default()
@@ -1128,6 +1159,7 @@ mod tests {
                 Forward {
                     servers: vec!["10.0.0.53".into(), "udp://10.0.0.54".into()],
                     stub: true,
+                    subscription_url: None,
                 },
             )],
             ..Entries::default()
@@ -1153,6 +1185,7 @@ mod tests {
                 Forward {
                     servers: vec!["tls://10.0.0.53".into()],
                     stub: true,
+                    subscription_url: None,
                 },
             )],
             ..Entries::default()

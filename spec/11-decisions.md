@@ -2961,3 +2961,13 @@ Revisit if a profile on real hardware shows syscalls dominating at the owner's t
 - Assistants connect with SSO and the user's consent, and no long-lived token is stored in the assistant.
 - Each request verifies a signature (keys cached with discovery, refreshed on rotation); no per-token cache is kept.
 - Providers that only issue opaque access tokens need a token per agent instead, until introspection is added.
+
+## ADR-183 — Refresh HTTPS AutoProxy DNS routes per node (Proposed)
+
+**Context.** DNS-017 and UPS-007 cover conditional forwarding. A GFWList URL carries AutoProxy rules for URL matching, and its contents can change independently of the configuration.
+
+**Decision.** Configure a named `[[route_subscription]]` and validate its HTTPS URL and upstream group. The existing forwarding API, UI and MCP tool can create entries with an upstream server list. Share the subscription configuration in the cluster. Each node downloads and persists its own last-good copy, so it answers while its peers or the list source are unavailable. On a node with no copy, keep ordinary routing until its first download succeeds.
+
+Compile whole-label suffixes separately from static routes. Support the decoded AutoProxy document with or without its Base64 wrapper. Ignore URL schemes and paths when forming the suffix and treat leading `*.` as the corresponding subtree. An `@@` exception suppresses the subscription for that subtree. Skip regex, partial host wildcards and IP literals. Static routes win equal-depth matches, then subscriptions in configuration order. A refresh does no network or disk work on the query path and publishes only a parsed copy with at least one forwarding rule.
+
+**Consequences.** DNS route changes from the remote source are visible after the next successful refresh. Cluster nodes can briefly use different copies, and a node without a cache keeps serving existing routes while the source is unreachable.

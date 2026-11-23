@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use std::net::SocketAddr;
 
+use arc_swap::ArcSwapOption;
 use telltale_config::{Config, HttpVersion, Strategy as CfgStrategy};
 use telltale_proto::NameBuf;
 
@@ -26,6 +27,34 @@ struct Route {
     target: usize,
 }
 
+// REQ: DNS-017, UPS-007 — index canonical wire suffixes off the query path. The key can
+// be looked up using a borrowed slice of the question, at DNS label boundaries.
+#[derive(Debug)]
+struct Subscription {
+    target: usize,
+    suffixes: ArcSwapOption<HashMap<Box<[u8]>, bool>>,
+}
+
+impl Subscription {
+    fn depth(&self, name: &NameBuf) -> Option<usize> {
+        let snapshot = self.suffixes.load();
+        let suffixes = snapshot.as_ref()?;
+        let mut wire = name.as_wire();
+        let mut matched = None;
+        let mut skipped = 0;
+        while wire[0] != 0 {
+            match suffixes.get(wire) {
+                Some(false) => return None, // AutoProxy exceptions win within this subscription.
+                Some(true) if matched.is_none() => matched = Some(skipped),
+                _ => {}
+            }
+            wire = &wire[1 + usize::from(wire[0])..];
+            skipped += 1;
+        }
+        matched.map(|removed| name.label_count() - removed)
+    }
+}
+
 /// The selected group plus a cache view ID that keeps answers from different groups apart.
 #[derive(Debug, Clone, Copy)]
 pub struct Selection<'a> {
@@ -41,6 +70,7 @@ pub struct Router {
     groups: Vec<Arc<Group>>,
     by_name: HashMap<String, usize>,
     routes: Vec<Route>,
+    subscriptions: Vec<Subscription>,
     default: Option<usize>,
     upstreams: Vec<Arc<Upstream>>,
 }
@@ -458,12 +488,30 @@ impl Router {
             qtypes: Vec::new(),
             target,
         }));
+        let subscriptions = cfg
+            .route_subscription
+            .iter()
+            .filter_map(|subscription| {
+                let Some(&target) = by_name.get(subscription.upstream_group.as_str()) else {
+                    errors.push(format!(
+                        "route subscription `{}` has no upstream group",
+                        subscription.name
+                    ));
+                    return None;
+                };
+                Some(Subscription {
+                    target,
+                    suffixes: ArcSwapOption::empty(),
+                })
+            })
+            .collect();
         let default = by_name.get("default").copied();
         if errors.is_empty() {
             Ok(Self {
                 groups,
                 by_name,
                 routes,
+                subscriptions,
                 default,
                 upstreams,
             })
@@ -488,6 +536,7 @@ impl Router {
             groups,
             by_name,
             routes: Vec::new(),
+            subscriptions: Vec::new(),
             default,
             upstreams,
         }
@@ -497,6 +546,21 @@ impl Router {
     /// The upstream group behind a cache view from [`Router::select`].
     pub fn group_by_view(&self, view: u16) -> Option<&Arc<Group>> {
         self.groups.get(usize::from(view))
+    }
+
+    /// Replace a configured subscription's suffixes in one publish. False entries are exceptions.
+    pub fn replace_subscription(
+        &self,
+        index: usize,
+        suffixes: impl IntoIterator<Item = (NameBuf, bool)>,
+    ) {
+        if let Some(subscription) = self.subscriptions.get(index) {
+            let suffixes = suffixes
+                .into_iter()
+                .map(|(name, forward)| (Box::from(name.as_wire()), forward))
+                .collect();
+            subscription.suffixes.store(Some(Arc::new(suffixes)));
+        }
     }
 
     pub fn select<S: AsRef<str>>(
@@ -530,6 +594,13 @@ impl Router {
                 && best.is_none_or(|(bd, _)| d > bd)
             {
                 best = Some((d, r.target));
+            }
+        }
+        for subscription in &self.subscriptions {
+            if let Some(depth) = subscription.depth(&q.name)
+                && best.is_none_or(|(previous, _)| depth > previous)
+            {
+                best = Some((depth, subscription.target));
             }
         }
         let idx = best.map(|(_, t)| t).or(self.default)?;

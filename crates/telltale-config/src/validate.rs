@@ -1596,6 +1596,53 @@ fn routes(cfg: &Config, groups: &HashSet<&str>, r: &mut Report<'_>) {
             }
         }
     }
+    route_subscriptions(cfg, groups, node_only, r);
+}
+
+// REQ: DNS-017, UPS-007 — validate remote suffix routing before the background worker starts.
+fn route_subscriptions(
+    cfg: &Config,
+    groups: &HashSet<&str>,
+    node_only: impl Fn(&str) -> bool,
+    r: &mut Report<'_>,
+) {
+    if cfg.route_subscription.len() > 16 {
+        r.err(
+            "route_subscription",
+            "at most 16 subscriptions are supported",
+        );
+    }
+    let mut names = HashSet::new();
+    for (i, subscription) in cfg.route_subscription.iter().enumerate() {
+        let p = format!("route_subscription[{i}]");
+        let name = subscription.name.as_str();
+        if !valid_list_name(name) || !names.insert(name) {
+            r.err(format!("{p}.name"), "must be a unique list name");
+        }
+        let url = subscription.url.as_str();
+        let valid = url.parse::<http::Uri>().is_ok_and(|uri| {
+            uri.scheme_str() == Some("https")
+                && uri
+                    .authority()
+                    .is_some_and(|a| !a.host().is_empty() && !a.as_str().contains('@'))
+        });
+        if !valid || url.contains('#') {
+            r.err(
+                format!("{p}.url"),
+                "must be an HTTPS URL without credentials or a fragment",
+            );
+        }
+        let group = subscription.upstream_group.as_str();
+        if !groups.contains(group) || node_only(group) {
+            r.err(
+                format!("{p}.upstream_group"),
+                "must name a shared upstream group",
+            );
+        }
+        if subscription.refresh_secs < 900 {
+            r.err(format!("{p}.refresh_secs"), "must be at least 900 seconds");
+        }
+    }
 }
 
 /// Most lists one snapshot can hold: list-ID bitsets are 1024 bits wide (`spec/05` §3.1).

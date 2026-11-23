@@ -4057,7 +4057,7 @@
           {
             "name": "domain",
             "in": "path",
-            "description": "The domain, e.g. corp.example (its whole subtree is sent).",
+            "description": "A domain suffix such as corp.example, or the subscription name when subscriptionUrl is set.",
             "required": true,
             "schema": {
               "type": "string"
@@ -13916,6 +13916,13 @@
           "stub": {
             "type": "boolean",
             "description": "REQ: DNS-022 — a stub zone: the servers are asked iteratively and their delegations\nfollowed."
+          },
+          "subscriptionUrl": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Source URL for a GFWList/AutoProxy subscription."
           }
         }
       },
@@ -13939,6 +13946,13 @@
           "stub": {
             "type": "boolean",
             "description": "REQ: DNS-022 — a stub zone (BIND's `static-stub`): the servers are authoritative only,\nso they're asked iteratively and the delegations they give to other servers are\nfollowed, instead of forwarding with recursion desired. Default `false`."
+          },
+          "subscriptionUrl": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "REQ: DNS-017, UPS-007 — subscribe to a GFWList/AutoProxy HTTPS URL. The path\nidentifies the subscription by name when this field is set."
           }
         },
         "additionalProperties": false
@@ -15506,6 +15520,13 @@
                 "stub": {
                   "type": "boolean",
                   "description": "REQ: DNS-022 — a stub zone: the servers are asked iteratively and their delegations\nfollowed."
+                },
+                "subscriptionUrl": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Source URL for a GFWList/AutoProxy subscription."
                 }
               }
             }
