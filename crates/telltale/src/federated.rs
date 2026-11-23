@@ -4176,7 +4176,7 @@ mod bridge_tests {
             std::thread::sleep(Duration::from_millis(25));
         }
         // What the primary decided at join, from the token (ADR-056): the witness is one.
-        assert_eq!(primary.witnesses(), [witness_node.clone()]);
+        assert_eq!(primary.witnesses(), std::slice::from_ref(&witness_node));
         Three {
             rt,
             witness_rt: Some(witness_rt),
