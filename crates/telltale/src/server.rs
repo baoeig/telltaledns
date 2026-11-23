@@ -356,17 +356,61 @@ pub(crate) fn rebuild_now(
         .swap(crate::devices::build_table(kernel, bindings.as_ref()))
 }
 
+/// REQ: FLT-006, CLU-002 (ADR-183) — how long router MACs may be missing, with a device named by its
+/// MAC, before the node says so: a node that has just started hasn't read its router or asked its
+/// members yet.
+const NO_BINDINGS_AFTER_S: u64 = 60;
+
+/// REQ: FLT-006, CLU-002 (ADR-183) — whether to say that no router MAC reaches this node: said
+/// once per spell, after [`NO_BINDINGS_AFTER_S`] seconds of a device being named by its MAC (and
+/// `router_macs` on) with no router or member binding in the table, and again only after bindings
+/// have come and gone.
+#[derive(Debug, Default)]
+struct NoBindings {
+    since: Option<u64>,
+    said: bool,
+}
+
+impl NoBindings {
+    /// One look at `now_s` (seconds on the task's monotonic clock): `wanted` is whether router
+    /// bindings are in use (a device is named by its MAC, `router_macs` is on), `bindings` how many
+    /// the table holds (this node's routers' and the members'). True exactly once per spell.
+    fn look(&mut self, wanted: bool, bindings: usize, now_s: u64) -> bool {
+        if !wanted || bindings > 0 {
+            *self = Self::default();
+            return false;
+        }
+        let since = *self.since.get_or_insert(now_s);
+        if self.said || now_s.saturating_sub(since) < NO_BINDINGS_AFTER_S {
+            return false;
+        }
+        self.said = true;
+        true
+    }
+}
+
+/// REQ: FLT-006, CLU-002 (ADR-183) — what the node says when no router MAC reaches it: on a
+/// resolver pod (an ephemeral member), which hears only the primary, that the primary's own router
+/// is what it gets and so the key belongs there; elsewhere that no router of its own is read and no
+/// member passes one on.
+fn no_bindings_notice(ephemeral: bool) -> &'static str {
+    if ephemeral {
+        "devices are named by their MAC address, but no router MAC reaches this resolver pod: a pod hears only the primary, so the primary's own router view is all it can get, and the router key belongs on the primary (and on the node a failover would promote). Until a MAC arrives those devices are recognized by their address, network or default group"
+    } else {
+        "devices are named by their MAC address, but no router MAC reaches this node: no router of its own is read here (its key may be missing: see the router's status) and no other full cluster member passes one on. Until one does those devices are recognized by their address, network or default group"
+    }
+}
+
 /// What the MAC table task has said in the log, so each change is said once.
 #[derive(Debug, Default)]
 struct MacTableLog {
     routers_in_use: bool,
-    said_empty: bool,
 }
 
 impl MacTableLog {
-    /// REQ: FLT-006 (ADR-183) — says when router and member bindings start or stop being used, and
-    /// once while devices are named by their MAC and the table has no entry at all.
-    fn note(&mut self, uses_macs: bool, table: &Neighbors) {
+    /// REQ: FLT-006 (ADR-183) — says when router and member bindings start or stop being used.
+    /// (That none reaches this node is [`NoBindings`]'s to say.)
+    fn note(&mut self, table: &Neighbors) {
         let bindings = table.router_len() + table.peer_len();
         if bindings > 0 && !self.routers_in_use {
             info!(
@@ -379,16 +423,6 @@ impl MacTableLog {
             );
         }
         self.routers_in_use = bindings > 0;
-        if uses_macs && table.is_empty() {
-            if !self.said_empty {
-                info!(
-                    "devices are named by their MAC address, but this node knows no MAC address: the neighbor table is empty or off, and no router or other node reports one (host networking, or a router integration, gives it addresses)"
-                );
-            }
-            self.said_empty = true;
-        } else {
-            self.said_empty = false;
-        }
     }
 }
 
@@ -397,8 +431,13 @@ impl MacTableLog {
 /// named by its MAC and `router_macs` is on, the routers' and the members' bindings after it. It
 /// looks every [`MAC_TABLE_TICK`] and rebuilds, in a blocking task, only when [`should_rebuild`]
 /// says so; the table it replaces is freed by `retire`. Off the query path: DNS never waits on it.
-fn spawn_mac_table(pipeline: Arc<Pipeline>, kernel_every: Option<Duration>) -> JoinHandle<()> {
+fn spawn_mac_table(
+    pipeline: Arc<Pipeline>,
+    kernel_every: Option<Duration>,
+    cluster: Option<Arc<telltale_cluster::net::Cluster>>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let started = tokio::time::Instant::now();
         let mut tick = tokio::time::interval(MAC_TABLE_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut kernel: Arc<Vec<(std::net::IpAddr, [u8; 6])>> = Arc::default();
@@ -406,6 +445,7 @@ fn spawn_mac_table(pipeline: Arc<Pipeline>, kernel_every: Option<Duration>) -> J
         let mut warned = false;
         let mut last: Option<MacInputs> = None;
         let mut log = MacTableLog::default();
+        let mut none = NoBindings::default();
         loop {
             tick.tick().await;
             let mut kernel_read = false;
@@ -429,6 +469,19 @@ fn spawn_mac_table(pipeline: Arc<Pipeline>, kernel_every: Option<Duration>) -> J
                 }
             }
             let now = MacInputs::load(&pipeline);
+            // REQ: FLT-006, CLU-002 (ADR-183) — say once, after a minute, when a device is named by
+            // its MAC and no router or member binding reaches this node, and why it may be so. A
+            // few atomic loads each look; the registry is read only when it is about to be said.
+            let held = pipeline.neighbors.router_len() + pipeline.neighbors.peer_len();
+            if none.look(now.uses_routers(), held, started.elapsed().as_secs()) {
+                let ephemeral = match cluster.clone() {
+                    Some(c) => tokio::task::spawn_blocking(move || c.is_ephemeral())
+                        .await
+                        .unwrap_or(false),
+                    None => false,
+                };
+                info!("{}", no_bindings_notice(ephemeral));
+            }
             if !should_rebuild(kernel_read, last.as_ref(), &now) {
                 continue;
             }
@@ -440,7 +493,7 @@ fn spawn_mac_table(pipeline: Arc<Pipeline>, kernel_every: Option<Duration>) -> J
                     continue;
                 }
             }
-            log.note(now.uses_macs, &pipeline.neighbors);
+            log.note(&pipeline.neighbors);
             last = Some(now);
         }
     })
@@ -1326,7 +1379,11 @@ pub(crate) async fn serve(files: Vec<PathBuf>, cfg: Config) -> io::Result<()> {
     // REQ: FLT-006 (ADR-183) — the MAC table's task runs on every node: the kernel's neighbor table
     // while `neighbor_table` is on, and the routers' and members' bindings while a device is named
     // by its MAC.
-    let mac_table = spawn_mac_table(Arc::clone(&pipeline), neighbor_refresh);
+    let mac_table = spawn_mac_table(
+        Arc::clone(&pipeline),
+        neighbor_refresh,
+        sources.cluster.clone(),
+    );
     // Every listener is bound: ready for traffic (OPS-006), unless in maintenance (OPS-010).
     // An ephemeral resolver pod waits for the cluster's configuration too, so it never serves
     // unfiltered (CLU-009).
@@ -1944,6 +2001,53 @@ mod tests {
         drop(rebuild_now(&p, &[], &off));
         assert_eq!((p.neighbors.router_len(), p.neighbors.peer_len()), (0, 0));
         assert!(!should_rebuild(false, Some(&off), &MacInputs::load(&p)));
+    }
+
+    // REQ: FLT-006, CLU-002 (ADR-183) — "no router MAC reaches this node" is said once per spell,
+    // after a minute (a node that has just started hasn't read its router or asked its members yet),
+    // only while router bindings are in use, and whatever the kernel's table holds: a pod's table
+    // has its network's gateway, and the old message never fired there.
+    #[test]
+    fn flt_006_no_router_macs_are_said_once_after_a_minute() {
+        let mut s = NoBindings::default();
+        assert!(!s.look(true, 0, 0));
+        assert!(!s.look(true, 0, NO_BINDINGS_AFTER_S - 1));
+        assert!(s.look(true, 0, NO_BINDINGS_AFTER_S), "after a minute");
+        assert!(!s.look(true, 0, NO_BINDINGS_AFTER_S + 1), "once");
+        assert!(!s.look(true, 0, 3_600));
+        // Bindings come: nothing to say, and the spell is over; gone again, it is said once more
+        // after a minute.
+        assert!(!s.look(true, 2, 3_601));
+        assert!(!s.look(true, 0, 3_700));
+        assert!(!s.look(true, 0, 3_700 + NO_BINDINGS_AFTER_S - 1));
+        assert!(s.look(true, 0, 3_700 + NO_BINDINGS_AFTER_S));
+        // Not in use (no device named by its MAC, or `router_macs` off): nothing, and the spell
+        // starts again when it is.
+        assert!(!s.look(false, 0, 4_000));
+        assert!(!s.look(true, 0, 4_010));
+        assert!(!s.look(true, 0, 4_010 + NO_BINDINGS_AFTER_S - 1));
+        assert!(s.look(true, 0, 4_010 + NO_BINDINGS_AFTER_S));
+    }
+
+    // REQ: FLT-006, CLU-002 (ADR-183) — the notice says what to do: on a resolver pod, whose only
+    // peer is the primary, that the key belongs on the primary; elsewhere, what is missing here.
+    #[test]
+    fn flt_006_the_no_router_macs_notice_says_what_to_do() {
+        let pod = no_bindings_notice(true);
+        assert!(
+            pod.contains("resolver pod") && pod.contains("primary"),
+            "{pod}"
+        );
+        assert!(pod.contains("router key"), "{pod}");
+        let node = no_bindings_notice(false);
+        assert!(!node.contains("resolver pod"), "{node}");
+        assert!(
+            node.contains("no router") && node.contains("full cluster member"),
+            "{node}"
+        );
+        for n in [pod, node] {
+            assert!(n.contains("named by their MAC address"), "{n}");
+        }
     }
 
     // REQ: FLT-006 (ADR-183) — what makes the task build the table again, and what doesn't (it
