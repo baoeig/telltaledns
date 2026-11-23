@@ -1265,7 +1265,10 @@ pub struct RouterConfig {
     /// Skip certificate verification (dangerous; logs a warning).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tls_insecure_skip_verify: bool,
-    /// Seconds between reads.
+    /// Seconds between reads. While a device is named by its MAC address and `[clients]
+    /// router_macs` is on, the MACs a router lists identify devices, so it is read at least
+    /// every 900 seconds whatever this says (a list older than that doesn't say who holds an
+    /// address).
     #[serde(default = "default_router_interval")]
     pub interval_secs: u32,
     /// UniFi: also name the clients that are offline now, if UniFi saw them within this many
@@ -1597,7 +1600,9 @@ pub struct ClientsConfig {
     /// Kubernetes pod or another VLAN, where the neighbor table sees nothing. On by default;
     /// `false` keeps to the neighbor table and trusted EDNS MACs. The cluster shares it, so every
     /// node identifies devices the same way, and it is not written while it is on: set it to
-    /// `false` only once every node runs this version (an older node refuses the key).
+    /// `false` only once every node runs this version (an older node refuses the key). While it
+    /// is on and a device is named by its MAC, each router is read at least every 15 minutes,
+    /// whatever its `interval_secs`, and a router silent for 15 minutes identifies nothing.
     #[serde(skip_serializing_if = "is_default_router_macs")]
     pub router_macs: bool,
 }

@@ -68,6 +68,32 @@ impl Polled {
 /// longer say who holds an address.
 pub(crate) const STALE_AFTER_S: u64 = 900;
 
+/// REQ: FLT-006 (ADR-183) — the longest a router that feeds identification waits between reads,
+/// in seconds: the same 15 minutes as [`STALE_AFTER_S`], so what an answer says is never more
+/// than that old when the next one replaces it (silence alone doesn't bound the age of an answer
+/// from a router read once an hour).
+pub(crate) const IDENTIFY_POLL_MAX_S: u32 = 900;
+
+/// REQ: FLT-006 (ADR-183) — how long to wait before reading the routers again: `interval` (the
+/// shortest `interval_secs`, at least 30), or 15 s while one is failing, and, while the routers
+/// feed identification (`identifies`: a device is named by its MAC and `router_macs` is on), at
+/// most [`IDENTIFY_POLL_MAX_S`].
+pub(crate) fn next_poll_secs(failing: bool, interval: u32, identifies: bool) -> u32 {
+    let base = if failing { interval.min(15) } else { interval };
+    if identifies {
+        base.min(IDENTIFY_POLL_MAX_S)
+    } else {
+        base
+    }
+}
+
+/// REQ: FLT-006 (ADR-183) — whether this node's routers feed identification now: a device is
+/// named by its MAC and `[clients] router_macs` is on.
+fn feeds_identification(sources: &crate::http::Sources) -> bool {
+    let state = sources.pipeline.current();
+    state.policy.clients.router_macs() && state.policy.clients.uses_macs()
+}
+
 /// REQ: FLT-006 (ADR-183) — the routers silent for more than [`STALE_AFTER_S`] seconds at `now`,
 /// given when each last answered (both on the monotonic clock, in seconds). Saturating: a
 /// `last` after `now` is not stale, and never panics.
@@ -742,17 +768,25 @@ pub(crate) async fn run(
         }
         rebuild(&parts, &view, &stale_routers(&last_ok, mono()));
         // A router that failed (it may still be booting) is asked again soon.
-        let wait = if failing.values().any(|f| *f) {
-            interval.min(15)
-        } else {
-            interval
-        };
+        let any_failing = failing.values().any(|f| *f);
         // REQ: T8.2 (ADR-181) — until the next read, or sooner when the routers change.
-        let until = tokio::time::Instant::now() + Duration::from_secs(u64::from(wait));
-        while tokio::time::Instant::now() < until {
+        // REQ: FLT-006 (ADR-183) — and, while this node's routers feed identification, within 15
+        // minutes whatever `interval_secs` says (also when a device named by its MAC appears
+        // during a long wait): an answer older than that doesn't say who holds an address.
+        let waited_from = tokio::time::Instant::now();
+        loop {
+            let wait = Duration::from_secs(u64::from(next_poll_secs(
+                any_failing,
+                interval,
+                feeds_identification(&sources),
+            )));
+            let left = (waited_from + wait).saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
             tokio::select! {
                 _ = stop.changed() => return,
-                () = tokio::time::sleep(CHANGE_CHECK.min(until - tokio::time::Instant::now())) => {}
+                () = tokio::time::sleep(CHANGE_CHECK.min(left)) => {}
             }
             // A sweep that couldn't run yet is tried again at each check, without a new round of
             // polls (correctness F3; cheap while the state database isn't open).
@@ -1334,6 +1368,39 @@ mod tests {
         assert!(
             at(&v, [10, 0, 0, 5]).1,
             "and the stale one is unsure by itself"
+        );
+    }
+
+    /// REQ: FLT-006 (ADR-183) — silence isn't age: a router read once an hour is never silent, yet
+    /// what it says can be an hour old. So while the routers feed identification they are read at
+    /// least every 15 minutes, whatever `interval_secs` is (and only then: a node that identifies
+    /// no device by MAC reads at the configured pace), and an answer older than 15 minutes is stale.
+    #[test]
+    fn flt_006_a_router_read_less_often_than_15_minutes_does_not_identify() {
+        // `interval_secs = 3600`: the effective pace is 900 s while they identify, 3600 s otherwise.
+        assert_eq!(next_poll_secs(false, 3600, true), 900);
+        assert_eq!(next_poll_secs(false, 3600, false), 3600);
+        // A shorter interval is kept; a failing router is still asked again at once.
+        assert_eq!(next_poll_secs(false, 300, true), 300);
+        assert_eq!(next_poll_secs(false, 900, true), 900);
+        assert_eq!(next_poll_secs(true, 3600, true), 15);
+        assert_eq!(next_poll_secs(true, 3600, false), 15);
+        assert_eq!(u64::from(IDENTIFY_POLL_MAX_S), STALE_AFTER_S, "one bound");
+        // And a binding older than that is unsure: the router that gave it is stale at 901 s.
+        let last_ok: HashMap<String, u64> = [("udm".to_owned(), 0)].into();
+        assert!(stale_routers(&last_ok, u64::from(IDENTIFY_POLL_MAX_S)).is_empty());
+        assert!(stale_routers(&last_ok, u64::from(IDENTIFY_POLL_MAX_S) + 1).contains("udm"));
+        let p = parts(vec![(
+            "udm",
+            polled(vec![dev("aa:bb:cc:00:00:01", [10, 0, 0, 5], "Desk")]),
+        )]);
+        assert_eq!(
+            at(&view_of(&p, &[]), [10, 0, 0, 5]),
+            (Some("Desk".into()), false, true)
+        );
+        assert_eq!(
+            at(&view_of(&p, &["udm"]), [10, 0, 0, 5]),
+            (Some("Desk".into()), true, false)
         );
     }
 }
