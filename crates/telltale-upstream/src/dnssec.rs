@@ -295,7 +295,7 @@ impl Validator {
             self.stats.count(Verdict::Insecure);
             return Ok(insecure_unfetched());
         }
-        let mut query = Query::query(name, RecordType::from(q.qtype));
+        let mut query = Query::query(name.clone(), RecordType::from(q.qtype));
         query.set_query_class(q.qclass.into());
         let mut opts = DnsRequestOptions::default();
         opts.use_edns = true;
@@ -371,7 +371,7 @@ impl Validator {
         } else {
             0
         };
-        tidy(&mut message, q.qtype, client_do, &qkey);
+        tidy(&mut message, q.qtype, client_do, &name);
         message.metadata.authentic_data = verdict == Verdict::Secure && (client_do || client_ad);
         message.metadata.checking_disabled = false;
         let bytes = message.to_vec().map_err(|_| ResolveError::Empty)?;
@@ -1126,11 +1126,11 @@ fn synthesized(
 
 /// The validated answer as it is served: DNSSEC records only for clients that asked (DO),
 /// records in resolution order.
-fn tidy(m: &mut Message, qtype: u16, client_do: bool, qkey: &str) {
+fn tidy(m: &mut Message, qtype: u16, client_do: bool, qname: &Name) {
     if !client_do {
         strip_dnssec(m, qtype);
     }
-    chain_order(&mut m.answers, qkey);
+    chain_order(&mut m.answers, qname);
 }
 
 /// Removes RRSIG, NSEC, and NSEC3 records a client didn't ask for (it sent no DO bit).
@@ -1148,12 +1148,24 @@ fn strip_dnssec(m: &mut Message, qtype: u16) {
 /// handle returns the validated record sets in no particular order, so an address could come
 /// before the CNAME that leads to it. Stub resolvers such as glibc's read a chain top-down and
 /// drop records whose owner isn't the current name yet, so those answers had no address at
-/// all for them. Order: a DNAME first (RFC 6672 §5.3.1), then from the question name each
-/// owner's CNAME, its other data, and its signatures, following CNAME targets; anything not on
-/// the chain keeps its place at the end. `qname` is lowercase, without the trailing dot
-/// ([`zone_key`]).
-fn chain_order(answers: &mut Vec<Record>, qname: &str) {
-    if answers.len() < 2 {
+/// all for them.
+///
+/// The order is the one a server builds its answer in (RFC 6672 §3.2): from the question name,
+/// each owner's CNAME, its other data and its signatures, following CNAME targets (step 3.A);
+/// a DNAME owned by an ancestor of the current name (a DNAME doesn't redirect its own owner,
+/// §2.3), with its signatures, just before the CNAME synthesized from it (step 3.C). Records
+/// off the chain keep their order, at the end. An answer without a CNAME or a DNAME has no
+/// chain and is left as it is.
+///
+/// Cost: one pass over the record types when there is nothing to order. Otherwise one vector
+/// the size of the answer and a name copy per link (on the stack for names of up to 32 bytes);
+/// owners are compared as names, case-insensitively, without making strings.
+fn chain_order(answers: &mut Vec<Record>, qname: &Name) {
+    if answers.len() < 2
+        || !answers
+            .iter()
+            .any(|r| matches!(r.record_type(), RecordType::CNAME | RecordType::DNAME))
+    {
         return;
     }
     let rank = |r: &Record| match r.record_type() {
@@ -1162,32 +1174,45 @@ fn chain_order(answers: &mut Vec<Record>, qname: &str) {
         _ => 1,
     };
     let mut rest = std::mem::take(answers);
-    let (dname, others): (Vec<_>, Vec<_>) = rest
-        .into_iter()
-        .partition(|r| r.record_type() == RecordType::DNAME);
-    answers.extend(dname);
-    rest = others;
-    let mut owner = qname.to_owned();
-    // A chain is at most as long as the answer; the bound also ends a CNAME loop.
+    answers.reserve_exact(rest.len());
+    let mut owner = qname.clone();
+    // Every link moves at least the CNAME it follows out of `rest`, so the walk ends within the
+    // answer's length, a CNAME loop included; the bound only says so.
     for _ in 0..=rest.len() {
-        let (mut here, others): (Vec<_>, Vec<_>) =
-            rest.into_iter().partition(|r| zone_key(&r.name) == owner);
-        rest = others;
-        if here.is_empty() {
-            break;
+        let apex = rest
+            .iter()
+            .find(|r| {
+                r.record_type() == RecordType::DNAME
+                    && r.name.zone_of(&owner)
+                    && !r.name.eq_ignore_root(&owner)
+            })
+            .map(|r| r.name.clone());
+        if let Some(apex) = apex {
+            let start = answers.len();
+            answers.extend(rest.extract_if(.., |r| {
+                r.name.eq_ignore_root(&apex)
+                    && (r.record_type() == RecordType::DNAME || rrsig_covers(r, RecordType::DNAME))
+            }));
+            answers[start..].sort_by_key(rank);
         }
-        here.sort_by_key(rank);
-        let next = here.iter().find_map(|r| match &r.data {
-            RData::CNAME(c) => Some(zone_key(&c.0)),
+        let start = answers.len();
+        answers.extend(rest.extract_if(.., |r| r.name.eq_ignore_root(&owner)));
+        answers[start..].sort_by_key(rank);
+        let next = answers[start..].iter().find_map(|r| match &r.data {
+            RData::CNAME(c) => Some(c.0.clone()),
             _ => None,
         });
-        answers.extend(here);
         match next {
-            Some(n) if n != owner => owner = n,
+            Some(n) if !n.eq_ignore_root(&owner) => owner = n,
             _ => break,
         }
     }
-    answers.extend(rest);
+    answers.append(&mut rest);
+}
+
+/// Whether `r` is a signature over records of type `t`.
+fn rrsig_covers(r: &Record, t: RecordType) -> bool {
+    matches!(&r.data, RData::DNSSEC(DNSSECRData::RRSIG(s)) if s.input().type_covered == t)
 }
 
 /// The answer an upstream group gave, before validation existed (for callers that need the
@@ -2278,7 +2303,7 @@ mod tests {
             addr("lb.example.net.", 2),
             cname("WWW.example.com.", "cdn.example.com."),
         ];
-        chain_order(&mut v, "www.example.com");
+        chain_order(&mut v, &Name::from_ascii("www.example.com").unwrap());
         assert_eq!(
             order(&v),
             vec![
@@ -2296,7 +2321,7 @@ mod tests {
             cname("b.example.", "a.example."),
             cname("a.example.", "b.example."),
         ];
-        chain_order(&mut v, "a.example");
+        chain_order(&mut v, &Name::from_ascii("a.example").unwrap());
         assert_eq!(
             order(&v),
             vec![
@@ -2308,7 +2333,7 @@ mod tests {
         // An answer already in order is unchanged.
         let mut v = vec![cname("x.example.", "y.example."), addr("y.example.", 3)];
         let before = v.clone();
-        chain_order(&mut v, "x.example");
+        chain_order(&mut v, &Name::from_ascii("x.example").unwrap());
         assert_eq!(v, before);
     }
 
@@ -2439,7 +2464,7 @@ mod order_tests {
     /// `v` in chain order for the question `qname`, checked to hold the same records as before.
     fn ordered(mut v: Vec<Record>, qname: &str) -> Vec<String> {
         let before = v.clone();
-        chain_order(&mut v, &qname.trim_end_matches('.').to_ascii_lowercase());
+        chain_order(&mut v, &n(qname));
         assert!(
             same_records(&before, &v),
             "nothing lost, added or duplicated: {:?}",
@@ -2450,12 +2475,7 @@ mod order_tests {
 
     /// `tidy` for an A question for `qname`.
     fn tidied(m: &mut Message, client_do: bool, qname: &str) {
-        tidy(
-            m,
-            u16::from(RecordType::A),
-            client_do,
-            &qname.trim_end_matches('.').to_ascii_lowercase(),
-        );
+        tidy(m, u16::from(RecordType::A), client_do, &n(qname));
     }
 
     /// A DO answer: each owner's signatures stay with it, after its data; the addresses keep
@@ -2702,5 +2722,78 @@ mod order_tests {
                 "lb.example.net. RRSIG(A)",
             ]
         );
+    }
+
+    /// RFC 6672 §3.2 step 3.C: a DNAME met in the middle of a chain comes just before the CNAME
+    /// synthesized from it, not at the top.
+    #[test]
+    fn dns_011_order_dname_goes_just_before_the_cname_it_synthesizes() {
+        let v = vec![
+            addr("x.t.example.", 1),
+            dname("d.example.", "t.example."),
+            cname("x.d.example.", "x.t.example."),
+            cname("www.a.example.", "x.d.example."),
+        ];
+        assert_eq!(
+            ordered(v, "www.a.example."),
+            [
+                "www.a.example. CNAME",
+                "d.example. DNAME",
+                "x.d.example. CNAME",
+                "x.t.example. A 192.0.2.1",
+            ]
+        );
+    }
+
+    /// A DNAME's signatures go with it, before the synthesized CNAME (which is never signed,
+    /// RFC 6672 §5.3.1). A signature of another type at the DNAME's owner isn't on the chain.
+    #[test]
+    fn dns_011_order_dname_signature_stays_with_the_dname() {
+        let v = vec![
+            sig("x.t.example.", RecordType::A),
+            addr("x.t.example.", 1),
+            sig("d.example.", RecordType::NS),
+            cname("x.d.example.", "x.t.example."),
+            sig("d.example.", RecordType::DNAME),
+            dname("d.example.", "t.example."),
+        ];
+        assert_eq!(
+            ordered(v, "x.d.example."),
+            [
+                "d.example. DNAME",
+                "d.example. RRSIG(DNAME)",
+                "x.d.example. CNAME",
+                "x.t.example. A 192.0.2.1",
+                "x.t.example. RRSIG(A)",
+                "d.example. RRSIG(NS)",
+            ]
+        );
+    }
+
+    /// Nothing to order without a CNAME or a DNAME: the answer is left exactly as it is.
+    #[test]
+    fn dns_011_order_answer_without_an_alias_is_left_as_it_is() {
+        for v in [
+            // A signed address set, its signature first.
+            vec![
+                sig("q.example.", RecordType::A),
+                addr("q.example.", 1),
+                addr("q.example.", 2),
+            ],
+            // Another name's record before the question's.
+            vec![addr("other.example.", 9), addr("q.example.", 1)],
+            // Several types (ANY), each set followed by its signature.
+            vec![
+                addr("q.example.", 1),
+                sig("q.example.", RecordType::A),
+                aaaa("q.example."),
+                sig("q.example.", RecordType::AAAA),
+            ],
+            // A single record.
+            vec![cname("q.example.", "x.example.")],
+        ] {
+            let before = shape(&v);
+            assert_eq!(ordered(v, "q.example."), before);
+        }
     }
 }
