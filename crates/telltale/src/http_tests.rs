@@ -575,6 +575,7 @@ fn clu_002_device_names_fall_back_to_the_peers() {
         expires: 0,
         offline: false,
         unsure: false,
+        stale: false,
     };
     let name = || crate::api_backend::device_name(&src, ip.to_ipv6_mapped().octets());
     assert_eq!(name(), None);

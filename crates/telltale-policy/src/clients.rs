@@ -377,13 +377,16 @@ impl MacTable {
         self.map.get(&ip).copied()
     }
 
-    /// REQ: FLT-006, API-010 (ADR-183) — how many addresses the kernel's neighbor table gives
-    /// `mac`: behind a MAC-translating extender it is the entry of every address behind it. One
-    /// pass over the table: for an API read (the dialog's `macShared`), never the query path.
+    /// REQ: FLT-006, API-010 (ADR-183) — how many IPv4 addresses the kernel's neighbor table gives
+    /// `mac`: behind a MAC-translating extender it is the entry of every address behind it. IPv6
+    /// entries are not counted (D6): a dual-stack device has a link-local and one or more global
+    /// IPv6 entries beside its IPv4 one, all the same device, and the routers' bindings are IPv4
+    /// only. One pass over the table: for an API read (the dialog's `macShared`), never the
+    /// query path.
     pub fn kernel_addresses_of(&self, mac: [u8; 6]) -> usize {
         self.map
-            .values()
-            .filter(|e| e.from == MacFrom::Kernel && e.mac == mac)
+            .iter()
+            .filter(|(ip, e)| ip.is_ipv4() && e.from == MacFrom::Kernel && e.mac == mac)
             .count()
     }
 

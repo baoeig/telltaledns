@@ -609,7 +609,8 @@ pub(crate) fn unusable_macs(seen: &[Device]) -> usize {
 /// router names an address over an earlier one (within one router a later row still does for a
 /// connected client, and the first for an offline one, the most recently seen). A binding is
 /// marked `unsure` when [`unsure_addresses`] says so, and every connected lease a stale router
-/// gives is: it still names the address, but a device there is not identified by it.
+/// gives is (and is marked `stale` too): it still names the address, but a device there is not
+/// identified by it, and the MAC it names is not counted at that address by anything fresh.
 fn rebuild(parts: &HashMap<String, Polled>, view: &ArcSwap<Leases>, stale: &HashSet<String>) {
     let lease = |d: &Device, offline: bool| Lease {
         mac: d.0.clone(),
@@ -618,6 +619,7 @@ fn rebuild(parts: &HashMap<String, Polled>, view: &ArcSwap<Leases>, stale: &Hash
         expires: 0,
         offline,
         unsure: false,
+        stale: false,
     };
     let mut order: Vec<&String> = parts.keys().collect();
     order.sort_by(|a, b| (!stale.contains(*a), *a).cmp(&(!stale.contains(*b), *b)));
@@ -637,7 +639,10 @@ fn rebuild(parts: &HashMap<String, Polled>, view: &ArcSwap<Leases>, stale: &Hash
     }
     let unsure = unsure_addresses(parts, &order, stale);
     for (ip, l) in &mut m {
-        l.unsure = unsure.contains(ip) || from_stale.contains(ip);
+        // A stale router's row is `stale` as well as `unsure`: still withheld on this node, but a
+        // MAC seen only there is not "a MAC at another address" for anything fresh (D5).
+        l.stale = from_stale.contains(ip);
+        l.unsure = unsure.contains(ip) || l.stale;
     }
     // Offline clients name only an address no router has connected; the router that comes last
     // in `order` wins, as for connected ones, and within one router the first row does.
@@ -1204,6 +1209,35 @@ mod tests {
                 "{name} names its address, and identifies nothing there"
             );
         }
+    }
+
+    /// REQ: FLT-006, CLU-002 (ADR-183) — the rows a silent router still lists say so, on this node
+    /// and, in the answer a member gives, on the others: `stale` (written only when true, so an
+    /// earlier node reads the old form plus a field it ignores) next to `unsure`. A node that
+    /// reads it counts them toward nothing and withholds nothing for them; the node that owns the
+    /// router keeps the address withheld.
+    #[test]
+    fn flt_006_a_stale_routers_rows_say_so_on_the_wire() {
+        let p = parts(vec![
+            (
+                "udm",
+                polled(vec![dev("aa:bb:cc:00:00:01", [10, 0, 0, 5], "Desk")]),
+            ),
+            (
+                "opn",
+                polled(vec![dev("aa:bb:cc:00:00:02", [10, 0, 0, 6], "Phone")]),
+            ),
+        ]);
+        let v = view_of(&p, &["udm"]);
+        let wire = |ip: [u8; 4]| serde_json::to_value(&v[&Ipv4Addr::from(ip)]).unwrap();
+        let stale = wire([10, 0, 0, 5]);
+        assert_eq!(stale["unsure"], true, "{stale}");
+        assert_eq!(stale["stale"], true, "{stale}");
+        let fresh = wire([10, 0, 0, 6]);
+        assert!(
+            fresh.get("stale").is_none() && fresh.get("unsure").is_none(),
+            "{fresh}"
+        );
     }
 
     /// REQ: FLT-006 (ADR-183) — a router silent for more than 900 seconds is stale: its bindings

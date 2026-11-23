@@ -559,12 +559,15 @@ pub trait Backend: Send + Sync + 'static {
     }
     /// REQ: FLT-006, CLU-002 (ADR-183) — this node's identity of a device as it answers another
     /// node's read: [`Backend::identity`] without `recognition`, which only the entry node's own
-    /// view uses (it is not computed for a peer, nor are this node's MACs sent to it).
+    /// view uses (it is not computed for a peer, nor are this node's MACs sent to it). A backend
+    /// that answers peers overrides it (the local one answers for itself, the federating one asks
+    /// its local backend and never every node); the default answers nothing, so a backend that
+    /// forgets cannot start a fan-out on a peer's behalf.
     fn identity_for_peer(&self, client: &str) -> Result<model::DeviceIdentity, Problem> {
-        self.identity(client).map(|mut i| {
-            i.recognition = None;
-            i
-        })
+        let _ = client;
+        Err(Problem::unavailable(
+            "device identification isn't available on this node",
+        ))
     }
     /// REQ: OBS-024 (T13.1) — what the shared configuration `config` (JSON) would have done to
     /// the logged queries over `opts`' window, compared with the configuration in effect

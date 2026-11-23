@@ -6748,6 +6748,7 @@ mod top_client_name_tests {
             expires: 0,
             offline: false,
             unsure: false,
+            stale: false,
         }
     }
 

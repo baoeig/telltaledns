@@ -3405,6 +3405,7 @@ groups = ["default"]
             expires: 0,
             offline: false,
             unsure,
+            stale: false,
         }
     }
 

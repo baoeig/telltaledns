@@ -12729,7 +12729,7 @@
           },
           "macShared": {
             "type": "boolean",
-            "description": "True when the routers report this MAC at more than one address, or this node's kernel\nneighbor table holds it at more than one (a range extender or bridge shares it): it can't tell\nthese devices apart, so a device named by a router's MAC isn't recognized at any of them, and\nthe naming dialog doesn't offer it as one device's."
+            "description": "True when the routers report this MAC at more than one address, or this node's kernel\nneighbor table holds it at more than one IPv4 address (a range extender or bridge shares it;\na device's own IPv6 addresses don't count): it can't tell\nthese devices apart, so a device named by a router's MAC isn't recognized at any of them, and\nthe naming dialog doesn't offer it as one device's."
           }
         }
       },

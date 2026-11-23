@@ -604,6 +604,7 @@ fn t8_2_offline_router_clients_are_not_announced_as_seen() {
         expires: 0,
         offline,
         unsure: false,
+        stale: false,
     };
     let table = |ls: &[crate::devices::Lease]| -> crate::devices::Leases {
         ls.iter().map(|l| (l.ip, l.clone())).collect()
@@ -637,6 +638,7 @@ fn obs_025_a_routers_mac_beats_the_kernels_behind_an_extender() {
         expires: 0,
         offline: false,
         unsure: false,
+        stale: false,
     };
     let (tv, phone, printer) = (
         lease(20, "aa:bb:cc:00:00:01"),

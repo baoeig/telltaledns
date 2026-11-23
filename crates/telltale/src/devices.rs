@@ -32,6 +32,15 @@ pub(crate) struct Lease {
     /// the same form as before.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) unsure: bool,
+    /// REQ: FLT-006, CLU-002 (ADR-183) — the router that gave this row has been silent for 15
+    /// minutes: the row is its last answer, kept for display and (always also `unsure`) to
+    /// withhold its own address on the node that reads that router. A row like this is never
+    /// counted as "a MAC at another address": a router that has gone silent doesn't veto what
+    /// the fresh ones say, here or on another node, and another node drops the row altogether.
+    /// Not written when false, so a node on an older build, which doesn't know the field,
+    /// reads the same form as before (and still takes the row for an `unsure` one).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) stale: bool,
 }
 
 /// Devices by address.
@@ -131,7 +140,8 @@ pub(crate) type MemberBindings = HashMap<String, (HashMap<Ipv4Addr, MemberBindin
 /// at `now`: only from answers that carry `vetted` and come from a full member (`full`: the
 /// registry lists it and it isn't ephemeral), each connected lease as a [`MemberBinding`] (a lease
 /// that is `unsure` or whose MAC can't identify withholds its address, as this node's own does).
-/// Offline ones are skipped. An answer that is not `vetted` (the member was rolled back to a build
+/// Offline ones are skipped, and so are `stale` ones (the member's router has been silent for 15
+/// minutes: its old rows withhold nothing here and count toward nothing). An answer that is not `vetted` (the member was rolled back to a build
 /// without the marks) removes the member's bindings kept so far, at once. Then forgets every
 /// member that is no longer full or hasn't answered for more than [`PEER_MACS_FOR_S`] seconds.
 /// Saturating: a time in the future is not old.
@@ -149,10 +159,13 @@ pub(crate) fn keep_answers(
         if !full(peer) {
             continue;
         }
+        // A stale row (its router has been silent for 15 minutes) is dropped like an offline one:
+        // it withholds nothing here and counts toward nothing (its own node keeps its address
+        // withheld, and an older node, which doesn't know the mark, reads it as `unsure`).
         let bindings = names
             .routers
             .iter()
-            .filter(|(_, l)| !l.offline)
+            .filter(|(_, l)| !l.offline && !l.stale)
             .map(|(ip, l)| {
                 let b = MemberBinding {
                     mac: usable_mac(&l.mac),
@@ -215,9 +228,9 @@ pub(crate) struct Bindings {
     /// members' (a tombstone a member gives for an address this node binds itself is not one).
     pub(crate) tombstones: HashSet<Ipv4Addr>,
     /// The addresses of a MAC that sits at two or more addresses (counted over every binding and
-    /// withheld lease, this node's and the members', tombstoned addresses included; the leases of a
-    /// router this node has marked stale count as they were last reported: the count is not
-    /// reduced for a stale or dead router), with that MAC: it identifies a device at none of them.
+    /// withheld lease, this node's and the members', tombstoned addresses included), with that
+    /// MAC: it identifies a device at none of them. The rows of a router that has gone silent
+    /// (`Lease::stale`) are not counted, here or on another node: they never veto fresh data.
     /// Not also tombstones.
     pub(crate) shared: HashMap<Ipv4Addr, [u8; 6]>,
     /// How many addresses are withheld, each once: the tombstones and the shared addresses (the
@@ -235,7 +248,9 @@ pub(crate) struct Bindings {
 /// 3. every MAC that is at two or more addresses, counted over this node's bindings and `unsure`
 ///    leases and every member binding and withheld lease (`PeerMacs::withheld`; tombstoned
 ///    addresses included, so a MAC-sharing extender can't hide behind an address one node
-///    withholds), moves its addresses from the bindings to `shared`;
+///    withholds), moves its addresses from the bindings to `shared`; the rows of a router that
+///    has gone silent (`stale`) are not counted: they never veto fresh data (a stale row's own
+///    address is still a tombstone here);
 /// 4. `unsure` is the number of tombstones plus shared addresses.
 pub(crate) fn router_bindings(own: &Leases, peers: &PeerMacs) -> Bindings {
     let mut b = Bindings::default();
@@ -254,8 +269,12 @@ pub(crate) fn router_bindings(own: &Leases, peers: &PeerMacs) -> Bindings {
             b.own.insert(*ip, mac);
             count(*ip, mac);
         } else {
+            // Its address stays withheld here; a stale row (its router has been silent) is not
+            // a MAC seen at an address, so it doesn't make anything shared (D5).
             b.tombstones.insert(*ip);
-            if let Some(mac) = usable_mac(&l.mac) {
+            if !l.stale
+                && let Some(mac) = usable_mac(&l.mac)
+            {
                 count(*ip, mac);
             }
         }
@@ -338,6 +357,30 @@ pub(crate) fn is_full_member(registry: &[telltale_cluster::node::NodeRecord], pe
     registry.iter().any(|n| n.node_id == peer && !n.ephemeral)
 }
 
+/// REQ: FLT-006, CLU-002 (ADR-183) — the check one round of [`run`] makes of each answering peer
+/// ("is it a full member?"), built in one place that `run` and the tests both use. `_claimed_primary`
+/// is who a peer's own Hello says is the primary (`reachable_primary()`): it is a parameter only so
+/// that the one call `run` makes, and a test, can say it changes nothing; the check is the
+/// registry's alone, and the test pins that.
+pub(crate) fn full_check<'a>(
+    registry: &'a [telltale_cluster::node::NodeRecord],
+    _claimed_primary: Option<&str>,
+) -> impl Fn(&str) -> bool + Copy + 'a {
+    move |p: &str| is_full_member(registry, p)
+}
+
+/// REQ: FLT-006, CLU-002 (ADR-183) — how many rows of routers (this node's connected leases, and
+/// the members' bindings and withheld addresses) have reached this node: what the "no router MAC
+/// reaches this node" notice counts, from the same data [`router_bindings`] reads (a kernel entry
+/// that shadows a router entry in the table doesn't hide it).
+pub(crate) fn bindings_reaching(own: &Leases, peers: &PeerMacs) -> usize {
+    // This node's connected rows (a stale router's are old news: nothing there identifies), and
+    // what the members gave: a binding, or an address they withhold (the two never overlap).
+    own.values().filter(|l| !l.offline && !l.stale).count()
+        + peers.macs.len()
+        + peers.tombstones.len()
+}
+
 /// REQ: CLU-002 (ADR-183) — how long to wait before asking the members again: [`RETRY`] while no
 /// full member has answered and the node is under [`RETRY_FOR_S`] seconds old, else a minute.
 pub(crate) fn next_wait(full_member_answered: bool, since_start_s: u64) -> std::time::Duration {
@@ -409,7 +452,7 @@ pub(crate) async fn run(
         };
         // The registry alone says who is a full member; `primary` below only orders display names.
         let primary = cluster.reachable_primary();
-        let full = |p: &str| is_full_member(&registry, p);
+        let full = full_check(&registry, primary.as_deref());
         answered |= answered_now(&answers, full);
         let now = started.elapsed().as_secs();
         keep_answers(&mut last, &answers, now, full);
@@ -456,6 +499,7 @@ mod tests {
             expires: 0,
             offline: false,
             unsure: false,
+            stale: false,
         }
     }
 
@@ -553,6 +597,19 @@ mod tests {
                 offline: false,
             }
         );
+        // The stale mark is written only when true, and an older answer has none; an older node
+        // reads the row (still `unsure`) as before and ignores the mark.
+        assert!(!sure.contains("stale"), "{sure}");
+        assert!(!serde_json::from_str::<Lease>(older).unwrap().stale);
+        let stale = Lease {
+            stale: true,
+            ..doubtful
+        };
+        let text = serde_json::to_string(&stale).unwrap();
+        assert!(text.contains("\"stale\":true"), "{text}");
+        assert_eq!(serde_json::from_str::<Lease>(&text).unwrap(), stale);
+        let old: PreviousLease = serde_json::from_str(&text).unwrap();
+        assert_eq!(old.ip, Ipv4Addr::new(10, 0, 0, 3), "{old:?}");
     }
 
     // REQ: FLT-006 (ADR-183) — only a connected client whose binding is sure, with a MAC that
@@ -647,8 +704,8 @@ mod tests {
         claimed_primary: Option<&str>,
         peer: &str,
     ) -> bool {
-        let _ = claimed_primary;
-        is_full_member(registry, peer)
+        // The task's own check (what `run` builds each round), not just the function under it.
+        full_check(registry, claimed_primary)(peer)
     }
 
     /// Whether these answers end the quick retry, as the task decides it (same `claimed_primary`,
@@ -660,6 +717,15 @@ mod tests {
     ) -> bool {
         let _ = claimed_primary;
         answered_now(answers, full)
+    }
+
+    /// A connected lease of a router that has gone silent (15 minutes): it still names its address
+    /// and never identifies (`unsure`), and says its router is stale.
+    fn stale_row(last: u8, mac: &str) -> Lease {
+        Lease {
+            stale: true,
+            ..bound(last, mac, true)
+        }
     }
 
     // REQ: FLT-006, CLU-002 (ADR-183) — a member's bindings count only from a full member (the
@@ -1217,6 +1283,124 @@ mod tests {
         assert_eq!(b.shared, HashMap::from([(at(6), MAC_A)]));
         assert_eq!(b.tombstones, HashSet::from([at(5)]));
         assert_eq!(b.unsure, 2);
+    }
+
+    // REQ: FLT-006, CLU-002 (ADR-183) — a router that has gone silent never vetoes fresh data: the
+    // rows it still lists (its last answer, kept while it fails) don't count toward "one MAC at two
+    // addresses" on any node, so a device that moved is recognized at its new address, on this
+    // node (its own stale rows) and on the others (a member's). The stale row's own address stays
+    // withheld on the node that owns the router, and nowhere else.
+    #[test]
+    fn flt_006_a_dead_routers_old_rows_do_not_withhold_a_moved_device() {
+        // This node's own rows: its dead router still lists m at X; the fresh one has m at Y.
+        let own = leases_of(&[
+            stale_row(5, "aa:bb:cc:00:00:01"),
+            bound(6, "aa:bb:cc:00:00:01", false),
+        ]);
+        let b = router_bindings(&own, &PeerMacs::default());
+        assert_eq!(b.own, HashMap::from([(at(6), MAC_A)]), "{b:?}");
+        assert!(b.shared.is_empty(), "{b:?}");
+        assert_eq!(
+            b.tombstones,
+            HashSet::from([at(5)]),
+            "its own address stays withheld"
+        );
+        assert_eq!(b.unsure, 1);
+
+        // A member's stale row (its dead router's last answer) is no binding here and withholds
+        // nothing here: not its address, not the MAC.
+        let peers = peers_of(vec![("pi", vetted(&[stale_row(5, "aa:bb:cc:00:00:01")]))]);
+        assert_eq!(peers, PeerMacs::default(), "{peers:?}");
+        let b = router_bindings(&leases_of(&[bound(6, "aa:bb:cc:00:00:01", false)]), &peers);
+        assert_eq!(b.own, HashMap::from([(at(6), MAC_A)]), "{b:?}");
+        assert!(b.shared.is_empty() && b.tombstones.is_empty(), "{b:?}");
+
+        // A node with no router of its own takes another member's fresh binding at Y, whatever a
+        // third member's dead router still says about X.
+        let peers = peers_of(vec![
+            ("pi", vetted(&[stale_row(5, "aa:bb:cc:00:00:01")])),
+            ("k8s", vetted(&[bound(6, "aa:bb:cc:00:00:01", false)])),
+        ]);
+        let b = router_bindings(&Leases::new(), &peers);
+        assert_eq!(b.peer, HashMap::from([(at(6), MAC_A)]), "{b:?}");
+        assert!(b.shared.is_empty() && b.tombstones.is_empty(), "{b:?}");
+
+        // A MAC that is at two addresses on fresh routers is still shared (the rule is intact).
+        let b = router_bindings(
+            &leases_of(&[
+                bound(5, "aa:bb:cc:00:00:01", false),
+                bound(6, "aa:bb:cc:00:00:01", false),
+            ]),
+            &PeerMacs::default(),
+        );
+        assert_eq!(b.shared.len(), 2, "{b:?}");
+    }
+
+    // REQ: FLT-006, CLU-002 (ADR-183) — the "no router MAC reaches this node" notice counts what
+    // reached this node, from the data the bindings are made from, not from table entries: a router
+    // lease or a member's binding counts even when a kernel entry shadows it in the table (an offline
+    // client, which binds nothing and withholds nothing, doesn't).
+    #[test]
+    fn flt_006_rows_that_reached_this_node_are_counted_from_the_bindings_data() {
+        assert_eq!(bindings_reaching(&Leases::new(), &PeerMacs::default()), 0);
+        let offline = Lease {
+            offline: true,
+            ..bound(5, "aa:bb:cc:00:00:01", false)
+        };
+        assert_eq!(
+            bindings_reaching(&leases_of(&[offline]), &PeerMacs::default()),
+            0
+        );
+        // A stale router's old row is not a row that reached this node: nothing there identifies.
+        let stale = stale_row(5, "aa:bb:cc:00:00:01");
+        assert_eq!(
+            bindings_reaching(&leases_of(&[stale]), &PeerMacs::default()),
+            0
+        );
+        // A connected lease, sure or not, is a row that reached this node.
+        for l in [
+            bound(5, "aa:bb:cc:00:00:01", false),
+            bound(6, "aa:bb:cc:00:00:02", true),
+        ] {
+            assert_eq!(bindings_reaching(&leases_of(&[l]), &PeerMacs::default()), 1);
+        }
+        // So is a member's binding, or an address a member withholds.
+        let bound_by_member = peers_of(vec![(
+            "pi",
+            vetted(&[bound(5, "aa:bb:cc:00:00:01", false)]),
+        )]);
+        assert_eq!(bindings_reaching(&Leases::new(), &bound_by_member), 1);
+        let withheld_by_member =
+            peers_of(vec![("pi", vetted(&[bound(5, "aa:bb:cc:00:00:01", true)]))]);
+        assert_eq!(bindings_reaching(&Leases::new(), &withheld_by_member), 1);
+    }
+
+    // REQ: FLT-006, CLU-002 (ADR-183) — the F1 tests test the check the task builds each round
+    // (`full_check`), not only the function under it: whoever a peer's own Hello says is the
+    // primary, nothing changes: the registry's listing, and not being ephemeral, is the whole of it.
+    // (Putting `|| claimed_primary == Some(p)` back into `full_check` breaks this test.)
+    #[test]
+    fn clu_002_a_claimed_primary_is_not_full_in_the_tasks_own_check() {
+        let registry = [
+            rec("primary", false),
+            rec("replica", false),
+            rec("pod-1", true),
+        ];
+        for claimed in [None, Some("pod-1"), Some("stranger"), Some("primary")] {
+            let full = full_check(&registry, claimed);
+            assert!(full("primary") && full("replica"), "{claimed:?}");
+            assert!(
+                !full("pod-1"),
+                "an ephemeral member that claims it: {claimed:?}"
+            );
+            assert!(
+                !full("stranger"),
+                "an unlisted node that claims it: {claimed:?}"
+            );
+        }
+        // Before the registry arrives (itself only), nobody else is full, claimed or not.
+        let early = [rec("replica", false)];
+        assert!(!full_check(&early, Some("primary"))("primary"));
     }
 
     // REQ: FLT-006, CLU-002 (ADR-183) — the same when two members disagree about X (so both are

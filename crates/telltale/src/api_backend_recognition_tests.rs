@@ -79,6 +79,7 @@ fn lease(last: u8, mac: &str) -> Lease {
         expires: 0,
         offline: false,
         unsure: false,
+        stale: false,
     }
 }
 
@@ -508,4 +509,68 @@ async fn flt_013_explain_finds_the_mac_of_a_mapped_address() {
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(v["client"]["mac"], "00:44:44:44:44:70", "{v}");
     assert_eq!(v["client"]["macFrom"], "neighbor", "{v}");
+}
+
+// REQ: FLT-006, API-010 (ADR-183) — "a MAC at several addresses" means several IPv4 addresses (the
+// routers' bindings are IPv4 only): the kernel's table holds a dual-stack device's MAC at its IPv4
+// address and at its link-local and global IPv6 ones, and that is one device, not an extender, so
+// no IPv6 entry makes a MAC shared. A MAC at two IPv4 addresses still is.
+#[tokio::test]
+async fn api_010_a_dual_stack_device_is_not_shared() {
+    let n = node(NO_MACS);
+    let dual: [u8; 6] = [0x00, 0xd1, 0xa1, 0x00, 0x00, 0x90];
+    let extender: [u8; 6] = [0x00, 0xee, 0xee, 0xee, 0xee, 0x02];
+    let v6 = |text: &str| -> std::net::IpAddr { text.parse().unwrap() };
+    n.src.pipeline.neighbors.replace([
+        (ip(90).into(), dual),
+        (v6("fe80::2d1:a1ff:fe00:90"), dual),
+        (v6("2001:db8::90"), dual),
+        (ip(91).into(), extender),
+        (ip(92).into(), extender),
+    ]);
+    let r = &identity(&n, &n.admin, "10.0.0.90").await["recognition"];
+    assert_eq!(r["mac"], "00:d1:a1:00:00:90", "{r}");
+    assert!(
+        r.get("macShared").is_none(),
+        "one IPv4 address and two IPv6 ones: {r}"
+    );
+    // The device's IPv6 address is the same device.
+    let r = &identity(&n, &n.admin, "2001:db8::90").await["recognition"];
+    assert_eq!(r["mac"], "00:d1:a1:00:00:90", "{r}");
+    assert!(r.get("macShared").is_none(), "{r}");
+    // Two IPv4 addresses with one MAC are still shared.
+    for last in [91, 92] {
+        let r = &identity(&n, &n.admin, &format!("10.0.0.{last}")).await["recognition"];
+        assert_eq!(r["macShared"], true, "{last}: {r}");
+    }
+}
+
+// REQ: AGT-004, FLT-006 (ADR-183) — `identify_device` through `/mcp` follows the same rule as the
+// REST route it calls (the tool re-enters the router with the caller's own credentials): an agent
+// with `analytics:read` alone (all `identify_device` needs) gets the recognition without the MAC,
+// one that may also read the devices (`config:read`, not restricted to a group) gets it. A guard,
+// not a fix: it passes on the code before this round.
+#[tokio::test]
+async fn agt_004_identify_device_through_mcp_gives_the_mac_only_to_who_may_read_devices() {
+    let n = node(NO_MACS);
+    routers(&n, &[lease(50, "00:11:11:11:11:50")], &[], &[]);
+    let analytics_only = n.agent("analytics:read", None);
+    let with_devices = n.agent("analytics:read config:read", None);
+    let call = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "identify_device", "arguments": {"client": "10.0.0.50"}}
+    });
+    for (who, creds, sees) in [
+        ("analytics only", &analytics_only, false),
+        ("with config:read", &with_devices, true),
+    ] {
+        let (s, v) = n.send("POST", "/mcp", creds, Some(call.clone())).await;
+        assert_eq!(s, StatusCode::OK, "{who}: {v}");
+        let text = v.to_string();
+        assert!(
+            text.contains("identifiedBy"),
+            "{who}: the recognition is there: {text}"
+        );
+        assert_eq!(text.contains("00:11:11:11:11:50"), sees, "{who}: {text}");
+    }
 }

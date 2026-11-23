@@ -373,10 +373,21 @@ struct NoBindings {
 
 impl NoBindings {
     /// One look at `now_s` (seconds on the task's monotonic clock): `wanted` is whether router
-    /// bindings are in use (a device is named by its MAC, `router_macs` is on), `bindings` how many
-    /// the table holds (this node's routers' and the members'). True exactly once per spell.
-    fn look(&mut self, wanted: bool, bindings: usize, now_s: u64) -> bool {
-        if !wanted || bindings > 0 {
+    /// bindings are in use (a device is named by its MAC, `router_macs` is on), `router_here`
+    /// whether a `[[router]]` is configured on this node, `in_cluster` whether the node is in a
+    /// cluster (a member may read a router), `bindings` how many rows of routers have reached it
+    /// (this node's and the members': see `devices::bindings_reaching`). A node where no router
+    /// could exist (standalone, none configured: a Pi with MAC clients from an import) is never
+    /// told: there is nothing to read. True exactly once per spell.
+    fn look(
+        &mut self,
+        wanted: bool,
+        router_here: bool,
+        in_cluster: bool,
+        bindings: usize,
+        now_s: u64,
+    ) -> bool {
+        if !wanted || !(router_here || in_cluster) || bindings > 0 {
             *self = Self::default();
             return false;
         }
@@ -397,7 +408,7 @@ fn no_bindings_notice(ephemeral: bool) -> &'static str {
     if ephemeral {
         "devices are named by their MAC address, but no router MAC reaches this resolver pod: a pod hears only the primary, so the primary's own router view is all it can get, and the router key belongs on the primary (and on the node a failover would promote). Until a MAC arrives those devices are recognized by their address, network or default group"
     } else {
-        "devices are named by their MAC address, but no router MAC reaches this node: no router of its own is read here (its key may be missing: see the router's status) and no other full cluster member passes one on. Until one does those devices are recognized by their address, network or default group"
+        "devices are named by their MAC address, but no router MAC reaches this node: no router of its own is read here (its key may be missing, or its router is silent: see the router's status) and no other full cluster member passes one on (the members run an earlier version, or haven't sent their member list yet, or this node refuses its configuration and so keeps no member's bindings). Until one does those devices are recognized by their address, network or default group"
     }
 }
 
@@ -435,6 +446,7 @@ fn spawn_mac_table(
     pipeline: Arc<Pipeline>,
     kernel_every: Option<Duration>,
     cluster: Option<Arc<telltale_cluster::net::Cluster>>,
+    routers_configured: impl Fn() -> bool + Send + 'static,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let started = tokio::time::Instant::now();
@@ -472,8 +484,18 @@ fn spawn_mac_table(
             // REQ: FLT-006, CLU-002 (ADR-183) — say once, after a minute, when a device is named by
             // its MAC and no router or member binding reaches this node, and why it may be so. A
             // few atomic loads each look; the registry is read only when it is about to be said.
-            let held = pipeline.neighbors.router_len() + pipeline.neighbors.peer_len();
-            if none.look(now.uses_routers(), held, started.elapsed().as_secs()) {
+            // What reached this node is counted from the data the bindings are made from, not from
+            // table entries (a kernel entry that shadows a router entry hides nothing from it); and
+            // only a node where a router could exist is told: one with a `[[router]]` here, or in a
+            // cluster (a member may read one).
+            let reached = crate::devices::bindings_reaching(&now.own, &now.peers);
+            if none.look(
+                now.uses_routers(),
+                routers_configured(),
+                cluster.is_some(),
+                reached,
+                started.elapsed().as_secs(),
+            ) {
                 let ephemeral = match cluster.clone() {
                     Some(c) => tokio::task::spawn_blocking(move || c.is_ephemeral())
                         .await
@@ -1383,6 +1405,10 @@ pub(crate) async fn serve(files: Vec<PathBuf>, cfg: Config) -> io::Result<()> {
         Arc::clone(&pipeline),
         neighbor_refresh,
         sources.cluster.clone(),
+        {
+            let sources = Arc::clone(&sources);
+            move || !sources.config.load().router.is_empty()
+        },
     );
     // Every listener is bound: ready for traffic (OPS-006), unless in maintenance (OPS-010).
     // An ephemeral resolver pod waits for the cluster's configuration too, so it never serves
@@ -1908,6 +1934,7 @@ mod tests {
             expires: 0,
             offline: false,
             unsure: false,
+            stale: false,
         }
     }
 
@@ -2010,23 +2037,50 @@ mod tests {
     #[test]
     fn flt_006_no_router_macs_are_said_once_after_a_minute() {
         let mut s = NoBindings::default();
-        assert!(!s.look(true, 0, 0));
-        assert!(!s.look(true, 0, NO_BINDINGS_AFTER_S - 1));
-        assert!(s.look(true, 0, NO_BINDINGS_AFTER_S), "after a minute");
-        assert!(!s.look(true, 0, NO_BINDINGS_AFTER_S + 1), "once");
-        assert!(!s.look(true, 0, 3_600));
+        // (A router is configured here; no cluster.)
+        assert!(!s.look(true, true, false, 0, 0));
+        assert!(!s.look(true, true, false, 0, NO_BINDINGS_AFTER_S - 1));
+        assert!(
+            s.look(true, true, false, 0, NO_BINDINGS_AFTER_S),
+            "after a minute"
+        );
+        assert!(
+            !s.look(true, true, false, 0, NO_BINDINGS_AFTER_S + 1),
+            "once"
+        );
+        assert!(!s.look(true, true, false, 0, 3_600));
         // Bindings come: nothing to say, and the spell is over; gone again, it is said once more
         // after a minute.
-        assert!(!s.look(true, 2, 3_601));
-        assert!(!s.look(true, 0, 3_700));
-        assert!(!s.look(true, 0, 3_700 + NO_BINDINGS_AFTER_S - 1));
-        assert!(s.look(true, 0, 3_700 + NO_BINDINGS_AFTER_S));
+        assert!(!s.look(true, true, false, 2, 3_601));
+        assert!(!s.look(true, true, false, 0, 3_700));
+        assert!(!s.look(true, true, false, 0, 3_700 + NO_BINDINGS_AFTER_S - 1));
+        assert!(s.look(true, true, false, 0, 3_700 + NO_BINDINGS_AFTER_S));
         // Not in use (no device named by its MAC, or `router_macs` off): nothing, and the spell
         // starts again when it is.
-        assert!(!s.look(false, 0, 4_000));
-        assert!(!s.look(true, 0, 4_010));
-        assert!(!s.look(true, 0, 4_010 + NO_BINDINGS_AFTER_S - 1));
-        assert!(s.look(true, 0, 4_010 + NO_BINDINGS_AFTER_S));
+        assert!(!s.look(false, true, false, 0, 4_000));
+        assert!(!s.look(true, true, false, 0, 4_010));
+        assert!(!s.look(true, true, false, 0, 4_010 + NO_BINDINGS_AFTER_S - 1));
+        assert!(s.look(true, true, false, 0, 4_010 + NO_BINDINGS_AFTER_S));
+    }
+
+    // REQ: FLT-006, CLU-002 (ADR-183) — the notice is for a node where a router MAC could reach it:
+    // one with a `[[router]]` configured here (its key may be missing, its router silent), or one in
+    // a cluster (a member may read a router). A standalone node with no router (a Pi with MAC
+    // clients from an import, say) is never told: there is nothing to read.
+    #[test]
+    fn flt_006_the_no_router_macs_notice_is_silent_where_no_router_could_exist() {
+        let said = |router_here: bool, in_cluster: bool| {
+            let mut s = NoBindings::default();
+            let first = s.look(true, router_here, in_cluster, 0, 0);
+            let later = s.look(true, router_here, in_cluster, 0, NO_BINDINGS_AFTER_S);
+            let much_later = s.look(true, router_here, in_cluster, 0, 10 * NO_BINDINGS_AFTER_S);
+            assert!(!first && !much_later, "never at once, and once");
+            later
+        };
+        assert!(!said(false, false), "standalone, no router");
+        assert!(said(true, false), "a router is configured here");
+        assert!(said(false, true), "in a cluster: a member may read one");
+        assert!(said(true, true));
     }
 
     // REQ: FLT-006, CLU-002 (ADR-183) — the notice says what to do: on a resolver pod, whose only
@@ -2045,6 +2099,15 @@ mod tests {
             node.contains("no router") && node.contains("full cluster member"),
             "{node}"
         );
+        // And the other causes, so the text doesn't point at the key alone.
+        for cause in [
+            "its router is silent",
+            "run an earlier version",
+            "member list",
+            "refuses its configuration",
+        ] {
+            assert!(node.contains(cause), "{cause}: {node}");
+        }
         for n in [pod, node] {
             assert!(n.contains("named by their MAC address"), "{n}");
         }

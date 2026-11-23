@@ -1921,6 +1921,16 @@ impl Backend for Federated {
             .collect();
         Ok(merge_identity(local, others, &key))
     }
+    // REQ: FLT-006, CLU-002 (ADR-183) — a peer's read of one device's identity is this node's own
+    // answer, without `recognition`, and never the fan-out of `identity` above (a read that asks
+    // every node must not ask every node again). `answer` calls it on the local backend; this
+    // override only makes sure the trait's default can never be what runs here.
+    fn identity_for_peer(
+        &self,
+        client: &str,
+    ) -> Result<telltale_api::model::DeviceIdentity, Problem> {
+        self.local.identity_for_peer(client)
+    }
     // REQ: OBS-031 — every node's view of the device (it may roam), summed by domain.
     fn client_rhythm(
         &self,
@@ -2787,6 +2797,7 @@ mod identity_tests {
             expires: 0,
             offline: false,
             unsure: false,
+            stale: false,
         };
         src.pipeline
             .router_leases
@@ -3200,7 +3211,7 @@ mod ephemeral_tests {
             "impl Backend for ApiBackend",
         );
         let fed = methods(include_str!("federated.rs"), "impl Backend for Federated");
-        let peer_only = ["identity_for_peer", "latency_hists", "shipped_timeseries"];
+        let peer_only = ["latency_hists", "shipped_timeseries"];
         let missing: Vec<&String> = api
             .iter()
             .filter(|m| !fed.contains(*m) && !peer_only.contains(&m.as_str()))

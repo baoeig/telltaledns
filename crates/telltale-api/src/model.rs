@@ -1025,7 +1025,8 @@ pub struct DeviceRecognition {
     #[schema(example = "router")]
     pub mac_from: Option<String>,
     /// True when the routers report this MAC at more than one address, or this node's kernel
-    /// neighbor table holds it at more than one (a range extender or bridge shares it): it can't tell
+    /// neighbor table holds it at more than one IPv4 address (a range extender or bridge shares it;
+    /// a device's own IPv6 addresses don't count): it can't tell
     /// these devices apart, so a device named by a router's MAC isn't recognized at any of them, and
     /// the naming dialog doesn't offer it as one device's.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
