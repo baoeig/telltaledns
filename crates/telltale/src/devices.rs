@@ -360,9 +360,9 @@ pub(crate) fn is_full_member(registry: &[telltale_cluster::node::NodeRecord], pe
 
 /// REQ: FLT-006, CLU-002 (ADR-183) — the check one round of [`run`] makes of each answering peer
 /// ("is it a full member?"), built in one place that `run` and the tests both use. `_claimed_primary`
-/// is who a peer's own Hello says is the primary (`reachable_primary()`): it is a parameter only so
-/// that the one call `run` makes, and a test, can say it changes nothing; the check is the
-/// registry's alone, and the test pins that.
+/// is the primary `reachable_primary()` reports: it is a parameter only so that the one call `run`
+/// makes, and a test, can show it changes nothing; the check is the registry's alone, and the test
+/// pins that.
 pub(crate) fn full_check<'a>(
     registry: &'a [telltale_cluster::node::NodeRecord],
     _claimed_primary: Option<&str>,
@@ -726,9 +726,8 @@ mod tests {
         }
     }
 
-    /// Whether `peer` is a full member, as the task decides it. `claimed_primary` is who a peer's
-    /// own Hello says is the primary (`reachable_primary()`): a claim anyone can make, so it must
-    /// change nothing.
+    /// Whether `peer` is a full member, as the task decides it. `claimed_primary` is the primary
+    /// `reachable_primary()` reports: it must change nothing.
     fn full_by(
         registry: &[telltale_cluster::node::NodeRecord],
         claimed_primary: Option<&str>,
@@ -1075,9 +1074,8 @@ mod tests {
     }
 
     // REQ: FLT-006, CLU-002 (ADR-183) — a member is full only if the member registry lists it and
-    // it isn't ephemeral. Nothing a peer says about itself (its Hello's `primary`, the one
-    // `reachable_primary()` reports) makes it one: any node with a valid certificate can send
-    // that. (A replica's first round can come before its registry is written; the quick retry
+    // it isn't ephemeral. Nothing else makes it one, not even being the node `reachable_primary()`
+    // reports. (A replica's first round can come before its registry is written; the quick retry
     // simply goes on until it is, a few seconds.)
     #[test]
     fn clu_002_a_member_is_full_only_if_the_registry_lists_it_and_it_is_not_ephemeral() {
@@ -1406,8 +1404,8 @@ mod tests {
     }
 
     // REQ: FLT-006, CLU-002 (ADR-183) — the F1 tests test the check the task builds each round
-    // (`full_check`), not only the function under it: whoever a peer's own Hello says is the
-    // primary, nothing changes: the registry's listing, and not being ephemeral, is the whole of it.
+    // (`full_check`), not only the function under it: whichever node `reachable_primary()` reports,
+    // nothing changes: the registry's listing, and not being ephemeral, is the whole of it.
     // (Putting `|| claimed_primary == Some(p)` back into `full_check` breaks this test.)
     #[test]
     fn clu_002_a_claimed_primary_is_not_full_in_the_tasks_own_check() {
