@@ -276,6 +276,11 @@ jobs:
       # OPS-010 (T13.4): maintenance on the replica from the primary, restarts, a stopped node.
       - name: Cluster (two processes)
         run: bash deploy/cluster/e2e.sh target/bench-fast/telltale
+      # REQ: FLT-006, CLU-002 (ADR-183) — a device named by a MAC is recognized from the router's list
+      # on the primary (which reads a fake router) and on a replica (which doesn't), and followed to
+      # a new address; the primary keeps its last answer when the router goes quiet (about 85 s).
+      - name: Cluster router MACs
+        run: bash deploy/cluster/router-macs-e2e.sh target/bench-fast/telltale
       # REQ: CLU-005 (T5.4b AC) — automatic failover with a witness: the replica is elected
       # within 30 s of the primary's death with 100% of DNS answered; the old primary follows.
       # OPS-010 (T13.4): a node in maintenance isn't elected; the primary hands over.
