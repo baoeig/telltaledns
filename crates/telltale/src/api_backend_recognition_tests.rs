@@ -382,9 +382,15 @@ async fn agt_004_recognition_mac_needs_config_read() {
             || (s == StatusCode::OK && v["recognition"].get("mac").is_none()),
         "{s}: {v}"
     );
+}
 
-    // Explain: the MAC the node knows for the client, and where it comes from, follow the same rule;
-    // a MAC the caller gave is theirs.
+// REQ: AGT-004, FLT-013 (ADR-183) — explain's MAC and where it comes from (`macFrom`) follow the same
+// rule as the identity's: a MAC the caller gave in the request is theirs.
+#[tokio::test]
+async fn agt_004_explain_mac_from_follows_the_mac() {
+    let n = node(NO_MACS);
+    let analytics_only = n.agent("analytics:read", None);
+    let with_devices = n.agent("analytics:read config:read", None);
     n.src
         .pipeline
         .neighbors
