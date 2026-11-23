@@ -295,6 +295,18 @@ pub(crate) fn answered_now(
         .any(|(p, n)| (full(p) && n.vetted && !n.routers.is_empty()) || primary == Some(p.as_str()))
 }
 
+/// REQ: FLT-006, CLU-002 (ADR-183) — whether `peer` is a full cluster member: the primary (never
+/// ephemeral, and a member whether or not this node's copy of the registry has arrived: a
+/// replica's file is written after it joins, and its first round can come before), or a member the
+/// registry lists that isn't ephemeral (as `rpc_handler` decides for a peer's requests).
+pub(crate) fn is_full_member(
+    registry: &[telltale_cluster::node::NodeRecord],
+    primary: Option<&str>,
+    peer: &str,
+) -> bool {
+    primary == Some(peer) || registry.iter().any(|n| n.node_id == peer && !n.ephemeral)
+}
+
 /// REQ: CLU-002 (ADR-183) — how long to wait before asking the members again: [`RETRY`] while no
 /// full member has answered and the node is under [`RETRY_FOR_S`] seconds old, else a minute.
 pub(crate) fn next_wait(full_member_answered: bool, since_start_s: u64) -> std::time::Duration {
@@ -364,12 +376,22 @@ pub(crate) async fn run(
                 .await
                 .unwrap_or_default()
         };
-        let full = |p: &str| registry.iter().any(|n| n.node_id == p && !n.ephemeral);
         let primary = cluster.reachable_primary();
+        let full = |p: &str| is_full_member(&registry, primary.as_deref(), p);
         answered |= answered_now(&answers, full, primary.as_deref());
         let now = started.elapsed().as_secs();
         keep_answers(&mut last, &answers, now, full);
         let macs = peer_macs(&last);
+        tracing::debug!(
+            answers = answers.len(),
+            vetted = answers.iter().filter(|(_, n)| n.vetted).count(),
+            full = answers.iter().filter(|(p, _)| full(p)).count(),
+            registry = registry.len(),
+            kept_members = last.len(),
+            bindings = macs.macs.len(),
+            tombstones = macs.tombstones.len(),
+            "devices.names round"
+        );
         if **sources.pipeline.peer_router_macs.load() != macs {
             sources
                 .pipeline
@@ -881,6 +903,44 @@ mod tests {
         assert_eq!(next_wait(answered, 5), Duration::from_secs(5));
         answered |= ask(vec![("primary", vetted(&[leased(5)]))], Some("primary"));
         assert_eq!(next_wait(answered, 10), Duration::from_secs(60));
+    }
+
+    // REQ: FLT-006, CLU-002 (ADR-183) — found by `deploy/cluster/router-macs-e2e.sh`: a replica's
+    // first round can come before its copy of the registry is written (it held only the replica
+    // itself), and the primary's answer was dropped as not a full member's: the quick retry ended
+    // on it (it is the primary's), so the replica then waited a minute and, at the next round,
+    // had still never used it. The primary is a full member whatever the registry says; any other
+    // peer is one only if the registry lists it and it isn't ephemeral.
+    #[test]
+    fn clu_002_the_primary_is_a_full_member_before_the_registry_arrives() {
+        use telltale_cluster::node::NodeRecord;
+        let rec = |id: &str, ephemeral: bool| NodeRecord {
+            node_id: id.into(),
+            site: "s".into(),
+            eligible: !ephemeral,
+            advertise: Vec::new(),
+            joined: 0,
+            witness: false,
+            ephemeral,
+        };
+        // The registry as the replica has it at its first round: itself only.
+        let early = [rec("replica", false)];
+        assert!(is_full_member(&early, Some("primary"), "primary"));
+        assert!(
+            !is_full_member(&early, None, "primary"),
+            "no primary known, not listed"
+        );
+        assert!(!is_full_member(&early, Some("primary"), "other"));
+        // Once it has arrived: listed members count, ephemeral ones and strangers don't.
+        let later = [
+            rec("primary", false),
+            rec("replica", false),
+            rec("pod-1", true),
+        ];
+        assert!(is_full_member(&later, None, "primary"));
+        assert!(is_full_member(&later, Some("primary"), "replica"));
+        assert!(!is_full_member(&later, Some("primary"), "pod-1"));
+        assert!(!is_full_member(&later, Some("primary"), "stranger"));
     }
 
     fn leases_of(l: &[Lease]) -> Leases {
