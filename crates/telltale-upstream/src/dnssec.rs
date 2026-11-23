@@ -2455,10 +2455,15 @@ mod order_tests {
             .collect()
     }
 
-    /// Whether `a` and `b` hold the same records, each as many times.
-    fn same_records(a: &[Record], b: &[Record]) -> bool {
-        let count = |v: &[Record], r: &Record| v.iter().filter(|x| *x == r).count();
-        a.len() == b.len() && a.iter().all(|r| count(a, r) == count(b, r))
+    /// Whether `before` and `after` hold the same records, each as many times.
+    fn same_records(before: &[Record], after: &[Record]) -> bool {
+        let count = |records: &[Record], record: &Record| {
+            records.iter().filter(|other| *other == record).count()
+        };
+        before.len() == after.len()
+            && before
+                .iter()
+                .all(|record| count(before, record) == count(after, record))
     }
 
     /// `v` in chain order for the question `qname`, checked to hold the same records as before.
