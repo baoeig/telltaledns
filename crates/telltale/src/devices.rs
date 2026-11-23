@@ -173,6 +173,99 @@ pub(crate) fn peer_macs(last: &MemberBindings) -> PeerMacs {
     }
 }
 
+/// REQ: FLT-006, CLU-002 (ADR-183) — the MAC bindings that identify a device on this node, from
+/// this node's routers and the members' (see [`router_bindings`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Bindings {
+    /// This node's routers' sure bindings.
+    pub(crate) own: HashMap<Ipv4Addr, [u8; 6]>,
+    /// The members' bindings, for addresses this node has no binding or tombstone for.
+    pub(crate) peer: HashMap<Ipv4Addr, [u8; 6]>,
+    /// Addresses no router or member entry fills: this node's `unsure` ones and the members'.
+    pub(crate) tombstones: HashSet<Ipv4Addr>,
+    /// The addresses of a MAC that sits at two or more addresses, with that MAC: it identifies
+    /// a device at none of them.
+    pub(crate) shared: HashMap<Ipv4Addr, [u8; 6]>,
+    /// How many bindings were withheld: this node's `unsure` leases, the addresses the members
+    /// dropped, and the shared ones (the metric `telltale_router_macs_unsure`).
+    pub(crate) unsure: usize,
+}
+
+/// REQ: FLT-006, CLU-002 (ADR-183) — what this node's routers (`own`) and the other full members'
+/// (`peers`) say about which MAC is at an address, as far as identifying a device goes:
+/// 1. this node's sure bindings (`eligible`); a connected `unsure` lease is a tombstone;
+/// 2. the members' bindings, for addresses that are neither this node's binding nor a tombstone
+///    (this node's or the members');
+/// 3. then every MAC at two or more addresses over both moves its addresses to `shared`.
+pub(crate) fn router_bindings(own: &Leases, peers: &PeerMacs) -> Bindings {
+    let mut b = Bindings::default();
+    let mut own_unsure = 0;
+    for (ip, l) in own {
+        if l.offline {
+            continue;
+        }
+        if l.unsure {
+            b.tombstones.insert(*ip);
+            own_unsure += 1;
+        } else if let Some(mac) = eligible(l) {
+            b.own.insert(*ip, mac);
+        }
+    }
+    b.tombstones.extend(peers.tombstones.iter().copied());
+    for (ip, mac) in &peers.macs {
+        if !b.own.contains_key(ip) && !b.tombstones.contains(ip) {
+            b.peer.insert(*ip, *mac);
+        }
+    }
+    let mut at: HashMap<[u8; 6], usize> = HashMap::new();
+    for mac in b.own.values().chain(b.peer.values()) {
+        *at.entry(*mac).or_default() += 1;
+    }
+    let mut shared = HashMap::new();
+    let mut sure = |map: &mut HashMap<Ipv4Addr, [u8; 6]>| {
+        map.retain(|ip, mac| {
+            let alone = at.get(mac).is_none_or(|n| *n < 2);
+            if !alone {
+                shared.insert(*ip, *mac);
+            }
+            alone
+        });
+    };
+    sure(&mut b.own);
+    sure(&mut b.peer);
+    b.unsure = own_unsure + peers.dropped + shared.len();
+    b.shared = shared;
+    b
+}
+
+/// REQ: FLT-006 (ADR-183) — the MAC table: the kernel's entries first, then this node's routers',
+/// then the members'. `None`: only the kernel's (no device is named by its MAC, or
+/// `router_macs` is off), and nothing of the routers is built.
+pub(crate) fn build_table(
+    kernel: &[(std::net::IpAddr, [u8; 6])],
+    bindings: Option<&Bindings>,
+) -> telltale_policy::MacTable {
+    let v4 = |m: &HashMap<Ipv4Addr, [u8; 6]>| -> Vec<(std::net::IpAddr, [u8; 6])> {
+        m.iter()
+            .map(|(ip, mac)| (std::net::IpAddr::V4(*ip), *mac))
+            .collect()
+    };
+    match bindings {
+        None => telltale_policy::MacTable::from_sources(
+            kernel.iter().copied(),
+            std::iter::empty(),
+            std::iter::empty(),
+            0,
+        ),
+        Some(b) => telltale_policy::MacTable::from_sources(
+            kernel.iter().copied(),
+            v4(&b.own),
+            v4(&b.peer),
+            b.unsure,
+        ),
+    }
+}
+
 /// REQ: CLU-002 (ADR-183) — how long to wait before asking the members again: [`RETRY`] while no
 /// full member has answered and the node is under [`RETRY_FOR_S`] seconds old, else a minute.
 pub(crate) fn next_wait(full_member_answered: bool, since_start_s: u64) -> std::time::Duration {

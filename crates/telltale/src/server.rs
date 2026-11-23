@@ -15,7 +15,7 @@ use telltale_config::{Config, ListenProto, Listener, Loader};
 use telltale_net::{
     CertStore, DohConfig, DohServer, TcpConfig, TcpServer, Transport, UdpConfig, UdpListener,
 };
-use telltale_policy::LocalData;
+use telltale_policy::{LocalData, Neighbors};
 use telltale_upstream::Router;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinHandle;
@@ -292,17 +292,131 @@ fn apex_soa_ns(
     (soa, ns)
 }
 
-/// REQ: FLT-006 — keeps the IP → MAC map fresh while any client is identified by MAC.
-fn spawn_neighbor_refresh(pipeline: Arc<Pipeline>, every: Duration) -> JoinHandle<()> {
+/// REQ: FLT-006 (ADR-183) — how often the MAC table task looks at what the table is built from.
+/// A look is a few atomic loads: whether anything changed is decided here, in the async loop,
+/// and a blocking task runs only to read the kernel or to rebuild.
+const MAC_TABLE_TICK: Duration = Duration::from_secs(5);
+
+/// REQ: FLT-006 (ADR-183) — what the MAC table is built from, as of one look: whether a device is
+/// named by its MAC, `[clients] router_macs`, this node's routers' view and the members'.
+#[derive(Debug, Clone)]
+pub(crate) struct MacInputs {
+    uses_macs: bool,
+    router_macs: bool,
+    own: Arc<crate::devices::Leases>,
+    peers: Arc<crate::devices::PeerMacs>,
+}
+
+impl MacInputs {
+    /// A look at the pipeline: atomic loads only.
+    pub(crate) fn load(p: &Pipeline) -> Self {
+        let state = p.current();
+        Self {
+            uses_macs: state.policy.clients.uses_macs(),
+            router_macs: state.policy.clients.router_macs(),
+            own: p.router_leases.load_full(),
+            peers: p.peer_router_macs.load_full(),
+        }
+    }
+
+    /// Router and member entries enter the table only while a device is named by its MAC and
+    /// the setting is on.
+    fn uses_routers(&self) -> bool {
+        self.uses_macs && self.router_macs
+    }
+}
+
+/// REQ: FLT-006 (ADR-183) — whether the table has to be built again: the first time; after a
+/// kernel read; when a device named by its MAC appears or goes, or `router_macs` changes (a
+/// reload); and, only while router and member entries are in use, when this node's routers' view
+/// or the members' bindings were replaced. Otherwise nothing runs.
+pub(crate) fn should_rebuild(kernel_read: bool, last: Option<&MacInputs>, now: &MacInputs) -> bool {
+    let Some(last) = last else {
+        return true;
+    };
+    kernel_read
+        || last.uses_macs != now.uses_macs
+        || last.router_macs != now.router_macs
+        || (now.uses_routers()
+            && (!Arc::ptr_eq(&last.own, &now.own) || !Arc::ptr_eq(&last.peers, &now.peers)))
+}
+
+/// REQ: FLT-006 (ADR-183) — builds the table from the kernel's entries and, while they are in
+/// use, the routers' and the members' bindings, swaps it in, and returns the old one for
+/// [`crate::pipeline::retire`] to free: a table is never freed on a query worker.
+pub(crate) fn rebuild_now(
+    p: &Pipeline,
+    kernel: &[(std::net::IpAddr, [u8; 6])],
+    inputs: &MacInputs,
+) -> Arc<telltale_policy::MacTable> {
+    let bindings = inputs
+        .uses_routers()
+        .then(|| crate::devices::router_bindings(&inputs.own, &inputs.peers));
+    p.neighbors
+        .swap(crate::devices::build_table(kernel, bindings.as_ref()))
+}
+
+/// What the MAC table task has said in the log, so each change is said once.
+#[derive(Debug, Default)]
+struct MacTableLog {
+    routers_in_use: bool,
+    said_empty: bool,
+}
+
+impl MacTableLog {
+    /// REQ: FLT-006 (ADR-183) — says when router and member bindings start or stop being used, and
+    /// once while devices are named by their MAC and the table has no entry at all.
+    fn note(&mut self, uses_macs: bool, table: &Neighbors) {
+        let bindings = table.router_len() + table.peer_len();
+        if bindings > 0 && !self.routers_in_use {
+            info!(
+                addresses = bindings,
+                "client identification: {bindings} addresses recognized by the MAC their routers report"
+            );
+        } else if bindings == 0 && self.routers_in_use {
+            info!(
+                "client identification: no address is recognized by the MAC a router reports now"
+            );
+        }
+        self.routers_in_use = bindings > 0;
+        if uses_macs && table.is_empty() {
+            if !self.said_empty {
+                info!(
+                    "devices are named by their MAC address, but this node knows no MAC address: the neighbor table is empty or off, and no router or other node reports one (host networking, or a router integration, gives it addresses)"
+                );
+            }
+            self.said_empty = true;
+        } else {
+            self.said_empty = false;
+        }
+    }
+}
+
+/// REQ: FLT-006 (ADR-183) — the one task that keeps the MAC table: the kernel's neighbor table
+/// every `kernel_every` (`Some` while `[clients] neighbor_table` is on), and, while a device is
+/// named by its MAC and `router_macs` is on, the routers' and the members' bindings after it. It
+/// looks every [`MAC_TABLE_TICK`] and rebuilds, in a blocking task, only when [`should_rebuild`]
+/// says so; the table it replaces is freed by `retire`. Off the query path: DNS never waits on it.
+fn spawn_mac_table(pipeline: Arc<Pipeline>, kernel_every: Option<Duration>) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut tick = tokio::time::interval(MAC_TABLE_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut kernel: Arc<Vec<(std::net::IpAddr, [u8; 6])>> = Arc::default();
+        let mut kernel_at: Option<tokio::time::Instant> = None;
         let mut warned = false;
+        let mut last: Option<MacInputs> = None;
+        let mut log = MacTableLog::default();
         loop {
-            if pipeline.current().policy.clients.uses_macs() {
+            tick.tick().await;
+            let mut kernel_read = false;
+            if let Some(every) = kernel_every
+                && kernel_at.is_none_or(|t| t.elapsed() >= every)
+            {
+                kernel_at = Some(tokio::time::Instant::now());
                 match tokio::task::spawn_blocking(telltale_net::neighbors).await {
                     Ok(Ok(n)) => {
-                        pipeline
-                            .neighbors
-                            .replace(n.into_iter().map(|x| (x.ip, x.mac)));
+                        kernel = Arc::new(n.into_iter().map(|x| (x.ip, x.mac)).collect());
+                        kernel_read = true;
                         warned = false;
                     }
                     Ok(Err(e)) if !warned => {
@@ -314,7 +428,20 @@ fn spawn_neighbor_refresh(pipeline: Arc<Pipeline>, every: Duration) -> JoinHandl
                     _ => {}
                 }
             }
-            tokio::time::sleep(every).await;
+            let now = MacInputs::load(&pipeline);
+            if !should_rebuild(kernel_read, last.as_ref(), &now) {
+                continue;
+            }
+            let (p, k, i) = (Arc::clone(&pipeline), Arc::clone(&kernel), now.clone());
+            match tokio::task::spawn_blocking(move || rebuild_now(&p, &k, &i)).await {
+                Ok(old) => crate::pipeline::retire(old),
+                Err(e) => {
+                    warn!("the MAC table could not be rebuilt: {e}");
+                    continue;
+                }
+            }
+            log.note(now.uses_macs, &pipeline.neighbors);
+            last = Some(now);
         }
     })
 }
@@ -1196,8 +1323,10 @@ pub(crate) async fn serve(files: Vec<PathBuf>, cfg: Config) -> io::Result<()> {
         http_stopped.clone(),
     ));
     start_http(&cfg, &sources, &http_stopped).await?;
-    let neighbors =
-        neighbor_refresh.map(|every| spawn_neighbor_refresh(Arc::clone(&pipeline), every));
+    // REQ: FLT-006 (ADR-183) — the MAC table's task runs on every node: the kernel's neighbor table
+    // while `neighbor_table` is on, and the routers' and members' bindings while a device is named
+    // by its MAC.
+    let mac_table = spawn_mac_table(Arc::clone(&pipeline), neighbor_refresh);
     // Every listener is bound: ready for traffic (OPS-006), unless in maintenance (OPS-010).
     // An ephemeral resolver pod waits for the cluster's configuration too, so it never serves
     // unfiltered (CLU-009).
@@ -1299,9 +1428,7 @@ pub(crate) async fn serve(files: Vec<PathBuf>, cfg: Config) -> io::Result<()> {
         l.shutdown();
     }
     health.abort();
-    if let Some(n) = neighbors {
-        n.abort();
-    }
+    mac_table.abort();
     if let Some(l) = lists {
         l.stop();
     }
@@ -1689,5 +1816,202 @@ mod tests {
                 "{bad}: {errs:?}"
             );
         }
+    }
+
+    const TABLET: [u8; 6] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01];
+    const STRANGER: [u8; 6] = [0x02, 0, 0, 0, 0, 0x99];
+    /// A device named by its MAC.
+    const BY_MAC: &str = "[[client]]\nname = \"tablet\"\nmatch = [\"aa:bb:cc:dd:ee:01\"]\n";
+
+    fn config_of(toml: &str) -> Config {
+        telltale_config::Loader::new()
+            .toml_str("t.toml", toml)
+            .env(Vec::<(String, String)>::new())
+            .load()
+            .unwrap()
+            .config
+    }
+
+    /// A pipeline made as `explain::run_cli` makes one: `build_dynamic`, then `Pipeline::new`.
+    fn pipeline_of(toml: &str) -> Arc<Pipeline> {
+        let (router, policy) = build_dynamic(&config_of(toml), None).unwrap();
+        Pipeline::new(
+            Settings::default(),
+            Arc::new(Cache::new(telltale_cache::CachePolicy::default())),
+            router,
+            policy,
+        )
+    }
+
+    fn lease_at(last: u8, mac: &str) -> crate::devices::Lease {
+        crate::devices::Lease {
+            mac: mac.into(),
+            ip: std::net::Ipv4Addr::new(10, 0, 0, last),
+            hostname: Some("x".into()),
+            expires: 0,
+            offline: false,
+            unsure: false,
+        }
+    }
+
+    fn ip(last: u8) -> std::net::IpAddr {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, last))
+    }
+
+    /// Gives the pipeline this node's router view (`own`) and the members' bindings.
+    fn give(p: &Pipeline, own: &[crate::devices::Lease], peers: &[(u8, [u8; 6])]) {
+        p.router_leases
+            .store(Arc::new(own.iter().map(|l| (l.ip, l.clone())).collect()));
+        p.peer_router_macs.store(Arc::new(crate::devices::PeerMacs {
+            macs: peers
+                .iter()
+                .map(|(last, mac)| (std::net::Ipv4Addr::new(10, 0, 0, *last), *mac))
+                .collect(),
+            ..Default::default()
+        }));
+    }
+
+    // REQ: FLT-006 (ADR-183) — without a device named by its MAC, the table holds the kernel's
+    // entries (they are read whenever `neighbor_table` is on, so a name can be offered for an
+    // address before anyone names a device by its MAC) and nothing the routers or members say; the
+    // moment one device is named by its MAC, their entries come in.
+    #[test]
+    fn flt_006_without_mac_clients_the_table_holds_kernel_entries_only() {
+        let kernel = [(ip(50), TABLET), (ip(51), STRANGER)];
+        let routers = [lease_at(5, "aa:bb:cc:dd:ee:01")];
+        let peers = [(6, STRANGER)];
+
+        let p = pipeline_of("[[client]]\nname = \"tv\"\nmatch = [\"192.168.1.30\"]\n");
+        give(&p, &routers, &peers);
+        let inputs = MacInputs::load(&p);
+        assert!(!inputs.uses_macs);
+        drop(rebuild_now(&p, &kernel, &inputs));
+        let n = &p.neighbors;
+        assert_eq!((n.kernel_len(), n.router_len(), n.peer_len()), (2, 0, 0));
+
+        let p = pipeline_of(BY_MAC);
+        give(&p, &routers, &peers);
+        let inputs = MacInputs::load(&p);
+        assert!(inputs.uses_macs && inputs.router_macs);
+        drop(rebuild_now(&p, &kernel, &inputs));
+        let n = &p.neighbors;
+        assert_eq!((n.kernel_len(), n.router_len(), n.peer_len()), (2, 1, 1));
+    }
+
+    // REQ: FLT-006 (ADR-183, ADR-023) — the table a rebuild replaces is handed back for `retire` to
+    // free off the query path: nothing but the caller holds it any more (the pipeline has swapped it
+    // out, no reader has it), so dropping what `rebuild_now` returns frees it. No timers.
+    #[test]
+    fn flt_006_the_old_table_is_retired() {
+        let p = pipeline_of(BY_MAC);
+        drop(rebuild_now(&p, &[(ip(50), TABLET)], &MacInputs::load(&p)));
+        let old = rebuild_now(&p, &[], &MacInputs::load(&p));
+        assert_eq!(old.kernel(), 1, "the table that was in use");
+        assert_eq!(p.neighbors.kernel_len(), 0, "and the new one is in");
+        let weak = Arc::downgrade(&old);
+        drop(old);
+        assert!(
+            weak.upgrade().is_none(),
+            "something else still holds the replaced table"
+        );
+    }
+
+    // REQ: FLT-006, CLU-010 (ADR-183) — `[clients] router_macs` is applied at reload: the table is
+    // built again, and without the setting it holds no router entry; nothing is rebuilt while
+    // nothing changed.
+    #[test]
+    fn flt_006_the_table_follows_the_setting() {
+        let p = pipeline_of(BY_MAC);
+        give(&p, &[lease_at(5, "aa:bb:cc:dd:ee:01")], &[(6, STRANGER)]);
+        let on = MacInputs::load(&p);
+        assert!(on.uses_routers());
+        drop(rebuild_now(&p, &[], &on));
+        assert_eq!((p.neighbors.router_len(), p.neighbors.peer_len()), (1, 1));
+        assert!(!should_rebuild(false, Some(&on), &MacInputs::load(&p)));
+
+        let (router, policy) = build_dynamic(
+            &config_of(&format!("[clients]\nrouter_macs = false\n{BY_MAC}")),
+            None,
+        )
+        .unwrap();
+        p.reload(router, policy);
+        let off = MacInputs::load(&p);
+        assert!(!off.router_macs && !off.uses_routers());
+        assert!(
+            should_rebuild(false, Some(&on), &off),
+            "the setting changed"
+        );
+        drop(rebuild_now(&p, &[], &off));
+        assert_eq!((p.neighbors.router_len(), p.neighbors.peer_len()), (0, 0));
+        assert!(!should_rebuild(false, Some(&off), &MacInputs::load(&p)));
+    }
+
+    // REQ: FLT-006 (ADR-183) — what makes the task build the table again, and what doesn't (it
+    // runs no blocking task when nothing changed): the first look, a kernel read, a device named by
+    // its MAC appearing or going, the setting, and — only while router and member entries are in
+    // use — a replaced router view or members' bindings.
+    #[test]
+    fn flt_006_the_table_is_rebuilt_only_when_an_input_changed() {
+        let base = MacInputs {
+            uses_macs: true,
+            router_macs: true,
+            own: Arc::default(),
+            peers: Arc::default(),
+        };
+        assert!(should_rebuild(false, None, &base), "the first look");
+        assert!(!should_rebuild(false, Some(&base), &base.clone()), "idle");
+        assert!(
+            should_rebuild(true, Some(&base), &base),
+            "the kernel was read"
+        );
+        let own = MacInputs {
+            own: Arc::default(),
+            ..base.clone()
+        };
+        assert!(
+            should_rebuild(false, Some(&base), &own),
+            "this node's routers"
+        );
+        let peers = MacInputs {
+            peers: Arc::default(),
+            ..base.clone()
+        };
+        assert!(should_rebuild(false, Some(&base), &peers), "the members'");
+        for changed in [
+            MacInputs {
+                uses_macs: false,
+                ..base.clone()
+            },
+            MacInputs {
+                router_macs: false,
+                ..base.clone()
+            },
+        ] {
+            assert!(should_rebuild(false, Some(&base), &changed));
+            assert!(should_rebuild(false, Some(&changed), &base));
+        }
+        // No router entries in use: a replaced router view changes nothing.
+        let off = MacInputs {
+            uses_macs: false,
+            ..base.clone()
+        };
+        let off_newer = MacInputs {
+            own: Arc::default(),
+            peers: Arc::default(),
+            ..off.clone()
+        };
+        assert!(!should_rebuild(false, Some(&off), &off_newer));
+        let setting_off = MacInputs {
+            router_macs: false,
+            ..off_newer.clone()
+        };
+        assert!(!should_rebuild(
+            false,
+            Some(&setting_off),
+            &MacInputs {
+                own: Arc::default(),
+                ..setting_off.clone()
+            }
+        ));
     }
 }

@@ -610,6 +610,7 @@ pub(crate) async fn run(
     let mut last_ok: HashMap<String, u64> = HashMap::new();
     let mut failing: HashMap<String, bool> = HashMap::new();
     let mut held: HashMap<String, String> = HashMap::new();
+    let mut warned_tls: HashSet<String> = HashSet::new();
     // REQ: API-002, T8.2 (ADR-181) — F5: the routers the last sweep of key files saw.
     let mut swept_for: Option<Vec<RouterConfig>> = None;
     // The routers last read: one removed, or now pointing at another device (type, address,
@@ -710,6 +711,18 @@ pub(crate) async fn run(
                 Ok(seen) => {
                     if was_failing || !parts.contains_key(r.name.as_str()) {
                         info!(router = %r.name, devices = seen.now.len(), offline = seen.offline.len(), "router integration: devices read");
+                    }
+                    // REQ: FLT-006 (ADR-183) — a router whose certificate isn't checked now
+                    // decides which named device an address is: said once per router.
+                    if r.tls_insecure_skip_verify {
+                        let current = sources.pipeline.current();
+                        let clients = &current.policy.clients;
+                        if clients.router_macs()
+                            && clients.uses_macs()
+                            && warned_tls.insert(r.name.to_string())
+                        {
+                            warn!(router = %r.name, "router integration: this router's certificate isn't checked (tls_insecure_skip_verify), and its client list now decides which named device an address is, so anything posing as it could give a device another's rules; set tls_ca (and tls_server_name), or `[clients] router_macs = false`");
+                        }
                     }
                     parts.insert(r.name.to_string(), seen);
                     last_ok.insert(r.name.to_string(), mono());
