@@ -276,16 +276,16 @@ mod tests {
         assert!(!s.is_on(monday_1030 + 3600));
     }
 
-    /// A one-window schedule in the system database's zone `tz`; `None` (the test says it
-    /// skipped) where that database isn't installed.
+    /// A one-window schedule in the system database's zone `tz`. `None` (the test says it
+    /// skipped) only where there is no time zone database at all: jiff found none in `TZDIR`,
+    /// `/usr/share/zoneinfo`, `/usr/share/lib/zoneinfo` or `/etc/zoneinfo`. With one, any lookup
+    /// error (a zone it can't find or refuses to read) fails the test.
     fn in_zone(tz: &str, window: &ScheduleWindow) -> Option<Compiled> {
-        let tz = match time_zone(Some(tz)) {
-            Ok(tz) => tz,
-            Err(e) => {
-                eprintln!("skipped: {e} (no system time zone database here)");
-                return None;
-            }
-        };
+        if jiff::tz::db().is_definitively_empty() {
+            eprintln!("skipped: no system time zone database here");
+            return None;
+        }
+        let tz = time_zone(Some(tz)).unwrap();
         Some(Compiled {
             name: "dst".into(),
             action: ScheduleAction::BlockAll,
@@ -294,6 +294,24 @@ mod tests {
             tz,
             windows: vec![parse_window(window).unwrap()],
         })
+    }
+
+    /// REQ: FLT-010 — the DST tests below skip only where there is no time zone database at all:
+    /// with one, a zone lookup that fails (here a zone that doesn't exist) fails them instead of
+    /// passing as a skip.
+    #[test]
+    fn flt_010_dst_tests_fail_on_a_lookup_error_when_a_database_exists() {
+        if jiff::tz::db().is_definitively_empty() {
+            eprintln!("skipped: no system time zone database here");
+            return;
+        }
+        let lookup = std::panic::catch_unwind(|| {
+            in_zone("Mars/Olympus_Mons", &w(&["sun"], "02:00", "03:00"))
+        });
+        assert!(
+            lookup.is_err(),
+            "an unknown zone must fail the test, not skip it"
+        );
     }
 
     /// The spans `[on, off)` (Unix seconds) in which `s` is on, checked every minute of `[from, to)`.
