@@ -2342,3 +2342,365 @@ mod tests {
         assert_eq!(m.answers[0].record_type(), RecordType::A);
     }
 }
+
+/// REQ: DNS-011 (issue #78) — the order of a validated answer, case by case. hickory returns the
+/// record sets in any order; the answer is served in the order a server builds it.
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+    use hickory_net::proto::dnssec::Algorithm;
+    use hickory_net::proto::dnssec::rdata::RRSIG;
+    use hickory_net::proto::dnssec::rdata::sig::SigInput;
+    use hickory_net::proto::rr::{SerialNumber, rdata};
+
+    fn n(s: &str) -> Name {
+        Name::from_ascii(s).unwrap()
+    }
+
+    fn record(owner: &str, data: RData) -> Record {
+        let mut r = Record::from_rdata(n(owner), 300, data);
+        r.proof = Proof::Secure;
+        r
+    }
+
+    fn cname(owner: &str, target: &str) -> Record {
+        record(owner, RData::CNAME(rdata::CNAME(n(target))))
+    }
+
+    fn addr(owner: &str, last: u8) -> Record {
+        record(owner, RData::A(rdata::A::new(192, 0, 2, last)))
+    }
+
+    fn aaaa(owner: &str) -> Record {
+        record(
+            owner,
+            RData::AAAA(rdata::AAAA(std::net::Ipv6Addr::LOCALHOST)),
+        )
+    }
+
+    /// A DNAME as hickory reads one from the wire (it has no type of its own for it).
+    fn dname(owner: &str, target: &str) -> Record {
+        let mut wire = Vec::new();
+        for label in target.split('.').filter(|l| !l.is_empty()) {
+            wire.push(u8::try_from(label.len()).unwrap());
+            wire.extend_from_slice(label.as_bytes());
+        }
+        wire.push(0);
+        record(
+            owner,
+            RData::Unknown {
+                code: RecordType::DNAME,
+                rdata: rdata::NULL::with(wire),
+            },
+        )
+    }
+
+    /// An RRSIG owned by `owner` covering `covered` (the signature itself isn't looked at).
+    fn sig(owner: &str, covered: RecordType) -> Record {
+        let input = SigInput {
+            type_covered: covered,
+            algorithm: Algorithm::ED25519,
+            num_labels: 2,
+            original_ttl: 300,
+            sig_expiration: SerialNumber::new(u32::MAX),
+            sig_inception: SerialNumber::new(0),
+            key_tag: 1,
+            signer_name: n("example."),
+        };
+        record(
+            owner,
+            RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::from_sig(input, vec![0; 64]))),
+        )
+    }
+
+    /// Each record as `owner TYPE`: `owner A address` for an address, `owner RRSIG(TYPE)` for
+    /// a signature; owners lowercase.
+    fn shape(v: &[Record]) -> Vec<String> {
+        v.iter()
+            .map(|r| {
+                let owner = r.name.to_ascii().to_ascii_lowercase();
+                match &r.data {
+                    RData::DNSSEC(DNSSECRData::RRSIG(s)) => {
+                        format!("{owner} RRSIG({})", s.input().type_covered)
+                    }
+                    RData::A(a) => format!("{owner} A {}", a.0),
+                    _ => format!("{owner} {}", r.record_type()),
+                }
+            })
+            .collect()
+    }
+
+    /// Whether `a` and `b` hold the same records, each as many times.
+    fn same_records(a: &[Record], b: &[Record]) -> bool {
+        let count = |v: &[Record], r: &Record| v.iter().filter(|x| *x == r).count();
+        a.len() == b.len() && a.iter().all(|r| count(a, r) == count(b, r))
+    }
+
+    /// `v` in chain order for the question `qname`, checked to hold the same records as before.
+    fn ordered(mut v: Vec<Record>, qname: &str) -> Vec<String> {
+        let before = v.clone();
+        chain_order(&mut v, &qname.trim_end_matches('.').to_ascii_lowercase());
+        assert!(
+            same_records(&before, &v),
+            "nothing lost, added or duplicated: {:?}",
+            shape(&v)
+        );
+        shape(&v)
+    }
+
+    /// `tidy` for an A question for `qname`.
+    fn tidied(m: &mut Message, client_do: bool, qname: &str) {
+        tidy(
+            m,
+            u16::from(RecordType::A),
+            client_do,
+            &qname.trim_end_matches('.').to_ascii_lowercase(),
+        );
+    }
+
+    /// A DO answer: each owner's signatures stay with it, after its data; the addresses keep
+    /// their own order (a round-robin set isn't reshuffled).
+    #[test]
+    fn dns_011_order_signed_chain_keeps_each_signature_with_its_owner() {
+        let v = vec![
+            sig("lb.example.net.", RecordType::A),
+            addr("lb.example.net.", 2),
+            sig("www.example.com.", RecordType::CNAME),
+            addr("lb.example.net.", 1),
+            cname("www.example.com.", "lb.example.net."),
+        ];
+        assert_eq!(
+            ordered(v, "www.example.com."),
+            [
+                "www.example.com. CNAME",
+                "www.example.com. RRSIG(CNAME)",
+                "lb.example.net. A 192.0.2.2",
+                "lb.example.net. A 192.0.2.1",
+                "lb.example.net. RRSIG(A)",
+            ]
+        );
+    }
+
+    /// A chain of four links is followed to its end.
+    #[test]
+    fn dns_011_order_long_chain_is_followed_to_its_end() {
+        let v = vec![
+            addr("e.example.", 5),
+            cname("c.example.", "d.example."),
+            cname("a.example.", "b.example."),
+            cname("d.example.", "e.example."),
+            cname("b.example.", "c.example."),
+        ];
+        assert_eq!(
+            ordered(v, "a.example."),
+            [
+                "a.example. CNAME",
+                "b.example. CNAME",
+                "c.example. CNAME",
+                "d.example. CNAME",
+                "e.example. A 192.0.2.5",
+            ]
+        );
+    }
+
+    /// RFC 6672 §3.2 step 3.C: a DNAME above the question name comes before the CNAME
+    /// synthesized from it, here at the start of the chain.
+    #[test]
+    fn dns_011_order_dname_at_the_start_comes_first() {
+        let v = vec![
+            addr("x.t.example.", 1),
+            cname("x.d.example.", "x.t.example."),
+            dname("d.example.", "t.example."),
+        ];
+        assert_eq!(
+            ordered(v, "x.d.example."),
+            [
+                "d.example. DNAME",
+                "x.d.example. CNAME",
+                "x.t.example. A 192.0.2.1",
+            ]
+        );
+    }
+
+    /// Loops end; a name with two CNAMEs and a repeated record lose nothing.
+    #[test]
+    fn dns_011_order_loops_and_repeated_names_end_without_losing_records() {
+        // A CNAME to itself (in another case).
+        let v = vec![addr("other.example.", 9), cname("a.example.", "A.Example.")];
+        assert_eq!(
+            ordered(v, "a.example."),
+            ["a.example. CNAME", "other.example. A 192.0.2.9"]
+        );
+        // A loop of three, entered at its second name.
+        let v = vec![
+            cname("c.example.", "a.example."),
+            cname("a.example.", "b.example."),
+            cname("b.example.", "c.example."),
+        ];
+        assert_eq!(
+            ordered(v, "b.example."),
+            ["b.example. CNAME", "c.example. CNAME", "a.example. CNAME"]
+        );
+        // Two CNAMEs at one name (not valid DNS, but nothing may be lost): the first is followed.
+        let v = vec![
+            addr("y.example.", 2),
+            cname("a.example.", "x.example."),
+            addr("x.example.", 1),
+            cname("a.example.", "y.example."),
+        ];
+        assert_eq!(
+            ordered(v, "a.example."),
+            [
+                "a.example. CNAME",
+                "a.example. CNAME",
+                "x.example. A 192.0.2.1",
+                "y.example. A 192.0.2.2",
+            ]
+        );
+        // The same record twice stays twice.
+        let v = vec![
+            addr("b.example.", 1),
+            cname("a.example.", "b.example."),
+            addr("b.example.", 1),
+        ];
+        assert_eq!(
+            ordered(v, "a.example."),
+            [
+                "a.example. CNAME",
+                "b.example. A 192.0.2.1",
+                "b.example. A 192.0.2.1",
+            ]
+        );
+    }
+
+    /// Records that aren't on the chain are kept after it, in their own order.
+    #[test]
+    fn dns_011_order_records_off_the_chain_keep_their_order_at_the_end() {
+        let v = vec![
+            addr("z.example.", 26),
+            addr("t.example.", 1),
+            sig("z.example.", RecordType::A),
+            cname("q.example.", "t.example."),
+            addr("y.example.", 25),
+        ];
+        assert_eq!(
+            ordered(v, "q.example."),
+            [
+                "q.example. CNAME",
+                "t.example. A 192.0.2.1",
+                "z.example. A 192.0.2.26",
+                "z.example. RRSIG(A)",
+                "y.example. A 192.0.2.25",
+            ]
+        );
+    }
+
+    /// Several types at the end of a chain (an ANY answer): the data in its own order, then
+    /// the signatures.
+    #[test]
+    fn dns_011_order_several_types_at_the_end_of_a_chain() {
+        let txt = record(
+            "x.example.",
+            RData::TXT(rdata::TXT::new(vec!["v=1".to_owned()])),
+        );
+        let v = vec![
+            sig("x.example.", RecordType::AAAA),
+            aaaa("x.example."),
+            cname("q.example.", "x.example."),
+            sig("x.example.", RecordType::A),
+            addr("x.example.", 1),
+            txt,
+            sig("q.example.", RecordType::CNAME),
+        ];
+        assert_eq!(
+            ordered(v, "q.example."),
+            [
+                "q.example. CNAME",
+                "q.example. RRSIG(CNAME)",
+                "x.example. AAAA",
+                "x.example. A 192.0.2.1",
+                "x.example. TXT",
+                "x.example. RRSIG(AAAA)",
+                "x.example. RRSIG(A)",
+            ]
+        );
+    }
+
+    /// Each of the 720 orders a signed two-link chain can come back in gives the same answer.
+    #[test]
+    fn dns_011_order_any_input_order_gives_the_same_chain() {
+        let chain = vec![
+            cname("www.example.com.", "cdn.example.net."),
+            sig("www.example.com.", RecordType::CNAME),
+            cname("cdn.example.net.", "lb.example.org."),
+            sig("cdn.example.net.", RecordType::CNAME),
+            addr("lb.example.org.", 1),
+            sig("lb.example.org.", RecordType::A),
+        ];
+        let expected = shape(&chain);
+        // Heap's algorithm: every permutation exactly once.
+        let mut v = chain;
+        assert_eq!(ordered(v.clone(), "www.example.com."), expected);
+        let mut seen = 1;
+        let mut c = vec![0usize; v.len()];
+        let mut i = 1;
+        while i < v.len() {
+            if c[i] < i {
+                if i % 2 == 0 {
+                    v.swap(0, i);
+                } else {
+                    v.swap(c[i], i);
+                }
+                assert_eq!(
+                    ordered(v.clone(), "WWW.Example.COM."),
+                    expected,
+                    "from {:?}",
+                    shape(&v)
+                );
+                seen += 1;
+                c[i] += 1;
+                i = 1;
+            } else {
+                c[i] = 0;
+                i += 1;
+            }
+        }
+        assert_eq!(seen, 720);
+    }
+
+    /// `resolve`'s last step: DNSSEC records are stripped for a client without DO, then the
+    /// chain is put in order; the other sections keep their order.
+    #[test]
+    fn dns_011_order_tidy_strips_then_orders() {
+        let scrambled = vec![
+            addr("lb.example.net.", 1),
+            sig("lb.example.net.", RecordType::A),
+            cname("www.example.com.", "lb.example.net."),
+            sig("www.example.com.", RecordType::CNAME),
+        ];
+        let mut m = Message::response(1, OpCode::Query);
+        m.answers = scrambled.clone();
+        m.additionals = vec![addr("ns2.example.", 2), addr("ns1.example.", 1)];
+        tidied(&mut m, false, "www.example.com.");
+        assert_eq!(
+            shape(&m.answers),
+            ["www.example.com. CNAME", "lb.example.net. A 192.0.2.1"]
+        );
+        assert_eq!(
+            shape(&m.additionals),
+            ["ns2.example. A 192.0.2.2", "ns1.example. A 192.0.2.1"]
+        );
+        let mut m = Message::response(1, OpCode::Query);
+        m.answers = scrambled;
+        tidied(&mut m, true, "www.example.com.");
+        assert_eq!(
+            shape(&m.answers),
+            [
+                "www.example.com. CNAME",
+                "www.example.com. RRSIG(CNAME)",
+                "lb.example.net. A 192.0.2.1",
+                "lb.example.net. RRSIG(A)",
+            ]
+        );
+    }
+}

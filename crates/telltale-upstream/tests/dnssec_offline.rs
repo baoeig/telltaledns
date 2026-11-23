@@ -1107,6 +1107,10 @@ async fn dns_011_offline_cname_chain_across_opt_out_unsigned_zones_is_insecure()
         2,
         "the CNAME and the address"
     );
+    // REQ: DNS-011 (issue #78) — in resolution order: the CNAME before the address it leads to.
+    let m = Message::from_vec(&r.bytes).unwrap();
+    let types: Vec<RecordType> = m.answers.iter().map(Record::record_type).collect();
+    assert_eq!(types, vec![RecordType::CNAME, RecordType::A], "chain order");
     assert!(!telltale_proto::Header::parse(&r.bytes).unwrap().flags.ad());
     assert_eq!(stats.bogus.load(Ordering::Relaxed), 0);
 }
