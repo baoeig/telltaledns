@@ -6159,7 +6159,7 @@ mod keep_in_git_tests {
             "upstreamGroup": "overseas"
         });
         let forward = forward_of(&body, "gfwlist").unwrap();
-        assert!(forward.servers.is_empty());
+        assert_eq!(forward.servers, Vec::<String>::new());
         let after = forward_json("gfwlist", &forward);
         assert_eq!(after["upstreamGroup"], "overseas");
         let config = keep_in_git(ManagedKind::Forward, "gfwlist", Some(&body), Some(&after));

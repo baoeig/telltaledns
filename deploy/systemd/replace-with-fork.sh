@@ -8,8 +8,8 @@ config=/etc/telltale/telltale.toml
 service=telltale.service
 service_user=telltale
 backup_root=/var/backups/telltale
-build_commit=8d30c44
-asset_ref=7d8ce37cfe115c9e79572c8302608c51b4267639
+build_commit=e8b6f72
+asset_ref=c51c90af29757f0826fe03ecd0335609c7076027
 assets="https://raw.githubusercontent.com/baoeig/telltaledns/$asset_ref"
 
 work=
