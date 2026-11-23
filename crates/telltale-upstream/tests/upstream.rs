@@ -791,7 +791,7 @@ async fn ups_006_query_ends_at_its_deadline_while_its_attempt_finishes() {
 }
 
 /// REQ: UPS-006 (ADR-165) — a burst of cache misses through two silent members: every attempt
-/// the burst started (at most one per member per query) ends within its own timeout and records
+/// the burst started (one per member per query) ends within its own timeout and records
 /// its outcome, and the runtime is back to the tasks it had before: nothing is left running.
 #[tokio::test]
 async fn ups_006_burst_of_misses_leaves_no_attempt_behind() {
@@ -838,9 +838,10 @@ async fn ups_006_burst_of_misses_leaves_no_attempt_behind() {
         answered < budget + Duration::from_millis(300),
         "every query answered at its deadline: {answered:?}"
     );
-    assert!(
-        launched <= 2 * N,
-        "at most one attempt per member per query: {launched}"
+    assert_eq!(
+        launched,
+        2 * N,
+        "one attempt per member per query: `parallel` starts both"
     );
     wait_until("every attempt has recorded its outcome", 3, || {
         recorded() == launched
