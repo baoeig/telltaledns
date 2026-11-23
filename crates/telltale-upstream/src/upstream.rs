@@ -1124,7 +1124,7 @@ mod tests {
     /// REQ: UPS-006 (ADR-013) — the hedge delay stays within [20 ms, attempt timeout] for every
     /// `timeout_ms` the config accepts; under 20 ms the attempt timeout is the bound that holds.
     #[test]
-    fn ups_006_short_timeout_hedge_delay_does_not_panic() {
+    fn ups_006_hedge_delay_stays_within_the_attempt_timeout() {
         const MS: Duration = Duration::from_millis(1);
         for ms in [1, 10, 19, 20, 21] {
             // TEST-NET-1 (RFC 5737): nothing is sent to it.
