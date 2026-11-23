@@ -200,7 +200,7 @@ Workspace crates set `publish = false`, so the short prefix can't collide on cra
 - **Chain:** client ID → EDNS MAC (only from `trust_edns_mac_from`: the option is client-supplied, so trusting it by default would let any device claim another's identity) → MAC from the kernel neighbor table (rtnetlink dump, IPv4 + IPv6, in `telltale-net`, refreshed only while some client is matched by MAC) → exact IP (IPv4-mapped IPv6 canonicalized) → most specific CIDR → `default`. Lookups are hash maps and a short sorted prefix list; a prefix trie can replace the list if CIDR counts grow.
 - **Groups:** a device in several groups gets the union of their lists; other settings come from the highest-priority group. Per-client list masks are precomputed whenever the snapshot or the client config changes. The filter state records the client table it was built for, so a query racing a reload never pairs one table's identity with another's masks.
 - **Routing:** client group names feed `[[route]] match_group`. Resolution now looks up the upstream group by the cache view chosen at selection time, rather than re-selecting without groups.
-- **Deferred:** hostname-based matching (DHCP leases / rDNS, FLT-006), client IDs until the DoH/DoT listeners (T4.5), and per-group block mode, pause, and schedules (T2.6, FLT-009/010). *(Closed by ADR-183, Proposed: host-name matching (DHCP leases, rDNS) is not built. The routers' lists contribute MAC addresses, not names, to identification, through the same MAC step as the kernel's neighbor table.)*
+- **Deferred:** hostname-based matching (DHCP leases / rDNS, FLT-006), client IDs until the DoH/DoT listeners (T4.5), and per-group block mode, pause, and schedules (T2.6, FLT-009/010). *(Still deferred after ADR-183, Proposed: host-name matching (DHCP leases, rDNS) is not built there either, and this ADR stays the reference for it; FLT-006's "hostname" item is not delivered. ADR-183 delivers identification by MAC from the routers' lists instead, through the same MAC step as the kernel's neighbor table.)*
 
 **Consequences:** Pi-hole-style per-device filtering, with MAC identification that survives DHCP and IPv6 privacy addresses on host-networked installs. Identification costs a few hash lookups per query and allocates nothing.
 
@@ -1649,7 +1649,7 @@ TelltaleDNS serves no DHCP (ADR-091), but the router integrations (ADR-080, ADR-
 
 Each gives an IPv4 address and a MAC, and every node shares what its routers report (ADR-125). Until now these were for display only.
 
-ADR-021 deferred host-name matching (FLT-006). ADR-067 says a quick rule's devices may be given "by name, IP, or MAC, as `[[client]]` keys"; the code takes a device name, an IP or a CIDR.
+ADR-021 deferred host-name matching (FLT-006), and it stays deferred: this ADR doesn't build it, and FLT-006's "hostname" item is not delivered by this change (ADR-021 remains the reference; `spec/01` is not edited). What it delivers is identification by MAC from the routers' lists. ADR-067 says a quick rule's devices may be given "by name, IP, or MAC, as `[[client]]` keys"; the code takes a device name, an IP or a CIDR. API-010 says naming creates a client object with "its IP, and the MAC when known": the dialog now offers the MAC and can store it **without** the IP, which is where this ADR records the difference from API-010's sentence (an IP key would name whoever holds the address next).
 
 A review of the first design (2026-11-20) found four ways a router binding could put one device's rules on another, which are closed below:
 1. a lower source filling an address a higher one distrusts;
@@ -1659,7 +1659,7 @@ A review of the first design (2026-11-20) found four ways a router binding could
 
 **Decision (proposed):**
 
-**Host names never identify a device.** A DHCP host name, a UniFi alias, an mDNS name and a reverse-DNS name name a device for display only. Any device can announce any name, many devices of one model announce the same one, and a UniFi alias arrives in the same field as the DHCP name. This closes ADR-021's deferral: the routers' lists contribute **MAC addresses**, not names, to identification.
+**Host names never identify a device.** A DHCP host name, a UniFi alias, an mDNS name and a reverse-DNS name name a device for display only. Any device can announce any name, many devices of one model announce the same one, and a UniFi alias arrives in the same field as the DHCP name. This does not build the host-name matching ADR-021 deferred, and doesn't close that deferral: the routers' lists contribute **MAC addresses**, not names, to identification.
 
 **One table, three sources, in this order.**
 1. The kernel's neighbor table: what this host saw on its own link.
@@ -1688,9 +1688,9 @@ Silence is counted on a monotonic clock from the node's start (never the wall cl
 
 Any member's `unsure` lease for an address removes that address. So does a disagreement between two members, and so does one MAC at two addresses across this node's and the members' bindings.
 
-A node never passes on what it learned from others, so a stale binding lives at most one router-silence window plus one member-silence window: about 30 minutes, plus one exchange.
+A node never passes on what it learned from others, so a stale binding lives at most one router-silence window plus one member-silence window: about 30 minutes, plus one exchange. That bound is on the *age of an answer*, not only on silence: a router read once an hour is never silent, yet what it said can be an hour old. So while a device is named by its MAC and `router_macs` is on, a node reads each of its routers at least every 15 minutes whatever the router's `interval_secs` says (also when such a device appears during a longer wait); with no device named by its MAC the pace is `interval_secs`.
 
-Until a full member has answered, a node asks every 5 seconds for at most 2 minutes, then once a minute as before.
+Until a full member that reads a router (its answer is `vetted` and carries router leases) has answered, or the reachable primary has, a node asks every 5 seconds for at most 2 minutes, then once a minute as before: a full replica without the router's key may answer first, and its empty answer doesn't end the retry.
 
 `Lease.unsure` and `Names.vetted` are written only when true: a node on an earlier build ignores both and reads the same form. ADR-125's display names are unchanged.
 
@@ -1776,7 +1776,9 @@ REQ: FLT-006, FLT-005, API-010, CLU-002, CLU-010, OBS-005, AGT-004. Implemented 
   - About 11 bytes per binding per full member that reads a router (kept whether or not a device matches by MAC).
   - A neighbor-table read every `neighbor_refresh_secs` on every node with `neighbor_table` on: new for nodes without a MAC-keyed device.
 - **Display.** Past queries are named by the device that holds the address now (names resolve when read, API-010).
-- **Amended ADRs.** ADR-067's wording is amended, ADR-021's host-name deferral is closed, and ADR-125's exchange feeds identification (pointers in those ADRs).
+- **Amended ADRs.** ADR-067's wording is amended, ADR-021's host-name deferral stays open (pointer there), and ADR-125's exchange feeds identification (pointers in those ADRs).
+- **Requirements.** `spec/01` is not edited (decided by the owner): FLT-006's "hostname" item is not delivered by this change; identification by MAC from the routers' lists is delivered by this ADR instead (`spec/10` T27.1 names it). API-010's "IP, and the MAC when known" describes the dialog's old behaviour; the dialog now offers the MAC and can store it without the IP, for the reason above.
+- **Not built:** host-name matching (DHCP host names, UniFi aliases, mDNS names, reverse DNS), a MAC in a rule's `devices`, IPv6 or OPNsense-state parsing, a per-router or per-site trust switch, MAC mutes, "seen at" addresses for a device named only by its MAC.
 
 **Verification (planned):**
 - **`telltale-policy`:** `flt_006_router_mac_identifies_named_device`, `flt_006_kernel_entry_wins_over_router_and_peer`, `flt_006_router_macs_counted_by_source`, `flt_006_no_mac_clients_never_read_the_table`, `flt_006_router_macs_off_ignores_router_entries`.
