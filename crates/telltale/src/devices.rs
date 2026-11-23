@@ -108,20 +108,33 @@ pub(crate) fn own(pipeline: &crate::pipeline::Pipeline) -> Result<Vec<u8>, Strin
 pub(crate) struct PeerMacs {
     pub(crate) macs: HashMap<Ipv4Addr, [u8; 6]>,
     pub(crate) tombstones: HashSet<Ipv4Addr>,
+    /// Every (address, MAC) pair a member reported at an address that ended up withheld (a lease
+    /// that is `unsure`, or an address two members disagree about): the MAC is still a MAC seen
+    /// there, so [`router_bindings`] counts it toward the shared-MAC rule.
+    pub(crate) withheld: HashSet<(Ipv4Addr, [u8; 6])>,
 }
 
-/// Each full member's last vetted answer, as the bindings it gave (an address to `Some(mac)`, or
-/// `None` for an `unsure` lease) and when it came (monotonic seconds).
-pub(crate) type MemberBindings = HashMap<String, (HashMap<Ipv4Addr, Option<[u8; 6]>>, u64)>;
+/// What a member's answer said about one address: the MAC its lease carries when that MAC can
+/// identify a device (parses, isn't zero or multicast), and whether the lease is sure (connected,
+/// not `unsure`, with such a MAC): only a sure lease binds the address; any other withholds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MemberBinding {
+    mac: Option<[u8; 6]>,
+    sure: bool,
+}
+
+/// Each full member's last vetted answer, as the bindings it gave (by address) and when it came
+/// (monotonic seconds).
+pub(crate) type MemberBindings = HashMap<String, (HashMap<Ipv4Addr, MemberBinding>, u64)>;
 
 /// REQ: FLT-006, CLU-002, CLU-010 (ADR-183) — keeps, per member, the bindings of its last answer
-/// at `now`: only from answers that carry `vetted` and come from a full member (`full`: in the
-/// registry and not ephemeral), as `eligible` gives them, with `None` for any other connected
-/// lease (`unsure`, or a MAC that can't identify: empty, all zero, multicast or unparsable): such a
-/// lease withholds its address, as this node's own does. Offline ones are skipped. Then forgets
-/// every member that is no longer full or hasn't
-/// answered for more than [`PEER_MACS_FOR_S`] seconds. Saturating: a time in the future is not
-/// old.
+/// at `now`: only from answers that carry `vetted` and come from a full member (`full`: the
+/// registry lists it and it isn't ephemeral), each connected lease as a [`MemberBinding`] (a lease
+/// that is `unsure` or whose MAC can't identify withholds its address, as this node's own does).
+/// Offline ones are skipped. An answer that is not `vetted` (the member was rolled back to a build
+/// without the marks) removes the member's bindings kept so far, at once. Then forgets every
+/// member that is no longer full or hasn't answered for more than [`PEER_MACS_FOR_S`] seconds.
+/// Saturating: a time in the future is not old.
 pub(crate) fn keep_answers(
     last: &mut MemberBindings,
     answers: &[(String, Names)],
@@ -129,14 +142,24 @@ pub(crate) fn keep_answers(
     full: impl Fn(&str) -> bool,
 ) {
     for (peer, names) in answers {
-        if !names.vetted || !full(peer) {
+        if !names.vetted {
+            last.remove(peer);
+            continue;
+        }
+        if !full(peer) {
             continue;
         }
         let bindings = names
             .routers
             .iter()
             .filter(|(_, l)| !l.offline)
-            .map(|(ip, l)| (*ip, eligible(l)))
+            .map(|(ip, l)| {
+                let b = MemberBinding {
+                    mac: usable_mac(&l.mac),
+                    sure: eligible(l).is_some(),
+                };
+                (*ip, b)
+            })
             .collect();
         last.insert(peer.clone(), (bindings, now));
     }
@@ -144,31 +167,38 @@ pub(crate) fn keep_answers(
 }
 
 /// REQ: FLT-006, CLU-002 (ADR-183) — the bindings the members agree on: an address that any
-/// member gives as `None`, or that two members give different MACs for, is a tombstone. The result
-/// doesn't depend on the order of the members.
+/// member withholds, or that two members give different MACs for, is a tombstone, and every MAC
+/// the members gave at a tombstoned address is kept in `withheld` (it still counts toward the
+/// shared-MAC rule). The result doesn't depend on the order of the members.
 pub(crate) fn peer_macs(last: &MemberBindings) -> PeerMacs {
     let mut agreed: HashMap<Ipv4Addr, [u8; 6]> = HashMap::new();
     let mut tombstones: HashSet<Ipv4Addr> = HashSet::new();
+    let mut seen: HashSet<(Ipv4Addr, [u8; 6])> = HashSet::new();
     for (bindings, _) in last.values() {
-        for (ip, mac) in bindings {
-            match (mac, agreed.get(ip)) {
+        for (ip, b) in bindings {
+            if let Some(m) = b.mac {
+                seen.insert((*ip, m));
+            }
+            match (b.mac.filter(|_| b.sure), agreed.get(ip)) {
                 (None, _) => {
                     tombstones.insert(*ip);
                 }
-                (Some(m), Some(other)) if other != m => {
+                (Some(m), Some(other)) if other != &m => {
                     tombstones.insert(*ip);
                 }
                 (Some(m), None) => {
-                    agreed.insert(*ip, *m);
+                    agreed.insert(*ip, m);
                 }
                 (Some(_), Some(_)) => {}
             }
         }
     }
     agreed.retain(|ip, _| !tombstones.contains(ip));
+    seen.retain(|(ip, _)| tombstones.contains(ip));
     PeerMacs {
         macs: agreed,
         tombstones,
+        withheld: seen,
     }
 }
 
@@ -185,8 +215,10 @@ pub(crate) struct Bindings {
     /// members' (a tombstone a member gives for an address this node binds itself is not one).
     pub(crate) tombstones: HashSet<Ipv4Addr>,
     /// The addresses of a MAC that sits at two or more addresses (counted over every binding and
-    /// withheld lease, tombstoned addresses included), with that MAC: it identifies a device at
-    /// none of them. Not also tombstones.
+    /// withheld lease, this node's and the members', tombstoned addresses included; the leases of a
+    /// router this node has marked stale count as they were last reported: the count is not
+    /// reduced for a stale or dead router), with that MAC: it identifies a device at none of them.
+    /// Not also tombstones.
     pub(crate) shared: HashMap<Ipv4Addr, [u8; 6]>,
     /// How many addresses are withheld, each once: the tombstones and the shared addresses (the
     /// metric `telltale_router_macs_unsure`).
@@ -201,9 +233,9 @@ pub(crate) struct Bindings {
 /// 2. the members' tombstones join, except for addresses this node binds itself; the members'
 ///    bindings fill the addresses that are neither this node's binding nor a tombstone;
 /// 3. every MAC that is at two or more addresses, counted over this node's bindings and `unsure`
-///    leases and every member binding (tombstoned addresses included, so a MAC-sharing extender
-///    can't hide behind an address one node withholds), moves its addresses from the bindings to
-///    `shared`;
+///    leases and every member binding and withheld lease (`PeerMacs::withheld`; tombstoned
+///    addresses included, so a MAC-sharing extender can't hide behind an address one node
+///    withholds), moves its addresses from the bindings to `shared`;
 /// 4. `unsure` is the number of tombstones plus shared addresses.
 pub(crate) fn router_bindings(own: &Leases, peers: &PeerMacs) -> Bindings {
     let mut b = Bindings::default();
@@ -229,6 +261,10 @@ pub(crate) fn router_bindings(own: &Leases, peers: &PeerMacs) -> Bindings {
         }
     }
     for (ip, mac) in &peers.macs {
+        count(*ip, *mac);
+    }
+    // The members' withheld addresses count too: a MAC a member isn't sure of at X is still at X.
+    for (ip, mac) in &peers.withheld {
         count(*ip, *mac);
     }
     b.tombstones.extend(peers.tombstones.iter().copied());
@@ -281,30 +317,25 @@ pub(crate) fn build_table(
     }
 }
 
-/// REQ: CLU-002 (ADR-183) — whether the answers of this round end the quick retry: a full member's
-/// answer that is `vetted` and carries router leases (it reads a router: its bindings are what
-/// the retry is for), or the reachable primary's answer, whatever it holds. A full replica with
-/// no router key answers first in some clusters, and its empty answer must not end the retry.
-pub(crate) fn answered_now(
-    answers: &[(String, Names)],
-    full: impl Fn(&str) -> bool,
-    primary: Option<&str>,
-) -> bool {
+/// REQ: CLU-002 (ADR-183) — whether the answers of this round end the quick retry: an answer that
+/// is *kept* (a full member's, `vetted`) and carries router leases (it reads a router: its
+/// bindings are what the retry is for). A full replica with no router key answers first in some
+/// clusters, the primary can answer before its first read of its router, and a replica's first
+/// round can come before its registry lists the answerer: none of those ends the retry.
+pub(crate) fn answered_now(answers: &[(String, Names)], full: impl Fn(&str) -> bool) -> bool {
     answers
         .iter()
-        .any(|(p, n)| (full(p) && n.vetted && !n.routers.is_empty()) || primary == Some(p.as_str()))
+        .any(|(p, n)| full(p) && n.vetted && !n.routers.is_empty())
 }
 
-/// REQ: FLT-006, CLU-002 (ADR-183) — whether `peer` is a full cluster member: the primary (never
-/// ephemeral, and a member whether or not this node's copy of the registry has arrived: a
-/// replica's file is written after it joins, and its first round can come before), or a member the
-/// registry lists that isn't ephemeral (as `rpc_handler` decides for a peer's requests).
-pub(crate) fn is_full_member(
-    registry: &[telltale_cluster::node::NodeRecord],
-    primary: Option<&str>,
-    peer: &str,
-) -> bool {
-    primary == Some(peer) || registry.iter().any(|n| n.node_id == peer && !n.ephemeral)
+/// REQ: FLT-006, CLU-002 (ADR-183) — whether `peer` is a full cluster member: the member registry
+/// lists it and it isn't ephemeral (as `rpc_handler` decides for a peer's requests). Nothing a peer
+/// says about itself counts: its Hello's `primary` flag is a claim any node with a valid
+/// certificate can make, and the rest of the cluster code refuses it too. A replica's first round
+/// can come before its registry is written; the answer is then not used, and the quick retry goes
+/// on until the registry lists the answerer.
+pub(crate) fn is_full_member(registry: &[telltale_cluster::node::NodeRecord], peer: &str) -> bool {
+    registry.iter().any(|n| n.node_id == peer && !n.ephemeral)
 }
 
 /// REQ: CLU-002 (ADR-183) — how long to wait before asking the members again: [`RETRY`] while no
@@ -376,9 +407,10 @@ pub(crate) async fn run(
                 .await
                 .unwrap_or_default()
         };
+        // The registry alone says who is a full member; `primary` below only orders display names.
         let primary = cluster.reachable_primary();
-        let full = |p: &str| is_full_member(&registry, primary.as_deref(), p);
-        answered |= answered_now(&answers, full, primary.as_deref());
+        let full = |p: &str| is_full_member(&registry, p);
+        answered |= answered_now(&answers, full);
         let now = started.elapsed().as_secs();
         keep_answers(&mut last, &answers, now, full);
         let macs = peer_macs(&last);
@@ -592,6 +624,42 @@ mod tests {
         let mut m: Vec<&str> = last.keys().map(String::as_str).collect();
         m.sort_unstable();
         m
+    }
+
+    /// A registry entry: a full member, or an ephemeral one (a resolver pod).
+    fn rec(id: &str, ephemeral: bool) -> telltale_cluster::node::NodeRecord {
+        telltale_cluster::node::NodeRecord {
+            node_id: id.into(),
+            site: "s".into(),
+            eligible: !ephemeral,
+            advertise: Vec::new(),
+            joined: 0,
+            witness: false,
+            ephemeral,
+        }
+    }
+
+    /// Whether `peer` is a full member, as the task decides it. `claimed_primary` is who a peer's
+    /// own Hello says is the primary (`reachable_primary()`): a claim anyone can make, so it must
+    /// change nothing.
+    fn full_by(
+        registry: &[telltale_cluster::node::NodeRecord],
+        claimed_primary: Option<&str>,
+        peer: &str,
+    ) -> bool {
+        let _ = claimed_primary;
+        is_full_member(registry, peer)
+    }
+
+    /// Whether these answers end the quick retry, as the task decides it (same `claimed_primary`,
+    /// which changes nothing).
+    fn retry_ends(
+        answers: &[(String, Names)],
+        full: impl Fn(&str) -> bool,
+        claimed_primary: Option<&str>,
+    ) -> bool {
+        let _ = claimed_primary;
+        answered_now(answers, full)
     }
 
     // REQ: FLT-006, CLU-002 (ADR-183) — a member's bindings count only from a full member (the
@@ -858,8 +926,9 @@ mod tests {
 
     // REQ: CLU-002 (ADR-183) — the quick retry isn't ended by a full replica that holds no router
     // key and answers first (its empty answer carries nothing the pods need), nor by an older
-    // member's answer or an ephemeral member's: only a full member's vetted answer with router
-    // leases, or the reachable primary's answer, ends it.
+    // member's answer or an ephemeral member's, nor by the primary's own answer when it carries
+    // no router leases (it may come before the primary's first read): only an answer that is
+    // kept (a full member's, `vetted`) and carries router leases ends it.
     #[test]
     fn clu_002_the_quick_retry_waits_for_an_answer_that_carries_routers() {
         use std::time::Duration;
@@ -869,7 +938,7 @@ mod tests {
         let with_router = vetted(&[leased(5)]);
         let older = names(&[leased(5)], &[]);
         let ask = |a: Vec<(&str, Names)>, primary: Option<&str>| {
-            answered_now(&from_nodes(a), full, primary)
+            retry_ends(&from_nodes(a), full, primary)
         };
         // A replica without the router key, vetted and empty: not yet.
         assert!(!ask(vec![("replica", replica_no_key.clone())], None));
@@ -890,57 +959,163 @@ mod tests {
         assert!(!ask(vec![("old", older)], None));
         assert!(!ask(vec![("pod-1", with_router.clone())], None));
         assert!(!ask(vec![("ghost", with_router)], None));
-        // The primary's answer, whatever it holds, ends it (it is the node that reads the router).
-        assert!(ask(
+        // The primary's own answer doesn't end it when it carries no router leases (it may come
+        // before the primary's first read of its router), whoever says it is the primary.
+        assert!(!ask(
             vec![("primary", replica_no_key.clone())],
             Some("primary")
         ));
         assert!(!ask(vec![("replica", replica_no_key)], Some("primary")));
         assert!(!ask(vec![], Some("primary")), "nobody answered");
-        // The whole story, with `next_wait`: the replica answers at 5 s, the primary at 10 s.
+        // The whole story, with `next_wait`: the replica answers at 5 s, the primary (before its
+        // first read) at 10 s, and the primary with its leases at 15 s.
         let mut answered = false;
         answered |= ask(vec![("replica", vetted(&[]))], Some("primary"));
         assert_eq!(next_wait(answered, 5), Duration::from_secs(5));
+        answered |= ask(vec![("primary", vetted(&[]))], Some("primary"));
+        assert_eq!(next_wait(answered, 10), Duration::from_secs(5));
         answered |= ask(vec![("primary", vetted(&[leased(5)]))], Some("primary"));
-        assert_eq!(next_wait(answered, 10), Duration::from_secs(60));
+        assert_eq!(next_wait(answered, 15), Duration::from_secs(60));
     }
 
-    // REQ: FLT-006, CLU-002 (ADR-183) — found by `deploy/cluster/router-macs-e2e.sh`: a replica's
-    // first round can come before its copy of the registry is written (it held only the replica
-    // itself), and the primary's answer was dropped as not a full member's: the quick retry ended
-    // on it (it is the primary's), so the replica then waited a minute and, at the next round,
-    // had still never used it. The primary is a full member whatever the registry says; any other
-    // peer is one only if the registry lists it and it isn't ephemeral.
+    // REQ: FLT-006, CLU-002 (ADR-183) — a member is full only if the member registry lists it and
+    // it isn't ephemeral. Nothing a peer says about itself (its Hello's `primary`, the one
+    // `reachable_primary()` reports) makes it one: any node with a valid certificate can send
+    // that. (A replica's first round can come before its registry is written; the quick retry
+    // simply goes on until it is, a few seconds.)
     #[test]
-    fn clu_002_the_primary_is_a_full_member_before_the_registry_arrives() {
-        use telltale_cluster::node::NodeRecord;
-        let rec = |id: &str, ephemeral: bool| NodeRecord {
-            node_id: id.into(),
-            site: "s".into(),
-            eligible: !ephemeral,
-            advertise: Vec::new(),
-            joined: 0,
-            witness: false,
-            ephemeral,
-        };
-        // The registry as the replica has it at its first round: itself only.
+    fn clu_002_a_member_is_full_only_if_the_registry_lists_it_and_it_is_not_ephemeral() {
+        // The registry as a replica has it at its first round: itself only.
         let early = [rec("replica", false)];
-        assert!(is_full_member(&early, Some("primary"), "primary"));
-        assert!(
-            !is_full_member(&early, None, "primary"),
-            "no primary known, not listed"
-        );
-        assert!(!is_full_member(&early, Some("primary"), "other"));
-        // Once it has arrived: listed members count, ephemeral ones and strangers don't.
+        assert!(!full_by(&early, Some("primary"), "primary"));
+        assert!(!full_by(&early, None, "primary"));
+        assert!(!full_by(&early, Some("primary"), "other"));
+        // Once it has arrived: listed members count, ephemeral ones and strangers don't, whoever
+        // is said to be the primary.
         let later = [
             rec("primary", false),
             rec("replica", false),
             rec("pod-1", true),
         ];
-        assert!(is_full_member(&later, None, "primary"));
-        assert!(is_full_member(&later, Some("primary"), "replica"));
-        assert!(!is_full_member(&later, Some("primary"), "pod-1"));
-        assert!(!is_full_member(&later, Some("primary"), "stranger"));
+        assert!(full_by(&later, None, "primary"));
+        assert!(full_by(&later, Some("pod-1"), "replica"));
+        assert!(!full_by(&later, Some("pod-1"), "pod-1"));
+        assert!(!full_by(&later, Some("stranger"), "stranger"));
+    }
+
+    // REQ: FLT-006, CLU-002 (ADR-183) — a resolver pod (a member the registry lists as ephemeral)
+    // whose own Hello says it is the primary gets no bindings, and doesn't end the quick retry:
+    // its vetted answer, with an address it made up, is not used.
+    #[test]
+    fn clu_002_a_peer_claiming_to_be_primary_gets_no_bindings_when_the_registry_lists_it_ephemeral()
+    {
+        let registry = [rec("primary", false), rec("pod-1", true)];
+        let claimed = Some("pod-1");
+        let full = |p: &str| full_by(&registry, claimed, p);
+        let answers = from_nodes(vec![(
+            "pod-1",
+            vetted(&[bound(5, "aa:bb:cc:00:00:01", false)]),
+        )]);
+        assert!(!full("pod-1"));
+        let mut last = MemberBindings::new();
+        keep_answers(&mut last, &answers, 10, full);
+        assert!(last.is_empty(), "{:?}", members(&last));
+        assert_eq!(peer_macs(&last), PeerMacs::default());
+        assert!(!retry_ends(&answers, full, claimed));
+    }
+
+    // REQ: FLT-006, CLU-002 (ADR-183) — the same for a node the registry doesn't list at all, once
+    // this node has the registry (it holds the primary and itself): a stranger that says it is the
+    // primary gets no bindings.
+    #[test]
+    fn clu_002_a_peer_claiming_to_be_primary_gets_no_bindings_when_the_registry_does_not_list_it() {
+        let registry = [rec("primary", false), rec("replica", false)];
+        let claimed = Some("stranger");
+        let full = |p: &str| full_by(&registry, claimed, p);
+        let answers = from_nodes(vec![(
+            "stranger",
+            vetted(&[bound(5, "aa:bb:cc:00:00:01", false)]),
+        )]);
+        let mut last = MemberBindings::new();
+        keep_answers(&mut last, &answers, 10, full);
+        assert!(last.is_empty(), "{:?}", members(&last));
+        assert_eq!(peer_macs(&last), PeerMacs::default());
+        assert!(!retry_ends(&answers, full, claimed));
+    }
+
+    // REQ: CLU-002 (ADR-183) — found by `deploy/cluster/router-macs-e2e.sh`: a replica's first
+    // round can come before its copy of the registry is written. The primary's answer is then not
+    // used, and it must not end the quick retry either: the retry goes on every 5 seconds until the
+    // registry lists the answerer, then the answer is kept and the retry ends.
+    #[test]
+    fn clu_002_the_quick_retry_goes_on_until_the_registry_lists_the_answerer() {
+        let answers = from_nodes(vec![(
+            "primary",
+            vetted(&[bound(5, "aa:bb:cc:00:00:01", false)]),
+        )]);
+        let early = [rec("replica", false)];
+        let full = |p: &str| full_by(&early, Some("primary"), p);
+        let mut last = MemberBindings::new();
+        keep_answers(&mut last, &answers, 5, full);
+        assert!(last.is_empty(), "not listed yet: not used");
+        assert!(
+            !retry_ends(&answers, full, Some("primary")),
+            "so the retry goes on"
+        );
+        // The registry arrives: the same answer is kept, and the retry ends.
+        let later = [rec("primary", false), rec("replica", false)];
+        let full = |p: &str| full_by(&later, Some("primary"), p);
+        keep_answers(&mut last, &answers, 10, full);
+        assert_eq!(members(&last), ["primary"]);
+        assert!(retry_ends(&answers, full, Some("primary")));
+    }
+
+    // REQ: CLU-002 (ADR-183) — the primary's vetted answer without router leases (it came before
+    // the primary's first read of its router, on a chart roll) doesn't end the quick retry: the
+    // next round, 5 seconds on, is the one that has the bindings.
+    #[test]
+    fn clu_002_the_quick_retry_does_not_end_on_the_primarys_empty_answer() {
+        let registry = [rec("primary", false), rec("replica", false)];
+        let full = |p: &str| full_by(&registry, Some("primary"), p);
+        let empty = from_nodes(vec![("primary", vetted(&[]))]);
+        assert!(!retry_ends(&empty, full, Some("primary")));
+        assert!(!retry_ends(&empty, full, None));
+        let leased = from_nodes(vec![(
+            "primary",
+            vetted(&[bound(5, "aa:bb:cc:00:00:01", false)]),
+        )]);
+        assert!(retry_ends(&leased, full, Some("primary")));
+    }
+
+    // REQ: FLT-006, CLU-002 (ADR-183) — an answer without `vetted` from a member that was kept
+    // (it was rolled back to a build without the marks) drops that member's bindings now, not
+    // after 15 minutes: its lists no longer follow the rules.
+    #[test]
+    fn clu_002_an_unvetted_answer_drops_the_members_bindings() {
+        let full = |p: &str| p == "pi";
+        let mut last = MemberBindings::new();
+        keep_answers(
+            &mut last,
+            &from_nodes(vec![(
+                "pi",
+                vetted(&[bound(5, "aa:bb:cc:00:00:01", false)]),
+            )]),
+            10,
+            full,
+        );
+        assert_eq!(members(&last), ["pi"]);
+        assert_eq!(peer_macs(&last).macs.len(), 1);
+        keep_answers(
+            &mut last,
+            &from_nodes(vec![(
+                "pi",
+                names(&[bound(5, "aa:bb:cc:00:00:01", false)], &[]),
+            )]),
+            20,
+            full,
+        );
+        assert!(last.is_empty(), "{:?}", members(&last));
+        assert_eq!(peer_macs(&last), PeerMacs::default());
     }
 
     fn leases_of(l: &[Lease]) -> Leases {
@@ -1025,6 +1200,39 @@ mod tests {
         let b = router_bindings(&leases_of(&[bound(5, "aa:bb:cc:00:00:09", true)]), &peers);
         assert!(b.peer.is_empty() && b.tombstones.contains(&at(5)), "{b:?}");
         assert_eq!(b.shared, HashMap::from([(at(6), MAC_A)]));
+    }
+
+    // REQ: FLT-006, CLU-002 (ADR-183) — a MAC a member withholds counts toward sharing here too:
+    // member A isn't sure of X (its lease is `unsure`, and carries m), member B binds Y to m, and
+    // this node has no router: m is at two addresses, so Y identifies nobody on this node either,
+    // as it wouldn't on a node that reads A's router itself.
+    #[test]
+    fn flt_006_a_mac_withheld_by_one_member_still_counts_toward_sharing() {
+        let peers = peers_of(vec![
+            ("pi", vetted(&[bound(5, "aa:bb:cc:00:00:01", true)])),
+            ("k8s", vetted(&[bound(6, "aa:bb:cc:00:00:01", false)])),
+        ]);
+        let b = router_bindings(&Leases::new(), &peers);
+        assert!(b.peer.is_empty(), "m is at X and Y: {b:?}");
+        assert_eq!(b.shared, HashMap::from([(at(6), MAC_A)]));
+        assert_eq!(b.tombstones, HashSet::from([at(5)]));
+        assert_eq!(b.unsure, 2);
+    }
+
+    // REQ: FLT-006, CLU-002 (ADR-183) — the same when two members disagree about X (so both are
+    // dropped there): the MAC each gave for X is still a MAC seen at X, so a third member's binding
+    // of one of them at Y is shared, not used.
+    #[test]
+    fn flt_006_a_mac_at_a_disagreed_address_still_counts_toward_sharing() {
+        let peers = peers_of(vec![
+            ("pi", vetted(&[bound(5, "aa:bb:cc:00:00:01", false)])),
+            ("k8s", vetted(&[bound(5, "aa:bb:cc:00:00:02", false)])),
+            ("nas", vetted(&[bound(6, "aa:bb:cc:00:00:01", false)])),
+        ]);
+        let b = router_bindings(&Leases::new(), &peers);
+        assert!(b.peer.is_empty(), "m is at X (disagreed) and Y: {b:?}");
+        assert_eq!(b.shared, HashMap::from([(at(6), MAC_A)]));
+        assert_eq!(b.tombstones, HashSet::from([at(5)]));
     }
 
     // REQ: FLT-006, CLU-002 (ADR-183) — a connected lease whose MAC can't identify a device (empty,
