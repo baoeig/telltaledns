@@ -1683,7 +1683,7 @@ The chain is otherwise unchanged: client ID → EDNS MAC from a trusted forwarde
 Silence is counted on a monotonic clock from the node's start (never the wall clock, which can step), with saturating arithmetic. Locally administered ("private") MACs count, and the UI says they may change. Display names keep their rules (within one router the last row still names an address; between routers the order is now fixed).
 
 **Across the cluster.** A node takes other members' bindings from their `devices.names` answers (ADR-125) only when all of these hold:
-- the answer is from a **full member** (listed in the registry and not ephemeral, ADR-143; a resolver pod holds no router keys, ADR-120);
+- the answer is from a **full member**: the cluster's primary (it is one whether or not this node's copy of the registry has arrived yet: a replica's first round can come before it), or a node listed in the registry and not ephemeral (ADR-143; a resolver pod holds no router keys, ADR-120);
 - the answer carries **`vetted`** (a new field, written by this version: an answer from an older member, whose lists lack these rules, gives no bindings);
 - the member answered within the last **15 minutes**.
 
@@ -1811,8 +1811,9 @@ REQ: FLT-006, FLT-005, API-010, CLU-002, CLU-010, OBS-005, AGT-004. Implemented 
   - `flt_005_quick_rule_follows_mac_device_across_ip_change`
   - `flt_006_without_mac_clients_the_table_holds_kernel_entries_only`
   - `flt_006_the_old_table_is_retired`
-- **API:** `flt_013_explain_says_a_router_mac_identified_the_client`, `api_010_identity_says_how_an_address_is_recognized`, `api_010_recognition_offers_a_router_mac_before_any_device_matches_by_mac`, `api_010_recognition_withholds_a_shared_or_tombstoned_mac`, `agt_004_recognition_mac_needs_config_read`.
-- **Playwright:** `api_010 name this device offers its MAC address when the router knows it`, `api_010 a device named by MAC is edited, not overwritten`, `api_010 a MAC only this node sees is offered, not chosen`.
+- **API:** `flt_013_explain_says_a_router_mac_identified_the_client`, `flt_013_a_given_mac_is_reported_as_given`, `api_010_identity_says_how_an_address_is_recognized`, `api_010_recognition_offers_a_router_mac_before_any_device_matches_by_mac`, `api_010_recognition_withholds_a_shared_or_tombstoned_mac`, `api_010_recognition_offers_no_router_mac_when_router_macs_is_off`, `api_010_recognition_is_hidden_at_privacy_level_2`, `agt_004_explain_mac_needs_config_read`, `agt_004_recognition_mac_needs_config_read`.
+- **Cluster reads:** `clu_002_identity_recognition_is_the_entry_nodes`, `clu_002_identity_recognition_hidden_here_stays_hidden`, `clu_010_identity_recognition_reads_both_ways`.
+- **Playwright:** `api_010 name this device offers its MAC address when the router knows it`, `api_010 a device named by MAC is edited, not overwritten`, `api_010 a MAC only this node sees is offered, not chosen`, `api_010 a shared or private MAC is flagged`.
 - **End to end:** `deploy/routers-e2e.sh` and `deploy/cluster/router-macs-e2e.sh`.
 - **Benchmarks:** the `flt_006_identify_mac` benches against the base, and `make bench-smoke`.
 
