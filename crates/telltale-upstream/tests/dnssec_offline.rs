@@ -500,6 +500,10 @@ async fn dns_011_offline_unsigned_zone_through_cname_is_insecure() {
     );
     assert_ne!(r.bytes.len(), 0, "an answer to serve");
     assert!(!telltale_proto::Header::parse(&r.bytes).unwrap().flags.ad());
+    // REQ: DNS-011 — in resolution order: the CNAME before the address it leads to.
+    let m = Message::from_vec(&r.bytes).unwrap();
+    let types: Vec<RecordType> = m.answers.iter().map(Record::record_type).collect();
+    assert_eq!(types, vec![RecordType::CNAME, RecordType::A], "chain order");
     let r = v
         .resolve(&g, question("cdn.u", rtype::A), budget, true, false)
         .await
