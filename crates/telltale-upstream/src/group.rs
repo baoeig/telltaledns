@@ -297,3 +297,134 @@ impl Group {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::endpoint::Endpoint;
+    use crate::health::Breaker;
+
+    const MS: Duration = Duration::from_millis(1);
+
+    /// A member these tests never ask: they only compute the attempt order.
+    fn member(id: u16) -> Arc<Upstream> {
+        // TEST-NET-1 (RFC 5737): nothing is sent to it.
+        let ep = Endpoint::parse("udp://192.0.2.1:53").unwrap();
+        Arc::new(Upstream::new(id, format!("u{id}"), ep, 400 * MS, 1).unwrap())
+    }
+
+    /// Members 1..=n with measured latencies of 10, 20, 30 ms, so `fastest` and `parallel`
+    /// sort them in that order (apart from the 5% exploration).
+    fn members(n: u16, t: Instant) -> Vec<Arc<Upstream>> {
+        (1..=n)
+            .zip([10, 20, 30])
+            .map(|(id, latency)| {
+                let m = member(id);
+                m.health.record(true, latency * MS, t);
+                m
+            })
+            .collect()
+    }
+
+    /// Opens a member's breaker with three failures in a row, for 10 s from `t`.
+    fn open(m: &Upstream, t: Instant) {
+        for _ in 0..3 {
+            m.health.record(false, MS, t);
+        }
+        assert_eq!(m.health.snapshot().breaker, Breaker::Open);
+    }
+
+    /// `(member id, patient)` at each position of the attempt order.
+    fn patience(g: &Group, now: Instant) -> Vec<(u16, bool)> {
+        let (order, patient) = g.attempt_order(now);
+        order
+            .iter()
+            .zip(patient)
+            .map(|((u, _), p)| (u.id, p))
+            .collect()
+    }
+
+    /// REQ: UPS-005, UPS-006 (ADR-165) — `parallel` starts its first `parallel_fanout` members
+    /// together, so none of them has another to hand over to: every racing member with a closed
+    /// breaker is patient, in whatever order the EWMA (and its 5% exploration) put them. With
+    /// three members and a fanout of 2, the third is patient too, as the last healthy member.
+    #[test]
+    fn ups_005_parallel_racing_members_are_patient() {
+        let t = Instant::now();
+        for n in [2, 3] {
+            let g = Group::new("p", members(n, t), Strategy::Parallel { fanout: 2 });
+            // 200 orders: the exploration swap (5% each) happens in almost every run.
+            for _ in 0..200 {
+                let p = patience(&g, t);
+                assert_eq!(p.len(), usize::from(n));
+                assert!(p.iter().all(|&(_, patient)| patient), "{n} members: {p:?}");
+            }
+        }
+    }
+
+    /// REQ: UPS-006 (ADR-165) — a member whose breaker is open (a last resort) or half-open
+    /// (the probe) is never patient, also in one of `parallel`'s racing slots (with two members
+    /// and a fanout of 2 both slots race, and the initial wave starts both); the members with a
+    /// closed breaker are.
+    #[test]
+    fn ups_006_probe_and_last_resort_never_patient() {
+        let t = Instant::now();
+        for n in [2, 3] {
+            let ups = members(n, t);
+            open(&ups[0], t);
+            let g = Group::new("p", ups, Strategy::Parallel { fanout: 2 });
+            for _ in 0..50 {
+                let p = patience(&g, t);
+                assert_eq!(p.len(), usize::from(n));
+                assert!(
+                    p.iter().all(|&(id, patient)| patient == (id != 1)),
+                    "{n} members, member 1 open: {p:?}"
+                );
+            }
+            // After the 10 s backoff the breaker is half-open: member 1 is admitted once, as
+            // the probe (its 1 ms failures sort it first), then is a last resort again while
+            // that probe is out.
+            let later = t + Duration::from_secs(11);
+            for round in ["the probe", "probe in flight"] {
+                let p = patience(&g, later);
+                assert_eq!(p.len(), usize::from(n));
+                assert!(
+                    p.iter().all(|&(id, patient)| patient == (id != 1)),
+                    "{n} members, member 1 {round}: {p:?}"
+                );
+            }
+        }
+    }
+
+    /// REQ: UPS-006 (ADR-165) — the strategies that try one member at a time keep ADR-165 as it
+    /// was: only the last member with a closed breaker is patient. `failover` exactly; `fastest`
+    /// (which explores), `round_robin` and `weighted` reorder, so for them: exactly one patient
+    /// member, and it is the last one whose breaker is closed.
+    #[test]
+    fn ups_006_one_at_a_time_strategies_patient_only_last_closed() {
+        let t = Instant::now();
+        let ups = members(3, t);
+        let g = Group::new("f", ups.clone(), Strategy::Failover);
+        assert_eq!(patience(&g, t), [(1, false), (2, false), (3, true)]);
+        open(&ups[2], t);
+        assert_eq!(patience(&g, t), [(1, false), (2, true), (3, false)]);
+
+        for strategy in [Strategy::Fastest, Strategy::RoundRobin, Strategy::Weighted] {
+            let ups = members(3, t);
+            open(&ups[1], t);
+            let g = Group::new("o", ups, strategy);
+            for _ in 0..200 {
+                let p = patience(&g, t);
+                let patient: Vec<usize> = p
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| entry.1)
+                    .map(|(pos, _)| pos)
+                    .collect();
+                let last_closed = p.iter().rposition(|&(id, _)| id != 2);
+                assert_eq!(patient.len(), 1, "{strategy:?}: {p:?}");
+                assert_eq!(patient.first().copied(), last_closed, "{strategy:?}: {p:?}");
+            }
+        }
+    }
+}

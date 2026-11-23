@@ -426,7 +426,11 @@ async fn ups_006_last_healthy_member_waits_for_a_slow_answer() {
 /// REQ: UPS-005, UPS-006 (ADR-165) — `parallel` starts its members together, so none has
 /// anyone to hand over to: the faster one isn't cut off at its adaptive timeout on a name it has
 /// to resolve itself (its answer would be thrown away, the client would wait for the slower
-/// member, and a timeout would be counted against an upstream that was only resolving).
+/// member, and a timeout would be counted against an upstream that was only resolving). The
+/// slower one isn't cut off either. Before, whichever member the EWMA order (or its 5%
+/// exploration) put first was cut off and had a timeout counted against it, so checking both
+/// members makes the test fail without the change every time, not only when the faster one
+/// happens to be first.
 #[tokio::test]
 async fn ups_005_parallel_members_each_wait_for_a_slow_answer() {
     use telltale_upstream::health::Outcome;
@@ -469,23 +473,33 @@ async fn ups_005_parallel_members_each_wait_for_a_slow_answer() {
         "the adaptive timeout is below the cold answer: {:?}",
         fast.attempt_timeout()
     );
-    let before = timeouts(&fast);
+    let before = (timeouts(&fast), timeouts(&slower));
+    let slower_outcomes = slower.health.snapshot().requests;
     let t = Instant::now();
     let ans = g
         .resolve(question("slow.example"), Duration::from_secs(2))
         .await
         .unwrap();
+    let took = t.elapsed();
+    // The slower member's attempt goes on in the background: wait (bounded) for its outcome.
+    let until = Instant::now() + Duration::from_secs(3);
+    while slower.health.snapshot().requests == slower_outcomes && Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert_eq!(
         ans.upstream_id, 1,
         "the faster member's answer was used, not cut off at its adaptive timeout"
     );
     assert_eq!(answer_tag(&ans.bytes), 1);
     assert!(
-        t.elapsed() < Duration::from_millis(600),
-        "did not wait for the slower member: {:?}",
-        t.elapsed()
+        took < Duration::from_millis(600),
+        "did not wait for the slower member: {took:?}"
     );
-    assert_eq!(timeouts(&fast), before, "no timeout counted against it");
+    assert_eq!(
+        (timeouts(&fast), timeouts(&slower)),
+        before,
+        "no timeout counted against either member (faster, slower)"
+    );
 }
 
 fn p99(mut v: Vec<Duration>) -> Duration {
