@@ -7,6 +7,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { query } from './dns';
 import { plainHttpPage } from '../../src/lib/plainHttp';
+import { isMac, listsMac, normMac, sameIp } from '../../src/lib/macKeys';
 import { FrameHub, Loop, PANEL_MIN, Particles, Ticker, chooseLayout, dotBudget, lerpBoxes, motionAllowed, parseEvery, parseLayout, parsePanels, screenClass, screenClassStable, type Box } from '../../src/lib/wall';
 
 test.describe.configure({ mode: 'serial' });
@@ -4625,7 +4626,7 @@ test('api_010 name this device offers its MAC address when the router knows it',
     // A router's MAC is what the form starts with: the device follows it when its address changes.
     await expect(by.getByRole('radio', { name: /Its MAC address/ })).toBeChecked();
     await expect(by.getByRole('radio', { name: /This address/ })).not.toBeChecked();
-    await expect(by).toContainText(`Its MAC address, ${mac} (from your router): follows the device when its address changes`);
+    await expect(by).toContainText(`Its MAC address, ${mac} (from your router): follows the device when its address changes, while your router still reports this MAC at one address (IPv4 only)`);
     await expect(by).toContainText(`This address, ${ip}: stops matching if the device gets another address (a DHCP reservation in your router keeps it)`);
     await expect(page.getByTestId('mac-reason')).toHaveCount(0);
     // A made-up ("private") address is said to be one, and a MAC alone is said to leave some views out.
@@ -4686,7 +4687,7 @@ test('api_010 a MAC only this node sees is offered, not chosen', async () => {
     // Other servers in a cluster, a pod or Docker don't see this MAC: the address is what the form starts with, and says why.
     await expect(by.getByRole('radio', { name: /This address/ })).toBeChecked();
     await expect(by.getByRole('radio', { name: /Its MAC address/ })).not.toBeChecked();
-    await expect(by).toContainText(`Its MAC address, ${mac} (seen on this network): follows the device when its address changes`);
+    await expect(by).toContainText(`Its MAC address, ${mac} (seen on this network): follows the device when its address changes, while this server's neighbor table still holds this MAC at one address`);
     await expect(page.getByTestId('mac-reason')).toContainText(
       "Only this server sees this MAC address directly: other servers in your cluster, or one in Docker or Kubernetes, won't recognize the device by it.",
     );
@@ -4730,5 +4731,108 @@ test('api_010 a shared or private MAC is flagged', async () => {
     await page.keyboard.press('Escape');
   } finally {
     await page.unroute(`**/api/v1/clients/${ip}/identity`);
+  }
+});
+
+// REQ: API-010, FLT-006 (ADR-183) — fix round 2. An existing device keeps its keys by default.
+test('api_010 an address-named device keeps its keys unless the MAC is chosen', async () => {
+  const ip = '127.0.0.95';
+  const mac = '02:00:00:00:00:95';
+  const csrf = await csrfToken();
+  const made = await page.request.put('/api/v1/clients/e2e-ipdev', { headers: { 'x-csrf-token': csrf }, data: { match: [ip], groups: ['default'] } });
+  expect(made.status()).toBe(200);
+  await recognizeAs(ip, { device: 'e2e-ipdev', identifiedBy: 'ip', mac, macFrom: 'router' });
+  const savedAs = async () => {
+    const put = page.waitForRequest((r) => r.method() === 'PUT' && r.url().endsWith('/api/v1/clients/e2e-ipdev') && !r.url().includes('dryRun'));
+    await page.getByRole('button', { name: 'Save' }).click();
+    const match = (await put).postDataJSON().match as string[];
+    await expect(page.getByRole('status').filter({ hasText: 'Saved.' })).toBeVisible();
+    await page.keyboard.press('Escape');
+    return match;
+  };
+  try {
+    // The router's MAC is offered, not preselected: the device recognized by its address keeps its keys.
+    await openNaming(ip);
+    const by = page.getByTestId('recognize-by');
+    await expect(by).toBeVisible();
+    await expect(page.getByLabel('Name', { exact: true })).toHaveValue('e2e-ipdev');
+    await expect(by.getByRole('radio', { name: /This address/ })).toBeChecked();
+    await expect(by.getByRole('radio', { name: /Its MAC address/ })).not.toBeChecked();
+    await expect(page.getByTestId('mac-only-limits')).toHaveCount(0);
+    expect(await savedAs()).toEqual([ip]);
+    // Choosing the MAC replaces the address key, and says what that leaves out.
+    await openNaming(ip);
+    await page.getByTestId('recognize-by').getByRole('radio', { name: /Its MAC address/ }).check();
+    await expect(page.getByTestId('mac-only-limits')).toBeVisible();
+    expect(await savedAs()).toEqual([mac]);
+    expect((await deviceNow('e2e-ipdev'))?.match).toEqual([mac]);
+  } finally {
+    await page.unroute(`**/api/v1/clients/${ip}/identity`);
+    await removeDevice('e2e-ipdev');
+  }
+});
+
+// REQ: API-010, FLT-006 (ADR-183) — a MAC the neighbor table holds at two addresses (a MAC-translating
+// extender) is flagged as the router's shared one is, with words about this server's table.
+test('api_010 a MAC the neighbor table holds at two addresses is flagged', async () => {
+  const ip = '127.0.0.96';
+  const mac = '00:11:22:33:44:96';
+  await recognizeAs(ip, { identifiedBy: 'default', mac, macFrom: 'neighbor', macShared: true });
+  try {
+    await openNaming(ip);
+    const by = page.getByTestId('recognize-by');
+    await expect(by.getByRole('radio', { name: /This address/ })).toBeChecked();
+    await expect(page.getByTestId('mac-reason')).toContainText(
+      "This server's neighbor table holds this MAC address at more than one address (a range extender or bridge may share it), so it can't tell these devices apart.",
+    );
+    await expect(page.getByTestId('mac-reason')).not.toContainText('Your router');
+    await page.keyboard.press('Escape');
+  } finally {
+    await page.unroute(`**/api/v1/clients/${ip}/identity`);
+  }
+});
+
+// REQ: API-010, FLT-006 (ADR-183) — a MAC is read in every spelling the server reads (`MatchKey::parse`):
+// either separator, mixed, any case, with the stray `+` the parser lets by, and compared as bytes.
+test('api_010 a MAC key is read in every spelling the server reads', () => {
+  expect(normMac('AA-BB-CC-DD-EE-01')).toBe('aa:bb:cc:dd:ee:01');
+  expect(normMac(' aa:bb-cc:dd-ee:01 ')).toBe('aa:bb:cc:dd:ee:01');
+  expect(normMac('+f:ab:cd:ef:01:02')).toBe('0f:ab:cd:ef:01:02');
+  for (const ok of ['aa:bb:cc:dd:ee:01', 'AA-BB-CC-DD-EE-01', 'aa:bb-cc:dd-ee:01', '+f:ab:cd:ef:01:02']) expect(isMac(ok), ok).toBe(true);
+  for (const no of ['aa:bb:cc:dd:ee', 'aa:bb:cc:dd:ee:0', 'aa:bb:cc:dd:ee:01:02', '192.168.1.5', 'id:kids', 'gg:bb:cc:dd:ee:01', '++:bb:cc:dd:ee:01']) expect(isMac(no), no).toBe(false);
+  expect(listsMac(['192.168.1.5', 'AA-BB-CC-DD-EE-01'], 'aa:bb:cc:dd:ee:01')).toBe(true);
+  expect(listsMac(['+f:ab:cd:ef:01:02'], '0f:ab:cd:ef:01:02')).toBe(true);
+  expect(listsMac(['aa:bb:cc:dd:ee:02'], 'aa:bb:cc:dd:ee:01')).toBe(false);
+  expect(sameIp('192.168.1.5/32', '192.168.1.5')).toBe(true);
+  expect(sameIp('::ffff:192.168.1.5', '192.168.1.5')).toBe(true);
+  expect(sameIp('192.168.1.0/24', '192.168.1.5')).toBe(false);
+});
+
+// REQ: FLT-013, FLT-006 (ADR-183) — Explain's words say where a MAC comes from, and no more than that:
+// "from your router" only for this node's router, "from another server in your cluster" for a member's,
+// "seen on this network" only for the neighbor table, "given with the question" for the caller's own.
+test('flt_013 explain says where the MAC that identified the client comes from', async () => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  const cases: { by: string; from: string | undefined; by_text: string; from_text: string | null }[] = [
+    { by: 'router_mac', from: 'router', by_text: '(by its MAC address, from your router)', from_text: '(from your router)' },
+    { by: 'router_mac', from: 'peer', by_text: '(by its MAC address, from another server in your cluster)', from_text: '(from another server in your cluster)' },
+    { by: 'neighbor_mac', from: 'neighbor', by_text: '(by its MAC address, seen on this network)', from_text: '(seen on this network)' },
+    { by: 'neighbor_mac', from: 'given', by_text: '(by its MAC address, given with the question)', from_text: '(given with the question)' },
+  ];
+  for (const c of cases) {
+    await page.route('**/api/v1/explain**', async (route) => {
+      const real = await route.fetch();
+      const body = await real.json();
+      body.client = { ...body.client, mac: '02:00:00:00:00:97', macFrom: c.from, device: 'e2e-tablet', identifiedBy: c.by };
+      await route.fulfill({ json: body });
+    });
+    try {
+      await page.goto('/#/');
+      await page.goto('/#/explain?name=nas.e2e.test&client=127.0.0.1');
+      await expect(page.getByTestId('explain-identified-by')).toHaveText(c.by_text);
+      await expect(page.getByTestId('explain-mac-from')).toHaveText(c.from_text as string);
+    } finally {
+      await page.unroute('**/api/v1/explain**');
+    }
   }
 });

@@ -74,12 +74,20 @@
   /** The device the form edits: the one that has the MAC when the MAC is chosen, else the one at this address. */
   const target = $derived(macChosen && heldElsewhere ? macHolder : existing);
   const macSource = $derived(recognition?.macFrom === 'neighbor' ? 'seen on this network' : 'from your router');
+  /** What keeps vouching for the MAC, and what it can't follow: the sentence says so, not just that the MAC "follows". */
+  const macVouch = $derived(
+    recognition?.macFrom === 'neighbor'
+      ? "this server's neighbor table still holds this MAC at one address"
+      : 'your router still reports this MAC at one address (IPv4 only)',
+  );
   /** Why the address, not the MAC, is what the form starts with. */
   const macReason = $derived(
     recognition?.macShared
-      ? 'Your router reports this MAC address at more than one address (a range extender or bridge may share it), so it can\'t tell these devices apart.'
+      ? recognition.macFrom === 'neighbor'
+        ? "This server's neighbor table holds this MAC address at more than one address (a range extender or bridge may share it), so it can't tell these devices apart."
+        : "Your router reports this MAC address at more than one address (a range extender or bridge may share it), so it can't tell these devices apart."
       : recognition?.macFrom === 'neighbor'
-        ? 'Only this server sees this MAC address directly: other servers in your cluster, or one in Docker or Kubernetes, won\'t recognize the device by it.'
+        ? "Only this server sees this MAC address directly: other servers in your cluster, or one in Docker or Kubernetes, won't recognize the device by it."
         : '',
   );
   /** Who the sentences below talk about. */
@@ -189,10 +197,11 @@
       }
       kind = existing?.kind ?? '';
       first = { name: newName, groups: [...chosen], kind };
-      // The MAC is what the form starts with only when a router reports it, for this address alone:
-      // the kernel's table is this server's (not a cluster's, a pod's or Docker's), and a shared MAC
-      // can't tell devices apart.
-      useMac = (recognition?.macFrom === 'router' || recognition?.macFrom === 'peer') && !recognition.macShared;
+      // For a new device the MAC is what the form starts with only when a router reports it, for
+      // this address alone: the kernel's table is this server's (not a cluster's, a pod's or
+      // Docker's), and a shared MAC can't tell devices apart. A device that already exists keeps its
+      // keys unless the MAC is chosen: re-saving it to change a group must not strip its address.
+      useMac = !existing && (recognition?.macFrom === 'router' || recognition?.macFrom === 'peer') && !recognition.macShared;
       if (target?.name !== existing?.name) fill();
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -388,7 +397,7 @@
             <legend>Recognize it by<HelpButton id="device-mac" /></legend>
             <label class="check">
               <input type="radio" name="recognize-by" value="mac" checked={useMac} onchange={() => recognizeBy(true)} />
-              <span>Its MAC address, <code>{mac}</code> <span class="muted small">({macSource}): follows the device when its address changes</span></span>
+              <span>Its MAC address, <code>{mac}</code> <span class="muted small">({macSource}): follows the device when its address changes, while {macVouch}</span></span>
             </label>
             <label class="check">
               <input type="radio" name="recognize-by" value="ip" checked={!useMac} onchange={() => recognizeBy(false)} />
