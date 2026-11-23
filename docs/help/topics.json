@@ -213,7 +213,7 @@
       "summary": "Give an address (or a MAC, or a client ID) a name so every view shows \"Living room TV\" instead of 192.168.1.42, and put it in groups.",
       "when": "You see an address you don't recognize, or want different rules for one device.",
       "example": "Name 192.168.1.42 \"Living room TV\" and add it to the kids group: its history relabels at once.",
-      "caution": "Addresses can change when a device reconnects; match by MAC for devices that don't keep their address (a DHCP reservation also works).",
+      "caution": "Addresses can change when a device reconnects. Name a device by its MAC address and it is followed to its new address wherever your router or this server's neighbor table reports the MAC (a DHCP reservation also works).",
       "docs": "naming-devices-in-the-ui"
     },
     {
@@ -224,6 +224,16 @@
       "when": "Always: a name you'll recognize in a month.",
       "example": "\"Kids tablet\", \"Office printer\", \"Ring doorbell\".",
       "caution": "Names must be unique; renaming keeps the device's groups.",
+      "docs": "naming-devices-in-the-ui"
+    },
+    {
+      "id": "device-mac",
+      "title": "Recognize a device by its MAC address",
+      "term": "MAC address",
+      "summary": "A MAC address is the number a device's network card goes by. Naming a device by it keeps the name, its groups and the rules that name it when the device gets another address; naming it by its address doesn't. TelltaleDNS reads the MAC from your router, or from this server's own neighbor table.",
+      "when": "The device's address can change (it isn't reserved in your router) and you want its name and rules to follow it.",
+      "example": "Your kids' tablet is named by 02:00:00:00:00:41; it moves from 192.168.1.20 to 192.168.1.35 and is still the tablet, in the kids group.",
+      "caution": "A phone or laptop's \"private\" Wi-Fi address is made up by the device and can change (per network, or when the network is forgotten): name the device again if it does. A range extender or bridge can show one MAC address for several devices, and a device can copy another's MAC address, so don't name a device by a MAC address for an allowance worth protecting: use a client ID (DoT or DoH), which a MAC address isn't.",
       "docs": "naming-devices-in-the-ui"
     },
     {

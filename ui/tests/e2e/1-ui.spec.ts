@@ -4577,3 +4577,158 @@ test('flt_005_quick_rule_refusal_shows_before_save', async () => {
   }
   expect(await rulesNow()).toEqual([]); // checking saves nothing, and the refused Save saved nothing
 });
+
+// REQ: API-010, FLT-006 (ADR-183) — "Name this device…" and the MAC address a router reports. What the
+// server says about how an address is recognized (`recognition` in its identity) is put in the answer
+// the dialog reads (the e2e node has no router): the dialog is what these tests are about, the server's
+// half is tested where the server is (`api_010_recognition_*`, `routers-e2e.sh`). Each test asks as its
+// own loopback address, so the address is in "Seen in the last hour", and removes what it made.
+async function recognizeAs(ip: string, recognition: Record<string, unknown>) {
+  await page.route(`**/api/v1/clients/${ip}/identity`, async (route) => {
+    const real = await route.fetch();
+    await route.fulfill({ json: { ...(await real.json()), recognition } });
+  });
+}
+/** The "Seen in the last hour" row of `ip`, once the node has counted its query. */
+async function seenRowOf(ip: string) {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await query('mac.e2e.test', 1, 15354, ip).catch(() => -1);
+  await page.goto('/#/clients');
+  const row = page.locator('section.card', { hasText: 'Seen in the last hour' }).locator('tbody tr', { hasText: ip });
+  await expect(async () => {
+    await page.reload();
+    await expect(row).toBeVisible({ timeout: 2000 });
+  }).toPass({ timeout: 20_000 });
+  return row;
+}
+/** Opens "Name this device…" for `ip` from its row. */
+async function openNaming(ip: string) {
+  const row = await seenRowOf(ip);
+  await row.getByRole('button', { name: ip, exact: true }).click();
+  await row.getByRole('menuitem', { name: 'Name this device…' }).click();
+}
+const deviceNow = async (name: string) =>
+  ((await (await page.request.get('/api/v1/clients')).json()).items as { name: string; match: string[]; groups: string[] }[]).find((c) => c.name === name);
+async function removeDevice(name: string) {
+  const csrf = await csrfToken();
+  await page.request.delete(`/api/v1/clients/${encodeURIComponent(name)}`, { headers: { 'x-csrf-token': csrf } });
+}
+
+test('api_010 name this device offers its MAC address when the router knows it', async () => {
+  const ip = '127.0.0.91';
+  const mac = '02:00:00:00:00:91';
+  await recognizeAs(ip, { identifiedBy: 'default', mac, macFrom: 'router', macRandomized: true });
+  try {
+    await openNaming(ip);
+    const by = page.getByTestId('recognize-by');
+    await expect(by).toBeVisible();
+    // A router's MAC is what the form starts with: the device follows it when its address changes.
+    await expect(by.getByRole('radio', { name: /Its MAC address/ })).toBeChecked();
+    await expect(by.getByRole('radio', { name: /This address/ })).not.toBeChecked();
+    await expect(by).toContainText(`Its MAC address, ${mac} (from your router): follows the device when its address changes`);
+    await expect(by).toContainText(`This address, ${ip}: stops matching if the device gets another address (a DHCP reservation in your router keeps it)`);
+    await expect(page.getByTestId('mac-reason')).toHaveCount(0);
+    // A made-up ("private") address is said to be one, and a MAC alone is said to leave some views out.
+    await expect(page.getByTestId('mac-randomized')).toContainText('This is a private Wi-Fi address the device made up.');
+    await expect(page.getByTestId('mac-only-limits')).toContainText(
+      "With only a MAC address, this device isn't covered by its group's anomaly mutes, change previews and simulations, the Clients page's guess of what it is, or look-ups of its identity and rhythm by name.",
+    );
+    await page.getByLabel('Name', { exact: true }).fill('e2e-macdev');
+    await expect(page.getByTestId('change-preview')).toContainText(`Queries from this device (${mac}, now at ${ip}) will show “e2e-macdev”`);
+    const put = page.waitForRequest((r) => r.method() === 'PUT' && r.url().endsWith('/api/v1/clients/e2e-macdev') && !r.url().includes('dryRun'));
+    await page.getByRole('button', { name: 'Save' }).click();
+    // The device is saved by the MAC alone: no key for the address it has now.
+    expect((await put).postDataJSON().match).toEqual([mac]);
+    await expect(page.getByRole('status').filter({ hasText: 'Saved.' })).toBeVisible();
+    expect(await deviceNow('e2e-macdev')).toMatchObject({ match: [mac] });
+    await page.keyboard.press('Escape');
+  } finally {
+    await page.unroute(`**/api/v1/clients/${ip}/identity`);
+    await removeDevice('e2e-macdev');
+  }
+});
+
+test('api_010 a device named by MAC is edited, not overwritten', async () => {
+  const ip = '127.0.0.92';
+  const mac = '02:00:00:00:00:92';
+  const csrf = await csrfToken();
+  const made = await page.request.put('/api/v1/clients/e2e-roamer', { headers: { 'x-csrf-token': csrf }, data: { match: [mac], groups: ['default'] } });
+  expect(made.status()).toBe(200);
+  await recognizeAs(ip, { device: 'e2e-roamer', identifiedBy: 'router_mac', mac, macFrom: 'router' });
+  try {
+    await openNaming(ip);
+    // The address is recognized as e2e-roamer, which lists the MAC already: nothing to choose, and its name is there.
+    await expect(page.getByLabel('Name', { exact: true })).toHaveValue('e2e-roamer');
+    await expect(page.getByTestId('recognize-by')).toHaveCount(0);
+    await expect(page.getByTestId('mac-only-limits')).toHaveCount(0);
+    const put = page.waitForRequest((r) => r.method() === 'PUT' && r.url().endsWith('/api/v1/clients/e2e-roamer') && !r.url().includes('dryRun'));
+    await page.getByRole('button', { name: 'Save' }).click();
+    // The same device, with its keys as they were (the MAC alone), not a second device for the address.
+    expect((await put).postDataJSON().match).toEqual([mac]);
+    await expect(page.getByRole('status').filter({ hasText: 'Saved.' })).toBeVisible();
+    const items = (await (await page.request.get('/api/v1/clients')).json()).items as { name: string; match: string[] }[];
+    expect(items.filter((c) => c.match.includes(ip))).toEqual([]);
+    expect(items.find((c) => c.name === 'e2e-roamer')?.match).toEqual([mac]);
+    await page.keyboard.press('Escape');
+  } finally {
+    await page.unroute(`**/api/v1/clients/${ip}/identity`);
+    await removeDevice('e2e-roamer');
+  }
+});
+
+test('api_010 a MAC only this node sees is offered, not chosen', async () => {
+  const ip = '127.0.0.93';
+  const mac = '00:11:22:33:44:93';
+  await recognizeAs(ip, { identifiedBy: 'default', mac, macFrom: 'neighbor' });
+  try {
+    await openNaming(ip);
+    const by = page.getByTestId('recognize-by');
+    // Other servers in a cluster, a pod or Docker don't see this MAC: the address is what the form starts with, and says why.
+    await expect(by.getByRole('radio', { name: /This address/ })).toBeChecked();
+    await expect(by.getByRole('radio', { name: /Its MAC address/ })).not.toBeChecked();
+    await expect(by).toContainText(`Its MAC address, ${mac} (seen on this network): follows the device when its address changes`);
+    await expect(page.getByTestId('mac-reason')).toContainText(
+      "Only this server sees this MAC address directly: other servers in your cluster, or one in Docker or Kubernetes, won't recognize the device by it.",
+    );
+    await expect(page.getByTestId('mac-randomized')).toHaveCount(0);
+    await expect(page.getByTestId('mac-only-limits')).toHaveCount(0);
+    // Choosing it anyway is allowed, and says what it leaves out; going back takes that away.
+    await by.getByRole('radio', { name: /Its MAC address/ }).check();
+    await expect(page.getByTestId('mac-only-limits')).toBeVisible();
+    await by.getByRole('radio', { name: /This address/ }).check();
+    await expect(page.getByTestId('mac-only-limits')).toHaveCount(0);
+    await page.getByLabel('Name', { exact: true }).fill('e2e-neighbor');
+    const put = page.waitForRequest((r) => r.method() === 'PUT' && r.url().endsWith('/api/v1/clients/e2e-neighbor') && !r.url().includes('dryRun'));
+    await page.getByRole('button', { name: 'Save' }).click();
+    expect((await put).postDataJSON().match).toEqual([ip]);
+    await expect(page.getByRole('status').filter({ hasText: 'Saved.' })).toBeVisible();
+    await page.keyboard.press('Escape');
+  } finally {
+    await page.unroute(`**/api/v1/clients/${ip}/identity`);
+    await removeDevice('e2e-neighbor');
+  }
+});
+
+test('api_010 a shared or private MAC is flagged', async () => {
+  const ip = '127.0.0.94';
+  const mac = '02:00:00:00:00:94';
+  await recognizeAs(ip, { identifiedBy: 'default', mac, macFrom: 'router', macShared: true, macRandomized: true });
+  try {
+    await openNaming(ip);
+    const by = page.getByTestId('recognize-by');
+    // A MAC the router reports at more than one address (a range extender) is never the default.
+    await expect(by.getByRole('radio', { name: /This address/ })).toBeChecked();
+    await expect(page.getByTestId('mac-reason')).toContainText(
+      "Your router reports this MAC address at more than one address (a range extender or bridge may share it), so it can't tell these devices apart.",
+    );
+    // The notice about a private address belongs to the MAC, so it shows once the MAC is chosen.
+    await expect(page.getByTestId('mac-randomized')).toHaveCount(0);
+    await by.getByRole('radio', { name: /Its MAC address/ }).check();
+    await expect(page.getByTestId('mac-randomized')).toContainText(
+      'It stays the same on your network unless the device is set to change it or forgets the network; if it changes, name the device again, or turn its private address off for this network.',
+    );
+    await page.keyboard.press('Escape');
+  } finally {
+    await page.unroute(`**/api/v1/clients/${ip}/identity`);
+  }
+});
