@@ -248,7 +248,8 @@ fn answer(b: &dyn Backend, r: Read) -> Result<Vec<u8>, String> {
         Read::LatencyHist { by, hour } => serde_json::to_vec(&b.latency_hists(by, hour)),
         Read::NewDevices { since_s } => serde_json::to_vec(&b.new_devices(since_s)),
         Read::Identities => serde_json::to_vec(&b.identities()),
-        Read::Identity { client } => serde_json::to_vec(&b.identity(&client).ok()),
+        // REQ: FLT-006, CLU-002 (ADR-183) — no `recognition` for a peer: the entry node keeps its own.
+        Read::Identity { client } => serde_json::to_vec(&b.identity_for_peer(&client).ok()),
         Read::ClientRhythm { client } => serde_json::to_vec(&b.client_rhythm(&client).ok()),
         Read::TailOpen { params } | Read::TailOpenNegated { params } => {
             serde_json::to_vec(&tail_open(b, &params).map_err(text)?)
@@ -1906,23 +1907,29 @@ impl Backend for Federated {
         let mut local = self.local.identity(client)?;
         local.node = Some(self.own_label());
         let key = local.client.clone();
-        let mut all = vec![local];
-        for (label, v) in
-            self.everyone_labelled::<Option<telltale_api::model::DeviceIdentity>>(|| {
-                Read::Identity {
-                    client: key.clone(),
-                }
+        let others = self
+            .everyone_labelled::<Option<telltale_api::model::DeviceIdentity>>(|| Read::Identity {
+                client: key.clone(),
             })
-        {
-            all.extend(v.map(|mut i| {
-                i.node = Some(label);
-                i
-            }));
-        }
-        Ok(crate::identify::merge(all)
             .into_iter()
-            .next()
-            .unwrap_or_else(|| crate::identify::unavailable(&key, "not_seen")))
+            .filter_map(|(label, v)| {
+                v.map(|mut i| {
+                    i.node = Some(label);
+                    i
+                })
+            })
+            .collect();
+        Ok(merge_identity(local, others, &key))
+    }
+    // REQ: FLT-006, CLU-002 (ADR-183) — a peer's read of one device's identity is this node's own
+    // answer, without `recognition`, and never the fan-out of `identity` above (a read that asks
+    // every node must not ask every node again). `answer` calls it on the local backend; this
+    // override only makes sure the trait's default can never be what runs here.
+    fn identity_for_peer(
+        &self,
+        client: &str,
+    ) -> Result<telltale_api::model::DeviceIdentity, Problem> {
+        self.local.identity_for_peer(client)
     }
     // REQ: OBS-031 — every node's view of the device (it may roam), summed by domain.
     fn client_rhythm(
@@ -2729,6 +2736,191 @@ impl Backend for Federated {
             WriteRoute::Here => self.local.write_client(w),
             WriteRoute::NoLease => Box::pin(async { Err(no_lease()) }),
         }
+    }
+}
+
+/// REQ: FLT-006, API-010 (ADR-183) — one device's identity across the nodes: the best guess of
+/// any of them (`identify::merge`), with how the address is recognized taken from this node's
+/// answer alone. Recognition is the entry node's own view (its table, its routers, its
+/// `router_macs`): another node's differs, and merging them would give a MAC that this node
+/// doesn't hold.
+fn merge_identity(
+    mut local: telltale_api::model::DeviceIdentity,
+    others: Vec<telltale_api::model::DeviceIdentity>,
+    key: &str,
+) -> telltale_api::model::DeviceIdentity {
+    let recognition = local.recognition.take();
+    let mut all = vec![local];
+    all.extend(others.into_iter().map(|mut i| {
+        i.recognition = None;
+        i
+    }));
+    let mut merged = crate::identify::merge(all)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| crate::identify::unavailable(key, "not_seen"));
+    merged.recognition = recognition;
+    merged
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use std::collections::HashMap;
+    use std::net::Ipv4Addr;
+    use std::sync::Arc;
+
+    use telltale_api::Backend as _;
+    use telltale_api::model::{DeviceIdentity, DeviceRecognition};
+
+    use super::{Read, answer, merge_identity};
+
+    // REQ: FLT-006, CLU-002, API-010 (ADR-183) — what a node answers a peer's identity read has no
+    // `recognition`: the entry node never uses it (it keeps its own), so a node doesn't compute it
+    // (the work of its routers' bindings, per read, per peer) or send it (its table's MACs, over the
+    // cluster channel, to any member, ephemeral ones included). The entry node's own read still
+    // has it, and the merge still shows the entry node's.
+    #[test]
+    fn clu_002_a_peers_identity_read_carries_no_recognition() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = Arc::new(crate::http::tests::sources_in(dir.path()));
+        src.pipeline.reload(
+            Arc::new(telltale_upstream::Router::default()),
+            crate::pipeline::Policy::from_config(
+                &telltale_config::Config::default(),
+                telltale_policy::LocalData::default(),
+            ),
+        );
+        let lease = crate::devices::Lease {
+            mac: "00:11:11:11:11:50".into(),
+            ip: Ipv4Addr::new(10, 0, 0, 50),
+            hostname: None,
+            expires: 0,
+            offline: false,
+            unsure: false,
+            stale: false,
+        };
+        src.pipeline
+            .router_leases
+            .store(Arc::new(HashMap::from([(lease.ip, lease)])));
+        let backend = crate::api_backend::ApiBackend {
+            src: Arc::clone(&src),
+        };
+        let mine = backend.identity("10.0.0.50").unwrap();
+        assert_eq!(
+            mine.recognition.as_ref().and_then(|r| r.mac.as_deref()),
+            Some("00:11:11:11:11:50"),
+            "the entry node's own read has it"
+        );
+        let bytes = answer(
+            &backend,
+            Read::Identity {
+                client: "10.0.0.50".into(),
+            },
+        )
+        .unwrap();
+        let theirs: Option<DeviceIdentity> = serde_json::from_slice(&bytes).unwrap();
+        let theirs = theirs.expect("an identity");
+        assert!(theirs.recognition.is_none(), "{theirs:?}");
+        assert_eq!(theirs.client, mine.client, "the rest is the same");
+        let merged = merge_identity(mine.clone(), vec![theirs], "10.0.0.50");
+        assert_eq!(merged.recognition, mine.recognition);
+    }
+
+    fn node(
+        label: &str,
+        product: Option<&str>,
+        score: f32,
+        recognition: Option<DeviceRecognition>,
+    ) -> DeviceIdentity {
+        DeviceIdentity {
+            client: "192.168.1.20".into(),
+            available: true,
+            product: product.map(str::to_owned),
+            class: "streaming".into(),
+            level: "likely".into(),
+            score,
+            source: "inferred".into(),
+            node: Some(label.into()),
+            recognition,
+            ..DeviceIdentity::default()
+        }
+    }
+
+    fn seen_as(device: &str, mac: &str, from: &str) -> DeviceRecognition {
+        DeviceRecognition {
+            device: Some(device.into()),
+            identified_by: "router_mac".into(),
+            mac: Some(mac.into()),
+            mac_from: Some(from.into()),
+            ..DeviceRecognition::default()
+        }
+    }
+
+    // REQ: FLT-006, API-010, CLU-002 (ADR-183) — how an address is recognized is the entry node's
+    // own view: the merged identity takes the best guess of any node (here the other node's, with
+    // the higher score), and the entry node's `recognition`, whatever the others say.
+    #[test]
+    fn clu_002_identity_recognition_is_the_entry_nodes() {
+        let entry = node(
+            "entry",
+            Some("Roku player"),
+            0.6,
+            Some(seen_as("tv", "02:00:00:00:00:01", "router")),
+        );
+        let other = node(
+            "pod",
+            Some("Roku Ultra"),
+            0.9,
+            Some(seen_as("someone else", "02:00:00:00:00:99", "peer")),
+        );
+        let merged = merge_identity(entry, vec![other], "192.168.1.20");
+        assert_eq!(
+            merged.product.as_deref(),
+            Some("Roku Ultra"),
+            "the best guess wins"
+        );
+        let r = merged.recognition.expect("the entry node's recognition");
+        assert_eq!(r.device.as_deref(), Some("tv"));
+        assert_eq!(r.mac.as_deref(), Some("02:00:00:00:00:01"));
+        assert_eq!(r.mac_from.as_deref(), Some("router"));
+    }
+
+    // REQ: FLT-006, API-010 (ADR-183) — an entry node that says nothing about recognition (privacy
+    // level 2 and above) leaves none on the merged identity, though another node had one: that
+    // node's MAC must not reach a caller this node hides it from.
+    #[test]
+    fn clu_002_identity_recognition_hidden_here_stays_hidden() {
+        let entry = node("entry", Some("Roku player"), 0.6, None);
+        let other = node(
+            "pod",
+            Some("Roku player"),
+            0.6,
+            Some(seen_as("tv", "02:00:00:00:00:01", "router")),
+        );
+        let merged = merge_identity(entry, vec![other], "192.168.1.20");
+        assert!(merged.recognition.is_none(), "{merged:?}");
+    }
+
+    // REQ: CLU-010, API-010 (ADR-183) — a mixed cluster: a node on an earlier build writes no
+    // `recognition` (it reads the same), and one on this build writes it where an earlier one
+    // ignores the key.
+    #[test]
+    fn clu_010_identity_recognition_reads_both_ways() {
+        let earlier = r#"{"client":"192.168.1.20","available":true,"class":"streaming","level":"likely","score":0.6,"source":"inferred"}"#;
+        let read: DeviceIdentity = serde_json::from_str(earlier).unwrap();
+        assert!(read.recognition.is_none());
+        let newer = node(
+            "pod",
+            None,
+            0.6,
+            Some(seen_as("tv", "02:00:00:00:00:01", "peer")),
+        );
+        let mut json = serde_json::to_value(&newer).unwrap();
+        assert_eq!(json["recognition"]["macFrom"], "peer");
+        // An earlier build's struct has no such field and no `deny_unknown_fields`: the same read
+        // with the key it doesn't know is what `from_value` does with an extra key here.
+        json["futureField"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<DeviceIdentity>(json).is_ok());
     }
 }
 

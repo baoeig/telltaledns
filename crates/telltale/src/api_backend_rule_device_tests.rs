@@ -20,6 +20,8 @@ fn lease(ip: [u8; 4], name: &str) -> crate::devices::Lease {
         hostname: Some(name.into()),
         expires: 0,
         offline: false,
+        unsure: false,
+        stale: false,
     }
 }
 
