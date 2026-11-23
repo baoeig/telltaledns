@@ -1601,8 +1601,9 @@ pub struct ClientsConfig {
     /// `false` keeps to the neighbor table and trusted EDNS MACs. The cluster shares it, so every
     /// node identifies devices the same way, and it is not written while it is on: set it to
     /// `false` only once every node runs this version (an older node refuses the key). While it
-    /// is on and a device is named by its MAC, each router is read at least every 15 minutes,
-    /// whatever its `interval_secs`, and a router silent for 15 minutes identifies nothing.
+    /// is on and a device is named by its MAC, each router is read at least every 10 minutes
+    /// (600 seconds), whatever its `interval_secs`, and a router silent for 15 minutes
+    /// identifies nothing.
     #[serde(skip_serializing_if = "is_default_router_macs")]
     pub router_macs: bool,
 }

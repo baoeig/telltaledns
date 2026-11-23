@@ -47,11 +47,12 @@ pub(crate) struct Lease {
 pub(crate) type Leases = HashMap<Ipv4Addr, Lease>;
 
 /// REQ: FLT-006 (ADR-183) — the MAC a lease can identify a device by: its client is connected
-/// (not offline), its binding is not `unsure`, and the MAC parses (`aa:bb:..` or `aa-bb-..`),
-/// isn't all zero, and is unicast. Locally administered ("private") MACs count. MACs are
-/// compared as parsed bytes, never as text.
+/// (not offline), its binding is not `unsure` and not `stale` (a stale row is always also `unsure`
+/// as `rebuild` makes it, but this doesn't rely on it), and the MAC parses (`aa:bb:..` or
+/// `aa-bb-..`), isn't all zero, and is unicast. Locally administered ("private") MACs count. MACs
+/// are compared as parsed bytes, never as text.
 pub(crate) fn eligible(l: &Lease) -> Option<[u8; 6]> {
-    if l.offline || l.unsure {
+    if l.offline || l.unsure || l.stale {
         return None;
     }
     usable_mac(&l.mac)
@@ -610,6 +611,35 @@ mod tests {
         assert_eq!(serde_json::from_str::<Lease>(&text).unwrap(), stale);
         let old: PreviousLease = serde_json::from_str(&text).unwrap();
         assert_eq!(old.ip, Ipv4Addr::new(10, 0, 0, 3), "{old:?}");
+    }
+
+    // REQ: FLT-006 (ADR-183) — a stale row (its router has been silent for 15 minutes) never
+    // identifies a device by itself: `eligible` doesn't rely on `rebuild` also marking it `unsure`,
+    // so a producer of `Lease` values that forgets to is not a way in.
+    #[test]
+    fn flt_006_a_stale_lease_never_identifies_even_when_not_marked_unsure() {
+        let row = |stale: bool, unsure: bool| Lease {
+            mac: "aa:bb:cc:00:00:01".into(),
+            stale,
+            unsure,
+            ..lease([10, 0, 0, 2], "x")
+        };
+        assert_eq!(
+            eligible(&row(false, false)),
+            Some(MAC_A),
+            "a fresh sure row does"
+        );
+        assert_eq!(
+            eligible(&row(true, false)),
+            None,
+            "stale alone is not eligible"
+        );
+        assert_eq!(
+            eligible(&row(true, true)),
+            None,
+            "stale and unsure (as rebuild makes it)"
+        );
+        assert_eq!(eligible(&row(false, true)), None, "unsure alone");
     }
 
     // REQ: FLT-006 (ADR-183) — only a connected client whose binding is sure, with a MAC that
