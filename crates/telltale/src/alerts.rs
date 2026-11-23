@@ -1285,6 +1285,7 @@ mod tests {
             rhythm: None,
             informational,
             muted_by: None,
+            storm_mute: None,
         };
         let b = Stub {
             view: telltale_api::model::ClusterView {
@@ -1314,6 +1315,63 @@ mod tests {
         assert!(anomaly.iter().all(|(k, _)| k.starts_with("beacon|")));
         assert_eq!(chatty.len(), 1, "{chatty:?}");
         assert!(chatty.iter().all(|(k, _)| k.starts_with("chatty_loop|")));
+    }
+
+    /// REQ: OBS-013, OBS-009 (ADR-186) — a sweep of private reverse names is counted, not
+    /// informational: the `anomaly` rule takes it, as it takes a storm; `chatty_loop` doesn't.
+    #[test]
+    fn obs_013_the_anomaly_rule_alerts_on_a_reverse_sweep() {
+        let sweep = telltale_api::model::AnomalyFinding {
+            id: "reverse_sweep".into(),
+            kind: "reverse_sweep".into(),
+            client: "192.168.1.30".into(),
+            client_name: Some("lg-tv".into()),
+            domain: None,
+            window_start: "2026-11-23T10:14:00.000Z".into(),
+            window_seconds: 60,
+            observed: 247.0,
+            baseline: 254.0,
+            spread: 0.0,
+            threshold: 30.0,
+            detail: "247 NXDOMAIN answers to reverse lookups of private addresses in a minute"
+                .into(),
+            nodes: Vec::new(),
+            acknowledged: None,
+            rhythm: None,
+            informational: false,
+            muted_by: None,
+            storm_mute: None,
+        };
+        let b = Stub {
+            view: telltale_api::model::ClusterView {
+                enabled: false,
+                cluster_id: None,
+                name: None,
+                this_node: None,
+                newest_config_seq: 0,
+                healthy: true,
+                checks: Vec::new(),
+                nodes: Vec::new(),
+                events: Vec::new(),
+                authority: None,
+                conflicts: Vec::new(),
+                failover: None,
+                source: None,
+                host: None,
+                rollout: None,
+            },
+            probes: Vec::new(),
+            findings: vec![sweep],
+        };
+        let o = |w: AlertWhen| observe(&b, &rule(w, 0), 1000, &[], &Paused::default());
+        let anomaly = o(AlertWhen::Anomaly);
+        assert_eq!(anomaly.len(), 1, "{anomaly:?}");
+        assert!(anomaly[0].0.starts_with("reverse_sweep|192.168.1.30|"));
+        assert!(
+            anomaly[0].1.starts_with("lg-tv: 247 NXDOMAIN"),
+            "{anomaly:?}"
+        );
+        assert_eq!(o(AlertWhen::ChattyLoop), Vec::<(String, String)>::new());
     }
 
     /// REQ: OBS-010 (review 04-10) — past the cap, only the oldest one-off subjects are
