@@ -1709,7 +1709,7 @@ pub(crate) async fn simulate(
         let body = serde_json::to_vec(&req).unwrap_or_default();
         let deadline = Duration::from_secs(u64::from(w.max_secs)) + PEER_SLACK;
         let calls: Vec<_> = cluster
-            .reachable_peers()
+            .serving_peers()
             .into_iter()
             .map(|peer| {
                 let (c, body) = (Arc::clone(cluster), body.clone());

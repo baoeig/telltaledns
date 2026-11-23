@@ -2409,6 +2409,35 @@ fn clu_001_a_peer_with_an_open_stream_is_never_forgotten() {
     assert_eq!(listed(&c), Vec::<String>::new());
 }
 
+// REQ: CLU-002 (ADR-056) — a witness only votes: reads that fan out across the cluster ask the
+// peers that serve them, so a witness with an open stream is reachable but never asked (the UI
+// said "Partial results: <witness> didn't answer" on every page).
+#[test]
+fn clu_002_a_witness_is_reachable_but_serves_no_reads() {
+    let (c, _dir) = auto_replica(
+        true,
+        &[
+            record("replica-b", true, false),
+            record("witness-w", false, true),
+        ],
+    );
+    let mut rxs = Vec::new();
+    for peer in ["replica-b", "witness-w"] {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Frame>(1);
+        c.outbox.lock().unwrap().insert(peer.into(), tx);
+        rxs.push(rx);
+    }
+    let mut reachable = c.reachable_peers();
+    reachable.sort();
+    assert_eq!(
+        reachable,
+        vec!["replica-b".to_owned(), "witness-w".to_owned()]
+    );
+    assert_eq!(c.witnesses(), vec!["witness-w".to_owned()]);
+    assert_eq!(c.serving_peers(), vec!["replica-b".to_owned()]);
+    drop(rxs);
+}
+
 // REQ: CLU-005, CLU-008 (ADR-173) — who the voters are comes from the registry file, and a read
 // that fails leaves only this node in it, which reads as "no automatic failover". That must not
 // make a node forget the voters it keeps a stream to: with the registry unreadable in an
