@@ -31,19 +31,26 @@ struct Route {
 // be looked up using a borrowed slice of the question, at DNS label boundaries.
 #[derive(Debug)]
 struct Subscription {
+    name: String,
+    url: String,
     target: usize,
-    suffixes: ArcSwapOption<HashMap<Box<[u8]>, bool>>,
+    snapshot: ArcSwapOption<SubscriptionSnapshot>,
+    error: ArcSwapOption<String>,
 }
 
-impl Subscription {
-    fn depth(&self, name: &NameBuf) -> Option<usize> {
-        let snapshot = self.suffixes.load();
-        let suffixes = snapshot.as_ref()?;
-        let mut wire = name.as_wire();
+#[derive(Debug)]
+struct SubscriptionSnapshot {
+    suffixes: HashMap<Box<[u8]>, bool>,
+    names_used: usize,
+    exceptions: usize,
+}
+
+impl SubscriptionSnapshot {
+    fn matching_suffix(&self, mut wire: &[u8]) -> Option<usize> {
         let mut matched = None;
         let mut skipped = 0;
         while wire[0] != 0 {
-            match suffixes.get(wire) {
+            match self.suffixes.get(wire) {
                 Some(false) => return None, // AutoProxy exceptions win within this subscription.
                 Some(true) if matched.is_none() => matched = Some(skipped),
                 _ => {}
@@ -51,8 +58,19 @@ impl Subscription {
             wire = &wire[1 + usize::from(wire[0])..];
             skipped += 1;
         }
-        matched.map(|removed| name.label_count() - removed)
+        matched
     }
+}
+
+/// REQ: DNS-017, UPS-007 — counts from the subscription snapshot this node uses for routing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionStatus {
+    /// Unique forwarding suffixes that aren't covered by an exception.
+    pub names_used: Option<usize>,
+    /// Unique exception suffixes.
+    pub exceptions: Option<usize>,
+    /// Latest refresh error, if any. An older snapshot can still be active.
+    pub error: Option<String>,
 }
 
 /// The selected group plus a cache view ID that keeps answers from different groups apart.
@@ -500,8 +518,11 @@ impl Router {
                     return None;
                 };
                 Some(Subscription {
+                    name: subscription.name.to_string(),
+                    url: subscription.url.to_string(),
                     target,
-                    suffixes: ArcSwapOption::empty(),
+                    snapshot: ArcSwapOption::empty(),
+                    error: ArcSwapOption::empty(),
                 })
             })
             .collect();
@@ -555,12 +576,44 @@ impl Router {
         suffixes: impl IntoIterator<Item = (NameBuf, bool)>,
     ) {
         if let Some(subscription) = self.subscriptions.get(index) {
-            let suffixes = suffixes
-                .into_iter()
-                .map(|(name, forward)| (Box::from(name.as_wire()), forward))
-                .collect();
-            subscription.suffixes.store(Some(Arc::new(suffixes)));
+            let mut snapshot = SubscriptionSnapshot {
+                suffixes: suffixes
+                    .into_iter()
+                    .map(|(name, forward)| (Box::from(name.as_wire()), forward))
+                    .collect(),
+                names_used: 0,
+                exceptions: 0,
+            };
+            for (name, forward) in &snapshot.suffixes {
+                if !forward {
+                    snapshot.exceptions += 1;
+                } else if snapshot.matching_suffix(name).is_some() {
+                    snapshot.names_used += 1;
+                }
+            }
+            subscription.snapshot.store(Some(Arc::new(snapshot)));
         }
+    }
+
+    /// Update the refresh result independently of the active routing snapshot.
+    pub fn set_subscription_error(&self, index: usize, error: Option<Arc<String>>) {
+        if let Some(subscription) = self.subscriptions.get(index) {
+            subscription.error.store(error);
+        }
+    }
+
+    /// Read status by name and URL so a reload cannot attach old counts to a different source.
+    pub fn subscription_status(&self, name: &str, url: &str) -> Option<SubscriptionStatus> {
+        let subscription = self
+            .subscriptions
+            .iter()
+            .find(|s| s.name == name && s.url == url)?;
+        let snapshot = subscription.snapshot.load();
+        Some(SubscriptionStatus {
+            names_used: snapshot.as_ref().map(|s| s.names_used),
+            exceptions: snapshot.as_ref().map(|s| s.exceptions),
+            error: subscription.error.load().as_deref().cloned(),
+        })
     }
 
     pub fn select<S: AsRef<str>>(
@@ -597,7 +650,11 @@ impl Router {
             }
         }
         for subscription in &self.subscriptions {
-            if let Some(depth) = subscription.depth(&q.name)
+            let snapshot = subscription.snapshot.load();
+            if let Some(depth) = snapshot
+                .as_ref()
+                .and_then(|s| s.matching_suffix(q.name.as_wire()))
+                .map(|removed| q.name.label_count() - removed)
                 && best.is_none_or(|(previous, _)| depth > previous)
             {
                 best = Some((depth, subscription.target));

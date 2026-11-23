@@ -1717,8 +1717,23 @@ pub struct ForwardInfo {
     /// Source URL for a GFWList/AutoProxy subscription.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription_url: Option<String>,
+    /// REQ: DNS-017, UPS-007 — this node's active subscription and latest refresh result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_status: Option<RouteSubscriptionStatus>,
     /// `file` (read-only here) or `api`.
     pub source: String,
+}
+
+/// Status of a route subscription on this node.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteSubscriptionStatus {
+    /// Unique forwarding suffixes outside exceptions. Null before the first snapshot.
+    pub names_used: Option<usize>,
+    /// Unique exception suffixes. Null before the first snapshot.
+    pub exceptions: Option<usize>,
+    /// Latest refresh error. An older snapshot can still be active.
+    pub error: Option<String>,
 }
 
 /// What a change to local names or forwarded domains did (or would do, with `dryRun`).

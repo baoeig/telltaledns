@@ -5273,6 +5273,7 @@ impl ApiBackend {
     pub(crate) fn list_forwards(&self) -> Vec<ForwardInfo> {
         let api = self.managed_names_of(crate::managed::FORWARD);
         let cfg = self.src.config.load();
+        let router = &self.src.pipeline.current().router;
         // A member's servers: its URL, or (REQ: DNS-022) a stub zone's addresses.
         let servers_of = |name: &str| {
             cfg.upstream
@@ -5320,6 +5321,7 @@ impl ApiBackend {
                     servers: servers.clone(),
                     stub,
                     subscription_url: None,
+                    subscription_status: None,
                     source: source(d),
                 });
             }
@@ -5333,6 +5335,13 @@ impl ApiBackend {
                     .collect(),
                 stub: false,
                 subscription_url: Some(s.url.to_string()),
+                subscription_status: router.subscription_status(&s.name, &s.url).map(|status| {
+                    telltale_api::model::RouteSubscriptionStatus {
+                        names_used: status.names_used,
+                        exceptions: status.exceptions,
+                        error: status.error,
+                    }
+                }),
                 source: source(&s.name),
             }
         }));

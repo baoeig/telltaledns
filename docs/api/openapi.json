@@ -13917,6 +13917,17 @@
             "type": "boolean",
             "description": "REQ: DNS-022 — a stub zone: the servers are asked iteratively and their delegations\nfollowed."
           },
+          "subscriptionStatus": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RouteSubscriptionStatus",
+                "description": "REQ: DNS-017, UPS-007 — this node's active subscription and latest refresh result."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "subscriptionUrl": {
             "type": [
               "string",
@@ -15520,6 +15531,17 @@
                 "stub": {
                   "type": "boolean",
                   "description": "REQ: DNS-022 — a stub zone: the servers are asked iteratively and their delegations\nfollowed."
+                },
+                "subscriptionStatus": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/RouteSubscriptionStatus",
+                      "description": "REQ: DNS-017, UPS-007 — this node's active subscription and latest refresh result."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 },
                 "subscriptionUrl": {
                   "type": [
@@ -19715,6 +19737,35 @@
               "null"
             ],
             "description": "Since when a change has waited for a canary (RFC 3339)."
+          }
+        }
+      },
+      "RouteSubscriptionStatus": {
+        "type": "object",
+        "description": "Status of a route subscription on this node.",
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Latest refresh error. An older snapshot can still be active."
+          },
+          "exceptions": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Unique exception suffixes. Null before the first snapshot.",
+            "minimum": 0
+          },
+          "namesUsed": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Unique forwarding suffixes outside exceptions. Null before the first snapshot.",
+            "minimum": 0
           }
         }
       },

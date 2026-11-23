@@ -71,6 +71,10 @@ impl RefreshTasks {
             Ok(v) => v,
             Err(e) => {
                 warn!("route subscriptions could not start: {e}");
+                let error = Arc::new(e);
+                for index in 0..cfg.route_subscription.len() {
+                    router.set_subscription_error(index, Some(Arc::clone(&error)));
+                }
                 return Self::default();
             }
         };
@@ -134,8 +138,8 @@ async fn refresh(
             client.get(source.url.as_str(), &conditional, MAX_BYTES),
         )
         .await;
-        let updated = match result {
-            Ok(Ok(Response::NotModified)) => true,
+        let error = match result {
+            Ok(Ok(Response::NotModified)) => None,
             Ok(Ok(Response::Body {
                 data,
                 etag,
@@ -150,26 +154,24 @@ async fn refresh(
                         etag,
                         last_modified,
                     };
-                    true
+                    None
                 }
-                Err(e) => {
-                    warn!(name = %source.name, "route subscription unchanged: {e}");
-                    false
-                }
+                Err(e) => Some(e),
             },
-            Ok(Err(e)) => {
-                warn!(name = %source.name, "route subscription download failed: {}", e.message);
-                false
-            }
-            Err(_) => {
-                warn!(name = %source.name, "route subscription download timed out");
-                false
-            }
+            Ok(Err(e)) => Some(e.message),
+            Err(_) => Some("Route subscription download timed out".into()),
         };
-        tokio::time::sleep(if updated {
-            interval
-        } else {
+        let error = error.map(|e| {
+            warn!(name = %source.name, "route subscription unchanged: {e}");
+            Arc::new(e)
+        });
+        for &index in &indexes {
+            router.set_subscription_error(index, error.clone());
+        }
+        tokio::time::sleep(if error.is_some() {
             Duration::from_secs(300)
+        } else {
+            interval
         })
         .await;
     }
@@ -311,6 +313,7 @@ upstream_group = "overseas"
         let source = b"[AutoProxy 0.2.9]\n\
             ! Comment\n\
             ||example.com\n\
+            ||example.com\n\
             @@||keep.example.com\n\
             ||nested.keep.example.com\n\
             ||custom.example\n\
@@ -322,8 +325,17 @@ upstream_group = "overseas"
         let encoded = base64::engine::general_purpose::STANDARD.encode(source);
         let wrapped = format!("{}\n{}\n", &encoded[..60], &encoded[60..]);
         let router = Router::from_config(&cfg).unwrap();
+        let url = &cfg.route_subscription[0].url;
+        let pending = router.subscription_status("gfwlist", url).unwrap();
+        assert_eq!(pending.names_used, None);
+        assert_eq!(pending.exceptions, None);
+        assert_eq!(pending.error, None);
         assert_eq!(group_for(&router, "www.example.com"), "default");
         router.replace_subscription(0, save(&store, &key, wrapped.as_bytes()).unwrap());
+        let loaded = router.subscription_status("gfwlist", url).unwrap();
+        assert_eq!(loaded.names_used, Some(4));
+        assert_eq!(loaded.exceptions, Some(1));
+        assert_eq!(loaded.error, None);
         assert_eq!(group_for(&router, "WWW.EXAMPLE.COM"), "overseas");
         assert_eq!(group_for(&router, "notexample.com"), "default");
         assert_eq!(group_for(&router, "nested.keep.example.com"), "default");
@@ -332,11 +344,23 @@ upstream_group = "overseas"
         assert_eq!(group_for(&router, "a.wild.example"), "overseas");
         assert_eq!(group_for(&router, "img1.skip.example"), "default");
         assert_eq!(group_for(&router, "1.2.3.4"), "default");
-        assert!(save(&store, &key, b"[AutoProxy 0.2.9]\n! Empty\n").is_err());
+        let error = save(&store, &key, b"[AutoProxy 0.2.9]\n! Empty\n").unwrap_err();
+        router.set_subscription_error(0, Some(Arc::new(error.clone())));
+        let failed_refresh = router.subscription_status("gfwlist", url).unwrap();
+        assert_eq!(failed_refresh.names_used, loaded.names_used);
+        assert_eq!(failed_refresh.exceptions, loaded.exceptions);
+        assert_eq!(failed_refresh.error.as_deref(), Some(error.as_str()));
+        assert_eq!(group_for(&router, "www.example.com"), "overseas");
 
         let restarted = Router::from_config(&cfg).unwrap();
         restore(&cfg, &restarted);
+        assert_eq!(restarted.subscription_status("gfwlist", url), Some(loaded));
         assert_eq!(group_for(&restarted, "www.example.com"), "overseas");
+        assert!(
+            restarted
+                .subscription_status("gfwlist", "https://lists.example/new.txt")
+                .is_none()
+        );
 
         let mut changed = cfg;
         changed.route_subscription[0].url = "https://lists.example/new.txt".into();

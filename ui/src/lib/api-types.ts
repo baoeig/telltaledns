@@ -4987,6 +4987,7 @@ export interface components {
              *     followed.
              */
             stub: boolean;
+            subscriptionStatus?: components["schemas"]["RouteSubscriptionStatus"] | null;
             /** @description Source URL for a GFWList/AutoProxy subscription. */
             subscriptionUrl?: string | null;
         };
@@ -5629,6 +5630,7 @@ export interface components {
                  *     followed.
                  */
                 stub: boolean;
+                subscriptionStatus?: components["schemas"]["RouteSubscriptionStatus"] | null;
                 /** @description Source URL for a GFWList/AutoProxy subscription. */
                 subscriptionUrl?: string | null;
             }[];
@@ -7395,6 +7397,15 @@ export interface components {
             version?: string | null;
             /** @description Since when a change has waited for a canary (RFC 3339). */
             waitingSince?: string | null;
+        };
+        /** @description Status of a route subscription on this node. */
+        RouteSubscriptionStatus: {
+            /** @description Latest refresh error. An older snapshot can still be active. */
+            error?: string | null;
+            /** @description Unique exception suffixes. Null before the first snapshot. */
+            exceptions?: number | null;
+            /** @description Unique forwarding suffixes outside exceptions. Null before the first snapshot. */
+            namesUsed?: number | null;
         };
         /** @description A quick rule (files and API), with how long it has left. */
         RuleInfo: {

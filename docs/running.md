@@ -1639,6 +1639,10 @@ refresh_secs = 86400
 
 The first fetch starts in the background. Each node refreshes the list daily by default,
 and retries after five minutes on failure. It keeps the last valid copy across restarts.
+The **DNS Routes** table shows the state, **Names used** (unique forwarding suffixes
+outside exceptions), and **Exceptions** (unique exception suffixes) on the current node.
+The counts appear when a valid copy is available. If a refresh fails, **Using last good**
+shows that the displayed counts still describe the copy in use.
 Without a valid copy, queries follow normal routing. Clear-text and Base64 AutoProxy are
 supported. Domain suffixes include subdomains, and `@@` exceptions skip that subscription.
 URL rules apply to the whole hostname, including when they name a specific path. Leading

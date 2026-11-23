@@ -319,7 +319,7 @@
       "summary": "Queries that match a domain in the list go to the DNS servers configured for that subscription.",
       "when": "A maintained GFWList or AutoProxy list should use a dedicated DNS server.",
       "example": "Subscribe to GFWList and send matching queries to a DNS-over-HTTPS server.",
-      "caution": "Refresh failures keep the last valid copy. Queries follow ordinary routing until a list first downloads successfully.",
+      "caution": "Names used and Exceptions count the active copy on this node. If the latest refresh failed, Using last good shows that the previous copy is still active.",
       "diagram": "route",
       "docs": "subscribe-to-gfwlist"
     },

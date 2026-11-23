@@ -1519,6 +1519,44 @@ test('dns_017 DNS Routes manages subscriptions from the sidebar', async () => {
   await expect(row).toHaveCount(0);
 });
 
+// REQ: DNS-017, UPS-007 — polling displays counts from the active copy, including after a failure.
+test('dns_017 DNS Routes shows the active subscription counts', async () => {
+  let subscriptionStatus: { namesUsed: number | null; exceptions: number | null; error: string | null } = {
+    namesUsed: null, exceptions: null, error: null,
+  };
+  const forwards = '**/api/v1/forwards';
+  const fixture = async (route: Route) => route.fulfill({ json: { items: [{
+    domain: 'gfwlist-counts',
+    servers: ['tls://10.0.0.9'],
+    source: 'api',
+    stub: false,
+    subscriptionUrl: 'https://lists.invalid/gfwlist.txt',
+    subscriptionStatus,
+  }] } });
+  await page.route(forwards, fixture);
+  try {
+    await page.goto('/#/local-dns');
+    await page.getByRole('link', { name: 'DNS Routes', exact: true }).click();
+    await expect(page.getByRole('columnheader', { name: 'Names used' })).toBeVisible();
+    const row = page.getByRole('row').filter({ hasText: 'gfwlist-counts' });
+    await expect(row.getByRole('cell', { name: 'pending' })).toBeVisible();
+    await expect(row.getByRole('cell', { name: '–', exact: true })).toHaveCount(2);
+
+    subscriptionStatus = { namesUsed: 4321, exceptions: 23, error: null };
+    await expect(row.getByRole('cell', { name: '4,321', exact: true })).toBeVisible({ timeout: 20_000 });
+    await expect(row.getByRole('cell', { name: '23', exact: true })).toBeVisible();
+    await expect(row.getByRole('cell', { name: 'ok', exact: true })).toBeVisible();
+
+    subscriptionStatus = { ...subscriptionStatus, error: 'Download failed' };
+    await page.reload();
+    await expect(row.getByRole('cell', { name: 'Using last good' })).toBeVisible();
+    await expect(row.getByRole('cell', { name: '4,321', exact: true })).toBeVisible();
+    await expect(row.getByText('Download failed')).toBeVisible();
+  } finally {
+    await page.unroute(forwards, fixture);
+  }
+});
+
 // REQ: FLT-005 (T6.12, ADR-067) — a quick rule from "Why?": allow a blocked name for this
 // device for an hour; DNS stops blocking it at once, the Rules page shows it with its
 // countdown, and removing it blocks the name again. No list is recompiled.

@@ -1,11 +1,14 @@
 <script lang="ts">
   // REQ: DNS-017, UPS-007 — manage route subscriptions through the forwarding API.
   import { api, type S } from '../lib/api';
+  import { num } from '../lib/format';
+  import { poll } from '../lib/poll';
   import { href } from '../lib/router.svelte';
   import { session } from '../lib/session.svelte';
   import Drawer from '../lib/components/Drawer.svelte';
   import ErrorNote from '../lib/components/ErrorNote.svelte';
   import HelpButton from '../lib/components/HelpButton.svelte';
+  import StatusBadge from '../lib/components/StatusBadge.svelte';
 
   type Forward = S['ForwardInfo'];
   let subscriptions = $state<Forward[] | null>(null);
@@ -14,17 +17,26 @@
   let formError = $state<unknown>(null);
   let busy = $state(false);
   let saved = $state(false);
+  let latestLoad = 0;
   const canEdit = $derived(session.user?.role === 'admin' || session.user?.role === 'operator');
 
   async function load() {
+    const request = ++latestLoad;
     try {
-      subscriptions = (await api.forwards()).items.filter((forward) => forward.subscriptionUrl);
+      const { items } = await api.forwards();
+      if (request !== latestLoad) return;
+      subscriptions = items.filter((forward) => forward.subscriptionUrl);
       error = null;
     } catch (e) {
-      error = e;
+      if (request === latestLoad) error = e;
     }
   }
-  $effect(() => { void load(); });
+  $effect(() => poll(load, 15000));
+
+  function listState(status: Forward['subscriptionStatus']) {
+    if (status?.error) return status.namesUsed == null ? 'failed' : 'stale';
+    return status?.namesUsed == null ? 'pending' : 'ok';
+  }
 
   function openEditor(forward?: Forward) {
     editor = {
@@ -84,12 +96,20 @@
     {:else}
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Name</th><th>Source URL</th><th>DNS servers</th><th>Defined in</th><th></th></tr></thead>
+          <thead><tr><th>List</th><th>State</th><th class="num">Names used</th><th class="num">Exceptions</th><th>DNS servers</th><th>Defined in</th><th></th></tr></thead>
           <tbody>
             {#each subscriptions as forward (forward.domain)}
+              {@const status = forward.subscriptionStatus}
+              {@const state = listState(status)}
               <tr>
-                <td class="mono">{forward.domain}</td>
-                <td class="mono small source">{forward.subscriptionUrl}</td>
+                <td>
+                  <strong>{forward.domain}</strong>
+                  <div class="muted small source">{forward.subscriptionUrl}</div>
+                  {#if status?.error}<div class="small err">{status.error}</div>{/if}
+                </td>
+                <td><StatusBadge value={state} label={state === 'stale' ? 'Using last good' : undefined} /></td>
+                <td class="num">{status?.namesUsed == null ? '–' : num(status.namesUsed)}</td>
+                <td class="num">{status?.exceptions == null ? '–' : num(status.exceptions)}</td>
                 <td class="mono small">{forward.servers.join(', ')}</td>
                 <td class="small">{forward.source === 'api' ? 'the UI / API' : 'config file'}</td>
                 <td class="num nowrap">
@@ -103,6 +123,7 @@
           </tbody>
         </table>
       </div>
+      <p class="muted small">“Names used” counts the domain suffixes in the active subscription. “Exceptions” counts suffixes exempt from this route.</p>
     {/if}
   </section>
   <p class="muted small">For single-domain forwarding, see <a href={href('/local-dns')}>Names on my network</a>.</p>

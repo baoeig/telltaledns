@@ -2970,7 +2970,7 @@ Revisit if a profile on real hardware shows syscalls dominating at the owner's t
 
 Compile whole-label suffixes separately from static routes. Support the decoded AutoProxy document with or without its Base64 wrapper. Ignore URL schemes and paths when forming the suffix and treat leading `*.` as the corresponding subtree. An `@@` exception suppresses the subscription for that subtree. Skip regex, partial host wildcards and IP literals. Static routes win equal-depth matches, then subscriptions in configuration order. A refresh does no network or disk work on the query path and publishes only a parsed copy with at least one forwarding rule.
 
-**Consequences.** DNS route changes from the remote source are visible after the next successful refresh. Cluster nodes can briefly use different copies, and a node without a cache keeps serving existing routes while the source is unreachable.
+**Consequences.** DNS route changes from the remote source are visible after the next successful refresh. Cluster nodes can briefly use different copies, and a node without a cache keeps serving existing routes while the source is unreachable. The DNS Routes table reports the serving node's refresh state and counts unique forwarding suffixes outside exceptions and unique exception suffixes from its active snapshot. Counts are unavailable until a snapshot is loaded and remain visible if a refresh fails.
 
 ## ADR-184 — Replace a native installation with a fork build (Proposed)
 
