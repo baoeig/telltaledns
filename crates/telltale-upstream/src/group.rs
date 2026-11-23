@@ -300,6 +300,13 @@ impl Group {
                 }
             }
         }
+        // REQ: UPS-006 (ADR-165) — attempts still running when the query ends (at its deadline,
+        // or with only a SERVFAIL or REFUSED in hand) finish in the background, as the losers
+        // above do, so their outcome reaches the health tracker: dropping the set would abort
+        // them, and a silent member would never be benched. Each still ends at its own timeout,
+        // set from what was left of the budget when it started (a retry after a truncated
+        // answer has some time of its own).
+        set.detach_all();
         match fallback {
             Some(mut a) => {
                 a.attempts = attempts;

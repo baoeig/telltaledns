@@ -29,6 +29,8 @@ enum Fake {
     Blackhole,
     /// Answers over UDP with TC=1 and properly over TCP on the same port.
     Truncating,
+    /// Answers over UDP with TC=1; over TCP it reads the query and never answers.
+    TruncatingSilentTcp,
     /// Answers A 192.0.2.1 at once, except names whose first label is `slow`, which it
     /// answers after `delay` (a name it has to resolve itself, under a cached-answer EWMA).
     SlowName {
@@ -65,7 +67,7 @@ async fn fake(kind: Fake) -> SocketAddr {
     for _ in 0..50 {
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = sock.local_addr().unwrap();
-        if !matches!(kind, Fake::Truncating) {
+        if !matches!(kind, Fake::Truncating | Fake::TruncatingSilentTcp) {
             bound = Some((sock, None));
             break;
         }
@@ -85,6 +87,10 @@ async fn fake(kind: Fake) -> SocketAddr {
                     s.read_exact(&mut len).await.ok()?;
                     let mut req = vec![0; usize::from(u16::from_be_bytes(len))];
                     s.read_exact(&mut req).await.ok()?;
+                    if matches!(kind, Fake::TruncatingSilentTcp) {
+                        // Keep the connection open, and never answer.
+                        std::future::pending::<()>().await;
+                    }
                     let resp = answer(&req, rcode::NOERROR, 99, false)?;
                     let mut framed = (resp.len() as u16).to_be_bytes().to_vec();
                     framed.extend(resp);
@@ -106,7 +112,9 @@ async fn fake(kind: Fake) -> SocketAddr {
                     }
                     Fake::ServFail => answer(&req, rcode::SERVFAIL, 0, false),
                     Fake::Blackhole => None,
-                    Fake::Truncating => answer(&req, rcode::NOERROR, 0, true),
+                    Fake::Truncating | Fake::TruncatingSilentTcp => {
+                        answer(&req, rcode::NOERROR, 0, true)
+                    }
                     Fake::SlowName { delay } => {
                         if req.get(12..17) == Some(b"\x04slow".as_slice()) {
                             tokio::time::sleep(delay).await;
@@ -663,6 +671,187 @@ async fn ups_006_short_timeout_member_answers_a_first_miss() {
             );
         }
     }
+}
+
+/// How many of an upstream's attempts timed out.
+fn timeouts_of(u: &Upstream) -> u64 {
+    use telltale_upstream::health::Outcome;
+    let s = u.health.snapshot();
+    Outcome::FAILURES
+        .iter()
+        .zip(s.failures_by_kind)
+        .find(|(k, _)| **k == Outcome::Timeout)
+        .map_or(0, |(_, n)| n)
+}
+
+/// Waits until `ok` holds, for at most `secs`.
+async fn wait_until(what: &str, secs: u64, mut ok: impl FnMut() -> bool) {
+    let until = Instant::now() + Duration::from_secs(secs);
+    while !ok() {
+        assert!(Instant::now() < until, "not met in time: {what}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// REQ: UPS-006 (ADR-165) — a query that ends at its deadline with only a SERVFAIL in hand lets
+/// the silent member's patient attempt finish in the background: its timeout is recorded, so
+/// three such queries bench it. The client still gets the SERVFAIL at the deadline.
+#[tokio::test]
+async fn ups_006_silent_member_behind_a_servfail_is_benched() {
+    let silent = upstream(1, fake(Fake::Blackhole).await, 1);
+    let servfail = upstream(2, fake(Fake::ServFail).await, 1);
+    let g = Group::new(
+        "p",
+        vec![Arc::clone(&silent), Arc::clone(&servfail)],
+        Strategy::Parallel { fanout: 2 },
+    );
+    let budget = Duration::from_millis(300);
+    for i in 0..3 {
+        let t = Instant::now();
+        let ans = g
+            .resolve(question(&format!("q{i}.example")), budget)
+            .await
+            .unwrap();
+        let took = t.elapsed();
+        assert_eq!(summarize(&ans.bytes).unwrap().rcode, rcode::SERVFAIL);
+        assert!(
+            took < budget + Duration::from_millis(150),
+            "answered at the deadline: {took:?}"
+        );
+        wait_until("the silent member's attempt is recorded", 2, || {
+            silent.health.snapshot().requests == i + 1
+        })
+        .await;
+    }
+    assert_eq!(timeouts_of(&silent), 3);
+    assert_eq!(silent.health.snapshot().breaker, Breaker::Open);
+    assert_eq!(servfail.health.snapshot().breaker, Breaker::Closed);
+}
+
+/// REQ: UPS-006 (ADR-165) — a dead sole upstream: each query waits for it up to the budget and
+/// ends at its deadline, and the attempt's timeout is still recorded, so three queries bench it.
+#[tokio::test]
+async fn ups_006_dead_sole_upstream_is_benched() {
+    let dead = upstream(1, fake(Fake::Blackhole).await, 1);
+    let g = Group::new("one", vec![Arc::clone(&dead)], Strategy::Failover);
+    let budget = Duration::from_millis(300);
+    for i in 0..3 {
+        let t = Instant::now();
+        let err = g
+            .resolve(question(&format!("q{i}.example")), budget)
+            .await
+            .unwrap_err();
+        let took = t.elapsed();
+        assert!(
+            took < budget + Duration::from_millis(150),
+            "{err}: answered at the deadline: {took:?}"
+        );
+        wait_until("the dead member's attempt is recorded", 2, || {
+            dead.health.snapshot().requests == i + 1
+        })
+        .await;
+    }
+    assert_eq!(timeouts_of(&dead), 3);
+    assert_eq!(dead.health.snapshot().breaker, Breaker::Open);
+}
+
+/// REQ: UPS-006 (ADR-165) — the client gets its answer at the query's deadline and doesn't wait
+/// for an attempt that runs past it: this one retries a truncated answer over TCP with
+/// `timeout_ms` (400 ms) of its own, after a 200 ms budget. The attempt still finishes in the
+/// background, within its own timeout, and its outcome is recorded.
+#[tokio::test]
+async fn ups_006_query_ends_at_its_deadline_while_its_attempt_finishes() {
+    let up = upstream(1, fake(Fake::TruncatingSilentTcp).await, 1);
+    let g = Group::new("one", vec![Arc::clone(&up)], Strategy::Failover);
+    let t = Instant::now();
+    let err = g
+        .resolve(question("big.example"), Duration::from_millis(200))
+        .await
+        .unwrap_err();
+    let took = t.elapsed();
+    assert!(
+        took < Duration::from_millis(300),
+        "{err}: answered at the deadline: {took:?}"
+    );
+    assert_eq!(
+        up.health.snapshot().requests,
+        0,
+        "the attempt was still running when the client got its answer"
+    );
+    wait_until("the attempt's outcome is recorded", 3, || {
+        up.health.snapshot().requests == 1
+    })
+    .await;
+    let ended = t.elapsed();
+    assert!(
+        ended > Duration::from_millis(350) && ended < Duration::from_secs(1),
+        "it ended at its own timeout: {ended:?}"
+    );
+    assert_eq!(timeouts_of(&up), 1);
+}
+
+/// REQ: UPS-006 (ADR-165) — a burst of cache misses through two silent members: every attempt
+/// the burst started (at most one per member per query) ends within its own timeout and records
+/// its outcome, and the runtime is back to the tasks it had before: nothing is left running.
+#[tokio::test]
+async fn ups_006_burst_of_misses_leaves_no_attempt_behind() {
+    const N: u64 = 64;
+    let first = upstream(1, fake(Fake::Blackhole).await, 1);
+    let second = upstream(2, fake(Fake::Blackhole).await, 1);
+    let group = Arc::new(Group::new(
+        "p",
+        vec![Arc::clone(&first), Arc::clone(&second)],
+        Strategy::Parallel { fanout: 2 },
+    ));
+    let budget = Duration::from_millis(300);
+    let recorded = || first.health.snapshot().requests + second.health.snapshot().requests;
+    let alive = || {
+        tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks()
+    };
+    let tasks_before = alive();
+    let start = Instant::now();
+    let burst: Vec<_> = (0..N)
+        .map(|i| {
+            let group = Arc::clone(&group);
+            tokio::spawn(async move {
+                group
+                    .resolve(question(&format!("b{i}.example")), budget)
+                    .await
+            })
+        })
+        .collect();
+    let mut launched = 0;
+    for query in burst {
+        launched += match query.await.unwrap() {
+            Ok(ans) => u64::from(ans.attempts),
+            Err(
+                telltale_upstream::ResolveError::Budget { attempts }
+                | telltale_upstream::ResolveError::AllFailed { attempts, .. },
+            ) => u64::from(attempts),
+            Err(other) => panic!("{other}"),
+        };
+    }
+    let answered = start.elapsed();
+    assert!(
+        answered < budget + Duration::from_millis(300),
+        "every query answered at its deadline: {answered:?}"
+    );
+    assert!(
+        launched <= 2 * N,
+        "at most one attempt per member per query: {launched}"
+    );
+    wait_until("every attempt has recorded its outcome", 3, || {
+        recorded() == launched
+    })
+    .await;
+    assert!(
+        start.elapsed() < budget + Duration::from_secs(1),
+        "within the attempts' own timeouts: {:?}",
+        start.elapsed()
+    );
+    wait_until("no task is left running", 3, || alive() <= tasks_before).await;
 }
 
 /// REQ: DNS-015 (T9.9) — `ecs = "client"`: the query carries the client's /24, and a
