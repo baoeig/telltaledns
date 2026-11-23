@@ -230,12 +230,22 @@ pub(crate) fn run_bounded(
     cmd: &mut std::process::Command,
     limit: Duration,
 ) -> Result<std::process::ExitStatus, String> {
+    run_bounded_via(cmd, limit, std::process::Command::spawn)
+}
+
+/// [`run_bounded`], with the way the program is started given (a test closes a file between two
+/// tries, so the second one finds it free, with no clock to race).
+fn run_bounded_via(
+    cmd: &mut std::process::Command,
+    limit: Duration,
+    mut start: impl FnMut(&mut std::process::Command) -> std::io::Result<std::process::Child>,
+) -> Result<std::process::ExitStatus, String> {
     let cmd = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let mut child =
-        retry_text_busy(EXEC_TRIES, EXEC_PAUSE, || cmd.spawn()).map_err(|e| e.to_string())?;
+        retry_text_busy(EXEC_TRIES, EXEC_PAUSE, || start(cmd)).map_err(|e| e.to_string())?;
     let started = std::time::Instant::now();
     loop {
         match child.try_wait() {

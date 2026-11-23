@@ -360,8 +360,10 @@ async fn ops_014_a_pinned_install_takes_only_an_index_of_the_versions_channel() 
 /// "text file busy" (ETXTBSY): Linux refuses to exec a file some process still has open for
 /// writing, and a parallel fork can hold a copy of that descriptor for a moment (it made
 /// `ops_004_update_check_and_swap` fail now and then). A binary that is busy only for a moment still
-/// runs: the exec is tried again for a short while. Here the descriptor is closed 120 ms after the
-/// first try (the tries span about 400 ms).
+/// runs: the exec is tried again. Here the file is written and kept open, the first try is made, and
+/// the file is closed right after it, inside the same closure that starts the program: the second try
+/// finds it free, whatever the clock does. On a kernel that runs a file open for writing there is
+/// nothing to retry, and the test says so and ends.
 #[cfg(unix)]
 #[test]
 fn ops_004_a_binary_busy_for_a_moment_still_runs() {
@@ -369,27 +371,34 @@ fn ops_004_a_binary_busy_for_a_moment_still_runs() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("busy");
-    let mut f = std::fs::File::create(&path).unwrap();
-    f.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+    let mut open = Some(std::fs::File::create(&path).unwrap());
+    open.as_mut()
+        .unwrap()
+        .write_all(b"#!/bin/sh\nexit 0\n")
+        .unwrap();
     set_executable(&path).unwrap();
-    // Open for writing, the kernel refuses the exec: this is the error the retry is for.
-    let refused = std::process::Command::new(&path).spawn().unwrap_err();
-    assert!(
-        refused.kind() == std::io::ErrorKind::ExecutableFileBusy
-            || refused.raw_os_error() == Some(26),
-        "{refused}"
-    );
-    let closer = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(120));
-        drop(f);
-    });
-    let status = run_bounded(
+
+    let (mut starts, mut first_was_busy) = (0, false);
+    let status = run_bounded_via(
         std::process::Command::new(&path).arg("--version"),
         VERSION_WAIT,
+        |cmd| {
+            starts += 1;
+            let started = cmd.spawn();
+            if starts == 1 {
+                first_was_busy = started.as_ref().err().is_some_and(text_file_busy);
+                drop(open.take()); // closed: the next try can run it
+            }
+            started
+        },
     )
     .unwrap();
-    assert!(status.success());
-    closer.join().unwrap();
+    assert!(status.success(), "{status}");
+    if !first_was_busy {
+        eprintln!("skipped (nothing to retry): this kernel runs a file that is open for writing");
+        return;
+    }
+    assert_eq!(starts, 2, "busy once, then it ran");
 }
 
 /// REQ: OPS-004, OPS-014 — only "text file busy" is tried again, up to five times in all: busy
