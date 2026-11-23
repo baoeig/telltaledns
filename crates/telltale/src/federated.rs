@@ -823,10 +823,10 @@ impl Federated {
             .is_none_or(|o| o.peers.iter().any(|p| p == node_id))
     }
 
-    /// The reachable peers in the read's scope.
+    /// The reachable peers in the read's scope that answer reads (no witnesses: ADR-056).
     fn peers(&self) -> Vec<String> {
         self.cluster
-            .reachable_peers()
+            .serving_peers()
             .into_iter()
             .filter(|p| self.in_scope(p))
             .collect()
@@ -976,12 +976,16 @@ impl Federated {
         ok
     }
 
-    /// The in-scope members that aren't connected, by site (or ID).
+    /// The in-scope members that aren't connected, by site (or ID). A witness has nothing to
+    /// read, so it's never missing from a read.
     fn unconnected(&self) -> Vec<String> {
+        let witnesses = self.cluster.witnesses();
         self.cluster
             .members()
             .into_iter()
-            .filter(|m| !m.connected && self.in_scope(&m.node_id))
+            .filter(|m| {
+                !m.connected && self.in_scope(&m.node_id) && !witnesses.contains(&m.node_id)
+            })
             .map(|m| if m.site.is_empty() { m.node_id } else { m.site })
             .collect()
     }
@@ -1528,7 +1532,7 @@ impl Backend for Federated {
     // REQ: OBS-008, CLU-002 (T9.2) — the live tail covers the cluster: a session on each
     // peer (same filter, a share of the rate cap), polled twice a second.
     fn tail(&self, p: &TailParams) -> Result<tokio::sync::mpsc::Receiver<TailItem>, Problem> {
-        let reachable = self.cluster.reachable_peers();
+        let reachable = self.cluster.serving_peers();
         let (me, peers): (bool, Vec<String>) = match p.scope.as_deref() {
             Some("node:local") => return self.local.tail(p),
             None | Some("" | "cluster") => (true, reachable),
