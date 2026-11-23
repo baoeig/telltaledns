@@ -432,6 +432,12 @@ impl Neighbors {
         self.map.swap(Arc::new(table))
     }
 
+    /// The table in use now, as one value: counts read from it agree with each other (a scrape
+    /// reads one table, not two swapped between loads).
+    pub fn table(&self) -> Arc<MacTable> {
+        self.map.load_full()
+    }
+
     #[inline]
     pub fn get(&self, ip: IpAddr) -> Option<[u8; 6]> {
         self.map.load().get(ip).map(|e| e.mac)

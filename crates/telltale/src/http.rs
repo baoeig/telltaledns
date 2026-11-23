@@ -1119,35 +1119,33 @@ fn render_qlog(w: &mut PromWriter, q: &telltale_store::qlog::Stats) {
     .sample("telltale_qlog_segments", &[], q.segments.load(Relaxed));
 }
 
-/// REQ: DNS-011 — DNSSEC verdicts on forwarded answers (`spec/06` §5).
 /// REQ: FLT-006, OBS-005 (ADR-183) — the MAC table by source: the kernel's neighbor table, and
 /// the bindings the routers report (this node's, other full members'), with the ones withheld.
-fn render_mac_table(w: &mut PromWriter, macs: &telltale_policy::Neighbors) {
+/// One table for the whole scrape: the counts are of one table, not of two swapped between them.
+fn render_mac_table(w: &mut PromWriter, neighbors: &telltale_policy::Neighbors) {
+    let macs = neighbors.table();
     w.family(
         "telltale_neighbors",
         "gauge",
         "Entries from the kernel's neighbor table (ARP/NDP), read every neighbor_refresh_secs while [clients] neighbor_table is on.",
     )
-    .sample("telltale_neighbors", &[], macs.kernel_len());
+    .sample("telltale_neighbors", &[], macs.kernel());
     w.family(
         "telltale_router_macs",
         "gauge",
         "Address-to-MAC bindings in use that routers report, by whose router (router: this node's, peer: other full cluster members'). They enter the table only while a [[client]] matches by MAC address and [clients] router_macs is on.",
     )
-    .sample(
-        "telltale_router_macs",
-        &[("source", "router")],
-        macs.router_len(),
-    )
-    .sample("telltale_router_macs", &[("source", "peer")], macs.peer_len());
+    .sample("telltale_router_macs", &[("source", "router")], macs.router())
+    .sample("telltale_router_macs", &[("source", "peer")], macs.peer());
     w.family(
         "telltale_router_macs_unsure",
         "gauge",
         "Router bindings withheld from identifying a device: this node's own that are not sure, addresses other members withdrew or disagree on, and MACs reported at more than one address.",
     )
-    .sample("telltale_router_macs_unsure", &[], macs.unsure_len());
+    .sample("telltale_router_macs_unsure", &[], macs.unsure());
 }
 
+/// REQ: DNS-011 — DNSSEC verdicts on forwarded answers (`spec/06` §5).
 fn render_dnssec(w: &mut PromWriter, s: &telltale_upstream::dnssec::Stats) {
     use std::sync::atomic::Ordering::Relaxed;
     let name = "telltale_dnssec_validation_total";
