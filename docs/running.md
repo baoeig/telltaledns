@@ -1636,8 +1636,12 @@ Handled before anything else (each can be turned off under `[special]`):
 | `use-application-dns.net` | NXDOMAIN | stops Firefox from silently switching to its own DoH (`block_firefox_canary`) |
 | CHAOS class (`version.bind`, …) | REFUSED | no fingerprinting (`refuse_chaos`) |
 | reverse lookups for private IPs | NXDOMAIN | never leaks your LAN layout to public resolvers, unless a local record or a `[[route]]` covers it (`private_ptr_nxdomain`) |
+| `resolver.arpa`, `_dns.resolver.arpa`, … | NOERROR, no records | encrypted-DNS discovery (RFC 9462): answered here, never forwarded, unless a local record or a `[[route]]` covers it (`resolver_arpa`) |
 
 `.local` names are passed through unchanged (many Active Directory domains use them; route them with `[[route]]`).
+
+`_dns.resolver.arpa` is the name a device asks to find an encrypted resolver (DDR). RFC 9462 says a resolver answers it itself, so TelltaleDNS doesn't pass it to your upstreams: their own answer, about their own encrypted endpoints, can't be validated (`[dnssec] mode = "validate"` would answer SERVFAIL). The answer says there's no encrypted endpoint to discover, and the device keeps asking TelltaleDNS as before. TelltaleDNS doesn't advertise encrypted endpoints of its own there yet.
+- **`[special] resolver_arpa`** (default `true`) turns this off: the name is forwarded again. It's shared by the cluster and applies without a restart. Set it to `false` only after every node is upgraded: an older replica refuses a shared configuration that has it (`shared configuration: unknown field …`; it keeps serving the last one it had), and an older build won't start with it in its own file. At the default the setting isn't written into what the primary shares, so older nodes aren't affected.
 
 ## Routing (conditional forwarding)
 ```toml

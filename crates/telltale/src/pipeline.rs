@@ -1492,9 +1492,10 @@ impl Pipeline {
         let orig = req.to_vec();
         let target = *target;
         let transport = meta.transport;
-        // A private reverse name stays local (RFC 6303), as when asked directly (T9.10).
+        // A private reverse name stays local (RFC 6303), as when asked directly (T9.10); so does
+        // a name in `resolver.arpa` (DNS-019, ADR-187).
         let special = telltale_policy::classify(&tq, &self.state.load().policy.special)
-            .filter(|s| *s == Special::PrivatePtr);
+            .filter(|s| matches!(s, Special::PrivatePtr | Special::LocallyServed));
         match self.resolve_or_defer(&treq, &tq, special, groups, who, meta, out, start, oc) {
             Response::Ready(n) => {
                 let resp = out[..n].to_vec();
@@ -1655,6 +1656,12 @@ impl Pipeline {
         // Private reverse lookups stay local unless a route explicitly forwards them (RFC 6303).
         if special == Some(Special::PrivatePtr) && !selection.is_some_and(|s| s.routed) {
             return self.simple(&q, out, rcode::NXDOMAIN, None, meta);
+        }
+        // REQ: DNS-019 (ADR-187) — RFC 9462 §6.4: `resolver.arpa` is a locally served zone:
+        // NOERROR with no records (no AD; never cached, validated or forwarded), unless a route
+        // explicitly forwards it (§6.1).
+        if special == Some(Special::LocallyServed) && !selection.is_some_and(|s| s.routed) {
+            return self.simple(&q, out, rcode::NOERROR, None, meta);
         }
         let Some(sel) = selection else {
             // No upstream group applies (none configured): we can't resolve this.
@@ -4788,6 +4795,128 @@ groups = ["kids"]
             ),
             (1, 1)
         );
+    }
+
+    /// REQ: DNS-019 (ADR-187, GitHub issue #77) — RFC 9462 §6.4: `resolver.arpa` is a locally
+    /// served zone. `_dns.resolver.arpa` (SVCB and A) and the apex get NOERROR with no records and
+    /// no AD, from a validating client too, and the upstream isn't asked. Before, it was forwarded,
+    /// and a forwarder answers it from its own data, which can never validate (the signed `arpa.`
+    /// zone denies `resolver.arpa`). Local records still answer first, as for private reverse
+    /// names; a rewrite to a name in it stays local too; a `[[route]]` for it forwards it (§6.1:
+    /// the owner's choice); and `[special] resolver_arpa = false` forwards it as before.
+    #[tokio::test]
+    async fn dns_019_resolver_arpa_answered_locally_in_pipeline() {
+        use std::sync::atomic::Ordering;
+
+        /// `(rcode, answers, AD)` when answered here; `None` when forwarded (its answer awaited).
+        async fn ask(p: &Arc<Pipeline>, name: &str, qtype: u16) -> Option<(u16, u16, bool)> {
+            let mut buf = [0u8; 512];
+            let n = NameBuf::from_presentation(name).unwrap();
+            let edns = EdnsOut {
+                udp_payload: 1232,
+                dnssec_ok: true,
+                ede: None,
+            };
+            let len = build_query(&mut buf, 9, &n, qtype, 1, true, Some(edns)).unwrap();
+            buf[3] |= 0x20; // AD: a validating stub asks for it
+            let meta = RequestMeta {
+                peer: "192.168.1.20:1000".parse().unwrap(),
+                local: None,
+                transport: Transport::Udp,
+                client_id: None,
+            };
+            let mut out = [0u8; 4096];
+            match Handler(Arc::clone(p)).handle(&buf[..len], &meta, &mut out) {
+                Response::Ready(l) => {
+                    let s = summarize(&out[..l]).unwrap();
+                    Some((s.rcode, s.answers, out[3] & 0x20 != 0))
+                }
+                Response::Deferred(f) => {
+                    assert!(f.await.is_some(), "{name}: the upstream answered");
+                    None
+                }
+                Response::Drop | Response::Close => panic!("{name}: no answer at all"),
+            }
+        }
+
+        let (public, at_public) = counting_upstream().await;
+        let (chosen, at_chosen) = counting_upstream().await;
+        let base = format!(
+            "[[upstream]]\nname = \"public\"\nurl = \"udp://{public}\"\n\
+             [[upstream_group]]\nname = \"default\"\nmembers = [\"public\"]\n\
+             [[record]]\nname = \"mine.resolver.arpa\"\ntype = \"A\"\nvalue = \"192.168.1.53\"\n\
+             [[group]]\nname = \"default\"\n\
+             rewrite = [{{ domain = \"ddr.example\", answer = \"_dns.resolver.arpa\" }}]\n"
+        );
+        let build = |extra: &str| {
+            let cfg = telltale_config::Loader::new()
+                .toml_str("t.toml", format!("{base}{extra}"))
+                .env(Vec::<(String, String)>::new())
+                .load()
+                .unwrap()
+                .config;
+            let (local, report) = telltale_policy::LocalData::from_config(&cfg);
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            Pipeline::new(
+                Settings::default(),
+                Arc::new(Cache::new(CachePolicy::default())),
+                Arc::new(Router::from_config(&cfg).unwrap()),
+                Policy::from_config(&cfg, local),
+            )
+        };
+        let asked = || {
+            (
+                at_public.load(Ordering::SeqCst),
+                at_chosen.load(Ordering::SeqCst),
+            )
+        };
+
+        let p = build("");
+        for (name, qtype) in [
+            ("_dns.resolver.arpa", rtype::SVCB),
+            ("_dns.resolver.arpa", rtype::A),
+            ("resolver.arpa", rtype::A),
+        ] {
+            assert_eq!(
+                ask(&p, name, qtype).await,
+                Some((rcode::NOERROR, 0, false)),
+                "{name} type {qtype}: answered here with no records and no AD (upstream asked {} time(s))",
+                asked().0
+            );
+        }
+        assert_eq!(asked(), (0, 0), "the upstream wasn't asked");
+        // Local data answers first.
+        assert_eq!(
+            ask(&p, "mine.resolver.arpa", rtype::A).await,
+            Some((rcode::NOERROR, 1, false))
+        );
+        // A rewrite to a name in it: the CNAME, and the target stays local.
+        assert_eq!(
+            ask(&p, "ddr.example", rtype::A).await,
+            Some((rcode::NOERROR, 1, false))
+        );
+        assert_eq!(asked(), (0, 0));
+        // An ordinary name still goes upstream (the counter counts).
+        assert_eq!(ask(&p, "example.com", rtype::A).await, None);
+        assert_eq!(asked(), (1, 0));
+
+        // RFC 9462 §6.1: a route the owner chose forwards it.
+        let routed = build(&format!(
+            "[[upstream]]\nname = \"chosen\"\nurl = \"udp://{chosen}\"\n\
+             [[upstream_group]]\nname = \"ddr\"\nmembers = [\"chosen\"]\n\
+             [[route]]\nmatch_suffix = [\"resolver.arpa\"]\nupstream_group = \"ddr\"\n"
+        ));
+        assert_eq!(
+            ask(&routed, "_dns.resolver.arpa", rtype::SVCB).await,
+            None,
+            "routed: forwarded"
+        );
+        assert_eq!(asked(), (1, 1));
+
+        // Off: forwarded to the default group, as before.
+        let off = build("[special]\nresolver_arpa = false\n");
+        assert_eq!(ask(&off, "_dns.resolver.arpa", rtype::SVCB).await, None);
+        assert_eq!(asked(), (2, 1));
     }
 
     /// REQ: DNS-007 — with `stale_answer_client_timeout_ms = 0`, an expired entry is answered

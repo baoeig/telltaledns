@@ -349,6 +349,27 @@ fn obs_024_route_changes_and_no_op_changes() {
     assert_eq!(mode(&lab.current, &alerts), Mode::NotApplicable);
 }
 
+// REQ: DNS-019, OBS-024 (ADR-187) — the simulation decides `resolver.arpa` as the pipeline does:
+// with `[special] resolver_arpa` turned off, the logged `_dns.resolver.arpa` queries are forwarded
+// instead of answered here (a changed answer); the other names are unchanged.
+#[test]
+fn dns_019_turning_resolver_arpa_off_is_a_changed_answer() {
+    let _s = serial();
+    let lab = Lab::new("");
+    lab.log("_dns.resolver.arpa", 7, 6, t0_s(), false);
+    lab.log("www.example", 7, 4, t0_s() - 50, false);
+    let s = lab
+        .simulate(lab.candidate("[special]\nresolver_arpa = false\n"))
+        .finish(None);
+    assert_eq!(s.rows, 10);
+    assert_eq!(s.changed_answer.queries, 6);
+    assert_eq!(s.unchanged, 4);
+    assert_eq!(
+        s.newly_blocked.queries + s.newly_allowed.queries + s.changed_route.queries,
+        0
+    );
+}
+
 // REQ: OBS-024 — AC (2): only lists the change adds or edits are compiled, into the side
 // snapshot; the serving snapshot is untouched, and its old version of an edited (or
 // removed) list no longer takes part.

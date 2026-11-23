@@ -3770,6 +3770,10 @@
           "description": "CHAOS-class `version.bind`, `id.server`, ... → REFUSED.",
           "type": "boolean",
           "default": true
+        },
+        "resolver_arpa": {
+          "description": "REQ: DNS-019 (ADR-187) — `resolver.arpa` and the names below it, such as\n`_dns.resolver.arpa` (encrypted-DNS discovery, RFC 9462) → NOERROR with no records, never\nforwarded (RFC 9462 §6.4: a locally served zone), unless a local record or a route covers\nthem. On by default. The cluster shares it, and it is not written while it is on: set it to\n`false` only once every node runs this version (an older node refuses the key).",
+          "type": "boolean"
         }
       },
       "additionalProperties": false

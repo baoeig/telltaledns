@@ -161,6 +161,8 @@ fn flt_013_explain_agrees_with_the_pipeline() {
         "nas.home.arpa",
         "host.corp.example",
         "localhost",
+        // REQ: DNS-019 (ADR-187) — answered here, not forwarded.
+        "_dns.resolver.arpa",
     ];
     for client in ["10.0.0.5", "10.0.0.9", "192.0.2.1"] {
         for name in names {
@@ -188,6 +190,22 @@ fn flt_013_explain_agrees_with_the_pipeline() {
             }
         }
     }
+}
+
+// REQ: DNS-019, FLT-013 (ADR-187) — explain says what the pipeline does with `resolver.arpa`:
+// answered here with no records, and forwarded when a route covers it.
+#[test]
+fn dns_019_explain_says_resolver_arpa_is_answered_here() {
+    let (p, sources) = setup();
+    let e = ask(&p, &sources, "_dns.resolver.arpa", "10.0.0.9");
+    assert_eq!(e.outcome, Outcome::Special, "{}", e.summary);
+    assert!(e.summary.contains("RFC 9462"), "{}", e.summary);
+    assert!(e.route.is_none(), "not forwarded");
+    let (p, sources) =
+        setup_with("[[route]]\nmatch_suffix = [\"resolver.arpa\"]\nupstream_group = \"lan\"\n");
+    let e = ask(&p, &sources, "_dns.resolver.arpa", "10.0.0.9");
+    assert_eq!(e.outcome, Outcome::Resolved, "{}", e.summary);
+    assert_eq!(e.route.as_ref().unwrap().group, "lan");
 }
 
 #[test]

@@ -1533,3 +1533,48 @@ fn flt_006_router_macs_default_on_and_not_written() {
     let errs = load_str("[clients]\nrouter_mac = false\n").unwrap_err();
     assert_eq!(errs.len(), 1, "{errs:?}");
 }
+
+/// REQ: DNS-019, CLU-010 (ADR-187) — `[special] resolver_arpa`: on unless set, `false` is read and
+/// written, and the default is not written back, so a node on an older build (the section refuses
+/// fields it doesn't know) still reads the shared configuration.
+#[test]
+fn dns_019_resolver_arpa_default_on_and_not_written() {
+    let special = |toml: &str| load_str(toml).unwrap().config.special;
+    let written = |s: &telltale_config::SpecialConfig| serde_json::to_value(s).unwrap();
+
+    let default = special("");
+    assert!(default.resolver_arpa);
+    assert!(
+        written(&default).get("resolver_arpa").is_none(),
+        "{default:?}"
+    );
+    assert!(
+        serde_json::to_value(Config::default()).unwrap()["special"]
+            .get("resolver_arpa")
+            .is_none()
+    );
+
+    // Other `[special]` settings leave it on, and still don't write it.
+    let other = special("[special]\nrefuse_chaos = false\n");
+    assert!(other.resolver_arpa);
+    assert!(written(&other).get("resolver_arpa").is_none());
+    let on = special("[special]\nresolver_arpa = true\n");
+    assert!(on.resolver_arpa);
+    assert!(
+        written(&on).get("resolver_arpa").is_none(),
+        "on is the default"
+    );
+
+    // Off is written, and reads back as off.
+    let off = special("[special]\nresolver_arpa = false\n");
+    assert!(!off.resolver_arpa);
+    let text = written(&off);
+    assert_eq!(text["resolver_arpa"], false);
+    let back: telltale_config::SpecialConfig = serde_json::from_value(text).unwrap();
+    assert!(!back.resolver_arpa);
+
+    // A typo or a wrong type is still an error.
+    let errs = load_str("[special]\nresolver_arpas = false\n").unwrap_err();
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(load_str("[special]\nresolver_arpa = \"no\"\n").is_err());
+}
