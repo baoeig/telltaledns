@@ -544,6 +544,36 @@ async fn ups_006_servfail_is_an_answer_not_a_dead_upstream() {
     assert_eq!(dead.health.snapshot().breaker, Breaker::Open);
 }
 
+/// REQ: UPS-006 (ADR-013) — members with a `timeout_ms` under the hedge delay's 20 ms floor
+/// answer the first lookup through them (no latency measured yet), in groups of one and two
+/// and with each kind of first launch.
+#[tokio::test]
+async fn ups_006_short_timeout_member_answers_a_first_miss() {
+    let addr = fake(HEALTHY).await;
+    let short = |id: u16| {
+        let ep = Endpoint::parse(&format!("udp://{addr}")).unwrap();
+        Arc::new(Upstream::new(id, format!("u{id}"), ep, Duration::from_millis(10), 1).unwrap())
+    };
+    for strategy in [
+        Strategy::Failover,
+        Strategy::Fastest,
+        Strategy::Parallel { fanout: 2 },
+    ] {
+        for n in [1, 2] {
+            let g = Group::new("short", (1..=n).map(short).collect(), strategy);
+            let ans = g
+                .resolve(question("x.example"), Duration::from_secs(2))
+                .await
+                .unwrap();
+            assert_eq!(
+                summarize(&ans.bytes).unwrap().rcode,
+                rcode::NOERROR,
+                "{strategy:?}, {n} members"
+            );
+        }
+    }
+}
+
 /// REQ: DNS-015 (T9.9) — `ecs = "client"`: the query carries the client's /24, and a
 /// question without a subnet (a private client) carries none.
 #[tokio::test]

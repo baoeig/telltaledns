@@ -806,12 +806,14 @@ impl Upstream {
     }
 
     /// How long to wait before hedging to the next upstream (ADR-013): about 3 × EWMA,
-    /// bounded to [20 ms, attempt timeout]; 100 ms until there is data.
+    /// bounded to [20 ms, attempt timeout]; 100 ms until there is data. The attempt timeout
+    /// wins: with a `timeout_ms` under 20 ms, the hedge delay is the attempt timeout.
     pub fn hedge_delay(&self) -> Duration {
         let d = self.health.ewma().map_or(Duration::from_millis(100), |e| {
             e * 3 + Duration::from_millis(10)
         });
-        d.clamp(Duration::from_millis(20), self.attempt_timeout())
+        // REQ: UPS-006 — the floor first, then the attempt timeout, which wins if it's lower.
+        d.max(Duration::from_millis(20)).min(self.attempt_timeout())
     }
 
     /// Open pooled connections (TCP/DoT), for tests and metrics.
@@ -1115,6 +1117,29 @@ mod tests {
         let len = encode_query(&q, 7, &mut buf).unwrap();
         let parsed = telltale_proto::parse_query(&buf[..len]).unwrap();
         assert!(parsed.edns.unwrap().client_subnet().is_none());
+    }
+
+    /// REQ: UPS-006 (ADR-013) — the hedge delay stays within [20 ms, attempt timeout] for every
+    /// `timeout_ms` the config accepts; under 20 ms the attempt timeout is the bound that holds.
+    #[test]
+    fn ups_006_short_timeout_hedge_delay_does_not_panic() {
+        const MS: Duration = Duration::from_millis(1);
+        for ms in [1, 10, 19, 20, 21] {
+            // TEST-NET-1 (RFC 5737): nothing is sent to it.
+            let ep = Endpoint::parse("udp://192.0.2.1:53").unwrap();
+            let up = Upstream::new(1, "short", ep, ms * MS, 1).unwrap();
+            // No latency measured yet: 100 ms, bounded by the attempt timeout (`timeout_ms`).
+            assert_eq!(up.attempt_timeout(), ms * MS);
+            assert_eq!(up.hedge_delay(), ms * MS, "timeout_ms = {ms}, no data");
+            // Measured at 1 ms: 3 × 1 + 10 = 13 ms, raised to 20 ms, then bounded by the
+            // attempt timeout.
+            up.health.record(true, MS, Instant::now());
+            assert_eq!(
+                up.hedge_delay(),
+                (20 * MS).min(ms * MS),
+                "timeout_ms = {ms}, measured"
+            );
+        }
     }
 
     /// REQ: OBS-020 (T11.3) — a self-probe carries no loop tag, so this node's own listener
