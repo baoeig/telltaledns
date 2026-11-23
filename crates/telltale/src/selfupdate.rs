@@ -35,6 +35,23 @@ pub(crate) const VERSION_WAIT: Duration = Duration::from_secs(10);
 /// pause between the tries is. Nothing else is tried again.
 const EXEC_TRIES: u32 = 5;
 const EXEC_PAUSE: Duration = Duration::from_millis(100);
+
+/// REQ: OPS-004, OPS-014 — the most the pauses between those tries add to `runs` bounded runs
+/// (each one is started, tried again while "text file busy", and only then waited for), in whole
+/// seconds, rounded up. Part of the root update service's time budget
+/// (`node_update::run_budget_secs`), so raising [`EXEC_TRIES`] or [`EXEC_PAUSE`] can't quietly use
+/// up the room the unit's `TimeoutStartSec=` leaves.
+#[cfg(test)]
+pub(crate) const fn exec_retry_secs(runs: u32) -> u64 {
+    let pauses = EXEC_PAUSE
+        .saturating_mul(EXEC_TRIES.saturating_sub(1))
+        .saturating_mul(runs);
+    if pauses.subsec_nanos() == 0 {
+        pauses.as_secs()
+    } else {
+        pauses.as_secs() + 1
+    }
+}
 /// How long `systemctl restart telltale` is waited for: twice the node unit's `TimeoutStopSec=30`
 /// (a graceful drain, then systemd's SIGKILL), so the old process is gone by then. The restart
 /// itself goes on if it takes longer, and neither that nor a non-zero exit fails the build: the
