@@ -83,6 +83,19 @@ A summary comes before anything is installed. The answers become `/etc/telltale/
 
 Re-running it upgrades the binary in place. `sudo telltale self-update --restart` does the same check-and-swap from the binary itself (`--channel edge` for builds from main, `--check` to only look): it verifies the signature with the release key built into the binary and the binary's SHA-256, test-runs the download, swaps it in atomically, and keeps the previous binary as `telltale.old`. In containers it refuses (pull a new image instead). `--to 0.8.0` installs that version only, from its own release page (older than the running one too: that's how to go back), and `--to 0.8.0-edge.393` an edge build while it is still the newest on the edge channel (edge binaries are replaced on every build, so an older one can't be downloaded); the release's signed `releases.json` must name the version and list the same checksum. To let the cluster upgrade the node for you, see [Upgrading from the cluster](#upgrading-from-the-cluster) (`install.sh --cluster-updates`).
 
+### Try this fork on an existing native install
+
+Run [`deploy/systemd/replace-with-fork.sh`](../deploy/systemd/replace-with-fork.sh) with
+`sudo sh` on the Linux host that runs the standard `install.sh` service. It downloads and
+verifies a prebuilt binary for x86-64, ARM64, or ARMv7. It checks the existing configuration,
+backs up the old binary and application state under `/var/backups/telltale`, then replaces
+the binary and restarts the same service. A failed restart or readiness check puts the old
+binary back. For a custom health endpoint, pass `--health-url URL`.
+
+The configuration, data directory, and systemd unit stay in place. Open **Filtering & DNS →
+DNS Routes** to manage subscriptions. Future runs of the official updater install an official
+build again.
+
 **Uninstalling:** `sudo sh install.sh --uninstall` stops and disables the service and removes its unit and the binary (`telltale.old` too).
 - **The system resolver:** if the install turned off systemd-resolved's stub listener, it asks to restore it (the default). `/etc/resolv.conf` is put back as the install found it (the install records the link it replaced, or keeps a copy of the file), and systemd-resolved is restarted, so the machine resolves names again without TelltaleDNS. Without a terminal or with `--yes` it restores without asking; `--keep-resolver` leaves it as the install set it. Installs from before this was recorded get the usual stub link (`/run/systemd/resolve/stub-resolv.conf`).
 - **Config and data** (`/etc/telltale`, `/var/lib/telltale`: users, query log, lists) are kept, so a later install picks them up. It asks whether to delete them; `--purge` deletes them and the `telltale` user without asking.

@@ -2971,3 +2971,11 @@ Revisit if a profile on real hardware shows syscalls dominating at the owner's t
 Compile whole-label suffixes separately from static routes. Support the decoded AutoProxy document with or without its Base64 wrapper. Ignore URL schemes and paths when forming the suffix and treat leading `*.` as the corresponding subtree. An `@@` exception suppresses the subscription for that subtree. Skip regex, partial host wildcards and IP literals. Static routes win equal-depth matches, then subscriptions in configuration order. A refresh does no network or disk work on the query path and publishes only a parsed copy with at least one forwarding rule.
 
 **Consequences.** DNS route changes from the remote source are visible after the next successful refresh. Cluster nodes can briefly use different copies, and a node without a cache keeps serving existing routes while the source is unreachable.
+
+## ADR-184 — Replace a native installation with a fork build (Proposed)
+
+**Context.** The standard native installer verifies upstream releases with the upstream signing key. A fork build for an existing installation needs a separate way to install a particular commit.
+
+**Decision.** Put the fork binaries and checksums on a separate distribution branch. Pin its full commit in the replacement script. Validate the staged binary as the existing service user, save the old binary and an application backup, and atomically rename the new executable in place. Restart the standard unit and put back the old binary if startup fails.
+
+**Consequences.** This path uses the existing service and data folder. The official signed update channel remains available through its own tools. The application backup excludes query logs, which stay in the live data folder.

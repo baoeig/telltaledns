@@ -101,6 +101,14 @@ sudo telltale self-update --to 0.8.0 --restart    # one version (older ones too)
   </div>
 </section>
 
+<section id="fork-native">
+  <h2>Try the fork on a native install</h2>
+  <p>On a Linux host with the standard <code>install.sh</code> service, the
+    <a href="https://github.com/baoeig/telltaledns/blob/codex/gfwlist-dns-routes/deploy/systemd/replace-with-fork.sh">fork replacement script</a>
+    downloads the matching build, backs up the installed binary and application state, and swaps the binary in place.
+    If the new process fails its readiness check, the script starts the previous binary again.</p>
+</section>
+
 <section id="cluster">
   <h2>Upgrade a cluster</h2>
   <ol class="steps">
