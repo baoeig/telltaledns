@@ -1671,13 +1671,14 @@ The chain is otherwise unchanged: client ID → EDNS MAC from a trusted forwarde
 - Where the table maps an address to a named device's MAC, that device wins over a `[[client]]` keyed by the exact IP, as a kernel entry already does. Where the binding is withheld (below), the exact-IP device wins again.
 
 **A router binding is withheld** when any of these holds:
-- **Offline, unparsable or non-unicast:** the client isn't connected (ADR-166), or its MAC doesn't parse, is all zero, or is multicast.
+- **Offline:** the client isn't connected (ADR-166). It gives no binding and withholds nothing.
+- **A MAC that can't identify:** a connected client whose MAC is empty, doesn't parse, is all zero or is multicast withholds its address, as an `unsure` one does (a tombstone, below), on this node and, for a member's lease, on every node: otherwise a member's router could fill the address with a named device's MAC (two sites reusing a range). The node says once per router, in the log, that its rows carry such MACs and that the fallback (the device is recognized by its address or network) is by design.
 - **`unsure`:** this node marks a binding `unsure` when:
   - its fresh routers, or two rows of one router, give one address different MACs (compared as parsed bytes);
   - they place one MAC at two or more addresses (a range extender or bridge that shares its MAC);
   - UniFi gave a connected client's address from `last_ip` or `fixed_ip` rather than `ip`;
   - the router hasn't answered for **15 minutes**.
-- **Tombstone:** an address this node marks `unsure` can't be filled by any lower source. The kernel still wins.
+- **Tombstone:** an address this node withholds (`unsure`, or a MAC that can't identify) can't be filled by any lower source. The kernel still wins. A member's tombstone doesn't withhold an address this node binds itself (own routers come first); `tombstones` holds only addresses with no binding of this node's, and the count of withheld addresses (`telltale_router_macs_unsure`) is those plus the shared ones, each once.
 
 Silence is counted on a monotonic clock from the node's start (never the wall clock, which can step), with saturating arithmetic. Locally administered ("private") MACs count, and the UI says they may change. Display names keep their rules (within one router the last row still names an address; between routers the order is now fixed).
 
@@ -1686,7 +1687,7 @@ Silence is counted on a monotonic clock from the node's start (never the wall cl
 - the answer carries **`vetted`** (a new field, written by this version: an answer from an older member, whose lists lack these rules, gives no bindings);
 - the member answered within the last **15 minutes**.
 
-Any member's `unsure` lease for an address removes that address. So does a disagreement between two members, and so does one MAC at two addresses across this node's and the members' bindings.
+Any member's `unsure` lease for an address removes that address. So does a disagreement between two members, and so does one MAC at two addresses across this node's and the members' bindings: the MAC is counted over every binding and withheld lease, the addresses a node withholds included, so a MAC-sharing extender can't hide behind an address one node is unsure of.
 
 A node never passes on what it learned from others, so a stale binding lives at most one router-silence window plus one member-silence window: about 30 minutes, plus one exchange. That bound is on the *age of an answer*, not only on silence: a router read once an hour is never silent, yet what it said can be an hour old. So while a device is named by its MAC and `router_macs` is on, a node reads each of its routers at least every 15 minutes whatever the router's `interval_secs` says (also when such a device appears during a longer wait); with no device named by its MAC the pace is `interval_secs`.
 
@@ -1762,6 +1763,7 @@ REQ: FLT-006, FLT-005, API-010, CLU-002, CLU-010, OBS-005, AGT-004. Implemented 
 - Recognition by MAC in change simulations and rule-impact estimates (they identify by address, ADR-115), in anomaly mutes (a device needs an address to be muted, ADR-161), on the Clients page's device guess and in identity or rhythm reads by name, and in `telltale explain` on the command line (no routers there).
 - Sites beyond about 7,000 connected clients, where the `devices.names` answer outgrows the cluster channel's 1 MiB frame.
 - Source NAT in front of a resolver pod, rootless Docker, Podman and Docker Desktop: the address seen isn't the device's.
+- The kernel's neighbor entries in the STALE state (the host last saw the device a while ago) still beat a fresh, sure router binding for the address, and are not part of the shared-MAC count: kernel behaviour is unchanged, as the kernel's view always won.
 
 **Consequences:**
 - **What users get.** A device named by its MAC keeps its name, groups and device rules when its address changes, within one router interval plus up to a minute on the other nodes. This works with host networking, rootful Docker, Kubernetes with preserved sources (the chart's `externalTrafficPolicy: Local`), and across VLANs.
@@ -1776,6 +1778,7 @@ REQ: FLT-006, FLT-005, API-010, CLU-002, CLU-010, OBS-005, AGT-004. Implemented 
   - About 11 bytes per binding per full member that reads a router (kept whether or not a device matches by MAC).
   - A neighbor-table read every `neighbor_refresh_secs` on every node with `neighbor_table` on: new for nodes without a MAC-keyed device.
 - **Display.** Past queries are named by the device that holds the address now (names resolve when read, API-010).
+- **A member that restarts** answers `vetted` with an empty router view until its first poll, which replaces its cached bindings at once: a pod can fall back for about a minute per primary restart. This is the conservative direction (a block rule fails open and an allow rule closed for that long) and is accepted.
 - **Amended ADRs.** ADR-067's wording is amended, ADR-021's host-name deferral stays open (pointer there), and ADR-125's exchange feeds identification (pointers in those ADRs).
 - **Requirements.** `spec/01` is not edited (decided by the owner): FLT-006's "hostname" item is not delivered by this change; identification by MAC from the routers' lists is delivered by this ADR instead (`spec/10` T27.1 names it). API-010's "IP, and the MAC when known" describes the dialog's old behaviour; the dialog now offers the MAC and can store it without the IP, for the reason above.
 - **Not built:** host-name matching (DHCP host names, UniFi aliases, mDNS names, reverse DNS), a MAC in a rule's `devices`, IPv6 or OPNsense-state parsing, a per-router or per-site trust switch, MAC mutes, "seen at" addresses for a device named only by its MAC.
