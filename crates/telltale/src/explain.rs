@@ -73,6 +73,11 @@ pub(crate) struct ClientInfo {
     pub(crate) ip: IpAddr,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) mac: Option<String>,
+    /// REQ: FLT-006 (ADR-183) — where the MAC comes from: `given` (the caller named it), or the
+    /// MAC table's entry: `neighbor` (this host's kernel table), `router` (this node's router) or
+    /// `peer` (another full member's router).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) mac_from: Option<&'static str>,
     /// The configured client it was recognized as.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) device: Option<String>,
@@ -122,7 +127,18 @@ pub(crate) fn source_name(s: IdSource) -> &'static str {
     }
 }
 
-fn mac_text(m: [u8; 6]) -> String {
+/// REQ: FLT-006 (ADR-183) — the name of a MAC table source in an explanation and an identity:
+/// `neighbor` (this host's kernel table), `router` (this node's router), `peer` (another full
+/// member's router).
+pub(crate) fn mac_from_name(f: telltale_policy::MacFrom) -> &'static str {
+    match f {
+        telltale_policy::MacFrom::Kernel => "neighbor",
+        telltale_policy::MacFrom::Router => "router",
+        telltale_policy::MacFrom::Peer => "peer",
+    }
+}
+
+pub(crate) fn mac_text(m: [u8; 6]) -> String {
     format!(
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         m[0], m[1], m[2], m[3], m[4], m[5]
@@ -194,6 +210,12 @@ pub(crate) fn explain(
         client: ClientInfo {
             ip: req.client,
             mac: req.mac.or_else(|| neighbors.get(req.client)).map(mac_text),
+            // REQ: FLT-006 (ADR-183) — the caller's own MAC is `given`; else the table's source.
+            mac_from: if req.mac.is_some() {
+                Some("given")
+            } else {
+                neighbors.entry(req.client).map(|e| mac_from_name(e.from))
+            },
             device: device.clone(),
             identified_by: source_name(ident.source),
             groups: clients

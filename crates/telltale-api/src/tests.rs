@@ -270,6 +270,7 @@ impl Backend for Fake {
             client: ExplainClient {
                 ip: "127.0.0.1".into(),
                 mac: None,
+                mac_from: None,
                 device: None,
                 identified_by: "default".into(),
                 groups: vec!["default".into()],

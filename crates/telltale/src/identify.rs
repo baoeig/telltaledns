@@ -260,6 +260,7 @@ pub(crate) fn to_identity(key: &str, g: &Guess, inp: &Inputs, at_s: u64) -> Devi
         node: None,
         changed_at: None,
         previous: None,
+        recognition: None,
         evidence: Some(IdentityEvidence {
             domains: g
                 .domains
@@ -318,6 +319,7 @@ pub(crate) fn workload_identity(
         node: None,
         changed_at: None,
         previous: None,
+        recognition: None,
         evidence: Some(IdentityEvidence {
             kubernetes: Some(telltale_api::model::WorkloadEvidence {
                 workload: w.text.to_string(),
@@ -364,6 +366,7 @@ pub(crate) fn override_identity(key: &str, kind: DeviceClass, at_s: u64) -> Devi
         evidence: None,
         changed_at: None,
         previous: None,
+        recognition: None,
     }
 }
 

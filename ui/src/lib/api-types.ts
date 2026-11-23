@@ -4507,6 +4507,7 @@ export interface components {
             productId?: string | null;
             /** @description `disabled`, `privacy_level`, or `not_seen` (no queries from it in the last day). */
             reason?: string | null;
+            recognition?: components["schemas"]["DeviceRecognition"] | null;
             /**
              * Format: float
              * @description 0 to 1.
@@ -4521,6 +4522,50 @@ export interface components {
             suggestedGroup?: string | null;
             /** @description The MAC's registered vendor. */
             vendor?: string | null;
+        };
+        /**
+         * @description REQ: FLT-006, API-010 (ADR-183) — how an address is recognized on the node that answered, and
+         *     the MAC a device at that address could be named by. A device named by that MAC (`[[client]]
+         *     match = ["aa:bb:cc:dd:ee:ff"]`) is recognized wherever the MAC is seen, and so are the rules
+         *     that name it. `mac`, `macFrom` and `macShared` go only to a caller who may read the devices
+         *     (`/api/v1/clients`: a signed-in person or API token of any role, or an agent token with
+         *     `config:read` that isn't restricted to a group); anyone else gets the rest.
+         */
+        DeviceRecognition: {
+            /**
+             * @description The configured device (`[[client]]`) the address is recognized as now. Never the name a
+             *     router or mDNS gives it, and never a Kubernetes workload.
+             * @example tablet
+             */
+            device?: string | null;
+            /**
+             * @description How: `client_id`, `edns_mac`, `neighbor_mac`, `router_mac`, `kubernetes`, `ip`, `cidr`, or
+             *     `default`.
+             * @example router_mac
+             */
+            identifiedBy?: string;
+            /**
+             * @description The MAC a device at this address could be named by (`aa:bb:cc:dd:ee:ff`): the kernel's
+             *     neighbor table's, else one a router reported, when it is sure of it.
+             */
+            mac?: string | null;
+            /**
+             * @description Where `mac` comes from: `neighbor` (this node's kernel table: other nodes may not see it),
+             *     `router` (this node's router) or `peer` (another full cluster member's router).
+             * @example router
+             */
+            macFrom?: string | null;
+            /**
+             * @description True when the MAC is locally administered (a "private" Wi-Fi address the device made up):
+             *     it stays the same on a network unless the device is set to change it.
+             */
+            macRandomized?: boolean;
+            /**
+             * @description True when the routers report this MAC at more than one address (a range extender or bridge
+             *     shares it): it can't tell these devices apart, so a device named by it isn't recognized at
+             *     any of them.
+             */
+            macShared?: boolean;
         };
         /** @description REQ: OBS-034 — one device's window as lanes and events. */
         DeviceTimeline: {
@@ -4837,10 +4882,25 @@ export interface components {
             device?: string | null;
             /** @description Highest priority first. */
             groups: string[];
-            /** @description `client_id`, `edns_mac`, `neighbor_mac`, `kubernetes`, `ip`, `cidr`, or `default`. */
+            /**
+             * @description `client_id`, `edns_mac`, `neighbor_mac` (a MAC the kernel's table gave, or the request),
+             *     `router_mac` (a MAC a router reported, this node's or another full member's),
+             *     `kubernetes`, `ip`, `cidr`, or `default`.
+             */
             identifiedBy: string;
             ip: string;
+            /**
+             * @description The client's MAC address: the one the request gave, else the one this node knows for the
+             *     address. Shown only to a caller who may read the devices (`config:read` for an agent token,
+             *     not restricted to a group), unless the caller gave it.
+             */
             mac?: string | null;
+            /**
+             * @description REQ: FLT-006 (ADR-183) — where the MAC comes from: `given` (the request's), `neighbor`
+             *     (this host's kernel table), `router` (this node's router) or `peer` (another full cluster
+             *     member's router). Withheld with `mac`.
+             */
+            macFrom?: string | null;
             workload?: components["schemas"]["ExplainWorkload"] | null;
         };
         ExplainFilter: {
@@ -5572,6 +5632,7 @@ export interface components {
                 productId?: string | null;
                 /** @description `disabled`, `privacy_level`, or `not_seen` (no queries from it in the last day). */
                 reason?: string | null;
+                recognition?: components["schemas"]["DeviceRecognition"] | null;
                 /**
                  * Format: float
                  * @description 0 to 1.

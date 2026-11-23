@@ -12654,6 +12654,17 @@
             ],
             "description": "`disabled`, `privacy_level`, or `not_seen` (no queries from it in the last day)."
           },
+          "recognition": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DeviceRecognition",
+                "description": "REQ: FLT-006, API-010 (ADR-183) — how this address is recognized now, by the node that\nanswered, and the MAC a device there could be named by (`GET /api/v1/clients/{address}/identity`\nonly, for an address; left out at query-log privacy level 2 and above)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "score": {
             "type": "number",
             "format": "float",
@@ -12677,6 +12688,48 @@
               "null"
             ],
             "description": "The MAC's registered vendor."
+          }
+        }
+      },
+      "DeviceRecognition": {
+        "type": "object",
+        "description": "REQ: FLT-006, API-010 (ADR-183) — how an address is recognized on the node that answered, and\nthe MAC a device at that address could be named by. A device named by that MAC (`[[client]]\nmatch = [\"aa:bb:cc:dd:ee:ff\"]`) is recognized wherever the MAC is seen, and so are the rules\nthat name it. `mac`, `macFrom` and `macShared` go only to a caller who may read the devices\n(`/api/v1/clients`: a signed-in person or API token of any role, or an agent token with\n`config:read` that isn't restricted to a group); anyone else gets the rest.",
+        "properties": {
+          "device": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The configured device (`[[client]]`) the address is recognized as now. Never the name a\nrouter or mDNS gives it, and never a Kubernetes workload.",
+            "example": "tablet"
+          },
+          "identifiedBy": {
+            "type": "string",
+            "description": "How: `client_id`, `edns_mac`, `neighbor_mac`, `router_mac`, `kubernetes`, `ip`, `cidr`, or\n`default`.",
+            "example": "router_mac"
+          },
+          "mac": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The MAC a device at this address could be named by (`aa:bb:cc:dd:ee:ff`): the kernel's\nneighbor table's, else one a router reported, when it is sure of it."
+          },
+          "macFrom": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where `mac` comes from: `neighbor` (this node's kernel table: other nodes may not see it),\n`router` (this node's router) or `peer` (another full cluster member's router).",
+            "example": "router"
+          },
+          "macRandomized": {
+            "type": "boolean",
+            "description": "True when the MAC is locally administered (a \"private\" Wi-Fi address the device made up):\nit stays the same on a network unless the device is set to change it."
+          },
+          "macShared": {
+            "type": "boolean",
+            "description": "True when the routers report this MAC at more than one address (a range extender or bridge\nshares it): it can't tell these devices apart, so a device named by it isn't recognized at\nany of them."
           }
         }
       },
@@ -13503,7 +13556,7 @@
           },
           "identifiedBy": {
             "type": "string",
-            "description": "`client_id`, `edns_mac`, `neighbor_mac`, `kubernetes`, `ip`, `cidr`, or `default`."
+            "description": "`client_id`, `edns_mac`, `neighbor_mac` (a MAC the kernel's table gave, or the request),\n`router_mac` (a MAC a router reported, this node's or another full member's),\n`kubernetes`, `ip`, `cidr`, or `default`."
           },
           "ip": {
             "type": "string"
@@ -13512,7 +13565,15 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "The client's MAC address: the one the request gave, else the one this node knows for the\naddress. Shown only to a caller who may read the devices (`config:read` for an agent token,\nnot restricted to a group), unless the caller gave it."
+          },
+          "macFrom": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "REQ: FLT-006 (ADR-183) — where the MAC comes from: `given` (the request's), `neighbor`\n(this host's kernel table), `router` (this node's router) or `peer` (another full cluster\nmember's router). Withheld with `mac`."
           },
           "workload": {
             "oneOf": [
@@ -15371,6 +15432,17 @@
                     "null"
                   ],
                   "description": "`disabled`, `privacy_level`, or `not_seen` (no queries from it in the last day)."
+                },
+                "recognition": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/DeviceRecognition",
+                      "description": "REQ: FLT-006, API-010 (ADR-183) — how this address is recognized now, by the node that\nanswered, and the MAC a device there could be named by (`GET /api/v1/clients/{address}/identity`\nonly, for an address; left out at query-log privacy level 2 and above)."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 },
                 "score": {
                   "type": "number",

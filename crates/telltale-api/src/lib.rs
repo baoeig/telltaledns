@@ -1923,6 +1923,7 @@ async fn explain(
     let mut e = blocking(move || b.explain(&p)).await?;
     if !shows_macs && !gave_mac {
         e.client.mac = None;
+        e.client.mac_from = None;
     }
     Ok(Json(e))
 }
