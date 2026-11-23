@@ -1683,15 +1683,19 @@ The chain is otherwise unchanged: client ID → EDNS MAC from a trusted forwarde
 Silence is counted on a monotonic clock from the node's start (never the wall clock, which can step), with saturating arithmetic. Locally administered ("private") MACs count, and the UI says they may change. Display names keep their rules (within one router the last row still names an address; between routers the order is now fixed).
 
 **Across the cluster.** A node takes other members' bindings from their `devices.names` answers (ADR-125) only when all of these hold:
-- the answer is from a **full member**: the cluster's primary (it is one whether or not this node's copy of the registry has arrived yet: a replica's first round can come before it), or a node listed in the registry and not ephemeral (ADR-143; a resolver pod holds no router keys, ADR-120);
+- the answer is from a **full member**: a node the member registry lists and that is not ephemeral (ADR-143; a resolver pod holds no router keys, ADR-120). Nothing a peer says about itself counts: its Hello's `primary` flag is a claim any node with a valid certificate can make, and the rest of the cluster code refuses it too (a fix round, 2026-11-23, took out a first version of this ADR's exception for "the primary"). A replica's first round can come before its copy of the registry is written; the answer is then not used and the quick retry (below) goes on until the registry lists the answerer, a few seconds;
 - the answer carries **`vetted`** (a new field, written by this version: an answer from an older member, whose lists lack these rules, gives no bindings);
 - the member answered within the last **15 minutes**.
 
-Any member's `unsure` lease for an address removes that address. So does a disagreement between two members, and so does one MAC at two addresses across this node's and the members' bindings: the MAC is counted over every binding and withheld lease, the addresses a node withholds included, so a MAC-sharing extender can't hide behind an address one node is unsure of.
+An answer from a member that is not `vetted` (a member rolled back to an earlier build) also removes that member's bindings kept so far, at once.
 
-A node never passes on what it learned from others, so a stale binding lives at most one router-silence window plus one member-silence window: about 30 minutes, plus one exchange. That bound is on the *age of an answer*, not only on silence: a router read once an hour is never silent, yet what it said can be an hour old. So while a device is named by its MAC and `router_macs` is on, a node reads each of its routers at least every 15 minutes whatever the router's `interval_secs` says (also when such a device appears during a longer wait); with no device named by its MAC the pace is `interval_secs`.
+Any member's `unsure` lease for an address removes that address. So does a disagreement between two members, and so does one MAC at two addresses across this node's and the members' bindings. The MAC is counted over every binding and every withheld lease, in this node's view and in the members': an address a node withholds, and an address two members disagree about, still count the MAC they gave there, so a MAC-sharing extender can't hide behind an address one node is unsure of. The one exception, conservative: the leases of a router this node has marked stale (silent for 15 minutes) are marked `unsure` as they are, and their MACs are counted as they were last reported (the count is not reduced for a stale or dead router), so a device that moved while such a router stayed configured is withheld until the router answers or is removed.
 
-Until a full member that reads a router (its answer is `vetted` and carries router leases) has answered, or the reachable primary has, a node asks every 5 seconds for at most 2 minutes, then once a minute as before: a full replica without the router's key may answer first, and its empty answer doesn't end the retry.
+A node never passes on what it learned from others, so a stale binding lives at most one router-silence window plus one member-silence window: about 30 minutes, plus one exchange. That bound is on the *age of an answer*, not only on silence: a router read once an hour is never silent, yet what it said can be an hour old. So while a device is named by its MAC and `router_macs` is on, a node reads each of its routers at least every 10 minutes (600 s) whatever the router's `interval_secs` says (also when such a device appears during a longer wait): a read that fails is asked again every 15 seconds, well inside the 15 minutes after which an answer is stale. With no device named by its MAC the pace is `interval_secs`. Two nodes that read one router (the high-availability setup) poll out of phase, so a device that has just moved can be withheld on both until both have polled: one MAC then sits at two addresses in their combined view.
+
+**Who hears whom.** A node asks only the members it has a direct stream to, and a member's answer carries only what its own routers said. Replicas dial the primary and voters link to each other; a resolver pod connects to the primary alone. So a router read by a replica reaches the primary and the other voters, not the resolver pods: a pod gets the primary's own router view. The router's key therefore belongs on the primary, and, for a failover, on the node that would be promoted. Relaying members' bindings to pods would lengthen the age bound (ephemeral members' own answers are never used), and is left for later.
+
+The quick retry: a node asks every 5 seconds for at most 2 minutes, then once a minute as before, until an answer is *kept* (from a full member, `vetted`) and carries router leases: the empty answer of a full replica without the router's key, the primary's own answer before its first read of its router, and an answer that is not used (a registry that has not arrived, an ephemeral or unlisted node) don't end it. A cluster with no router anywhere pays about 24 small calls in those two minutes.
 
 `Lease.unsure` and `Names.vetted` are written only when true: a node on an earlier build ignores both and reads the same form. ADR-125's display names are unchanged.
 
@@ -1715,14 +1719,15 @@ On the query path: the same one atomic load and one hash lookup as before, and o
 - `device`: the configured device the address is recognized as now;
 - `identifiedBy`: how;
 - `mac`, `macFrom` (`neighbor`, `router` or `peer`), `macShared`: the MAC a device there could be named by;
-- `macRandomized`: the MAC is locally administered.
+- `macRandomized`: the MAC is locally administered. It is kept for every caller who may read identities, with `device` and `identifiedBy`, including one who may not read MACs: one bit (the address has a made-up MAC), which names no device and no MAC.
 
 How it is built:
 - It is the answering node's own view (set after the federated merge).
 - It is computed in the request from the table and the same withholding rules, with no kernel read in the request.
 - It is left out at query-log privacy level 2 and above.
-- `mac`, `macFrom` and `macShared` are given only to a caller who may read `/api/v1/clients` (which already shows MAC keys): signed-in users and API tokens of any role, and agent tokens with `config:read` not restricted to a group. Others get `recognition` without them.
-- Explain follows the same rule for `client.mac` (unless the caller gave it) and its new `macFrom`. It reports `identifiedBy: router_mac`.
+- `mac`, `macFrom` and `macShared` are given only to a caller who may read `/api/v1/clients` (which already shows MAC keys): signed-in users and API tokens of any role, and agent tokens with `config:read` not restricted to a group. Others get `recognition` without them. `config:read` is a default agent scope, so a default agent token reads the MAC of any address through `identify_device` and explain, while `/api/v1/dhcp/leases` stays closed to agents: kept on purpose, since the naming flow needs the MAC, and said in `spec/13` and the agent docs.
+- Explain follows the same rule for `client.mac` (unless the caller gave it) and its new `macFrom`, and, like `recognition`, shows neither at query-log privacy level 2 and above (a MAC the caller gave is theirs and comes back). It reports `identifiedBy: router_mac`.
+- A MAC the kernel's neighbor table holds at two or more addresses (a MAC-translating extender) is `macShared` too, counted in the request over this node's table, off the query path: the kernel table has no shared-MAC rule for identification, and the dialog must not offer that MAC as one device's.
 
 "Name this device…":
 - It edits the device the address is recognized as (or the one that already lists the MAC) instead of making a second one.
@@ -1733,7 +1738,7 @@ How it is built:
 - `telltale_neighbors` counts the kernel's entries.
 - `telltale_router_macs{source="router"|"peer"}` counts the bindings in use.
 - `telltale_router_macs_unsure` counts the ones withheld.
-- The log says when router bindings start and stop being used, and once when devices match by MAC but this node can see no MACs. It warns when a router with `tls_insecure_skip_verify` starts feeding identification.
+- The log says when router bindings start and stop being used, and, once per spell and after a minute, when a device is named by its MAC and `router_macs` is on but no router or member binding reaches this node (whatever the kernel's table holds); on a resolver pod it says that only the primary's own router view reaches it, so the key belongs on the primary. It warns when a router with `tls_insecure_skip_verify` starts feeding identification.
 
 REQ: FLT-006, FLT-005, API-010, CLU-002, CLU-010, OBS-005, AGT-004. Implemented in:
 - `telltale_policy::clients` (`MacTable`, `MacFrom`, `IdSource::RouterMac`);
@@ -1759,7 +1764,8 @@ REQ: FLT-006, FLT-005, API-010, CLU-002, CLU-010, OBS-005, AGT-004. Implemented 
 - IPv6 bindings from routers: a MAC-only device's IPv6 queries are recognized only through the kernel's NDP table.
 - OPNsense lease states: rows are taken as the API returns them, and conflicts are caught by `unsure`.
 - A per-router or per-site choice of which routers identify. In a cluster spanning sites that reuse one private range, a member at another site can bind a local address.
-- An address reused within one router interval (300 s by default) before the next poll.
+- An address reused within one router interval (300 s by default) before the next poll: the new holder gets the old holder's rules until the router's next answer (and a minute more on members).
+- **Resolver pods and a replica's router.** A node asks only the members it has a direct stream to, and a member's answer carries only what its own routers said, so a router read by a replica reaches the primary and the voters but not the resolver pods, which connect to the primary alone: a pod recognizes a MAC-only device only through the primary's own router view. The router's key belongs on the primary (and on the node a failover would promote). Relaying members' vetted bindings to pods, with their age, is a follow-up: it would lengthen the age bound to about 45 minutes, so it needs an age stamp and an owner decision.
 - Recognition by MAC in change simulations and rule-impact estimates (they identify by address, ADR-115), in anomaly mutes (a device needs an address to be muted, ADR-161), on the Clients page's device guess and in identity or rhythm reads by name, and in `telltale explain` on the command line (no routers there).
 - Sites beyond about 7,000 connected clients, where the `devices.names` answer outgrows the cluster channel's 1 MiB frame.
 - Source NAT in front of a resolver pod, rootless Docker, Podman and Docker Desktop: the address seen isn't the device's.
@@ -1771,7 +1777,7 @@ REQ: FLT-006, FLT-005, API-010, CLU-002, CLU-010, OBS-005, AGT-004. Implemented 
 - **When a binding is missing or withheld:** at start-up, more than 15 minutes into a router or member silence, on an older member's answer, or when the binding is shared or `unsure`. A block rule for the device then fails open and an allow rule fails closed, and the device takes its network's or the default group. DNS is answered throughout (CLU-004).
   - A router firmware update longer than 15 minutes moves MAC-only devices to that fallback until the router answers.
   - A device that moved while its old OPNsense lease is still listed isn't recognized by MAC until the old lease goes.
-- **HA.** Router-based identity survives a failover only if the router's key is on two full members: config-file routers with the key in `/etc/telltale-secrets/` or `/run/secrets/` on both. A key pasted in the UI stays on the node that saved it (ADR-181), so after a failover MAC-only devices fall back 15 minutes later, until the key is entered on the new primary.
+- **HA.** Router-based identity survives a failover only if the router's key is on two full members, the primary and the node that would be promoted (resolver pods hear only the primary): config-file routers with the key in `/etc/telltale-secrets/` or `/run/secrets/` on both. While two nodes read one router, a device that has just moved can be withheld on both until both have polled (they poll out of phase). A key pasted in the UI stays on the node that saved it (ADR-181), so after a failover MAC-only devices fall back 15 minutes later, until the key is entered on the new primary.
 - **Mixed versions (CLU-010).** A node on an earlier build accepts a MAC-only `[[client]]` (MAC keys were always valid) but recognizes it only through its kernel table. Upgraded nodes take no bindings from an older member. So in a rolling upgrade (replicas first), MAC-only devices are recognized by router data only once the node that reads the router (usually the primary) runs this version. Nothing in the shared configuration changes for older nodes while `router_macs` is at its default.
 - **Cost.**
   - Memory: about 50 KB per 1,000 table entries (twice that during a swap).
@@ -1801,6 +1807,7 @@ REQ: FLT-006, FLT-005, API-010, CLU-002, CLU-010, OBS-005, AGT-004. Implemented 
   - `clu_002_a_silent_member_is_dropped_after_15_minutes`
   - `clu_010_bindings_from_an_older_member_are_not_used`
   - `clu_002_names_are_asked_again_soon_until_a_full_member_answers`
+  - fix round 2: `clu_002_a_member_is_full_only_if_the_registry_lists_it_and_it_is_not_ephemeral`, `clu_002_a_peer_claiming_to_be_primary_gets_no_bindings_when_the_registry_lists_it_ephemeral`, `clu_002_a_peer_claiming_to_be_primary_gets_no_bindings_when_the_registry_does_not_list_it`, `clu_002_the_quick_retry_waits_for_an_answer_that_carries_routers`, `clu_002_the_quick_retry_goes_on_until_the_registry_lists_the_answerer`, `clu_002_the_quick_retry_does_not_end_on_the_primarys_empty_answer`, `clu_002_an_unvetted_answer_drops_the_members_bindings`, `flt_006_a_mac_withheld_by_one_member_still_counts_toward_sharing`, `flt_006_a_mac_at_a_disagreed_address_still_counts_toward_sharing`, `flt_006_a_router_read_less_often_than_15_minutes_does_not_identify` (the 600 s cap), `flt_006_no_router_macs_are_said_once_after_a_minute`, `flt_006_the_no_router_macs_notice_says_what_to_do`
 - **The table:**
   - `flt_006_own_unsure_address_is_not_filled_by_a_peer`
   - `flt_006_exact_ip_device_wins_again_when_the_binding_is_unsure`
@@ -1811,9 +1818,9 @@ REQ: FLT-006, FLT-005, API-010, CLU-002, CLU-010, OBS-005, AGT-004. Implemented 
   - `flt_005_quick_rule_follows_mac_device_across_ip_change`
   - `flt_006_without_mac_clients_the_table_holds_kernel_entries_only`
   - `flt_006_the_old_table_is_retired`
-- **API:** `flt_013_explain_says_a_router_mac_identified_the_client`, `flt_013_a_given_mac_is_reported_as_given`, `api_010_identity_says_how_an_address_is_recognized`, `api_010_recognition_offers_a_router_mac_before_any_device_matches_by_mac`, `api_010_recognition_withholds_a_shared_or_tombstoned_mac`, `api_010_recognition_offers_no_router_mac_when_router_macs_is_off`, `api_010_recognition_is_hidden_at_privacy_level_2`, `agt_004_explain_mac_needs_config_read`, `agt_004_explain_mac_from_follows_the_mac`, `agt_004_recognition_mac_needs_config_read`.
-- **Cluster reads:** `clu_002_identity_recognition_is_the_entry_nodes`, `clu_002_identity_recognition_hidden_here_stays_hidden`, `clu_010_identity_recognition_reads_both_ways`.
-- **Playwright:** `api_010 name this device offers its MAC address when the router knows it`, `api_010 a device named by MAC is edited, not overwritten`, `api_010 a MAC only this node sees is offered, not chosen`, `api_010 a shared or private MAC is flagged`.
+- **API:** `flt_013_explain_says_a_router_mac_identified_the_client`, `flt_013_a_given_mac_is_reported_as_given`, `api_010_identity_says_how_an_address_is_recognized`, `api_010_recognition_offers_a_router_mac_before_any_device_matches_by_mac`, `api_010_recognition_withholds_a_shared_or_tombstoned_mac`, `api_010_recognition_offers_no_router_mac_when_router_macs_is_off`, `api_010_recognition_is_hidden_at_privacy_level_2`, `agt_004_explain_mac_needs_config_read`, `agt_004_explain_mac_from_follows_the_mac`, `agt_004_recognition_mac_needs_config_read`; fix round 2: `api_010_recognition_flags_a_kernel_mac_at_two_addresses`, `agt_004_explain_mac_is_hidden_at_privacy_level_2`, `flt_013_explain_finds_the_mac_of_a_mapped_address`.
+- **Cluster reads:** `clu_002_identity_recognition_is_the_entry_nodes`, `clu_002_identity_recognition_hidden_here_stays_hidden`, `clu_010_identity_recognition_reads_both_ways`; fix round 2: `clu_002_a_peers_identity_read_carries_no_recognition`.
+- **Playwright:** `api_010 name this device offers its MAC address when the router knows it`, `api_010 a device named by MAC is edited, not overwritten`, `api_010 a MAC only this node sees is offered, not chosen`, `api_010 a shared or private MAC is flagged`; fix round 2: `api_010 an address-named device keeps its keys unless the MAC is chosen`, `api_010 a MAC the neighbor table holds at two addresses is flagged`, `api_010 a MAC key is read in every spelling the server reads`, `flt_013 explain says where the MAC that identified the client comes from`.
 - **End to end:** `deploy/routers-e2e.sh` and `deploy/cluster/router-macs-e2e.sh`.
 - **Benchmarks:** the `flt_006_identify_mac` benches against the base, and `make bench-smoke`.
 
