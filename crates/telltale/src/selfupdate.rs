@@ -211,11 +211,11 @@ fn retry_text_busy<T>(
     pause: Duration,
     mut exec: impl FnMut() -> std::io::Result<T>,
 ) -> std::io::Result<T> {
-    let mut tried = 1;
+    let mut attempt = 1;
     loop {
         match exec() {
-            Err(e) if text_file_busy(&e) && tried < tries => {
-                tried += 1;
+            Err(e) if text_file_busy(&e) && attempt < tries => {
+                attempt += 1;
                 std::thread::sleep(pause);
             }
             done => return done,
