@@ -11,20 +11,17 @@
   import StatusBadge from '../lib/components/StatusBadge.svelte';
 
   type Forward = S['ForwardInfo'];
-  type Editor = { name: string; url: string; upstreamGroup: string; originalServers?: string[]; editing: boolean };
+  type Editor = { name: string; url: string; servers: string; upstreamGroup?: string; useAddresses: boolean; editing: boolean };
   let subscriptions = $state<Forward[] | null>(null);
   let error = $state<unknown>(null);
   let editor = $state<Editor | null>(null);
-  let groups = $state<string[] | null>(null);
-  let groupsError = $state<unknown>(null);
   let formError = $state<unknown>(null);
   let busy = $state(false);
   let saved = $state(false);
   let latestLoad = 0;
   const canEdit = $derived(session.user?.role === 'admin' || session.user?.role === 'operator');
-  const destinationReady = $derived(editor && (editor.upstreamGroup
-    ? groups?.includes(editor.upstreamGroup)
-    : !!editor.originalServers));
+  const addresses = $derived(editor?.servers.split(/[\s,]+/).filter(Boolean) ?? []);
+  const destinationReady = $derived(editor && (!editor.useAddresses || addresses.length > 0));
 
   async function load() {
     const request = ++latestLoad;
@@ -39,21 +36,6 @@
   }
   $effect(() => poll(load, 15000));
 
-  // REQ: UPS-007 — use the same definitions shown on Upstreams. Route subscriptions are shared.
-  $effect(() => {
-    if (!editor) return;
-    let open = true;
-    groups = null;
-    groupsError = null;
-    void api.configEntries('upstream_group').then(({ items }) => {
-      if (open) groups = items.filter(({ definition }) => definition && definition.node_only !== true)
-        .map(({ name }) => name);
-    }).catch((e) => {
-      if (open) groupsError = e;
-    });
-    return () => { open = false; };
-  });
-
   function listState(status: Forward['subscriptionStatus']) {
     if (status?.error) return status.namesUsed == null ? 'failed' : 'stale';
     return status?.namesUsed == null ? 'pending' : 'ok';
@@ -63,8 +45,9 @@
     editor = {
       name: forward?.domain ?? '',
       url: forward?.subscriptionUrl ?? '',
-      upstreamGroup: forward?.upstreamGroup ?? '',
-      originalServers: forward && !forward.upstreamGroup ? forward.servers : undefined,
+      servers: forward?.servers.join(' ') ?? '',
+      upstreamGroup: forward?.upstreamGroup ?? undefined,
+      useAddresses: !forward?.upstreamGroup,
       editing: !!forward,
     };
     formError = null;
@@ -75,17 +58,22 @@
     event.preventDefault();
     const draft = editor;
     if (!draft || !destinationReady) return;
-    const { name, url, upstreamGroup, originalServers } = draft;
+    const { name, url } = draft;
+    // REQ: UPS-007 — existing group bindings stay in effect until explicitly replaced.
+    const upstreamGroup = draft.useAddresses ? undefined : draft.upstreamGroup;
     busy = true;
     formError = null;
     saved = false;
     try {
       await api.putForward(name.trim(), {
         subscriptionUrl: url.trim(),
-        ...(upstreamGroup ? { upstreamGroup } : { servers: originalServers }),
+        ...(upstreamGroup ? { upstreamGroup } : { servers: addresses }),
       });
       if (editor === draft) {
-        if (upstreamGroup) draft.originalServers = undefined;
+        if (!upstreamGroup) {
+          draft.upstreamGroup = undefined;
+          draft.useAddresses = true;
+        }
         saved = true;
       }
       await load();
@@ -123,7 +111,7 @@
     {:else}
       <div class="table-wrap">
         <table>
-          <thead><tr><th>List</th><th>State</th><th class="num">Names used</th><th class="num">Exceptions</th><th>Upstream group</th><th>Defined in</th><th></th></tr></thead>
+          <thead><tr><th>List</th><th>State</th><th class="num">Names used</th><th class="num">Exceptions</th><th>DNS servers</th><th>Defined in</th><th></th></tr></thead>
           <tbody>
             {#each subscriptions as forward (forward.domain)}
               {@const status = forward.subscriptionStatus}
@@ -138,8 +126,8 @@
                 <td class="num">{status?.namesUsed == null ? '–' : num(status.namesUsed)}</td>
                 <td class="num">{status?.exceptions == null ? '–' : num(status.exceptions)}</td>
                 <td>
-                  {#if forward.upstreamGroup}<strong>{forward.upstreamGroup}</strong>{/if}
-                  <div class="mono small source" class:muted={!!forward.upstreamGroup}>{forward.servers.join(', ')}</div>
+                  <div class="mono small source">{forward.servers.join(', ')}</div>
+                  {#if forward.upstreamGroup}<div class="muted small">Group {forward.upstreamGroup}</div>{/if}
                 </td>
                 <td class="small">{forward.source === 'api' ? 'the UI / API' : 'config file'}</td>
                 <td class="num nowrap">
@@ -164,19 +152,15 @@
     <form class="stack" onsubmit={save}>
       <label>Subscription name <input bind:value={editor.name} placeholder="gfwlist" pattern="[a-z0-9_\-]+" maxlength="64" required readonly={editor.editing} /></label>
       <label>GFWList URL <input type="url" bind:value={editor.url} placeholder="https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt" required /></label>
-      <label>Upstream group
-        <select bind:value={editor.upstreamGroup} required={!editor.originalServers} disabled={groups === null}>
-          <option value="">{editor.originalServers ? 'Keep current servers' : 'Choose an upstream group'}</option>
-          {#each groups ?? [] as group (group)}<option value={group}>{group}</option>{/each}
-        </select>
-      </label>
-      {#if !editor.upstreamGroup && editor.originalServers}
-        <p class="mono muted small source">{editor.originalServers.join(', ')}</p>
+      {#if editor.upstreamGroup}
+        <label class="row">
+          <input type="checkbox" bind:checked={editor.useAddresses} /> Replace group {editor.upstreamGroup} with manual addresses
+        </label>
       {/if}
-      {#if groups?.length === 0}
-        <p class="muted small">Create a shared upstream group in <a href={href('/upstreams')}>Upstreams</a>.</p>
+      <label>Server address <input bind:value={editor.servers} placeholder="https://cloudflare-dns.com/dns-query" disabled={!editor.useAddresses} required={editor.useAddresses} /></label>
+      {#if editor.useAddresses}
+        <p class="muted small">Separate multiple servers with spaces or commas. They are tried in order.</p>
       {/if}
-      <ErrorNote error={groupsError} />
       <ErrorNote error={formError} />
       {#if saved}<p class="notice ok" role="status">Subscription saved. The list will refresh in the background.</p>{/if}
       <div class="row"><button type="submit" class="primary" disabled={busy || !destinationReady}>{busy ? 'Saving…' : 'Save'}</button></div>

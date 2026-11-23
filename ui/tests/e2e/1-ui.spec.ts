@@ -1488,10 +1488,6 @@ test('api_011 names on my network: wizards, DNS, and the API', async () => {
 
 // REQ: DNS-017, UPS-007 — the DNS Routes sidebar entry manages subscriptions.
 test('dns_017 DNS Routes manages subscriptions from the sidebar', async () => {
-  const csrf = (await (await page.request.get('/api/v1/auth/status')).json()).csrfToken as string;
-  const headers = { 'x-csrf-token': csrf };
-  const groupPath = '/api/v1/upstream-groups/gfwlist-target';
-  expect((await page.request.put(groupPath, { headers, data: { members: ['router'] } })).status()).toBe(200);
   await page.goto('/#/local-dns');
   await page.getByRole('link', { name: 'DNS Routes', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'DNS Routes' })).toBeVisible();
@@ -1499,15 +1495,13 @@ test('dns_017 DNS Routes manages subscriptions from the sidebar', async () => {
   await page.getByLabel('Subscription name').fill('gfwlist-test');
   await page.getByLabel('GFWList URL').fill('https://lists.invalid/gfwlist.txt');
   await expect(page.getByRole('button', { name: 'Save' })).toBeDisabled();
-  await page.getByLabel('Upstream group').selectOption('gfwlist-target');
+  await page.getByLabel('Server address').fill('tls://10.0.0.9');
   await page.getByRole('button', { name: 'Save' }).click();
   await expect(page.getByRole('status')).toContainText('Subscription saved');
   await page.keyboard.press('Escape');
   const row = page.getByRole('row').filter({ hasText: 'gfwlist-test' });
   await expect(row).toContainText('https://lists.invalid/gfwlist.txt');
-  await expect(row).toContainText('gfwlist-target');
-  await expect(row).toContainText('udp://127.0.0.1:15399');
-  expect((await page.request.delete(groupPath, { headers })).status()).toBe(422);
+  await expect(row).toContainText('tls://10.0.0.9');
 
   await page.getByRole('navigation').getByRole('link', { name: 'Names on my network', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Names on my network' })).toBeVisible();
@@ -1518,7 +1512,7 @@ test('dns_017 DNS Routes manages subscriptions from the sidebar', async () => {
 
   await page.getByRole('link', { name: 'DNS Routes', exact: true }).click();
   await row.getByRole('button', { name: 'Edit' }).click();
-  await expect(page.getByLabel('Upstream group')).toHaveValue('gfwlist-target');
+  await expect(page.getByLabel('Server address')).toHaveValue('tls://10.0.0.9');
   await page.getByLabel('GFWList URL').fill('https://lists.invalid/updated.txt');
   await page.getByRole('button', { name: 'Save' }).click();
   await expect(page.getByRole('status')).toContainText('Subscription saved');
@@ -1526,33 +1520,40 @@ test('dns_017 DNS Routes manages subscriptions from the sidebar', async () => {
   await expect(row).toContainText('https://lists.invalid/updated.txt');
   await row.getByRole('button', { name: 'Remove gfwlist-test' }).click();
   await expect(row).toHaveCount(0);
-  expect((await page.request.delete(groupPath, { headers })).status()).toBe(200);
 });
 
-// REQ: DNS-017, UPS-007 — subscriptions created with addresses can keep them or choose a group.
-test('dns_017 DNS Routes migrates a subscription from addresses to a group', async () => {
+// REQ: DNS-017, UPS-007 — a stored group is kept until the operator replaces its addresses.
+test('dns_017 DNS Routes keeps a group until manual addresses are saved', async () => {
   const csrf = (await (await page.request.get('/api/v1/auth/status')).json()).csrfToken as string;
-  const put = await page.request.put('/api/v1/forwards/legacy-route', {
-    headers: { 'x-csrf-token': csrf },
-    data: { servers: ['tls://10.0.0.9'], subscriptionUrl: 'https://lists.invalid/legacy.txt' },
+  const headers = { 'x-csrf-token': csrf };
+  const groupPath = '/api/v1/upstream-groups/gfwlist-target';
+  expect((await page.request.put(groupPath, { headers, data: { members: ['router'] } })).status()).toBe(200);
+  const put = await page.request.put('/api/v1/forwards/group-route', {
+    headers,
+    data: { upstreamGroup: 'gfwlist-target', subscriptionUrl: 'https://lists.invalid/group.txt' },
   });
   expect(put.status()).toBe(200);
   await page.reload();
-  const row = page.getByRole('row').filter({ hasText: 'legacy-route' });
+  const row = page.getByRole('row').filter({ hasText: 'group-route' });
   await row.getByRole('button', { name: 'Edit' }).click();
-  await expect(page.getByRole('dialog').getByText('tls://10.0.0.9', { exact: true })).toBeVisible();
-  await page.getByLabel('GFWList URL').fill('https://lists.invalid/legacy-updated.txt');
+  const addresses = page.getByLabel('Server address');
+  await expect(addresses).toHaveValue('udp://127.0.0.1:15399');
+  await expect(addresses).toBeDisabled();
+  await page.getByLabel('GFWList URL').fill('https://lists.invalid/group-updated.txt');
   await page.getByRole('button', { name: 'Save' }).click();
   await expect(page.getByRole('status')).toContainText('Subscription saved');
-  await expect(row).toContainText('legacy-updated.txt');
-  await expect(row).toContainText('tls://10.0.0.9');
-  await page.getByLabel('Upstream group').selectOption('router');
+  await expect(row).toContainText('group-updated.txt');
+  await expect(row).toContainText('Group gfwlist-target');
+  expect((await page.request.delete(groupPath, { headers })).status()).toBe(422);
+  await page.getByRole('checkbox', { name: 'Replace group gfwlist-target with manual addresses' }).check();
+  await addresses.fill('tls://10.0.0.9, 10.0.0.53');
   await page.getByRole('button', { name: 'Save' }).click();
   await expect(page.getByRole('status')).toContainText('Subscription saved');
   await page.keyboard.press('Escape');
-  await expect(row).toContainText('router');
-  await expect(row).toContainText('udp://127.0.0.1:15399');
-  await row.getByRole('button', { name: 'Remove legacy-route' }).click();
+  await expect(row).toContainText('tls://10.0.0.9, udp://10.0.0.53');
+  await expect(row).not.toContainText('Group gfwlist-target');
+  expect((await page.request.delete(groupPath, { headers })).status()).toBe(200);
+  await row.getByRole('button', { name: 'Remove group-route' }).click();
   await expect(row).toHaveCount(0);
 });
 

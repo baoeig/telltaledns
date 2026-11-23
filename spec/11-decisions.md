@@ -2985,3 +2985,9 @@ Compile whole-label suffixes separately from static routes. Support the decoded 
 **Context.** DNS-017 and UPS-007 allow TOML subscriptions to reference a shared group. The UI previously entered DNS URLs and made an upstream group for each subscription.
 
 **Decision.** New subscriptions in DNS Routes select a shared group from Upstreams. The forwarding API and its MCP planner accept `upstreamGroup` together with `subscriptionUrl`, or accept the existing `servers` form. Store the name so the subscription follows the configuration when the group changes. The merged configuration must validate before applying edits, including removal of a referenced group. Existing address-based subscriptions can keep their servers when edited or switch to a group.
+
+## ADR-186 — Enter DNS server addresses in the subscription form (Proposed)
+
+**Context.** The owner asked to return the DNS Routes form to direct server addresses. Existing subscriptions may already reference a group under ADR-185.
+
+**Decision.** Enter one or more DNS server addresses in DNS Routes and use them in order. When editing a subscription that references a group, let the operator opt in to replacing it with addresses. Other edits retain the group reference. The forwarding API, MCP planner and TOML support group references for their existing callers.
