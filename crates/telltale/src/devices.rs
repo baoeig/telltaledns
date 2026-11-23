@@ -266,6 +266,20 @@ pub(crate) fn build_table(
     }
 }
 
+/// REQ: CLU-002 (ADR-183) — whether the answers of this round end the quick retry: a full member's
+/// answer that is `vetted` and carries router leases (it reads a router: its bindings are what
+/// the retry is for), or the reachable primary's answer, whatever it holds. A full replica with
+/// no router key answers first in some clusters, and its empty answer must not end the retry.
+pub(crate) fn answered_now(
+    answers: &[(String, Names)],
+    full: impl Fn(&str) -> bool,
+    primary: Option<&str>,
+) -> bool {
+    answers
+        .iter()
+        .any(|(p, n)| (full(p) && n.vetted && !n.routers.is_empty()) || primary == Some(p.as_str()))
+}
+
 /// REQ: CLU-002 (ADR-183) — how long to wait before asking the members again: [`RETRY`] while no
 /// full member has answered and the node is under [`RETRY_FOR_S`] seconds old, else a minute.
 pub(crate) fn next_wait(full_member_answered: bool, since_start_s: u64) -> std::time::Duration {
@@ -327,10 +341,17 @@ pub(crate) async fn run(
                 serde_json::from_slice(&body).ok().map(|n| (peer, n))
             })
             .collect();
-        // A full member: in the registry and not ephemeral (as `rpc_handler` decides).
-        let registry = cluster.identity.registry();
+        // A full member: in the registry and not ephemeral (as `rpc_handler` decides). The
+        // registry is a small file: read off the async task.
+        let registry = {
+            let c = std::sync::Arc::clone(&cluster);
+            tokio::task::spawn_blocking(move || c.identity.registry())
+                .await
+                .unwrap_or_default()
+        };
         let full = |p: &str| registry.iter().any(|n| n.node_id == p && !n.ephemeral);
-        answered |= answers.iter().any(|(p, _)| full(p));
+        let primary = cluster.reachable_primary();
+        answered |= answered_now(&answers, full, primary.as_deref());
         let now = started.elapsed().as_secs();
         keep_answers(&mut last, &answers, now, full);
         let macs = peer_macs(&last);
@@ -344,7 +365,6 @@ pub(crate) async fn run(
         if answers.is_empty() {
             continue;
         }
-        let primary = cluster.reachable_primary();
         let names = merge(answers, primary.as_deref());
         if **sources.pipeline.peer_names.load() != names {
             sources
@@ -796,5 +816,54 @@ mod tests {
         assert_eq!(next_wait(false, u64::MAX), minute);
         assert_eq!(next_wait(true, 0), minute);
         assert_eq!(next_wait(true, 60), minute);
+    }
+
+    // REQ: CLU-002 (ADR-183) — the quick retry isn't ended by a full replica that holds no router
+    // key and answers first (its empty answer carries nothing the pods need), nor by an older
+    // member's answer or an ephemeral member's: only a full member's vetted answer with router
+    // leases, or the reachable primary's answer, ends it.
+    #[test]
+    fn clu_002_the_quick_retry_waits_for_an_answer_that_carries_routers() {
+        use std::time::Duration;
+        let full = |p: &str| matches!(p, "replica" | "primary" | "old");
+        let leased = |last: u8| bound(last, "aa:bb:cc:00:00:01", false);
+        let replica_no_key = vetted(&[]);
+        let with_router = vetted(&[leased(5)]);
+        let older = names(&[leased(5)], &[]);
+        let ask = |a: Vec<(&str, Names)>, primary: Option<&str>| {
+            answered_now(&from_nodes(a), full, primary)
+        };
+        // A replica without the router key, vetted and empty: not yet.
+        assert!(!ask(vec![("replica", replica_no_key.clone())], None));
+        assert!(!ask(
+            vec![("replica", replica_no_key.clone())],
+            Some("primary")
+        ));
+        // A vetted answer with router leases from a full member: done.
+        assert!(ask(vec![("primary", with_router.clone())], None));
+        assert!(ask(
+            vec![
+                ("replica", replica_no_key.clone()),
+                ("primary", with_router.clone())
+            ],
+            None
+        ));
+        // An older member (no `vetted`), an ephemeral pod or an unlisted node, with leases: not done.
+        assert!(!ask(vec![("old", older)], None));
+        assert!(!ask(vec![("pod-1", with_router.clone())], None));
+        assert!(!ask(vec![("ghost", with_router)], None));
+        // The primary's answer, whatever it holds, ends it (it is the node that reads the router).
+        assert!(ask(
+            vec![("primary", replica_no_key.clone())],
+            Some("primary")
+        ));
+        assert!(!ask(vec![("replica", replica_no_key)], Some("primary")));
+        assert!(!ask(vec![], Some("primary")), "nobody answered");
+        // The whole story, with `next_wait`: the replica answers at 5 s, the primary at 10 s.
+        let mut answered = false;
+        answered |= ask(vec![("replica", vetted(&[]))], Some("primary"));
+        assert_eq!(next_wait(answered, 5), Duration::from_secs(5));
+        answered |= ask(vec![("primary", vetted(&[leased(5)]))], Some("primary"));
+        assert_eq!(next_wait(answered, 10), Duration::from_secs(60));
     }
 }
