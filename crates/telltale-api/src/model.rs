@@ -1666,7 +1666,9 @@ pub struct RuleInput {
     /// Who it applies to: the names of configured devices (`[[client]]`, any case), IPs, or CIDRs.
     /// A name a router or a device gives an address (the query log's `clientName` for an unnamed
     /// device) isn't a device here and is refused (422, with a hint): use the address, or name the
-    /// device first. A rule for an address stops matching when the address changes.
+    /// device first. A rule for an address stops matching when the address changes. A Kubernetes
+    /// pod's address changes with every restart (its `clientName` is `namespace/kind/name`): for a
+    /// pod use `groups` with the group an operator placed the workload in, not the pod's address.
     #[serde(default)]
     pub devices: Vec<String>,
     /// Groups it applies to. With neither devices nor groups: everyone.
