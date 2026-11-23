@@ -4439,7 +4439,9 @@ test('flt_005_quick_rule_prefill_id_keyed_device_of_the_same_name_is_not_this_ad
 });
 
 // Review N2: whether a row is a pod comes from the explanation's workload, not from the shape of the
-// name: a router or a device may call itself `lab/ns/alias`, and that is no pod.
+// name: a router or a device may call itself `lab/ns/alias`, and that is no pod. The pre-fill and the
+// scope don't change with the shape; only the advice does: a name of that shape may be a pod this node
+// doesn't know about, and "reserve the address in your router" is wrong advice for a pod.
 test('flt_017_quick_rule_prefill_name_shaped_like_a_workload_is_not_a_pod_without_the_explanation', async () => {
   await page.route('**/api/v1/queries?**', async (route) => {
     const real = await route.fetch();
@@ -4453,6 +4455,8 @@ test('flt_017_quick_rule_prefill_name_shaped_like_a_workload_is_not_a_pod_withou
     await expect(deviceField(form)).toHaveValue('127.0.0.42');
     await expect(whySeen(form)).toContainText('127.0.0.42 (shown in the log as lab/ns/alias).');
     await expect(whySeen(form)).not.toContainText('one pod of');
+    await expect(whySeen(form)).toContainText("This looks like a Kubernetes pod this node doesn't know about: a pod's address changes whenever it restarts, so use the group an operator placed it in, not the address.");
+    await expect(whySeen(form)).not.toContainText('reserve the address in your router');
     await page.keyboard.press('Escape');
   } finally {
     await page.unroute('**/api/v1/queries?**');

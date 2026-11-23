@@ -73,6 +73,10 @@
   /** The words for a workload's group, whichever it is. */
   const origin = (from: string) =>
     Object.hasOwn(placedBy, from) ? placedBy[from] : Object.hasOwn(otherGroup, from) ? otherGroup[from] : 'its group';
+  // What the log calls a pod is `namespace/kind/name`. When this node's explanation has no workload for
+  // the row, that shape decides nothing about the rule (the field and the scope stay as they were);
+  // it only changes the advice in the label, which is wrong for a pod: its address changes.
+  const podLike = $derived(/^[^/\s]+\/[^/\s]+\/[^/\s]+$/.test(seenAs));
   // Only a group an operator placed the workload in starts a pod's rule, and never `default`: that is
   // every device nothing else claims. (`group` is today's group of the workload, not the row's.)
   const placed = $derived(!!workload && !!group && group !== 'default' && Object.hasOwn(placedBy, workloadFrom));
@@ -277,8 +281,13 @@
     {:else if scope === 'device' && who.trim() === address}
       <p class="muted small seen" data-testid="quick-rule-seen-as">
         {#if seenAs && seenAs !== address}{address} (shown in the log as <bdi>{seenAs}</bdi>).{/if}
-        A rule for an address stops matching when the address changes: reserve the address in your router, or name the device so you change one
-        place, not every rule.<HelpButton id="device-name" />
+        {#if podLike}
+          This looks like a Kubernetes pod this node doesn't know about: a pod's address changes whenever it restarts, so use the group an
+          operator placed it in, not the address.
+        {:else}
+          A rule for an address stops matching when the address changes: reserve the address in your router, or name the device so you change
+          one place, not every rule.<HelpButton id="device-name" />
+        {/if}
       </p>
     {/if}
   {/if}
