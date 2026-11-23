@@ -250,27 +250,28 @@
    * REQ: FLT-005, FLT-017 (issue #73) — what the quick rule form starts with. A rule can name a
    * configured device, an IP, or a CIDR; never a name a router or mDNS gives an address, nor a pod's
    * `namespace/kind/name`. So, in order:
-   * - a pod (this node's explanation names its workload, or the log does): its address, and today's
-   *   group of the workload from the same explanation (the row's own group is the one it was logged
-   *   with, which may be from before the workload was placed);
+   * - a pod (this node's explanation has the workload; the shape of a name decides nothing, as a
+   *   device or a router may call itself anything): its address, and today's group of the workload
+   *   from the same explanation (the row's own group is the one it was logged with, which may be
+   *   from before the workload was placed);
    * - the device this node's explanation recognized;
    * - a configured device the log names, when the explanation has none (the row may come from a node
    *   that recognized it by a MAC address this node can't see) and the device's own keys could be
-   *   this address (`mayBeAt`): a name that merely equals what a router or mDNS calls another device
-   *   is not that device;
+   *   this address (`mayBeAt`: its IP holds it, or its MAC is not ruled out by the MAC the
+   *   explanation knows): a name that merely equals what a router or mDNS calls another device is
+   *   not that device;
    * - the address, with what the log shows for it as a label, not as the value.
    */
   function prefillOf(row: S['QueryRow'], x: S['Explanation'], devices: S['ClientInfo'][]) {
     const pod = x.client.workload ?? undefined;
     const logged = row.clientName ?? '';
-    const podName = pod?.name ?? (/^[^/\s]+\/[^/\s]+\/[^/\s]+$/.test(logged) ? logged : '');
-    if (podName) {
-      return { device: row.client, seenAs: '', workload: podName, workloadFrom: pod?.groupFrom ?? '', group: pod ? (x.client.groups[0] ?? '') : '' };
+    if (pod) {
+      return { device: row.client, seenAs: '', workload: pod.name, workloadFrom: pod.groupFrom, group: x.client.groups[0] ?? '' };
     }
     const own = x.client.device ?? undefined;
     const named = own
       ? undefined
-      : devices.find((d) => d.name.toLowerCase() === logged.toLowerCase() && mayBeAt(d, row.client))?.name;
+      : devices.find((d) => d.name.toLowerCase() === logged.toLowerCase() && mayBeAt(d, row.client, x.client.mac))?.name;
     const device = own ?? named ?? row.client;
     return {
       device,

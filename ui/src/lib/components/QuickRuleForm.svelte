@@ -71,7 +71,8 @@
     none: "its network's group",
   };
   /** The words for a workload's group, whichever it is. */
-  const origin = (from: string) => (Object.hasOwn(placedBy, from) ? placedBy[from] : (otherGroup[from] ?? 'its group'));
+  const origin = (from: string) =>
+    Object.hasOwn(placedBy, from) ? placedBy[from] : Object.hasOwn(otherGroup, from) ? otherGroup[from] : 'its group';
   // Only a group an operator placed the workload in starts a pod's rule, and never `default`: that is
   // every device nothing else claims. (`group` is today's group of the workload, not the row's.)
   const placed = $derived(!!workload && !!group && group !== 'default' && Object.hasOwn(placedBy, workloadFrom));

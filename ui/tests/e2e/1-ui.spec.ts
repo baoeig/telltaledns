@@ -4378,27 +4378,84 @@ test('flt_017_quick_rule_prefill_workload_placed_by_a_rule_uses_its_group', asyn
   }
 });
 
-// A pod row explained by a node that has no entry for that pod (a replica without the Kubernetes
-// table, or a pod long gone): the log still names it `namespace/kind/name`. It is a pod all the
-// same: the label says so and starts from the pod's address, not "reserve the address in your router".
-test('flt_017_quick_rule_prefill_pod_row_explained_without_the_pod_uses_the_pod_text', async () => {
+// Review N1: with a MAC address in its keys a device could be anyone's, so the log's name for an
+// address counts as that device only when this node's explanation doesn't know the address's own MAC
+// (the answering node may have seen it) or knows exactly the device's. Two same-named devices on a
+// node that sees MACs: device A is keyed by MAC 0a, this address's MAC is 0b. This is the host
+// networked Pi: the explanation has no device but does have the MAC.
+test('flt_005_quick_rule_prefill_mac_keyed_device_of_the_same_name_is_not_this_address', async () => {
+  const csrf = await csrfToken();
+  const put = await page.request.put('/api/v1/clients/lg-e2e-mac', {
+    headers: { 'x-csrf-token': csrf },
+    data: { match: ['02:00:00:00:00:0a'], groups: ['lab'] },
+  });
+  expect(put.status()).toBe(200);
+  let explainMac = '02:00:00:00:00:0b';
   await page.route('**/api/v1/explain**', async (route) => {
     const real = await route.fetch();
     const body = await real.json();
-    delete body.client.workload;
     delete body.client.device;
+    body.client.mac = explainMac; // what this node's neighbor table says for the address
     await route.fulfill({ status: 200, contentType: 'application/json', json: body });
   });
   try {
-    const form = await whyDrawerFor('127.0.0.83', 'db/sts/postgres');
-    await expect(form.getByRole('combobox', { name: 'Applies to' })).toHaveValue('device');
-    await expect(deviceField(form)).toHaveValue('127.0.0.83');
-    await expect(whySeen(form)).toContainText('127.0.0.83 is one pod of db/sts/postgres');
-    await expect(whySeen(form)).not.toContainText('reserve the address in your router');
-    await expect(whySeen(form)).not.toContainText('shown in the log as');
+    await announceMdns('lg-e2e-mac', [127, 0, 0, 40]);
+    const form = await whyDrawerFor('127.0.0.40', 'lg-e2e-mac');
+    await expect(deviceField(form)).toHaveValue('127.0.0.40');
+    await expect(whySeen(form)).toContainText('127.0.0.40 (shown in the log as lg-e2e-mac).');
+    await expect(whySeen(form)).not.toContainText('is your device');
+    await page.keyboard.press('Escape');
+    // The address's MAC is the device's (in the other spelling): it is that device.
+    explainMac = '02-00-00-00-00-0A';
+    const same = await whyDrawerFor('127.0.0.40', 'lg-e2e-mac', 'ads.e2e.test', { ask: false });
+    await expect(deviceField(same)).toHaveValue('lg-e2e-mac');
+    await expect(whySeen(same)).toContainText('127.0.0.40 is your device “lg-e2e-mac”.');
     await page.keyboard.press('Escape');
   } finally {
     await page.unroute('**/api/v1/explain**');
+    await page.request.delete('/api/v1/clients/lg-e2e-mac', { headers: { 'x-csrf-token': csrf } });
+  }
+});
+
+// Review N1: which client ID a query used is not something the form can tell, so a device keyed only
+// by an ID is never filled in because its name matches the log's.
+test('flt_005_quick_rule_prefill_id_keyed_device_of_the_same_name_is_not_this_address', async () => {
+  const csrf = await csrfToken();
+  const put = await page.request.put('/api/v1/clients/lg-e2e-id', {
+    headers: { 'x-csrf-token': csrf },
+    data: { match: ['id:lg-e2e-id'], groups: ['lab'] },
+  });
+  expect(put.status()).toBe(200);
+  try {
+    await announceMdns('lg-e2e-id', [127, 0, 0, 41]);
+    const form = await whyDrawerFor('127.0.0.41', 'lg-e2e-id');
+    await expect(deviceField(form)).toHaveValue('127.0.0.41');
+    await expect(whySeen(form)).toContainText('127.0.0.41 (shown in the log as lg-e2e-id).');
+    await expect(whySeen(form)).not.toContainText('is your device');
+    await page.keyboard.press('Escape');
+  } finally {
+    await page.request.delete('/api/v1/clients/lg-e2e-id', { headers: { 'x-csrf-token': csrf } });
+  }
+});
+
+// Review N2: whether a row is a pod comes from the explanation's workload, not from the shape of the
+// name: a router or a device may call itself `lab/ns/alias`, and that is no pod.
+test('flt_017_quick_rule_prefill_name_shaped_like_a_workload_is_not_a_pod_without_the_explanation', async () => {
+  await page.route('**/api/v1/queries?**', async (route) => {
+    const real = await route.fetch();
+    const body = await real.json();
+    for (const row of body.items ?? []) if (row.client === '127.0.0.42') row.clientName = 'lab/ns/alias';
+    await route.fulfill({ status: 200, contentType: 'application/json', json: body });
+  });
+  try {
+    const form = await whyDrawerFor('127.0.0.42', 'lab/ns/alias');
+    await expect(form.getByRole('combobox', { name: 'Applies to' })).toHaveValue('device');
+    await expect(deviceField(form)).toHaveValue('127.0.0.42');
+    await expect(whySeen(form)).toContainText('127.0.0.42 (shown in the log as lab/ns/alias).');
+    await expect(whySeen(form)).not.toContainText('one pod of');
+    await page.keyboard.press('Escape');
+  } finally {
+    await page.unroute('**/api/v1/queries?**');
   }
 });
 

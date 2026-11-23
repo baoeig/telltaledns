@@ -5,6 +5,9 @@ import type { S } from './api';
 
 const MAC = /^[0-9a-f]{2}([:-][0-9a-f]{2}){5}$/i;
 
+/** A MAC address in one form (lowercase, colons), so two spellings of one compare equal. */
+const macOf = (s: string) => s.toLowerCase().replace(/-/g, ':');
+
 /** `a.b.c.d` as a number, or null (an IPv6 address, or not an address). */
 function v4(s: string): number | null {
   const p = s.split('.');
@@ -29,13 +32,19 @@ function inNetwork(cidr: string, address: string): boolean {
 }
 
 /**
- * Could this configured device be the one at `address`? A MAC address or a client ID can (the node
- * that answered may have seen it, this one can't); an IP or a network must hold the address. When
- * unsure the answer is no: the address itself is always something a rule can name.
+ * Could this configured device be the one at `address`?
+ * - An IP must be the address, a network must hold it.
+ * - A MAC address counts only when this node's explanation has no MAC for the address (the node that
+ *   answered may have seen it, this one can't); when the explanation knows the address's MAC, the
+ *   device's MAC must be that one (a node that sees it would have recognized the device already).
+ * - A client ID never counts: which ID a query used is not something the form can tell.
+ * When unsure the answer is no: the address itself is always something a rule can name.
  */
-export function mayBeAt(device: S['ClientInfo'], address: string): boolean {
+export function mayBeAt(device: S['ClientInfo'], address: string, macOfAddress?: string | null): boolean {
+  const seen = macOfAddress ? macOf(macOfAddress) : '';
   return device.match.some((key) => {
-    if (key.startsWith('id:') || MAC.test(key)) return true;
+    if (MAC.test(key)) return !seen || macOf(key) === seen;
+    if (key.startsWith('id:')) return false;
     return key.includes('/') ? inNetwork(key, address) : key.toLowerCase() === address.toLowerCase();
   });
 }
