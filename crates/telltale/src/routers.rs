@@ -593,7 +593,7 @@ fn unsure_addresses(
 /// REQ: FLT-006 (ADR-183) — how many of a router's rows carry a MAC that can't identify a device
 /// (empty, all zero, multicast, or in a form that isn't read): such an address is withheld from
 /// identification, and the device falls back to its address, by design.
-pub(crate) fn unusable_macs(seen: &Seen) -> usize {
+pub(crate) fn unusable_macs(seen: &[Device]) -> usize {
     seen.iter()
         .filter(|d| crate::devices::usable_mac(&d.0).is_none())
         .count()
