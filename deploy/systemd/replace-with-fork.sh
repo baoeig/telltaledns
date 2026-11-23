@@ -8,8 +8,8 @@ config=/etc/telltale/telltale.toml
 service=telltale.service
 service_user=telltale
 backup_root=/var/backups/telltale
-build_commit=e8b6f72
-asset_ref=c51c90af29757f0826fe03ecd0335609c7076027
+build_commit=126ae92
+asset_ref=cf158063d7b2debc2d5ea724ae0a6eacc590cebf
 assets="https://raw.githubusercontent.com/baoeig/telltaledns/$asset_ref"
 
 work=
@@ -132,7 +132,8 @@ main() {
     esac
 
     work=$(mktemp -d)
-    fetch "$assets/SHA256SUMS" "$work/SHA256SUMS"
+    # Use a separate cache key for the manifest when a new build is published.
+    fetch "$assets/SHA256SUMS?commit=$asset_ref" "$work/SHA256SUMS"
     fetch "$assets/$asset" "$work/$asset"
     expected=$(awk -v name="$asset" '$2 == name { print $1 }' "$work/SHA256SUMS")
     actual=$(sha256sum "$work/$asset")
