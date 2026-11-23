@@ -885,7 +885,7 @@ fn rule(action: &'static str, a: &Value) -> Result<Write, String> {
 fn rule_schema(what: &str) -> Value {
     json!({"type": "object", "properties": {
         "domain": {"type": "string", "description": format!("The domain to {what}; its subdomains are included.")},
-        "devices": {"type": "array", "items": {"type": "string"}, "description": "Only for these devices (names, IPs, or CIDRs)."},
+        "devices": {"type": "array", "items": {"type": "string"}, "description": "Only for these devices: names of configured devices, IPs, or CIDRs. A name from a query's clientName that no configured device has (what a router or mDNS calls an address) is refused: use the address. A Kubernetes pod (`namespace/kind/name`) changes address with every restart: use `groups` with the group an operator placed it in instead."},
         "groups": {"type": "array", "items": {"type": "string"}, "description": "Only for these groups. With neither devices nor groups: everyone."},
         "forMinutes": {"type": "integer", "minimum": 1, "description": "Stop after this many minutes (default: until removed)."},
         "reason": reason_schema()

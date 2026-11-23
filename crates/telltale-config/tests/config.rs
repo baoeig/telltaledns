@@ -543,6 +543,41 @@ expires = "tomorrow"
     }
 }
 
+/// REQ: FLT-005 (GitHub issue #73) — a rule's device is a configured device's name (any case), an
+/// IP, or a CIDR; the refusal says exactly that, in words that tell a named device (`[[client]]`)
+/// from a name a router gives an address.
+#[test]
+fn flt_005_rule_device_refusal_says_what_a_rule_can_name() {
+    let base = r#"
+[[client]]
+name = "Mom phone"
+match = ["192.168.1.20"]
+[[rule]]
+id = "r1"
+action = "block"
+domain = "scan.example.com"
+"#;
+    for ok in [
+        "Mom phone",
+        "mom PHONE",
+        "192.168.1.20",
+        "192.168.1.0/24",
+        "fd00::1",
+    ] {
+        let cfg = format!("{base}devices = [\"{ok}\"]\n");
+        assert!(load_str(&cfg).is_ok(), "{ok} is a rule target");
+    }
+    let errs = load_str(&format!("{base}devices = [\"LGwebOSTV\"]\n")).unwrap_err();
+    let e = errs
+        .iter()
+        .find(|e| e.path == "rule[0].devices[0]")
+        .unwrap_or_else(|| panic!("the device is refused at its path: {errs:?}"));
+    assert_eq!(
+        e.message,
+        "`LGwebOSTV` isn't a named device (`[[client]]`), an IP, or a CIDR"
+    );
+}
+
 /// REQ: OPS-012 (ADR-163) — the watchdog is on by default (60 s, restart, six an hour), and its
 /// limits are checked at their paths.
 #[test]

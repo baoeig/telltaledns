@@ -1427,8 +1427,19 @@ A quick rule allows or blocks a site, and everything under it, for one device, a
 - allow something a list blocks by mistake while you report it.
 
 **Making one:**
-- In the **query log**, press **Why?** on a query and use **Make a quick rule**. The site, the device, and its group are filled in.
+- In the **query log**, press **Why?** on a query and use **Make a quick rule**. The site is filled in, and so is who it's for (see below): the device TelltaleDNS recognizes at the address; when it recognizes none, a device you named that the log names, but only if its own IP (or network) holds the address or its MAC address could be this one (when TelltaleDNS knows the address's MAC, the device's MAC must be that one, and a device known only by a client ID is never taken this way); otherwise the address itself. Where TelltaleDNS can tell, a name that merely matches what a router calls another device doesn't count. For a Kubernetes workload the rule starts for its group, as it is now, only when an operator placed the workload in one (a pod or namespace label, or a rule: the form says which); a workload that falls to its network's group or `default` starts from the pod's address instead, because a rule for that group would cover every device in it. Put the workload in a group first (click its name, then **Add to group…**) to make a rule for all its pods.
 - On the **Quick rules** page (Filtering & DNS), which also lists what's in effect with a countdown, who made each rule, and Edit and Remove buttons.
+
+**Who a rule can be for:**
+- a **named device** (a `[[client]]`, or one you named with **Name this device…**), by its name in any case;
+- an **IP address**, or a **network** such as `192.168.1.0/24`;
+- a **group**, or everyone.
+
+The name the query log shows for a device nobody named here (for example `LGwebOSTV`) is what your router's DHCP or the device itself over mDNS calls it. It's good for recognizing the device, but it isn't a device TelltaleDNS knows, so a rule can't be for it: the form fills in the address and shows that name beside it ("shown in the log as …"), and the API refuses it (422) with a hint that names the address, or, when that address is a device you named, says to use its name. A MAC address typed as the device gets words of its own: name the device with that MAC in its `match` list, then use the name. Whether a rule is accepted never depends on a node's own router or mDNS tables, so every node gives the same answer; only the hint reads them (an agent token without `querylog:read` gets the plain hint, also from a replica that forwards the change to the primary; during a rolling upgrade an older node shows the plain hint to everyone).
+
+A rule for an address stops matching when the address changes (a new lease, a phone's private Wi-Fi address). Two ways to keep it:
+- give the device a fixed address in your router (a DHCP reservation);
+- **name the device** (click its address, then **Name this device…**) and make the rule for the name. Naming recognizes the device by the address it has now, so the name alone doesn't survive an address change; what it saves is the rules: change the device's `match` list once (in the config file, or `PUT /api/v1/clients/{name}`) instead of every rule. A device recognized by its MAC address (`match = ["aa:bb:cc:dd:ee:ff"]`) keeps its rules when its address changes, where TelltaleDNS can see MAC addresses (see **How a query's device is recognized** under Groups and devices).
 
 **Changing one:** press **Edit** on the rule. The form opens filled in, with the same preview as for a new rule, and **Save changes** replaces the rule under the same ID, so it applies on the next query. The rule keeps who made it and when (the audit log records who changed it, with the rule before and after). The end time stays as it was (**Keep the current end**) unless you pick a new duration, which counts from now. There is no Edit for rules in a config file (change the file), or for a rule made through the API for several devices or groups (use `PUT /api/v1/rules/{id}`).
 

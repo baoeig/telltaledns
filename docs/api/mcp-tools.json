@@ -998,7 +998,7 @@
       "additionalProperties": false,
       "properties": {
         "devices": {
-          "description": "Only for these devices (names, IPs, or CIDRs).",
+          "description": "Only for these devices: names of configured devices, IPs, or CIDRs. A name from a query's clientName that no configured device has (what a router or mDNS calls an address) is refused: use the address. A Kubernetes pod (`namespace/kind/name`) changes address with every restart: use `groups` with the group an operator placed it in instead.",
           "items": {
             "type": "string"
           },
@@ -1049,7 +1049,7 @@
       "additionalProperties": false,
       "properties": {
         "devices": {
-          "description": "Only for these devices (names, IPs, or CIDRs).",
+          "description": "Only for these devices: names of configured devices, IPs, or CIDRs. A name from a query's clientName that no configured device has (what a router or mDNS calls an address) is refused: use the address. A Kubernetes pod (`namespace/kind/name`) changes address with every restart: use `groups` with the group an operator placed it in instead.",
           "items": {
             "type": "string"
           },

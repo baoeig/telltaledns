@@ -2277,6 +2277,11 @@ export interface paths {
          *     given), before any list: a device rule beats a group rule beats an everyone rule; within one
          *     scope the longer domain wins, then allow. With `expires` or `forMinutes` it stops applying
          *     then (and is removed). It takes effect on the next query, without recompiling the lists.
+         *     `devices` takes the names of configured devices, IPs, or CIDRs; the name a router or mDNS gives
+         *     an address (a query's `clientName` for a device nobody named) is refused (422, with a hint):
+         *     use the address, or name the device first. A rule for an address stops matching when the
+         *     address changes (a Kubernetes pod's does with every restart: use `groups`, with the group an
+         *     operator placed the workload in).
          *     Rules from the config files are read-only here (409). Needs the operator role (or the
          *     `config:write:rules` agent scope, with a reason).
          */
@@ -7183,7 +7188,11 @@ export interface components {
             answers: number;
             /** @description Client address. */
             client: string;
-            /** @description The configured device name, when known. */
+            /**
+             * @description The name shown for the client: a configured device's name, else what the router or mDNS
+             *     reports for the address (or a Kubernetes workload's `namespace/kind/name`). Only a
+             *     configured device's name works in a quick rule's `devices`; use the address for the others.
+             */
             clientName?: string | null;
             /** @description The client's primary group. */
             group?: string | null;
@@ -7418,7 +7427,14 @@ export interface components {
              * @example allow
              */
             action: string;
-            /** @description Device names, IPs, or CIDRs it applies to. */
+            /**
+             * @description Who it applies to: the names of configured devices (`[[client]]`, any case), IPs, or CIDRs.
+             *     A name a router or a device gives an address (the query log's `clientName` for an unnamed
+             *     device) isn't a device here and is refused (422, with a hint): use the address, or name the
+             *     device first. A rule for an address stops matching when the address changes. A Kubernetes
+             *     pod's address changes with every restart (its `clientName` is `namespace/kind/name`): for a
+             *     pod use `groups` with the group an operator placed the workload in, not the pod's address.
+             */
             devices?: string[];
             /**
              * @description The domain; its subdomains are included.
@@ -13355,7 +13371,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description An unknown device or group, a bad domain, or an expiry in the past. */
+            /** @description A device that isn't a configured device's name, an IP, or a CIDR (the hint says what to do; a name a router or mDNS gives an address is one), an unknown group, a bad domain, or an expiry in the past. */
             422: {
                 headers: {
                     [name: string]: unknown;
