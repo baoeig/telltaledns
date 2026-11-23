@@ -1763,7 +1763,7 @@ REQ: FLT-006, FLT-005, API-010, CLU-002, CLU-010, OBS-005, AGT-004. Implemented 
 - A compromised or misconfigured router or full member, which can bind any address to any MAC.
 - IPv6 bindings from routers: a MAC-only device's IPv6 queries are recognized only through the kernel's NDP table.
 - OPNsense lease states: rows are taken as the API returns them, and conflicts are caught by `unsure`.
-- A per-router or per-site choice of which routers identify. In a cluster spanning sites that reuse one private range, a member at another site can bind a local address.
+- A per-router or per-site choice of which routers identify. In a cluster spanning sites that reuse one private range, a member at another site can bind a local address, and the protection also ends when a site's router goes silent: its stale rows are dropped on the other nodes, so another site's fresh binding for the same address fills it there (the node that reads the silent router still withholds those addresses).
 - A MAC that the kernel's table holds at several IPv6 addresses (and one IPv4 address) is one device, not a shared MAC: the dialog's "shared" counts IPv4 addresses only (decision D6), as the routers' bindings are IPv4 only.
 - A replica that refuses a configuration (invalid files, a newer schema) never writes the member list, so it keeps no member's bindings: it is degraded anyway, and its log says it.
 - An address reused within one router interval (300 s by default) before the next poll: the new holder gets the old holder's rules until the router's next answer (and a minute more on members).
