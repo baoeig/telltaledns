@@ -4528,8 +4528,10 @@ export interface components {
          *     the MAC a device at that address could be named by. A device named by that MAC (`[[client]]
          *     match = ["aa:bb:cc:dd:ee:ff"]`) is recognized wherever the MAC is seen, and so are the rules
          *     that name it. `mac`, `macFrom` and `macShared` go only to a caller who may read the devices
-         *     (`/api/v1/clients`: a signed-in person or API token of any role, or an agent token with
-         *     `config:read` that isn't restricted to a group); anyone else gets the rest.
+         *     (`/api/v1/clients`: a person signed in with a session or an API token of any role, or an agent
+         *     token with `config:read` that isn't restricted to a group; not a display session); anyone else
+         *     gets the rest. The MAC may also be missing because the node's query-log privacy level hides
+         *     clients (2 and above leave out `recognition` altogether).
          */
         DeviceRecognition: {
             /**
@@ -4557,13 +4559,16 @@ export interface components {
             macFrom?: string | null;
             /**
              * @description True when the MAC is locally administered (a "private" Wi-Fi address the device made up):
-             *     it stays the same on a network unless the device is set to change it.
+             *     it stays the same on a network unless the device is set to change it. Unlike `mac`, `macFrom`
+             *     and `macShared` it is shown, with `device` and `identifiedBy`, to every caller who may read
+             *     identities, including one who may not read MACs: one bit, which names no device and no MAC.
              */
             macRandomized?: boolean;
             /**
-             * @description True when the routers report this MAC at more than one address (a range extender or bridge
-             *     shares it): it can't tell these devices apart, so a device named by it isn't recognized at
-             *     any of them.
+             * @description True when the routers report this MAC at more than one address, or this node's kernel
+             *     neighbor table holds it at more than one (a range extender or bridge shares it): it can't tell
+             *     these devices apart, so a device named by a router's MAC isn't recognized at any of them, and
+             *     the naming dialog doesn't offer it as one device's.
              */
             macShared?: boolean;
         };

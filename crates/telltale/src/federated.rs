@@ -248,7 +248,8 @@ fn answer(b: &dyn Backend, r: Read) -> Result<Vec<u8>, String> {
         Read::LatencyHist { by, hour } => serde_json::to_vec(&b.latency_hists(by, hour)),
         Read::NewDevices { since_s } => serde_json::to_vec(&b.new_devices(since_s)),
         Read::Identities => serde_json::to_vec(&b.identities()),
-        Read::Identity { client } => serde_json::to_vec(&b.identity(&client).ok()),
+        // REQ: FLT-006, CLU-002 (ADR-183) — no `recognition` for a peer: the entry node keeps its own.
+        Read::Identity { client } => serde_json::to_vec(&b.identity_for_peer(&client).ok()),
         Read::ClientRhythm { client } => serde_json::to_vec(&b.client_rhythm(&client).ok()),
         Read::TailOpen { params } | Read::TailOpenNegated { params } => {
             serde_json::to_vec(&tail_open(b, &params).map_err(text)?)
@@ -2754,9 +2755,65 @@ fn merge_identity(
 
 #[cfg(test)]
 mod identity_tests {
+    use std::collections::HashMap;
+    use std::net::Ipv4Addr;
+    use std::sync::Arc;
+
+    use telltale_api::Backend as _;
     use telltale_api::model::{DeviceIdentity, DeviceRecognition};
 
-    use super::merge_identity;
+    use super::{Read, answer, merge_identity};
+
+    // REQ: FLT-006, CLU-002, API-010 (ADR-183) — what a node answers a peer's identity read has no
+    // `recognition`: the entry node never uses it (it keeps its own), so a node doesn't compute it
+    // (the work of its routers' bindings, per read, per peer) or send it (its table's MACs, over the
+    // cluster channel, to any member, ephemeral ones included). The entry node's own read still
+    // has it, and the merge still shows the entry node's.
+    #[test]
+    fn clu_002_a_peers_identity_read_carries_no_recognition() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = Arc::new(crate::http::tests::sources_in(dir.path()));
+        src.pipeline.reload(
+            Arc::new(telltale_upstream::Router::default()),
+            crate::pipeline::Policy::from_config(
+                &telltale_config::Config::default(),
+                telltale_policy::LocalData::default(),
+            ),
+        );
+        let lease = crate::devices::Lease {
+            mac: "00:11:11:11:11:50".into(),
+            ip: Ipv4Addr::new(10, 0, 0, 50),
+            hostname: None,
+            expires: 0,
+            offline: false,
+            unsure: false,
+        };
+        src.pipeline
+            .router_leases
+            .store(Arc::new(HashMap::from([(lease.ip, lease)])));
+        let backend = crate::api_backend::ApiBackend {
+            src: Arc::clone(&src),
+        };
+        let mine = backend.identity("10.0.0.50").unwrap();
+        assert_eq!(
+            mine.recognition.as_ref().and_then(|r| r.mac.as_deref()),
+            Some("00:11:11:11:11:50"),
+            "the entry node's own read has it"
+        );
+        let bytes = answer(
+            &backend,
+            Read::Identity {
+                client: "10.0.0.50".into(),
+            },
+        )
+        .unwrap();
+        let theirs: Option<DeviceIdentity> = serde_json::from_slice(&bytes).unwrap();
+        let theirs = theirs.expect("an identity");
+        assert!(theirs.recognition.is_none(), "{theirs:?}");
+        assert_eq!(theirs.client, mine.client, "the rest is the same");
+        let merged = merge_identity(mine.clone(), vec![theirs], "10.0.0.50");
+        assert_eq!(merged.recognition, mine.recognition);
+    }
 
     fn node(
         label: &str,
@@ -3143,7 +3200,7 @@ mod ephemeral_tests {
             "impl Backend for ApiBackend",
         );
         let fed = methods(include_str!("federated.rs"), "impl Backend for Federated");
-        let peer_only = ["latency_hists", "shipped_timeseries"];
+        let peer_only = ["identity_for_peer", "latency_hists", "shipped_timeseries"];
         let missing: Vec<&String> = api
             .iter()
             .filter(|m| !fed.contains(*m) && !peer_only.contains(&m.as_str()))

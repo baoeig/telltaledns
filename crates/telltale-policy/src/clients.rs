@@ -377,6 +377,16 @@ impl MacTable {
         self.map.get(&ip).copied()
     }
 
+    /// REQ: FLT-006, API-010 (ADR-183) — how many addresses the kernel's neighbor table gives
+    /// `mac`: behind a MAC-translating extender it is the entry of every address behind it. One
+    /// pass over the table: for an API read (the dialog's `macShared`), never the query path.
+    pub fn kernel_addresses_of(&self, mac: [u8; 6]) -> usize {
+        self.map
+            .values()
+            .filter(|e| e.from == MacFrom::Kernel && e.mac == mac)
+            .count()
+    }
+
     /// Entries, from every source.
     pub fn len(&self) -> usize {
         self.map.len()

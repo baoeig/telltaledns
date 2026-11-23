@@ -95,6 +95,7 @@ fn routers(n: &Node, own: &[Lease], peers: &[(u8, [u8; 6])], peer_tombstones: &[
         .store(std::sync::Arc::new(PeerMacs {
             macs: peers.iter().map(|(l, m)| (ip(*l), *m)).collect(),
             tombstones: peer_tombstones.iter().map(|l| ip(*l)).collect(),
+            ..PeerMacs::default()
         }));
 }
 
@@ -424,4 +425,87 @@ async fn agt_004_explain_mac_from_follows_the_mac() {
         .await;
     assert_eq!(v["client"]["mac"], "00:55:55:55:55:55", "{v}");
     assert_eq!(v["client"]["macFrom"], "given", "{v}");
+}
+
+// REQ: FLT-006, API-010 (ADR-183) — the kernel's neighbor table has no shared-MAC rule (a device is
+// recognized by an entry it holds, as it always was), so behind a MAC-translating extender the
+// kernel holds one MAC at every address behind it. The identity says so (`macShared`), so the
+// dialog doesn't offer that MAC as if it named one device: it is withheld from the default, with
+// the reason. Counted in the request, over this node's table, never on the query path.
+#[tokio::test]
+async fn api_010_recognition_flags_a_kernel_mac_at_two_addresses() {
+    let n = node(NO_MACS);
+    n.src.pipeline.neighbors.replace([
+        (ip(80).into(), [0x00, 0xee, 0xee, 0xee, 0xee, 0x01]),
+        (ip(81).into(), [0x00, 0xee, 0xee, 0xee, 0xee, 0x01]),
+        (ip(82).into(), [0x00, 0xaa, 0xaa, 0xaa, 0xaa, 0x82]),
+    ]);
+    for last in [80, 81] {
+        let r = &identity(&n, &n.admin, &format!("10.0.0.{last}")).await["recognition"];
+        assert_eq!(r["mac"], "00:ee:ee:ee:ee:01", "{last}: {r}");
+        assert_eq!(r["macFrom"], "neighbor", "{last}: {r}");
+        assert_eq!(r["macShared"], true, "{last}: {r}");
+    }
+    let r = &identity(&n, &n.admin, "10.0.0.82").await["recognition"];
+    assert_eq!(r["mac"], "00:aa:aa:aa:aa:82", "{r}");
+    assert!(r.get("macShared").is_none(), "alone at its address: {r}");
+}
+
+// REQ: AGT-004, FLT-013 (ADR-183) — explain's MAC and `macFrom` are hidden at query-log privacy
+// level 2 and above, as the identity's recognition is (every node reads its neighbor table now,
+// so the MAC of a neighbor is there to be read); a MAC the caller gave is theirs and comes back.
+#[tokio::test]
+async fn agt_004_explain_mac_is_hidden_at_privacy_level_2() {
+    for (level, shown) in [(0, true), (1, true), (2, false), (3, false)] {
+        let n = node(&format!(
+            "[telemetry.qlog]\nprivacy_level = {level}\n{NO_MACS}"
+        ));
+        n.src
+            .pipeline
+            .neighbors
+            .replace([(ip(70).into(), [0x00, 0x44, 0x44, 0x44, 0x44, 0x70])]);
+        let explain = "/api/v1/explain?name=example.com&client=10.0.0.70";
+        let (s, v) = n.send("GET", explain, &n.admin, None).await;
+        assert_eq!(s, StatusCode::OK, "level {level}: {v}");
+        assert_eq!(
+            v["client"]["mac"].as_str(),
+            shown.then_some("00:44:44:44:44:70"),
+            "level {level}: {v}"
+        );
+        assert_eq!(
+            v["client"]["macFrom"].as_str(),
+            shown.then_some("neighbor"),
+            "level {level}: {v}"
+        );
+        let given = format!("{explain}&mac=00:55:55:55:55:55");
+        let (_, v) = n.send("GET", &given, &n.admin, None).await;
+        assert_eq!(
+            v["client"]["mac"], "00:55:55:55:55:55",
+            "level {level}: {v}"
+        );
+        assert_eq!(v["client"]["macFrom"], "given", "level {level}: {v}");
+    }
+}
+
+// REQ: FLT-013 (ADR-183) — explain looks the client's MAC up under its canonical address, as
+// identification does: a client given as an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) has the
+// MAC of the IPv4 address.
+#[tokio::test]
+async fn flt_013_explain_finds_the_mac_of_a_mapped_address() {
+    let n = node(NO_MACS);
+    n.src
+        .pipeline
+        .neighbors
+        .replace([(ip(70).into(), [0x00, 0x44, 0x44, 0x44, 0x44, 0x70])]);
+    let (s, v) = n
+        .send(
+            "GET",
+            "/api/v1/explain?name=example.com&client=::ffff:10.0.0.70",
+            &n.admin,
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["client"]["mac"], "00:44:44:44:44:70", "{v}");
+    assert_eq!(v["client"]["macFrom"], "neighbor", "{v}");
 }

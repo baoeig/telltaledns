@@ -165,9 +165,16 @@ pub(crate) fn recognize(src: &Sources, ip: IpAddr) -> DeviceRecognition {
         identified_by: crate::explain::source_name(id.source).to_owned(),
         ..DeviceRecognition::default()
     };
-    // The kernel's entry first, as in the table; else, while `router_macs` is on, the routers'.
-    let (mac, from, shared) = match src.pipeline.neighbors.entry(ip) {
-        Some(e) if e.from == telltale_policy::MacFrom::Kernel => (Some(e.mac), "neighbor", false),
+    // The kernel's entry first, as in the table; else, while `router_macs` is on, the routers'. A
+    // kernel MAC at two or more addresses (a MAC-translating extender) is shared: the kernel table
+    // has no such rule for identification, and the dialog must not offer it as one device's.
+    let table = src.pipeline.neighbors.table();
+    let (mac, from, shared) = match table.get(ip) {
+        Some(e) if e.from == telltale_policy::MacFrom::Kernel => (
+            Some(e.mac),
+            "neighbor",
+            table.kernel_addresses_of(e.mac) >= 2,
+        ),
         _ => match router_mac_of(src, &state.policy.clients, ip) {
             Some((mac, from, shared)) => (Some(mac), from, shared),
             None => (None, "", false),
@@ -654,6 +661,49 @@ fn qlog_filter(q: &QueryParams, from_us: u64, to_us: u64) -> Result<qlog::Filter
 }
 
 impl ApiBackend {
+    /// One device's identity (by address, or a named device's name), with the evidence, and, for an
+    /// address and when `with_recognition`, how it is recognized here (REQ: FLT-006, API-010,
+    /// ADR-183): the entry node's own read has it, what a node answers a peer doesn't.
+    fn identity_of(
+        &self,
+        client: &str,
+        with_recognition: bool,
+    ) -> Result<telltale_api::model::DeviceIdentity, Problem> {
+        // REQ: FLT-017 — a workload's identity is under its analytics key.
+        if let Some((_, key)) = self.workload(client) {
+            return Ok(self.src.identify.get(&key));
+        }
+        if let Ok(ip) = client.parse::<IpAddr>() {
+            let mut id = self.src.identify.get(client);
+            // REQ: FLT-006, API-010 (ADR-183) — how this address is recognized, and the MAC a
+            // device here could be named by: not at query-log privacy level 2 and above.
+            if with_recognition && self.src.config.load().telemetry.qlog.privacy_level < 2 {
+                id.recognition = Some(recognize(&self.src, ip));
+            }
+            return Ok(id);
+        }
+        let cfg = self.src.config.load();
+        let c = cfg
+            .client
+            .iter()
+            .find(|c| c.name.as_str().eq_ignore_ascii_case(client))
+            .ok_or_else(|| {
+                Problem::not_found(format!(
+                    "`{client}` is neither an address nor a named device"
+                ))
+                .hint("Give a device's IP address, or the name it has on the Clients page.")
+            })?;
+        let snap = self.src.identify.snapshot();
+        let addrs = device_addresses(c);
+        let addr = addrs
+            .iter()
+            .find(|a| snap.by_client.contains_key(*a))
+            .or(addrs.first())
+            .cloned()
+            .unwrap_or_else(|| client.to_owned());
+        Ok(self.src.identify.get(&addr))
+    }
+
     /// One query-log directory, as an API page. `node` labels its rows (shipped logs).
     fn search_dir(
         &self,
@@ -1653,13 +1703,17 @@ impl Backend for ApiBackend {
             .pipeline
             .explain(&req, crate::lists::source_reader(&cfg))
             .map_err(|e| Problem::invalid(e).hint("Pass a domain name such as ads.example.com."))?;
+        // REQ: FLT-013, AGT-004 (ADR-183) — at query-log privacy level 2 and above (clients hidden)
+        // the node's own knowledge of the client's MAC isn't shown, as the identity's `recognition`
+        // isn't; a MAC the caller gave is theirs and comes back.
+        let hide_mac = mac.is_none() && cfg.telemetry.qlog.privacy_level >= 2;
         Ok(Explanation {
             name: e.name,
             qtype: qtype_name(e.qtype),
             client: ExplainClient {
                 ip: e.client.ip.to_string(),
-                mac: e.client.mac,
-                mac_from: e.client.mac_from.map(str::to_owned),
+                mac: e.client.mac.filter(|_| !hide_mac),
+                mac_from: e.client.mac_from.filter(|_| !hide_mac).map(str::to_owned),
                 device: e.client.device,
                 identified_by: e.client.identified_by.to_owned(),
                 groups: e.client.groups,
@@ -2128,39 +2182,17 @@ impl Backend for ApiBackend {
     }
 
     fn identity(&self, client: &str) -> Result<telltale_api::model::DeviceIdentity, Problem> {
-        // REQ: FLT-017 — a workload's identity is under its analytics key.
-        if let Some((_, key)) = self.workload(client) {
-            return Ok(self.src.identify.get(&key));
-        }
-        if let Ok(ip) = client.parse::<IpAddr>() {
-            let mut id = self.src.identify.get(client);
-            // REQ: FLT-006, API-010 (ADR-183) — how this address is recognized, and the MAC a
-            // device here could be named by: not at query-log privacy level 2 and above.
-            if self.src.config.load().telemetry.qlog.privacy_level < 2 {
-                id.recognition = Some(recognize(&self.src, ip));
-            }
-            return Ok(id);
-        }
-        let cfg = self.src.config.load();
-        let c = cfg
-            .client
-            .iter()
-            .find(|c| c.name.as_str().eq_ignore_ascii_case(client))
-            .ok_or_else(|| {
-                Problem::not_found(format!(
-                    "`{client}` is neither an address nor a named device"
-                ))
-                .hint("Give a device's IP address, or the name it has on the Clients page.")
-            })?;
-        let snap = self.src.identify.snapshot();
-        let addrs = device_addresses(c);
-        let addr = addrs
-            .iter()
-            .find(|a| snap.by_client.contains_key(*a))
-            .or(addrs.first())
-            .cloned()
-            .unwrap_or_else(|| client.to_owned());
-        Ok(self.src.identify.get(&addr))
+        self.identity_of(client, true)
+    }
+
+    // REQ: FLT-006, CLU-002, API-010 (ADR-183) — what a node answers another node's identity read:
+    // the identity without `recognition`, which only the entry node's own view uses, so it is not
+    // computed here, nor are this node's MACs sent over the cluster channel.
+    fn identity_for_peer(
+        &self,
+        client: &str,
+    ) -> Result<telltale_api::model::DeviceIdentity, Problem> {
+        self.identity_of(client, false)
     }
 
     // REQ: OBS-033 — this node's change markers.

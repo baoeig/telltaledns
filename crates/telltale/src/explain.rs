@@ -209,12 +209,18 @@ pub(crate) fn explain(
         qtype: req.qtype,
         client: ClientInfo {
             ip: req.client,
-            mac: req.mac.or_else(|| neighbors.get(req.client)).map(mac_text),
+            // The table is keyed by canonical addresses (an IPv4-mapped IPv6 client is its IPv4 one).
+            mac: req
+                .mac
+                .or_else(|| neighbors.get(req.client.to_canonical()))
+                .map(mac_text),
             // REQ: FLT-006 (ADR-183) — the caller's own MAC is `given`; else the table's source.
             mac_from: if req.mac.is_some() {
                 Some("given")
             } else {
-                neighbors.entry(req.client).map(|e| mac_from_name(e.from))
+                neighbors
+                    .entry(req.client.to_canonical())
+                    .map(|e| mac_from_name(e.from))
             },
             device: device.clone(),
             identified_by: source_name(ident.source),

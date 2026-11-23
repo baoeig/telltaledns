@@ -557,6 +557,15 @@ pub trait Backend: Send + Sync + 'static {
             "device identification isn't available on this node",
         ))
     }
+    /// REQ: FLT-006, CLU-002 (ADR-183) — this node's identity of a device as it answers another
+    /// node's read: [`Backend::identity`] without `recognition`, which only the entry node's own
+    /// view uses (it is not computed for a peer, nor are this node's MACs sent to it).
+    fn identity_for_peer(&self, client: &str) -> Result<model::DeviceIdentity, Problem> {
+        self.identity(client).map(|mut i| {
+            i.recognition = None;
+            i
+        })
+    }
     /// REQ: OBS-024 (T13.1) — what the shared configuration `config` (JSON) would have done to
     /// the logged queries over `opts`' window, compared with the configuration in effect
     /// (`POST /api/v1/simulate`).
