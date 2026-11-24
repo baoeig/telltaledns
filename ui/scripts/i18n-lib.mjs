@@ -780,8 +780,9 @@ export function check(root, { previous = null, ratchets = true } = {}) {
   return { findings, entries, shipped, files, data };
 }
 
-/** Until part A ends, literal text in a file that `i18n-baseline.json` does not list (a file new
- * since the baseline was written) is reported, not failed; part A's last commit sets this to true. */
+/** Until part A ends, a ratchet count above zero in a file that `i18n-baseline.json` does not list
+ * (a file new, or moved, since the baseline was written) is reported, not failed; part A's last
+ * commit sets this to true. */
 export const NEW_FILES_STRICT = false;
 
 /** The ratchets: literal text, Intl outside format.ts, physical CSS. */
@@ -808,7 +809,10 @@ function ratchetFindings(root, files, add) {
         if (n > 0 && listed && b === 0) add({ level: 'fail', rule: 'literal-text', file: src(rel), line: f?.literal[0], msg: `${n} literal text${n === 1 ? '' : 's'} in a file the baseline holds at zero: use t() (${lines})` });
         else if (n > 0 && !listed)
           add({ level: NEW_FILES_STRICT ? 'fail' : 'report', rule: 'literal-text', file: src(rel), line: f?.literal[0], msg: `${n} literal text${n === 1 ? '' : 's'} in a file i18n-baseline.json does not list: use t() (${lines})` });
-      } else if (n > b) add({ level: 'fail', rule: kind === 'intl' ? 'intl' : 'physical-css', file: kind === 'physical' && rel === 'app.css' ? 'src/app.css' : src(rel), msg: kind === 'intl' ? `${n} Intl/toLocale call sites, ${b} allowed: format in lib/format.ts` : `${n} physical CSS properties, ${b} allowed: use logical ones (margin-inline-start, text-align: start)` });
+      } else if (n > b) {
+        const what = kind === 'intl' ? `${n} Intl/toLocale call sites, ${b} allowed: format in lib/format.ts` : `${n} physical CSS properties, ${b} allowed: use logical ones (margin-inline-start, text-align: start)`;
+        add({ level: listed || NEW_FILES_STRICT ? 'fail' : 'report', rule: kind === 'intl' ? 'intl' : 'physical-css', file: kind === 'physical' && rel === 'app.css' ? 'src/app.css' : src(rel), msg: listed ? what : `${what} (a file i18n-baseline.json does not list)` });
+      }
       if (kind === 'intl' && n > 0 && f?.usesLayer && rel !== 'lib/format.ts') add({ level: 'fail', rule: 'intl', file: src(rel), msg: 'a file on the translation layer formats through lib/format.ts only' });
       if (n < b) add({ level: 'report', rule: 'baseline', file: 'i18n-baseline.json', msg: `${kind} ${JSON.stringify(rel)}: ${n}, baseline ${b} (lower it: node scripts/i18n.mjs baseline)` });
     }
@@ -948,13 +952,26 @@ export function ratchetCounts(root, files) {
   return counts;
 }
 
-/** The baseline file as it would be written from the current tree (zeros omitted). */
-export function baselineOf(root, files) {
+/**
+ * The baseline file from the current tree and the baseline before it (`node scripts/i18n.mjs
+ * baseline`). Each ratchet lists every file, zeros too, so a file the baseline does not list is new
+ * (or moved) since it was written. A listed file keeps the lower of its two counts: a count is
+ * lowered, never raised. A file not listed is added only at zero (one that holds text, an Intl call
+ * or a physical property stays unlisted: reported until part A ends). A file that is gone is
+ * dropped. Without a baseline before it, every count is written as it is.
+ */
+export function baselineOf(root, files, previous = null) {
   const counts = ratchetCounts(root, files);
   const out = {};
-  // Literal text lists every file, zeros too: a file at zero fails on any literal text, and a file
-  // the baseline does not list is new since it was written. The other two omit zeros (growth fails).
-  for (const [k, v] of Object.entries(counts)) out[k] = k === 'literal' ? { ...v } : Object.fromEntries(Object.entries(v).filter(([, n]) => n > 0));
+  for (const [k, v] of Object.entries(counts)) {
+    const was = previous?.[k];
+    out[k] = {};
+    for (const [rel, n] of Object.entries(v)) {
+      if (!was) out[k][rel] = n;
+      else if (Object.hasOwn(was, rel)) out[k][rel] = Math.min(was[rel], n);
+      else if (n === 0) out[k][rel] = 0;
+    }
+  }
   return out;
 }
 
@@ -1142,5 +1159,41 @@ export function conserve(analysis, entry, exceptions = []) {
     }
   }
   for (const s of markup) problems.push(`template text "${s}" is gone`);
+  return problems;
+}
+
+/**
+ * The ledger test over the whole tree (`files`: the check's per-file analyses). A file on the layer
+ * with a ledger entry conserves it (`conserve`). A file on the layer without one is new, or moved:
+ * - when an entry whose file is gone has its file name (a move to another folder), the entry moves
+ *   with it (renamed in the ledger, where the diff shows it);
+ * - otherwise each message must be English that some ledger entry had, or be listed for that file
+ *   under `new` in ledger-exceptions.json.
+ * A removed file, or a moved file not on the layer, needs nothing. Returns a list of problems.
+ */
+export function ledgerProblems(files, ledger, exceptions = {}) {
+  const problems = [];
+  const here = new Set(files.map((f) => f.rel));
+  const migrated = files.filter((f) => f.usesLayer);
+  const fresh = exceptions.new ?? {};
+  const known = new Set(Object.values(ledger).flatMap((e) => [...e.markup, ...e.script]));
+  const gone = Object.keys(ledger).filter((k) => !here.has(k));
+  for (const f of migrated) {
+    if (Object.hasOwn(ledger, f.rel)) {
+      for (const p of conserve(f, ledger[f.rel], exceptions[f.rel] ?? [])) problems.push(`${f.rel}: ${p}`);
+      continue;
+    }
+    const from = gone.filter((k) => basename(k) === basename(f.rel));
+    for (const k of from) problems.push(`${f.rel}: the ledger entry of ${JSON.stringify(k)}, which is no longer a source file, has its name: rename that entry to ${JSON.stringify(f.rel)}`);
+    if (from.length) continue;
+    const english = f.messages.flatMap((m) => (Array.isArray(m.english) ? m.english : [m.english])).map(masked).filter((m) => m !== null);
+    const listed = Array.isArray(fresh[f.rel]) ? fresh[f.rel] : [];
+    for (const m of english) if (!known.has(m) && !listed.includes(m)) problems.push(`${f.rel}: message ${JSON.stringify(m)} is not English any ledger entry had: list it under "new" in ledger-exceptions.json`);
+  }
+  for (const rel of Object.keys(exceptions)) {
+    if (rel === 'new') continue;
+    if (!migrated.some((f) => f.rel === rel)) problems.push(`exception for ${JSON.stringify(rel)}: not a file on the layer`);
+  }
+  for (const rel of Object.keys(fresh)) if (!migrated.some((f) => f.rel === rel) || Object.hasOwn(ledger, rel)) problems.push(`"new" English for ${JSON.stringify(rel)}: only for a file on the layer without a ledger entry`);
   return problems;
 }

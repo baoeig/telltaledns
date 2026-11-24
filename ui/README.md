@@ -102,22 +102,28 @@ file `i18n-baseline.json` holds at zero (in the markup, or in an attribute a rea
 `aria-label`, `title`, `placeholder`, `alt`, `aria-roledescription`, `aria-description`,
 `aria-valuetext`, `aria-placeholder`, and `label` on `<optgroup>`), a new `Intl` call outside
 `lib/format.ts`, and a new physical CSS property (`margin-left`, `text-align: right`; use logical
-ones). It reports, and never fails on,
-missing, outdated and left-over translations. A change to English alone never fails a language.
-Until part A of ADR-189 ends, literal text in a file the baseline does not list (one added since) is
-reported, not failed; part A's last commit makes it a failure.
+ones). It reports, and never fails on, missing, outdated and left-over translations. A change to
+English alone never fails a language. Until part A of ADR-189 ends, literal text, an `Intl` call or
+a physical property in a file the baseline does not list (one added or moved since) is reported, not
+failed; part A's last commit makes it a failure. Adding, removing or moving a file needs no baseline
+change. After removing text, an `Intl` call or a physical property, `node scripts/i18n.mjs baseline`
+lowers that file's count (it never raises one, and lists a new file only at zero).
 
 **An intended English edit** in a file already on the layer: until part A ends, regenerate that
 file's English ledger entry in the same commit, `node scripts/i18n.mjs ledger <file>` (the path under
-`src/`, for example `lib/format.ts`), and say so in the commit message.
+`src/`, for example `lib/format.ts`), and say so in the commit message. A file on the layer moved to
+another folder takes its ledger entry with it (rename the key); a new file on the layer shows only
+English some entry already has, or lists its new English under `new` in
+`tests/i18n-fixtures/ledger-exceptions.json` (`{"new": {"lib/x.ts": ["English"]}}`).
 
 **Add a language.** A maintainer adds the tag to `src/locales/manifest.json` (`owners`: the GitHub
 logins of the people who answer for its content; `dir`; `offered: false` until a release turns it
 on; `since`), and the language to `src/locales/plurals.json` if it is not there (`node
 scripts/i18n.mjs plurals` writes it from CLDR; review the diff). A tag names the script where the
-language has several (`zh-Hans`, `sr-Latn`); there is no `en-*` catalog (English is built in). The translator then runs `node scripts/i18n.mjs sync
-<tag>`, fills in the empty translations of `src/locales/<tag>.json` (pairs of English and
-translation; a plural lists the language's categories), and opens a pull request with that one file.
+language has several (`zh-Hans`, `sr-Latn`); there is no `en-*` catalog (English is built in). The
+translator then runs `node scripts/i18n.mjs sync <tag>`, fills in the empty translations of
+`src/locales/<tag>.json` (pairs of English and translation; a plural lists the language's
+categories), and opens a pull request with that one file.
 After an English edit that keeps the meaning, a maintainer runs `node scripts/i18n.mjs carry
 <context> --from "<old>" --to "<new>"`; otherwise the old pair is reported as left over and English
 is shown until the language's owner confirms the new text.

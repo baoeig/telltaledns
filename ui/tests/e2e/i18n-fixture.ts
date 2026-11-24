@@ -14,7 +14,7 @@ export type Finding = { level: 'fail' | 'report'; rule: string; check?: string; 
 export type Result = {
   findings: Finding[];
   shipped: Record<string, { json: string }>;
-  files: { rel: string; usesLayer: boolean }[];
+  files: { rel: string; usesLayer: boolean; literal: number[]; intl: number; physical: number }[];
   entries: Map<string, unknown>;
 };
 
@@ -29,6 +29,16 @@ export function project(edit?: (dir: string) => void): string {
   const dir = mkdtempSync(join(tmpdir(), 'tt-i18n-'));
   temps.push(dir);
   cpSync(FIXTURE, dir, { recursive: true });
+  edit?.(dir);
+  return dir;
+}
+/** A copy of the UI's sources and ratchet baseline (all the check reads) in a temporary folder,
+ * after `edit`. */
+export function uiCopy(edit?: (dir: string) => void): string {
+  const dir = mkdtempSync(join(tmpdir(), 'tt-i18n-ui-'));
+  temps.push(dir);
+  cpSync(join(UI, 'src'), join(dir, 'src'), { recursive: true });
+  cpSync(join(UI, 'i18n-baseline.json'), join(dir, 'i18n-baseline.json'));
   edit?.(dir);
   return dir;
 }

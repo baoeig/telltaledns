@@ -3,25 +3,51 @@
 // file on the translation layer still shows the English its ledger entry recorded, and each rule
 // fails on a fixture made to trip it.
 import { expect, test } from '@playwright/test';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync, readFileSync, renameSync, rmSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import * as lib from '../../scripts/i18n-lib.mjs';
-import { UI, checkUi, cleanup, edit, failRules, fails, project, put, run } from './i18n-fixture';
+import { UI, checkUi, cleanup, edit, failRules, fails, project, put, run, uiCopy, type Result } from './i18n-fixture';
 
 test.afterAll(cleanup);
+
+const LEDGER = JSON.parse(readFileSync(join(UI, 'tests/i18n-fixtures/english-ledger.json'), 'utf8'));
+const EXCEPTIONS = JSON.parse(readFileSync(join(UI, 'tests/i18n-fixtures/ledger-exceptions.json'), 'utf8'));
+const total = (o: Record<string, number>) => Object.values(o).reduce((a, b) => a + b, 0);
+
+/** What these tests require of a tree, as a list of problems (empty: green). */
+function ratchetProblems(root: string, r: Result): string[] {
+  const out = fails(r)
+    .filter((f) => ['literal-text', 'intl', 'physical-css', 'malformed'].includes(f.rule))
+    .map((f) => `${f.rule} ${f.file}: ${f.msg}`);
+  const base = JSON.parse(readFileSync(join(root, 'i18n-baseline.json'), 'utf8'));
+  // Every file the ledger lists (the files of A0) is in the baseline while it exists. A file added,
+  // removed or moved since needs no baseline change (one with text is reported until part A ends).
+  for (const f of r.files) if (Object.hasOwn(LEDGER, f.rel) && !Object.hasOwn(base.literal, f.rel)) out.push(`i18n-baseline.json does not list ${f.rel}`);
+  // Over the files the baseline lists, Intl calls and physical properties never grow.
+  const now = lib.ratchetCounts(root, r.files);
+  for (const kind of ['intl', 'physical'] as const) {
+    const listed = Object.fromEntries(Object.entries(now[kind] as Record<string, number>).filter(([rel]) => Object.hasOwn(base[kind], rel)));
+    if (total(listed) > total(base[kind])) out.push(`${kind}: ${total(listed)}, the baseline's ${total(base[kind])}`);
+  }
+  out.push(...lib.ledgerProblems(r.files, LEDGER, EXCEPTIONS));
+  return out;
+}
 
 test('api_012 only format.ts formats', () => {
   const r = checkUi();
   expect(fails(r).filter((f) => f.rule === 'intl')).toEqual([]);
+  expect(ratchetProblems(UI, r)).toEqual([]);
   const base = JSON.parse(readFileSync(join(UI, 'i18n-baseline.json'), 'utf8'));
   const now = lib.ratchetCounts(UI, r.files).intl as Record<string, number>;
-  const total = (o: Record<string, number>) => Object.values(o).reduce((a, b) => a + b, 0);
   console.log(`Intl/toLocale call sites outside format.ts: ${total(now)} in ${Object.values(now).filter((n) => n > 0).length} files (baseline ${total(base.intl)})`);
-  expect(total(now)).toBeLessThanOrEqual(total(base.intl));
   // Growth fails; a file on the layer is at zero; format.ts itself is the place for it.
   expect(failRules(run(project((d) => edit(d, 'src/pages/Old.svelte', (s) => s.replace('</script>', '  const n = (1).toLocaleString();\n</script>')))))).toEqual(['intl']);
   expect(failRules(run(project((d) => edit(d, 'src/lib/labels.ts', (s) => `${s}\nexport const nf = new Intl.NumberFormat();\n`))))).toEqual(['intl']);
   expect(failRules(run(project((d) => put(d, 'src/lib/format.ts', 'export const nf = new Intl.NumberFormat();\n'))))).toEqual([]);
+  // A file the baseline does not list (new or moved since) is reported until part A ends.
+  const fresh = run(project((d) => put(d, 'src/lib/fresh.ts', 'export const nf = new Intl.NumberFormat();\n')));
+  expect(failRules(fresh)).toEqual([]);
+  expect(fresh.findings.filter((f) => f.file === 'src/lib/fresh.ts').map((f) => `${f.level} ${f.rule}`)).toEqual(['report intl']);
   // A file whose baseline allows its call moves to the layer: it must be at zero, growth or not.
   const old = run(project((d) => edit(d, 'src/pages/Old.svelte', (s) => s.replace('<script lang="ts">\n', "<script lang=\"ts\">\n  import { tr } from '../lib/i18n';\n  const { t } = tr('old');\n"))));
   expect(failRules(old)).toEqual(['intl']);
@@ -34,9 +60,8 @@ test('api_012 migrated files hold no literal text', () => {
   const counts = lib.ratchetCounts(UI, r.files).literal as Record<string, number>;
   const above = Object.entries(counts).filter(([, n]) => n > 0);
   console.log(`files above 0 (moved to the layer in their own batch): ${above.length}\n${above.map(([f, n]) => `  ${f} ${n}`).join('\n')}`);
-  // The baseline lists every source file, zeros too.
-  const base = JSON.parse(readFileSync(join(UI, 'i18n-baseline.json'), 'utf8'));
-  expect(Object.keys(base.literal).sort()).toEqual(r.files.map((f) => f.rel).sort());
+  // Every file the ledger lists is in the baseline (zeros too); other files need not be.
+  expect(ratchetProblems(UI, r)).toEqual([]);
   // A file at zero fails on any literal text; a file above zero is only printed.
   expect(failRules(run(project((d) => edit(d, 'src/pages/Cache.svelte', (s) => `${s}<p>Plain words</p>\n`))))).toEqual(['literal-text']);
   expect(failRules(run(project((d) => edit(d, 'src/pages/Cache.svelte', (s) => `${s}<input placeholder="Search" />\n`))))).toEqual(['literal-text']);
@@ -48,6 +73,57 @@ test('api_012 migrated files hold no literal text', () => {
   expect(failRules(run(project((d) => edit(d, 'src/pages/Old.svelte', (s) => `${s}\n<p>More words</p>\n`))))).toEqual([]);
   // Data marked translate="no", and text without letters, are not literal text.
   expect(failRules(run(project((d) => edit(d, 'src/pages/Cache.svelte', (s) => `${s}<p translate="no">example.com</p>\n<p>· — (42)</p>\n`))))).toEqual([]);
+});
+
+test('api_012 a new removed or renamed file leaves the ratchets green', () => {
+  const r0 = checkUi();
+  expect(ratchetProblems(UI, r0)).toEqual([]);
+  // Files that hold text and an Intl call or a physical property, not on the layer.
+  const pick = (p: (f: Result['files'][number]) => boolean, not = '') => {
+    const f = r0.files.find((x) => !x.usesLayer && x.rel !== not && x.literal.length > 0 && p(x));
+    if (!f) throw new Error('no such file in the UI');
+    return f.rel;
+  };
+  const removed = pick((f) => f.physical > 0);
+  const moved = pick((f) => f.intl > 0, removed);
+  const cases: [string, (d: string) => void][] = [
+    ['a new file without text', (d) => put(d, 'src/lib/components/Spark.svelte', '<svg viewBox="0 0 8 8"><path d="M0 8 L8 0" /></svg>\n')],
+    [`${removed} removed`, (d) => rmSync(join(d, 'src', removed))],
+    [
+      `${moved} moved to another folder`,
+      (d) => {
+        mkdirSync(dirname(join(d, 'src/moved', moved)), { recursive: true });
+        renameSync(join(d, 'src', moved), join(d, 'src/moved', moved));
+      },
+    ],
+  ];
+  for (const [name, change] of cases) {
+    const d = uiCopy(change);
+    expect(ratchetProblems(d, run(d)), name).toEqual([]);
+  }
+  // A new file with text is reported, never failed, until part A ends.
+  const d = uiCopy((x) => put(x, 'src/pages/Spare.svelte', '<h1>A new page</h1>\n<p>With words.</p>\n'));
+  const r = run(d);
+  expect(ratchetProblems(d, r)).toEqual([]);
+  expect(r.findings.filter((f) => f.file === 'src/pages/Spare.svelte').map((f) => `${f.level} ${f.rule}`)).toEqual(['report literal-text']);
+});
+
+test('api_012 the baseline command lowers counts and never raises one', () => {
+  const was = JSON.parse(readFileSync(join(project(), 'i18n-baseline.json'), 'utf8'));
+  const d = project((x) => {
+    edit(x, 'src/pages/Old.svelte', (s) => s.replace('margin-left: 4px;', 'margin-inline-start: 4px;'));
+    edit(x, 'src/pages/Cache.svelte', (s) => `${s}<p>Plain words</p>\n`);
+    put(x, 'src/pages/Blank.svelte', '<hr />\n');
+    put(x, 'src/pages/Wordy.svelte', '<h1>A new page</h1>\n');
+    rmSync(join(x, 'src/lib/labels.ts'));
+  });
+  const b = lib.baselineOf(d, run(d).files, was);
+  // Lowered (Old's physical property), never raised (Cache), a new file at zero listed (Blank), a
+  // new file above zero not listed (Wordy), a removed file dropped (labels.ts).
+  expect(b.physical).toEqual({ 'pages/Blank.svelte': 0, 'pages/Cache.svelte': 0, 'pages/Old.svelte': 0, 'pages/Wordy.svelte': 0 });
+  expect(b.literal).toEqual({ 'pages/Blank.svelte': 0, 'pages/Cache.svelte': 0, 'pages/Old.svelte': 2 });
+  // With no baseline before it, every count is written.
+  expect(lib.baselineOf(d, run(d).files, null).literal).toEqual({ 'pages/Blank.svelte': 0, 'pages/Cache.svelte': 1, 'pages/Old.svelte': 2, 'pages/Wordy.svelte': 1 });
 });
 
 test('api_012 the attributes a reader sees or hears are text', () => {
@@ -62,15 +138,10 @@ test('api_012 the attributes a reader sees or hears are text', () => {
 });
 
 test('api_012 migrated files conserve their english strings', () => {
-  const ledger = JSON.parse(readFileSync(join(UI, 'tests/i18n-fixtures/english-ledger.json'), 'utf8'));
-  const exceptions = JSON.parse(readFileSync(join(UI, 'tests/i18n-fixtures/ledger-exceptions.json'), 'utf8'));
   const r = checkUi();
-  const migrated = (r.files as { rel: string; usesLayer: boolean }[]).filter((f) => f.usesLayer);
-  expect(migrated.map((f) => f.rel)).toContain('lib/format.ts');
-  expect(ledger['lib/format.ts']).toBeTruthy();
-  // A file with no ledger entry is new since the ledger was written: it had no English to keep.
-  for (const f of migrated) if (Object.hasOwn(ledger, f.rel)) expect(lib.conserve(f, ledger[f.rel], exceptions[f.rel] ?? []), f.rel).toEqual([]);
-  for (const rel of Object.keys(exceptions)) expect(migrated.map((f) => f.rel), `exception for ${rel}`).toContain(rel);
+  expect(r.files.filter((f) => f.usesLayer).map((f) => f.rel)).toContain('lib/format.ts');
+  expect(LEDGER['lib/format.ts']).toBeTruthy();
+  expect(lib.ledgerProblems(r.files, LEDGER, EXCEPTIONS)).toEqual([]);
   // The rule can fail: a page before and after a migration.
   const before = lib.analyzeFile('pages/X.svelte', '<h1>Holds</h1>\n<p title="Close">Muted by <b>{who}</b>: not counted</p>\n', 'x');
   const entry = { markup: [...before.ledger.markup].sort(), script: [...before.ledger.script].sort() };
@@ -86,14 +157,30 @@ test('api_012 migrated files conserve their english strings', () => {
   expect(lib.conserve(after(ok.replace("<h1>{t('Holds')}</h1>", '<h1>Holds now</h1>')), entry, [merged]).join('\n')).toContain('"Holds now" is not in the ledger');
   expect(lib.conserve(after(ok), entry, [{ ...merged, fragments: ['Muted by', ': counted'] }]).join('\n')).toContain("not the sentence's pieces");
   expect(lib.conserve(after(ok), entry, [{ ...merged, fragments: ['Muted by', ': not counted', 'Elsewhere'] }]).join('\n')).toContain('"Elsewhere" is not in this file\'s ledger entry');
+  // Over the tree: a file on the layer moved to another folder carries its entry, renamed.
+  const at = (rel: string, src: string) => lib.analyzeFile(rel, src, lib.contextName(rel));
+  const ledger = { 'pages/X.svelte': entry };
+  expect(lib.ledgerProblems([at('pages/hosts/X.svelte', ok)], ledger, { 'pages/hosts/X.svelte': [merged] })).toEqual([
+    'pages/hosts/X.svelte: the ledger entry of "pages/X.svelte", which is no longer a source file, has its name: rename that entry to "pages/hosts/X.svelte"',
+  ]);
+  expect(lib.ledgerProblems([at('pages/hosts/X.svelte', ok)], { 'pages/hosts/X.svelte': entry }, { 'pages/hosts/X.svelte': [merged] })).toEqual([]);
+  // A removed file, or a moved file not on the layer, needs nothing.
+  expect(lib.ledgerProblems([], ledger, {})).toEqual([]);
+  expect(lib.ledgerProblems([at('pages/hosts/X.svelte', '<h1>Holds</h1>\n')], ledger, {})).toEqual([]);
+  // A new file on the layer: each message is English some entry had, or listed under "new".
+  const mod = (e: string) => at('lib/rates.ts', `import { tr } from './i18n';\n\nconst { m } = tr('rates');\nexport const RATE = m('${e}');\n`);
+  expect(lib.ledgerProblems([mod('Holds')], ledger, {})).toEqual([]);
+  expect(lib.ledgerProblems([mod('Rate-limited')], ledger, {})).toEqual(['lib/rates.ts: message "Rate-limited" is not English any ledger entry had: list it under "new" in ledger-exceptions.json']);
+  expect(lib.ledgerProblems([mod('Rate-limited')], ledger, { new: { 'lib/rates.ts': ['Rate-limited'] } })).toEqual([]);
+  expect(lib.ledgerProblems([mod('Holds')], ledger, { new: { 'lib/other.ts': ['x'] } })).toEqual(['"new" English for "lib/other.ts": only for a file on the layer without a ledger entry']);
 });
 
 test('api_012 no new physical css properties', () => {
   const r = checkUi();
   expect(fails(r).filter((f) => f.rule === 'physical-css')).toEqual([]);
+  expect(ratchetProblems(UI, r)).toEqual([]);
   const base = JSON.parse(readFileSync(join(UI, 'i18n-baseline.json'), 'utf8'));
   const now = lib.ratchetCounts(UI, r.files).physical as Record<string, number>;
-  const total = (o: Record<string, number>) => Object.values(o).reduce((a, b) => a + b, 0);
   console.log(`physical CSS properties: ${total(now)} in ${Object.values(now).filter((n) => n > 0).length} files (baseline ${total(base.physical)})`);
   expect(lib.physical('margin-left', '1px')).toBe(true);
   expect(lib.physical('border-top-right-radius', '2px')).toBe(true);
@@ -105,7 +192,12 @@ test('api_012 no new physical css properties', () => {
   expect(lib.physical('margin', '0 4px')).toBe(false);
   expect(failRules(run(project((d) => edit(d, 'src/pages/Old.svelte', (s) => s.replace('margin-left: 4px;', 'margin-left: 4px;\n    text-align: right;')))))).toEqual(['physical-css']);
   expect(failRules(run(project((d) => edit(d, 'src/pages/Cache.svelte', (s) => s.replace('<h2>', '<h2 style:margin-right="2px">')))))).toEqual(['physical-css']);
+  // (The fixture's baseline lists app.css at zero.)
   expect(failRules(run(project((d) => put(d, 'src/app.css', '.x {\n  text-align: left;\n}\n'))))).toEqual(['physical-css']);
+  // A file the baseline does not list is reported until part A ends.
+  const fresh = run(project((d) => put(d, 'src/pages/Fresh.svelte', '<hr />\n<style>\n  hr {\n    margin-left: 1px;\n  }\n</style>\n')));
+  expect(failRules(fresh)).toEqual([]);
+  expect(fresh.findings.filter((f) => f.file === 'src/pages/Fresh.svelte').map((f) => `${f.level} ${f.rule}`)).toEqual(['report physical-css']);
   expect(failRules(run(project((d) => put(d, 'src/app.css', '.x {\n  margin-inline-start: 1px;\n  text-align: start;\n}\n'))))).toEqual([]);
   expect(failRules(run(project((d) => edit(d, 'src/pages/Old.svelte', (s) => s.replace('margin-left: 4px;', 'margin-inline-start: 4px;')))))).toEqual([]);
 });

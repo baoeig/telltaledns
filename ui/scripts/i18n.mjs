@@ -10,7 +10,8 @@
 //   node scripts/i18n.mjs carry <context> --from "<old>" --to "<new>"   for maintainers: an English
 //                                            edit that keeps the meaning keeps its translations
 //   node scripts/i18n.mjs ledger <file>... | --all   rewrites english-ledger.json entries from the tree
-//   node scripts/i18n.mjs baseline           rewrites i18n-baseline.json from the tree
+//   node scripts/i18n.mjs baseline           lowers i18n-baseline.json's counts to the tree's (and
+//                                            lists new files at zero); never raises one
 //   node scripts/i18n.mjs plurals            for maintainers, once and reviewed: rewrites
 //                                            src/locales/plurals.json from this Node's CLDR data
 // Needs a Node that strips TypeScript types (24, as CI and the Dockerfile use; or 22.18+): the
@@ -94,8 +95,11 @@ switch (cmd) {
     break;
   }
   case 'baseline': {
+    // Lowers counts and lists new files at zero; never raises a count or lists a file above zero.
     const result = check(ROOT, { ratchets: false });
-    writeFileSync(join(ROOT, 'i18n-baseline.json'), serializeJson(baselineOf(ROOT, result.files)));
+    const path = join(ROOT, 'i18n-baseline.json');
+    const previous = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : null;
+    writeFileSync(path, serializeJson(baselineOf(ROOT, result.files, previous)));
     console.log('i18n baseline: i18n-baseline.json written');
     break;
   }
