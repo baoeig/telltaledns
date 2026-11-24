@@ -118,6 +118,13 @@ another folder takes its ledger entry with it (rename the key); a new file on th
 English some entry already has, or lists its new English under `new` in
 `tests/i18n-fixtures/ledger-exceptions.json` (`{"new": {"lib/x.ts": ["English"]}}`).
 
+**Moving a file to the layer** (part A): `node scripts/i18n-codemod.mjs <file under src/>` (or
+`--all`) prints, per file, what it can move and what it leaves for the hand; `--write` rewrites the
+file. Each template text and each attribute a reader sees or hears becomes `t('…')` (the text as
+the browser shows it), and the file gets its `tr()` line. It lists, with the line, and never edits:
+a sentence with an expression, an inline element or a block inside, `<pre>`, script strings, plural
+ternaries (`tn()` takes the `one` form for -1), labels used as keys, canvas text and `Intl` calls.
+
 **Add a language.** A maintainer adds the tag to `src/locales/manifest.json` (`owners`: the GitHub
 logins of the people who answer for its content; `dir`; `offered: false` until a release turns it
 on; `since`), and the language to `src/locales/plurals.json` if it is not there (`node
