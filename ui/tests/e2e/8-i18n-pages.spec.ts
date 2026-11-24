@@ -13,7 +13,8 @@ async function signIn(page: Page) {
   await page.getByLabel('Username', { exact: true }).fill(ADMIN.user);
   await page.getByLabel('Password', { exact: true }).fill(ADMIN.pass);
   await page.getByRole('button', { name: 'Sign in' }).click();
-  await expect(page.getByRole('heading', { name: 'Dashboard', exact: true }).first()).toBeVisible();
+  // As 1-ui.spec.ts finds it: the heading's accessible name holds more than the word (and Argon2 is slow).
+  await expect(page.getByRole('heading', { name: 'Dashboard' }).first()).toBeVisible({ timeout: 30_000 });
 }
 
 test('api_012 an english session requests only core assets', async ({ page }) => {
@@ -29,7 +30,7 @@ test('api_012 an english session requests only core assets', async ({ page }) =>
     ['/#/settings', 'Settings'],
   ]) {
     await page.goto(path);
-    await expect(page.getByRole('heading', { name: heading, exact: true }).first()).toBeVisible();
+    await expect(page.getByRole('heading', { name: heading }).first()).toBeVisible();
   }
   await expect(page.locator('html')).toHaveAttribute('lang', 'en');
   expect(assets.length, 'the page loaded its assets').toBeGreaterThan(0);
