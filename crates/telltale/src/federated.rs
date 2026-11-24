@@ -4161,7 +4161,7 @@ mod bridge_tests {
             on_a_thread(n, &gate, move |fed| crate::alerts::drill_reports(fed, now));
         let _ = gate.send(());
         assert!(seen.is_empty(), "{seen:?}");
-        // Bounds only, far from the deadline (2.5 s and the bridge's grace): no race.
+        // Bounds only, far from the wait (the 3 s deadline and the bridge's 250 ms grace): no race.
         assert!(took >= Duration::from_secs(2), "{took:?}: it gave up early");
         assert!(took < Duration::from_secs(8), "{took:?}");
         drop(n);

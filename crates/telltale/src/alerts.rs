@@ -769,9 +769,11 @@ fn observe(
 }
 
 /// REQ: CLU-004, CLU-014 (ADR-174) — how long the drill-report alert waits for the drill
-/// reports; the bridge adds its grace. The read's longest call is the primary relaying it to the
-/// nodes this one has no stream to: 2.5 s (`drill::via_primary`, its 2 s and a hop); half a second
-/// more.
+/// reports; the bridge adds its 250 ms grace. The alert runs only on the primary or a standalone
+/// node (`run`), where the read asks each member for 2 s at most (`drill::READ_DEADLINE`) and
+/// relays nothing (`drill::via_primary` is a replica's): a second to spare. A node that stops being
+/// the primary during the round relays through the new one, 2.5 s (its 2 s and a hop), which
+/// still fits.
 const DRILL_READ_DEADLINE: Duration = Duration::from_secs(3);
 
 /// REQ: CLU-014 (owner 2026-10-19) — the `drill_report` alert's subjects: once per drill report,
@@ -784,7 +786,7 @@ pub(crate) fn drill_reports(b: &dyn Backend, now: u64) -> Observed {
     // REQ: CLU-004 (ADR-174's known leftover; GitHub issue #7) — through the bridge, with a
     // deadline of the operating system's, never `Handle::block_on`: a runtime that can't run the
     // read costs this round its reports (each is sent once, so the next round sends it), never
-    // this thread for as long as the runtime is stuck.
+    // this thread for as long as the runtime is stuck. The debug log says why a round had none.
     let page = crate::federated::read_within(
         &h,
         "the drill reports",
