@@ -1,0 +1,380 @@
+// REQ: API-012 (ADR-189) — languages in the web UI, the layer itself, without a browser: messages,
+// plurals, matching, the agreement rule, the pseudo-locale, the runtime's tables, the catalog step,
+// and the pair files. The languages tool is 7-i18n-check.spec.ts, the ratchets and the
+// English ledger 7-i18n-ratchets.spec.ts, the pages 8-i18n-pages.spec.ts.
+import { expect, test } from '@playwright/test';
+import { interpolate, parts, plural } from '../../src/lib/i18n/message';
+import { candidates, canonical, match, type Request } from '../../src/lib/i18n/match';
+import { agree, agreesAtRuntime, codePoints, tokens, urls } from '../../src/lib/i18n/safe';
+import { LOWER, UPPER, pseudo } from '../../src/lib/i18n/pseudo';
+import { hash } from '../../src/lib/i18n/ident';
+import { PairFileError, merge, parse, skeleton } from '../../src/lib/i18n/pairs';
+import { catalogRuntime, install, load, parseCatalog, tk, tr, type Choice } from '../../src/lib/i18n';
+
+/** Runs `body` with `c` installed, then English again. */
+function under(c: Choice, body: () => void) {
+  install(c);
+  try {
+    body();
+  } finally {
+    install({ tag: 'en' });
+  }
+}
+const table = (o: object) => parseCatalog(JSON.stringify(o));
+
+// ---------------------------------------------------------------------------------------------
+// Messages
+
+
+test('api_012 interpolation is single pass and own-property only', () => {
+  expect(interpolate('Hello {name}', { name: '{name}' })).toBe('Hello {name}');
+  expect(interpolate('{a} and {b}', { a: '{b}', b: 'x' })).toBe('{b} and x');
+  expect(interpolate('Hi {who}', { who: '<b>x</b>' })).toBe('Hi <b>x</b>');
+  expect(interpolate('{constructor} {toString} {__proto__} {hasOwnProperty}', {})).toBe('{constructor} {toString} {__proto__} {hasOwnProperty}');
+  expect(interpolate('{inherited}', Object.create({ inherited: 'no' }))).toBe('{inherited}');
+  expect(interpolate('{v} $1', { v: '$& $1' })).toBe('$& $1 $1');
+  expect(interpolate('{missing}', { other: 1 })).toBe('{missing}');
+  expect(interpolate('no params {x}')).toBe('no params {x}');
+});
+
+test('api_012 a nullish parameter renders as empty', () => {
+  expect(interpolate('[{v}]', { v: undefined })).toBe('[]');
+  expect(interpolate('[{v}]', { v: null })).toBe('[]');
+  expect(interpolate('[{v}]', { v: 0 })).toBe('[0]');
+  expect(interpolate('[{v}]', { v: false })).toBe('[false]');
+  expect(interpolate('[{v}]', { v: '' })).toBe('[]');
+  const { t, tn } = tr('fixture');
+  expect(t('[{v}]', { v: undefined })).toBe('[]');
+  expect(tn('{n} row ({v})', '{n} rows ({v})', 2, { n: 2, v: null })).toBe('2 rows ()');
+});
+
+test('api_012 message markup becomes text and named snippets only', () => {
+  const tags = ['b', 'a', 'br'];
+  expect(parts('Muted by <b>{who}</b>: ok', { who: '<i>x</i>' }, tags)).toEqual([{ text: 'Muted by ' }, { tag: 'b', text: '<i>x</i>' }, { text: ': ok' }]);
+  expect(parts('<img src=x onerror=alert(1)>', null, tags)).toEqual([{ text: '<img src=x onerror=alert(1)>' }]);
+  expect(parts('<script>alert(1)</script>', null, tags)).toEqual([{ text: '<script>alert(1)</script>' }]);
+  expect(parts('unclosed <b>bold', null, tags)).toEqual([{ text: 'unclosed <b>bold' }]);
+  expect(parts('<a href="https://evil.example">link</a>', null, tags)).toEqual([{ text: '<a href="https://evil.example">link</a>' }]);
+  expect(parts('line<br/>next', null, tags)).toEqual([{ text: 'line' }, { tag: 'br', text: '' }, { text: 'next' }]);
+  // A tag the caller has no snippet for stays text; a parameter never becomes a tag.
+  expect(parts('<b>x</b>', null, [])).toEqual([{ text: '<b>x</b>' }]);
+  expect(parts('{x}', { x: '<b>y</b>' }, ['b'])).toEqual([{ text: '<b>y</b>' }]);
+  // No nesting: the outer tag stays text.
+  expect(parts('<b><a>x</a></b>', null, tags)).toEqual([{ text: '<b>' }, { tag: 'a', text: 'x' }, { text: '</b>' }]);
+});
+
+test('api_012 english plurals come from the catalog language', () => {
+  // What the browser's own rules would say: French 0 is "one", Russian 2 is "few", Japanese 1 is "other".
+  expect(new Intl.PluralRules('fr').select(0)).toBe('one');
+  expect(new Intl.PluralRules('ru').select(2)).toBe('few');
+  expect(new Intl.PluralRules('ja').select(1)).toBe('other');
+  // English: there is no browser input at all.
+  const { tn } = tr('fixture');
+  expect([0, 1, 2].map((n) => tn('{n} answer', '{n} answers', n, { n }))).toEqual(['0 answers', '1 answer', '2 answers']);
+  for (const browser of ['fr', 'ja', 'ru']) {
+    // A page in the browser's language whose catalog lacks the message: English text, English rules.
+    under({ tag: browser, table: table({}), formatLocale: `${browser}-XX` }, () => {
+      const { tn: tb } = tr('fixture');
+      expect([0, 1, 2].map((n) => tb('{n} answer', '{n} answers', n, { n })), browser).toEqual(['0 answers', '1 answer', '2 answers']);
+    });
+    const f = catalogRuntime(browser, table({}), 'ltr', browser).forms('fixture', '{n} answer', '{n} answers');
+    expect(f.lang).toBe('en');
+    expect([0, 1, 2].map((n) => plural(f.lang, f.forms, n))).toEqual(['{n} answers', '{n} answer', '{n} answers']);
+  }
+  // The pseudo-locale is English text: English rules.
+  under({ tag: 'en-XA' }, () => expect(tr('fixture').tn('{n} answer', '{n} answers', 1, { n: 1 })).toBe(pseudo('{n} answer').replace('{n}', '1')));
+});
+
+test('api_012 a missing plural category falls back within the catalog', () => {
+  const k = hash('c', ['{n} file', '{n} files']);
+  under({ tag: 'ru', table: table({ [k]: { one: '{n} файл', other: '{n} файлов' } }), formatLocale: 'ru-RU' }, () => {
+    const { tn } = tr('c');
+    expect(tn('{n} file', '{n} files', 1, { n: 1 })).toBe('1 файл');
+    // Russian 3 is "few" and 5 is "many": the catalog has neither, so its own "other", never English.
+    expect(tn('{n} file', '{n} files', 3, { n: 3 })).toBe('3 файлов');
+    expect(tn('{n} file', '{n} files', 5, { n: 5 })).toBe('5 файлов');
+  });
+  // A plural without "other" is not a catalog entry: English.
+  under({ tag: 'ru', table: table({ [k]: { one: '{n} файл' } }) }, () => expect(tr('c').tn('{n} file', '{n} files', 3, { n: 3 })).toBe('3 files'));
+});
+
+// ---------------------------------------------------------------------------------------------
+// Matching
+
+
+test('api_012 locale matching follows the request order and scripts', () => {
+  const offered = { 'zh-Hans': { offered: true } };
+  const browser = (...tags: string[]): Request[] => tags.map((tag) => ({ tag, source: 'browser' as const }));
+  expect(match(browser('zh-TW', 'zh', 'en-US', 'en'), offered)).toBe('en');
+  expect(match(browser('zh-HK', 'zh'), offered)).toBe('en');
+  expect(match(browser('zh', 'zh-TW'), offered)).toBe('zh-Hans');
+  expect(match(browser('zh-TW', 'zh-CN', 'en'), offered)).toBe('zh-Hans');
+  expect(match(browser('zh-SG'), offered)).toBe('zh-Hans');
+  expect(match(browser('de-DE', 'en-US', 'zh-CN'), offered)).toBe('en');
+  expect(match(browser('not a tag', '__proto__', 'constructor', 'toString', ''), offered)).toBe('en');
+  expect(match([], offered)).toBe('en');
+  expect(candidates('zh', ['zh-TW'])).toEqual(['zh', 'zh-Hant-TW', 'zh-Hant']);
+  expect(candidates('zh')).toEqual(['zh', 'zh-Hans-CN', 'zh-Hans']);
+  expect(canonical('zh-hant-tw')).toBe('zh-Hant-TW');
+  expect(canonical('__proto__')).toBeNull();
+  // A catalog that is not offered is reached through ?lang= only.
+  const hidden = { 'zh-Hans': { offered: false } };
+  expect(match(browser('zh-CN'), hidden)).toBe('en');
+  expect(match([{ tag: 'zh-CN', source: 'stored' }], hidden)).toBe('en');
+  expect(match([{ tag: 'zh-CN', source: 'param' }], hidden)).toBe('zh-Hans');
+  // ?lang= comes first, then the stored choice, then the browser.
+  const two = { 'zh-Hans': { offered: true }, 'fr-FR': { offered: true } };
+  expect(match([{ tag: 'fr-FR', source: 'param' }, { tag: 'zh-CN', source: 'stored' }], two)).toBe('fr-FR');
+  // The pseudo-locale only from ?lang=.
+  expect(match([{ tag: 'en-XA', source: 'param' }], offered)).toBe('en-XA');
+  expect(match([{ tag: 'en-XA', source: 'browser' }, { tag: 'zh-CN', source: 'browser' }], offered)).toBe('en');
+});
+
+// ---------------------------------------------------------------------------------------------
+// The agreement rule
+
+
+const failed = (en: string, tx: string, o?: object) => [...new Set(agree(en, tx, o).fails.map((f) => f.rule))];
+
+test('api_012 url and token extraction', () => {
+  // A CJK full stop after a URL, and text right after it.
+  expect(urls('打开https://192.168.1.1。然后登录')).toEqual(['https://192.168.1.1']);
+  expect(failed('Open https://192.168.1.1.', '打开https://192.168.1.1。然后登录')).toEqual([]);
+  // A fullwidth parenthesis ends the URL: here a bare scheme.
+  expect(urls('见 https://（DNS…')).toEqual(['https://']);
+  // A fullwidth colon does not glue two tokens.
+  expect(tokens('OPNsense：https://x.example/a')).toEqual(['OPNsense', 'https://x.example/a']);
+  // Fullwidth letters and dots in an address are caught.
+  expect(failed('See https://example.com/x', '见 https://ｅｖｉｌ．ｃｏｍ/x')).toContain('urls');
+  expect(failed('See https://example.com/x', '见 https://ｅｖｉｌ.com/x')).toContain('urls');
+  // A scheme with a host and port, and its number, must stay.
+  expect(failed('Use smtp://host:587 to send', '用邮件服务器发送')).toEqual(['structural', 'digits']);
+  // A verbatim word renamed fails; kept as a word (also between CJK letters) it passes.
+  expect(failed('Send by email', '通过电子邮件发送', { verbatim: ['email'] })).toEqual(['verbatim']);
+  expect(failed('Send by email', '通过email发送', { verbatim: ['email'] })).toEqual([]);
+  expect(failed('Send by email', '通过 emails 发送', { verbatim: ['email'] })).toEqual(['verbatim']);
+  // A hyphenated word and a short acronym translated: reported, not failed.
+  const v = agree('Use the UI to sign-in', '使用界面登录');
+  expect(v.fails).toEqual([]);
+  expect(v.reports.map((r) => r.rule).sort()).toEqual(['capitals', 'hyphenated']);
+  // A token the translation adds is reported.
+  expect(agree('Holds', '保存 DNS').reports.map((r) => r.rule)).toEqual(['added']);
+  // A Latin word with one Cyrillic letter fails.
+  expect(failed('Password', 'Pаssword')).toEqual(['mixed-script']);
+  // A glossary term is structural.
+  expect(failed('NXDOMAIN answers', '否定回答', { glossary: ['NXDOMAIN'] })).toEqual(['structural']);
+  expect(failed('NXDOMAIN answers', 'NXDOMAIN 回答', { glossary: ['NXDOMAIN'] })).toEqual([]);
+});
+
+test('api_012 forbidden code points', () => {
+  const named: Record<string, string> = {
+    'U+202A': '‪', 'U+202E': '‮', 'U+2066': '⁦', 'U+2069': '⁩', 'U+200B': '​', 'U+2060': '⁠',
+    'U+2064': '⁤', 'U+FEFF': '﻿', 'U+00AD': '­', 'U+0000': '\u0000', 'U+0009': '\t', 'U+001F': '\u001F',
+    'U+007F': '\u007F', 'U+0080': '\u0080', 'U+009F': '\u009F',
+  };
+  for (const [name, c] of Object.entries(named)) expect(codePoints(`a${c}b`), name).toEqual([name]);
+  expect(codePoints('a\nb')).toEqual([]);
+  // U+200C/U+200D between letters of a script that needs them; nowhere else.
+  expect(codePoints('می‌خواهم')).toEqual([]);
+  expect(codePoints('क्‍ष')).toEqual([]);
+  expect(codePoints('ab‌cd')).toEqual(['U+200C']);
+  expect(codePoints('‌می')).toEqual(['U+200C']);
+  expect(codePoints('a‍b')).toEqual(['U+200D']);
+  // U+200E, U+200F and U+061C right to left only.
+  for (const c of ['‎', '‏', '؜']) {
+    expect(codePoints(`a${c}b`)).toHaveLength(1);
+    expect(codePoints(`a${c}b`, 'rtl')).toEqual([]);
+  }
+  expect(failed('Hello', 'Hel‮lo')).toEqual(['code-point']);
+  expect(agreesAtRuntime('Hello', 'Hel​lo')).toBe(false);
+});
+
+test('api_012 findings name the rule the token and its place', () => {
+  const v = agree('See https://a.example/docs and {n} items', 'Qa {n} https://b.example/docs Pаss‮');
+  const pick = (rule: string) => v.fails.filter((f) => f.rule === rule).map(({ token, at, detail }) => ({ token, at, detail }));
+  expect(pick('urls')).toEqual([
+    { token: 'https://a.example/docs', at: -1, detail: 'missing' },
+    { token: 'https://b.example/docs', at: 7, detail: 'added' },
+  ]);
+  expect(pick('structural')).toEqual([{ token: 'https://a.example/docs', at: -1, detail: 'missing' }]);
+  expect(pick('mixed-script')).toEqual([{ token: 'Pаss', at: 30, detail: 'mixes Latin with Cyrillic or Greek letters' }]);
+  expect(pick('code-point')).toEqual([{ token: 'U+202E', at: 34, detail: 'forbidden' }]);
+  // The browser's first-use check is a separate yes or no on the same rules.
+  expect(agreesAtRuntime('See https://a.example/docs and {n} items', 'Qa {n} https://b.example/docs Pаss‮')).toBe(false);
+});
+
+test('api_012 a translation keeps the placeholders tags urls and tokens of english', () => {
+  expect(failed('{n} rows', '{n} 行')).toEqual([]);
+  expect(failed('{n} rows', '行')).toEqual(['placeholders']);
+  expect(failed('{n} rows', '{n} {m} 行')).toEqual(['placeholders']);
+  expect(failed('{n} rows', '{N} 行')).toEqual(['placeholders']);
+  expect(failed('Muted by <b>{who}</b>', '静音 <b>{who}</b>')).toEqual([]);
+  expect(failed('Muted by <b>{who}</b>', '静音 {who}')).toEqual(['tags']);
+  expect(failed('Muted by <b>{who}</b>', '静音 <i>{who}</i>')).toEqual(['tags']);
+  expect(failed('See https://a.example/docs', '见 https://a.example/docs')).toEqual([]);
+  expect(failed('See https://a.example/docs', '见 https://b.example/docs')).toEqual(['urls', 'structural']);
+  expect(failed('See the docs', '见 https://evil.example')).toEqual(['urls']);
+  expect(failed('Set upstream=1.1.1.1', '设置上游')).toEqual(['structural', 'digits']);
+  expect(failed('Path /etc/telltale/ here', '路径 /etc/telltale/')).toEqual([]);
+  expect(failed('Path /etc/telltale/ here', '路径')).toEqual(['structural']);
+  expect(failed('Code [x] here', '代码 [x]')).toEqual([]);
+  expect(failed('a|b and $HOME and x_y', 'ab')).toEqual(['structural']);
+  expect(failed('localhost:8053', '本机')).toEqual(['structural', 'digits']);
+  expect(failed('Run `telltale ctl` now', '现在运行 `telltale ctl`')).toEqual([]);
+  expect(failed('Run `telltale ctl` now', '现在运行 `telltale-ctl`')).toEqual(['code']);
+  expect(failed('Wait 7 days', '等待七天')).toEqual(['digits']);
+  expect(failed('Wait 7 days', '等待七天', { exemptDigits: true })).toEqual([]);
+  expect(failed('Port 53 and 53', 'port 53')).toEqual(['digits']);
+  // The browser applies the same rules, without the data-file ones (verbatim, glossary).
+  expect(agreesAtRuntime('Send by email', '通过电子邮件发送')).toBe(true);
+  expect(agreesAtRuntime('See https://a.example', '见 https://b.example')).toBe(false);
+  expect(agreesAtRuntime('{n} rows', '行')).toBe(false);
+  expect(agreesAtRuntime('Set upstream=1.1.1.1', '设置 upstream=1.1.1.1')).toBe(true);
+});
+
+test('api_012 pseudo text keeps placeholders and tags and accents every letter', () => {
+  expect(LOWER).toHaveLength(26);
+  expect(UPPER).toHaveLength(26);
+  expect([...LOWER, ...UPPER].every((c) => c.charCodeAt(0) > 127)).toBe(true);
+  const p = pseudo('Muted by <b>{who}</b>: 3 rows');
+  expect(p).toContain('<b>{who}</b>');
+  expect(p).toContain('3');
+  expect(p.replace(/<\/?b>|\{who\}/g, '')).not.toMatch(/[A-Za-z]/);
+  const plain = 'Holds the answers';
+  expect(pseudo(plain).length).toBeGreaterThanOrEqual(Math.ceil(plain.length * 1.3));
+  expect(pseudo('')).toBe('');
+  under({ tag: 'en-XA' }, () => expect(tr('fixture').t('Hello {name}', { name: 'Ada' })).toBe(pseudo('Hello {name}').replace('{name}', 'Ada')));
+});
+
+// ---------------------------------------------------------------------------------------------
+// The runtime and its tables
+
+
+test('api_012 catalog entries named like object members are data', () => {
+  const parsed = parseCatalog(
+    '{"__proto__": {"polluted": "yes"}, "constructor": "c", "toString": "t", "0123abcd": "ok", "0123abce": {"other": "x", "__proto__": "y", "constructor": "z"}}',
+  ) as Record<string, unknown>;
+  expect(Object.getPrototypeOf(parsed)).toBeNull();
+  expect(Object.keys(parsed)).toEqual(['0123abcd', '0123abce']);
+  expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  expect(Object.getPrototypeOf(parsed['0123abce'])).toBeNull();
+  expect(Object.keys(parsed['0123abce'] as object)).toEqual(['other']);
+  expect(Object.keys(parseCatalog('not json'))).toEqual([]);
+  expect(Object.keys(parseCatalog('[1, 2]'))).toEqual([]);
+  const t3 = table({ [hash('c', 'constructor')]: 'Qa-constructor', [hash('c', '__proto__')]: 'Qa __proto__', [hash('__proto__', 'x')]: 'Qa-x' });
+  under({ tag: 'qaa', table: t3 }, () => {
+    const { t } = tr('c');
+    expect(t('constructor')).toBe('Qa-constructor');
+    expect(t('__proto__')).toBe('Qa __proto__');
+    expect(t('toString')).toBe('toString');
+    expect(t('hasOwnProperty')).toBe('hasOwnProperty');
+    expect(t('valueOf')).toBe('valueOf');
+    expect(tk({ c: 'c', e: 'constructor' })).toBe('Qa-constructor');
+    expect(tr('__proto__').t('x')).toBe('Qa-x');
+    expect(tr('constructor').t('toString')).toBe('toString');
+  });
+});
+
+test('api_012 the runtime drops a translation that differs from current english', () => {
+  const en = {
+    url: 'Read https://example.com/docs first',
+    token: 'Set upstream=1.1.1.1',
+    placeholder: 'Hello {name}',
+    digits: 'Wait 7 days',
+    tag: 'Kept by <b>{who}</b>',
+    ok: 'Holds',
+  };
+  const entries = {
+    [hash('c', en.url)]: 'Qa-read https://evil.example/docs',
+    [hash('c', en.token)]: 'Qa-set upstream',
+    [hash('c', en.placeholder)]: 'Qa-hello',
+    [hash('c', en.digits)]: 'Qa-wait days',
+    [hash('c', en.tag)]: 'Qa-kept {who}',
+    [hash('c', en.ok)]: 'Qa-holds',
+    [hash('c', ['{n} answer', '{n} answers'])]: { other: 'Qa answers' },
+  };
+  under({ tag: 'qaa', table: table(entries) }, () => {
+    const { t, tn } = tr('c');
+    expect(t('Read https://example.com/docs first')).toBe(en.url);
+    expect(t('Set upstream=1.1.1.1')).toBe(en.token);
+    expect(t('Hello {name}', { name: 'Ada' })).toBe('Hello Ada');
+    expect(t('Wait 7 days')).toBe(en.digits);
+    expect(t('Kept by <b>{who}</b>', { who: 'x' })).toBe('Kept by <b>x</b>');
+    expect(tn('{n} answer', '{n} answers', 2, { n: 2 })).toBe('2 answers');
+    // An agreeing translation is shown, and found again however the English is spaced or quoted.
+    expect(t('Holds')).toBe('Qa-holds');
+    expect(t(' Holds ')).toBe('Qa-holds');
+    // A translation made from older English matches nothing: English.
+    expect(t('Holds now')).toBe('Holds now');
+  });
+});
+
+test('api_012 the catalog step falls back to english', async () => {
+  const locales = Object.assign(Object.create(null), { 'zh-Hans': { url: '/assets/locales/zh-Hans-00000000.json', dir: 'ltr', offered: true } });
+  const src = (languages: string[], search = '') => ({ search, stored: null, languages });
+  const body = JSON.stringify({ [hash('c', 'Holds')]: '保存' });
+  const ok = (async () => new Response(body, { status: 200 })) as typeof fetch;
+  const asked: string[] = [];
+  const spy = (async (url: string) => (asked.push(url), new Response(body))) as typeof fetch;
+  // English needs no request.
+  expect(await load(locales, src(['en-US']), spy)).toEqual({ tag: 'en' });
+  expect(await load(locales, src(['de-DE']), spy)).toEqual({ tag: 'en' });
+  expect(asked).toEqual([]);
+  expect(await load(locales, src(['en-US'], '?lang=en-XA'), spy)).toEqual({ tag: 'en-XA' });
+  // A catalog: its table, its direction, and the browser's variant of its language for formats.
+  const zh = await load(locales, src(['zh-CN', 'en']), ok);
+  expect(zh.tag).toBe('zh-Hans');
+  expect(zh.formatLocale).toBe('zh-CN');
+  under(zh, () => expect(tr('c').t('Holds')).toBe('保存'));
+  // A failed, refused or late catalog request: English.
+  expect(await load(locales, src(['zh-CN']), (async () => new Response('', { status: 404 })) as typeof fetch)).toEqual({ tag: 'en' });
+  expect(await load(locales, src(['zh-CN']), (async () => Promise.reject(new Error('offline'))) as typeof fetch)).toEqual({ tag: 'en' });
+  const never = ((_u: string, init?: RequestInit) =>
+    new Promise((_, reject) => init?.signal?.addEventListener('abort', () => reject(new Error('aborted'))))) as typeof fetch;
+  expect(await load(locales, src(['zh-CN']), never, 20)).toEqual({ tag: 'en' });
+  // A provider is asked first; nothing, or a failure, goes on as before.
+  expect(await load(locales, src(['en-US']), spy, 4000, () => ({ tag: 'en-XA' }))).toEqual({ tag: 'en-XA' });
+  expect(await load(locales, src(['en-US']), spy, 4000, () => null)).toEqual({ tag: 'en' });
+  expect(
+    await load(locales, src(['en-US']), spy, 4000, () => {
+      throw new Error('broken');
+    }),
+  ).toEqual({ tag: 'en' });
+  expect(asked).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------------------------
+// The pair files
+
+
+test('api_012 the pair-file parser refuses what json would lose', () => {
+  expect(parse('{"a": [1, "x", null, true]}')).toEqual({ a: [1, 'x', null, true] });
+  const refused = (text: string, limits?: { bytes: number; depth: number }) => {
+    try {
+      parse(text, limits);
+      return null;
+    } catch (e) {
+      expect(e).toBeInstanceOf(PairFileError);
+      return (e as Error).message;
+    }
+  };
+  expect(refused('{"a": [], "a": []}')).toContain('the key "a" twice');
+  expect(refused('{"c": [[["one", "other"], {"other": "x", "other": "y"}]]}')).toContain('the key "other" twice');
+  expect(refused('[[[[[1]]]]]')).toContain('nesting deeper than 4');
+  expect(refused('{"a": 1}', { bytes: 4, depth: 4 })).toContain('over 4 characters');
+  expect(refused('{"a": 1} x')).toContain('text after the end');
+  expect(refused('{"a": "\u0001"}')).toContain('a malformed string');
+  expect(refused('{"a": 1,}')).toContain('a key that is not a string');
+  const proto = parse('{"__proto__": {"x": 1}}') as Record<string, unknown>;
+  expect(Object.getPrototypeOf(proto)).toBe(Object.prototype);
+  expect(Object.keys(proto)).toEqual(['__proto__']);
+  expect(({} as Record<string, unknown>).x).toBeUndefined();
+  // sync is extract -> skeleton -> merge: the same functions run on a skeleton alone.
+  const skel = skeleton([{ ctx: 'c', english: 'Holds' }, { ctx: 'c', english: ['{n} file', '{n} files'] }, { ctx: 'c', english: 'Open', note: 'verb' }], ['one', 'few', 'other']);
+  expect(skel).toEqual({ c: [['Holds', ''], [['{n} file', '{n} files'], { one: '', few: '', other: '' }], ['Open', '', 'verb']] });
+  const key = (ctx: string, e: unknown, n?: string) => `${ctx}|${JSON.stringify(e)}|${n ?? ''}`;
+  const merged = merge({ c: [['Holds', 'Qa'], ['Gone', 'Qa-gone']], '~leftover': [['Older', 'Qa-older']] }, skel, key);
+  expect(merged.c).toEqual([['Holds', 'Qa'], [['{n} file', '{n} files'], { one: '', few: '', other: '' }], ['Open', '', 'verb']]);
+  expect(merged['~leftover']).toEqual([['Older', 'Qa-older'], ['Gone', 'Qa-gone']]);
+  expect(merge({ c: [['Gone', 'x']] }, skel, key, { prune: true })['~leftover']).toBeUndefined();
+});
