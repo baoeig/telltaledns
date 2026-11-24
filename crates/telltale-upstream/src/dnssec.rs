@@ -12,6 +12,9 @@
 //! - **insecure** is served without AD;
 //! - **bogus** becomes SERVFAIL with EDE 6 (or is served, in permissive mode).
 //!
+//! An answer whose denial is about a CNAME's target, which the library checks for the name that
+//! was asked, is validated link by link (`Validator::validate_links`).
+//!
 //! Validation runs only on cache misses: the validated answer goes into the cache with its AD
 //! bit, so hits cost nothing extra.
 //!
@@ -28,7 +31,7 @@ use std::time::Duration;
 use futures_util::StreamExt as _;
 use futures_util::stream::{self, Stream};
 use hickory_net::dnssec::DnssecDnsHandle;
-use hickory_net::proto::dnssec::rdata::{DNSSECRData, NSEC3};
+use hickory_net::proto::dnssec::rdata::{DNSSECRData, NSEC, NSEC3};
 use hickory_net::proto::dnssec::{Proof, TrustAnchors};
 use hickory_net::proto::op::{
     DnsRequest, DnsRequestOptions, DnsResponse, Edns, Message, OpCode, Query, ResponseCode,
@@ -53,6 +56,16 @@ pub enum Verdict {
 }
 
 impl Verdict {
+    /// The weaker of the two.
+    fn weakest(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Bogus, _) | (_, Self::Bogus) => Self::Bogus,
+            (Self::Indeterminate, _) | (_, Self::Indeterminate) => Self::Indeterminate,
+            (Self::Insecure, _) | (_, Self::Insecure) => Self::Insecure,
+            _ => Self::Secure,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Secure => "secure",
@@ -307,7 +320,8 @@ impl Validator {
         let result =
             tokio::time::timeout(budget * LOOKUP_SHARE.0 / LOOKUP_SHARE.1, stream.next()).await;
         let (upstream_id, attempts) = *last.lock();
-        let response = match result {
+        let rtype = RecordType::from(q.qtype);
+        let response = match result.map(|r| r.map(|r| or_wildcard(r, &name, rtype))) {
             Ok(Some(Ok(r))) => r,
             // An upstream failure is an upstream failure (stale or SERVFAIL as usual).
             Ok(Some(Err(e))) if is_transport(&e) => return Err(ResolveError::Empty),
@@ -319,6 +333,15 @@ impl Validator {
                     .await
                 {
                     verdict = Verdict::Insecure;
+                } else if denied_through_cname(&e, &name, &q)
+                    && let Some((verdict, message)) = self
+                        .validate_links(group, &handle, &name, &q, budget, deadline)
+                        .await?
+                {
+                    tracing::debug!(name = %qkey, ?verdict, "DNSSEC: validated link by link");
+                    self.stats.count(verdict);
+                    let by = *last.lock();
+                    return finish(message, verdict, &q, &name, (client_do, client_ad), by);
                 }
                 self.stats.count(verdict);
                 return Ok(Validated {
@@ -349,8 +372,19 @@ impl Validator {
             tracing::debug!(name = %qkey, "DNSSEC: bogus verdict corrected: the zone is unsigned");
             verdict = Verdict::Insecure;
         }
-        self.stats.count(verdict);
         let mut message = response.into_message();
+        // A chain from a signed zone into an unsigned one the library misjudges (as above).
+        if verdict == Verdict::Bogus
+            && follows_cname(&q)
+            && starts_with_cname(&message, &name)
+            && let Some(found) = self
+                .validate_links(group, &handle, &name, &q, budget, deadline)
+                .await?
+        {
+            tracing::debug!(name = %qkey, verdict = ?found.0, "DNSSEC: validated link by link");
+            (verdict, message) = found;
+        }
+        self.stats.count(verdict);
         // REQ: DNS-011 (T9.16) — a secure denial's NSEC ranges, for later questions.
         if self.aggressive && verdict == Verdict::Secure {
             let mut all = self.nsec.lock();
@@ -361,28 +395,43 @@ impl Validator {
                 .or_default()
                 .learn(&message, std::time::Instant::now());
         }
-        // Before DNSSEC records are stripped: why a bogus answer failed.
-        let ede = if verdict == Verdict::Bogus {
-            message
-                .to_vec()
-                .map_or(telltale_proto::ede::DNSSEC_BOGUS, |b| {
-                    bogus_reason(&b, unix_now_u32())
-                })
-        } else {
-            0
-        };
-        tidy(&mut message, q.qtype, client_do, &name);
-        message.metadata.authentic_data = verdict == Verdict::Secure && (client_do || client_ad);
-        message.metadata.checking_disabled = false;
-        let bytes = message.to_vec().map_err(|_| ResolveError::Empty)?;
-        Ok(Validated {
-            bytes,
-            verdict,
-            ede,
-            upstream_id,
-            attempts,
-        })
+        let client = (client_do, client_ad);
+        finish(message, verdict, &q, &name, client, (upstream_id, attempts))
     }
+}
+
+/// The validated answer to cache and serve, with its verdict. `client`: whether it set DO and
+/// AD; `by`: the upstream that answered, and after how many attempts.
+fn finish(
+    mut message: Message,
+    verdict: Verdict,
+    q: &Question,
+    name: &Name,
+    client: (bool, bool),
+    by: (u16, u8),
+) -> Result<Validated, ResolveError> {
+    let (client_do, client_ad) = client;
+    // Before DNSSEC records are stripped: why a bogus answer failed.
+    let ede = if verdict == Verdict::Bogus {
+        message
+            .to_vec()
+            .map_or(telltale_proto::ede::DNSSEC_BOGUS, |b| {
+                bogus_reason(&b, unix_now_u32())
+            })
+    } else {
+        0
+    };
+    tidy(&mut message, q.qtype, client_do, name);
+    message.metadata.authentic_data = verdict == Verdict::Secure && (client_do || client_ad);
+    message.metadata.checking_disabled = false;
+    let bytes = message.to_vec().map_err(|_| ResolveError::Empty)?;
+    Ok(Validated {
+        bytes,
+        verdict,
+        ede,
+        upstream_id: by.0,
+        attempts: by.1,
+    })
 }
 
 fn unix_now_u32() -> u32 {
@@ -433,6 +482,8 @@ pub fn bogus_reason(msg: &[u8], now: u32) -> u16 {
     }
 }
 
+/// The most CNAMEs followed when an answer is validated link by link.
+const MAX_LINKS: usize = 8;
 /// How many zone levels the unsigned-zone check looks at below the top-level domain.
 const MAX_ZONE_LEVELS: usize = 6;
 /// How long a proof that a zone is unsigned is trusted at most (less when the TTLs of the
@@ -586,6 +637,137 @@ impl Validator {
         true
     }
 
+    /// REQ: DNS-011 (RFC 4035 §5.4, RFC 5155 §8) — the validation library proves a denial for
+    /// the name that was asked, but after a CNAME the answer's NSEC or NSEC3 records are about
+    /// the last name of the chain (a missing type or name there, or a wildcard's expansion), so
+    /// it calls a signed answer bogus. This validates such an answer one link at a time, each
+    /// as a question of its own: the CNAME at a name, then the question at its target, until
+    /// the target answers it. The verdict is the weakest of them, and the answer is made of
+    /// their validated records only: nothing of the answer that failed is used, it is just the
+    /// reason to look. `None`: not every link holds (the answer stays bogus).
+    ///
+    /// NFR-004 — bounded like the unsigned-zone proof: by `deadline`, by a handful at once, and
+    /// by a minute's memory of questions that failed; and by [`MAX_LINKS`].
+    async fn validate_links(
+        &self,
+        group: &Arc<Group>,
+        handle: &DnssecDnsHandle<GroupHandle>,
+        name: &Name,
+        q: &Question,
+        budget: Duration,
+        deadline: std::time::Instant,
+    ) -> Result<Option<(Verdict, Message)>, ResolveError> {
+        // A type and a space first: never the key of an unsigned-zone proof.
+        let key = format!("{} {}", q.qtype, zone_key(name));
+        let Some(_slot) = self.proofs.enter(&key) else {
+            return Ok(None);
+        };
+        let found = self
+            .follow_links(group, handle, name, q, budget, deadline)
+            .await?;
+        if found.is_none() {
+            self.proofs.failed(&key);
+        }
+        Ok(found)
+    }
+
+    /// [`Self::validate_links`], without its limits on how often and how many.
+    async fn follow_links(
+        &self,
+        group: &Arc<Group>,
+        handle: &DnssecDnsHandle<GroupHandle>,
+        name: &Name,
+        q: &Question,
+        budget: Duration,
+        deadline: std::time::Instant,
+    ) -> Result<Option<(Verdict, Message)>, ResolveError> {
+        let qtype = RecordType::from(q.qtype);
+        let mut worst = Verdict::Secure;
+        let mut chain: Vec<Record> = Vec::new();
+        // The proofs of wildcard-expanded links.
+        let mut proofs: Vec<Record> = Vec::new();
+        let mut seen = vec![name.clone()];
+        let mut at = name.clone();
+        for _ in 0..MAX_LINKS {
+            let Ok(link) = ask(handle, &at, RecordType::CNAME, deadline).await? else {
+                return Ok(None);
+            };
+            let Some(target) = link.answers.iter().find_map(|r| match &r.data {
+                RData::CNAME(c) if r.name == at => Some(c.0.clone()),
+                _ => None,
+            }) else {
+                return Ok(None);
+            };
+            let Some(v) = self
+                .link_verdict(group, handle, &link, &at, budget, deadline)
+                .await
+            else {
+                return Ok(None);
+            };
+            worst = worst.weakest(v);
+            let link = link.into_message();
+            chain.extend(link.answers.into_iter().filter(|r| {
+                r.name == at
+                    && (r.record_type() == RecordType::CNAME || rrsig_covers(r, RecordType::CNAME))
+            }));
+            proofs.extend(link.authorities.into_iter().filter(is_denial));
+            if seen.contains(&target) {
+                return Ok(None);
+            }
+            seen.push(target.clone());
+            at = target;
+            let end = match ask(handle, &at, qtype, deadline).await? {
+                // Another link: what follows it is judged by the questions of its own, not by
+                // this answer (which may end at a CNAME without a proof of what's missing).
+                Ok(end) if starts_with_cname(&end, &at) => continue,
+                Ok(end) => end,
+                Err(e) if denied_through_cname(&e, &at, q) => continue,
+                Err(e) => {
+                    tracing::debug!(name = %zone_key(&at), "DNSSEC: link by link: {e}");
+                    return Ok(None);
+                }
+            };
+            let Some(v) = self
+                .link_verdict(group, handle, &end, &at, budget, deadline)
+                .await
+            else {
+                return Ok(None);
+            };
+            let mut m = end.into_message();
+            m.queries = vec![Query::query(name.clone(), qtype)];
+            chain.append(&mut m.answers);
+            m.answers = chain;
+            for r in proofs {
+                if !m.authorities.contains(&r) {
+                    m.authorities.push(r);
+                }
+            }
+            return Ok(Some((worst.weakest(v), m)));
+        }
+        Ok(None)
+    }
+
+    /// What one link's answer is worth: secure, or insecure (also when its zone is proven
+    /// unsigned); `None` for anything else.
+    async fn link_verdict(
+        &self,
+        group: &Arc<Group>,
+        handle: &DnssecDnsHandle<GroupHandle>,
+        answer: &Message,
+        owner: &Name,
+        budget: Duration,
+        deadline: std::time::Instant,
+    ) -> Option<Verdict> {
+        match verdict(answer) {
+            v @ (Verdict::Secure | Verdict::Insecure) => Some(v),
+            Verdict::Bogus => self
+                .all_unsigned(group, handle, answer, &zone_key(owner), budget, deadline)
+                .await
+                .then_some(Verdict::Insecure),
+            Verdict::Indeterminate => None,
+        }
+    }
+
     /// REQ: DNS-011 (T10.9, ADR-184) — `name` is in a zone already proven unsigned through the
     /// upstream group at address `group`.
     fn known_insecure(&self, group: usize, name: &str) -> bool {
@@ -707,6 +889,153 @@ fn request(name: &Name, rtype: RecordType) -> DnsRequest {
     let mut opts = DnsRequestOptions::default();
     opts.use_edns = true;
     DnsRequest::from_query(Query::query(name.clone(), rtype), opts)
+}
+
+/// The validating handle's answer to a question of its own, within `deadline`. The outer error
+/// is the upstream's (no answer in time); the inner one is what the validator found wrong.
+async fn ask(
+    handle: &DnssecDnsHandle<GroupHandle>,
+    name: &Name,
+    rtype: RecordType,
+    deadline: std::time::Instant,
+) -> Result<Result<DnsResponse, NetError>, ResolveError> {
+    let mut s = handle.send(request(name, rtype));
+    match tokio::time::timeout(left(deadline), s.next()).await {
+        Ok(Some(Err(e))) if is_transport(&e) => Err(ResolveError::Empty),
+        Ok(Some(r)) => Ok(or_wildcard(r, name, rtype)),
+        Ok(None) | Err(_) => Err(ResolveError::Empty),
+    }
+}
+
+/// REQ: DNS-011 — the validator refused the denial in an answer for `name` that starts with a
+/// CNAME at `name`: a reason to validate it link by link.
+fn denied_through_cname(e: &NetError, name: &Name, q: &Question) -> bool {
+    let NetError::Dns(hickory_net::DnsError::Nsec { response, .. }) = e else {
+        return false;
+    };
+    follows_cname(q) && starts_with_cname(response, name)
+}
+
+/// Whether a CNAME is followed for this question (not for CNAME itself, DS, RRSIG or ANY).
+fn follows_cname(q: &Question) -> bool {
+    use RecordType::{ANY, CNAME, DS, RRSIG};
+    q.qclass == 1 && !matches!(RecordType::from(q.qtype), ANY | CNAME | DS | RRSIG)
+}
+
+/// `name` has a CNAME in the answer.
+fn starts_with_cname(m: &Message, name: &Name) -> bool {
+    m.answers
+        .iter()
+        .any(|r| r.record_type() == RecordType::CNAME && r.name == *name)
+}
+
+/// REQ: DNS-011 — what the validator returned, with a wildcard's answer it refused put right
+/// ([`wildcard_proven`]).
+fn or_wildcard(
+    r: Result<DnsResponse, NetError>,
+    name: &Name,
+    rtype: RecordType,
+) -> Result<DnsResponse, NetError> {
+    match r {
+        Err(NetError::Dns(hickory_net::DnsError::Nsec { response, .. }))
+            if wildcard_proven(&response, name, rtype) =>
+        {
+            tracing::debug!(name = %zone_key(name), "DNSSEC: wildcard expansion proven");
+            Ok(*response)
+        }
+        r => r,
+    }
+}
+
+/// REQ: DNS-011 (RFC 4035 §5.3.4) — a wildcard's answer is authenticated by its signature and
+/// an NSEC record showing that no closer name exists. The validation library also wants an NSEC
+/// covering the wildcard, which can't be there when that wildcard gave the answer, so it calls
+/// the answer bogus wherever the wildcard stands right above the name. This checks the rule
+/// itself, over records the library validated. True only when:
+/// - the answer is one record set, the question's, and it and its signatures are secure;
+/// - every signature covers fewer labels than `name` has, all the same number of them, by one
+///   signer, a zone `name` is in: the wildcard one label above that many;
+/// - a secure NSEC signed by that zone covers the next closer name (`name`, cut to one label
+///   more): it doesn't exist, nor does anything below it;
+/// - and there is no NSEC3 beside it.
+fn wildcard_proven(m: &Message, name: &Name, rtype: RecordType) -> bool {
+    if m.metadata.response_code != ResponseCode::NoError || name.is_wildcard() {
+        return false;
+    }
+    let mut sigs = Vec::new();
+    for r in &m.answers {
+        if r.proof != Proof::Secure || r.name != *name {
+            return false;
+        }
+        match &r.data {
+            RData::DNSSEC(DNSSECRData::RRSIG(s)) if s.input().type_covered == rtype => {
+                sigs.push((s.input().num_labels, &s.input().signer_name));
+            }
+            _ if r.record_type() == rtype => {}
+            _ => return false,
+        }
+    }
+    let Some(&(labels, zone)) = sigs.first() else {
+        return false;
+    };
+    if sigs.iter().any(|s| *s != (labels, zone))
+        || !m.answers.iter().any(|r| r.record_type() == rtype)
+        || labels >= name.num_labels()
+        || zone.num_labels() > labels
+        || !zone.zone_of(name)
+    {
+        return false;
+    }
+    let next_closer = name.trim_to(usize::from(labels) + 1);
+    if m.authorities
+        .iter()
+        .any(|r| r.record_type() == RecordType::NSEC3)
+    {
+        return false;
+    }
+    m.authorities.iter().any(|r| {
+        let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = &r.data else {
+            return false;
+        };
+        r.proof == Proof::Secure
+            && nsec_signed_by(m, &r.name, zone)
+            && nsec_covers(&r.name, nsec, zone, &next_closer)
+    })
+}
+
+/// The NSEC owned by `owner` has a secure signature, in the authority section, by `zone`.
+fn nsec_signed_by(m: &Message, owner: &Name, zone: &Name) -> bool {
+    m.authorities.iter().any(|r| {
+        matches!(&r.data, RData::DNSSEC(DNSSECRData::RRSIG(s))
+            if r.proof == Proof::Secure
+                && r.name == *owner
+                && s.input().type_covered == RecordType::NSEC
+                && s.input().signer_name == *zone)
+    })
+}
+
+/// `zone`'s NSEC at `owner` shows that neither `name` nor anything below it exists: `name` lies
+/// strictly between the owner and the next name (the zone's last NSEC points to its apex), it
+/// isn't an ancestor of the next name (an empty non-terminal), and it isn't below a delegation
+/// or a DNAME at the owner (RFC 6840 §4.1).
+fn nsec_covers(owner: &Name, nsec: &NSEC, zone: &Name, name: &Name) -> bool {
+    let next = nsec.next_domain_name();
+    let types = nsec.type_set();
+    let cut = types.contains(RecordType::NS) && !types.contains(RecordType::SOA);
+    zone.zone_of(owner)
+        && zone.zone_of(next)
+        && zone.zone_of(name)
+        && owner < name
+        && (name < next || next == zone)
+        && !name.zone_of(next)
+        && !((cut || types.contains(RecordType::DNAME)) && owner.zone_of(name))
+}
+
+/// An NSEC or NSEC3 record, or the signature of one.
+fn is_denial(r: &Record) -> bool {
+    matches!(r.record_type(), RecordType::NSEC | RecordType::NSEC3)
+        || rrsig_covers(r, RecordType::NSEC)
+        || rrsig_covers(r, RecordType::NSEC3)
 }
 
 /// `apex` has its own SOA (an unvalidated query).
@@ -1084,12 +1413,7 @@ fn verdict(m: &Message) -> Verdict {
             Proof::Bogus => Verdict::Bogus,
             Proof::Indeterminate => Verdict::Indeterminate,
         };
-        worst = match (worst, v) {
-            (Verdict::Bogus, _) | (_, Verdict::Bogus) => Verdict::Bogus,
-            (Verdict::Indeterminate, _) | (_, Verdict::Indeterminate) => Verdict::Indeterminate,
-            (Verdict::Insecure, _) | (_, Verdict::Insecure) => Verdict::Insecure,
-            _ => Verdict::Secure,
-        };
+        worst = worst.weakest(v);
     }
     worst
 }
@@ -1294,6 +1618,193 @@ mod depth_tests {
         assert_eq!(base32hex(b"foob"), "cpnmuog");
         assert_eq!(base32hex(b"fooba"), "cpnmuoj1");
         assert_eq!(base32hex(b"foobar"), "cpnmuoj1e8");
+    }
+
+    /// REQ: DNS-011 (RFC 4035 §5.3.4) — a wildcard's answer, built by hand: accepted with the
+    /// signed zone's NSEC for the next closer name, and not when any part of that is missing.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one case per condition
+    fn dns_011_wildcard_answer_needs_its_proof() {
+        use RecordType::{A, AAAA, NSEC as T_NSEC, RRSIG as T_RRSIG};
+        use hickory_net::proto::dnssec::Algorithm;
+        use hickory_net::proto::dnssec::Nsec3HashAlgorithm;
+        use hickory_net::proto::dnssec::rdata::{RRSIG, SigInput};
+        use hickory_net::proto::rr::SerialNumber;
+        let n = |s: &str| Name::from_ascii(s).unwrap();
+        let secure = |name: &str, data: RData| {
+            let mut r = Record::from_rdata(n(name), 300, data);
+            r.proof = Proof::Secure;
+            r
+        };
+        let sig = |name: &str, covered: RecordType, labels: u8, signer: &str| {
+            let input = SigInput {
+                type_covered: covered,
+                algorithm: Algorithm::ED25519,
+                num_labels: labels,
+                original_ttl: 300,
+                sig_expiration: SerialNumber::new(2),
+                sig_inception: SerialNumber::new(1),
+                key_tag: 1,
+                signer_name: n(signer),
+            };
+            secure(
+                name,
+                RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::from_sig(input, vec![0]))),
+            )
+        };
+        let address = || RData::A(hickory_net::proto::rr::rdata::A::new(192, 0, 2, 1));
+        let nsec = |owner: &str, next: &str| {
+            let data = NSEC::new(n(next), [A, T_RRSIG, T_NSEC]);
+            secure(owner, RData::DNSSEC(DNSSECRData::NSEC(data)))
+        };
+        // `m.z.test.`, from `*.z.test.` (two labels), with `k`'s NSEC up to `p`.
+        let good = || {
+            let mut m = Message::response(0, OpCode::Query);
+            m.answers = vec![
+                secure("m.z.test.", address()),
+                sig("m.z.test.", A, 2, "z.test."),
+            ];
+            m.authorities = vec![
+                nsec("k.z.test.", "p.z.test."),
+                sig("k.z.test.", T_NSEC, 3, "z.test."),
+            ];
+            m
+        };
+        let name = n("m.z.test.");
+        assert!(wildcard_proven(&good(), &name, A));
+        assert!(!wildcard_proven(&good(), &name, AAAA), "another type");
+        assert!(
+            !wildcard_proven(&good(), &n("l.z.test."), A),
+            "another name"
+        );
+        let refused = |what: &str, change: &dyn Fn(&mut Message)| {
+            let mut m = good();
+            change(&mut m);
+            assert!(!wildcard_proven(&m, &name, A), "{what}");
+        };
+        refused("NXDOMAIN", &|m| {
+            m.metadata.response_code = ResponseCode::NXDomain;
+        });
+        refused("the address isn't secure", &|m| {
+            m.answers[0].proof = Proof::Bogus;
+        });
+        refused("the signature isn't secure", &|m| {
+            m.answers[1].proof = Proof::Indeterminate;
+        });
+        refused("no signature", &|m| {
+            m.answers.pop();
+        });
+        refused("no address", &|m| {
+            m.answers.remove(0);
+        });
+        refused("not a wildcard's signature", &|m| {
+            m.answers[1] = sig("m.z.test.", A, 3, "z.test.");
+        });
+        refused("signatures of two wildcards", &|m| {
+            m.answers.push(sig("m.z.test.", A, 1, "z.test."));
+        });
+        refused("signers of two zones", &|m| {
+            m.answers.push(sig("m.z.test.", A, 2, "test."));
+        });
+        refused("a signer below the wildcard", &|m| {
+            m.answers[1] = sig("m.z.test.", A, 1, "z.test.");
+        });
+        refused("a signer elsewhere", &|m| {
+            m.answers[1] = sig("m.z.test.", A, 2, "y.test.");
+        });
+        refused("another record in the answer", &|m| {
+            m.answers.push(secure("o.z.test.", address()));
+        });
+        refused("no NSEC", &|m| m.authorities.clear());
+        refused("the NSEC isn't secure", &|m| {
+            m.authorities[0].proof = Proof::Bogus;
+        });
+        refused("the NSEC isn't signed", &|m| {
+            m.authorities.pop();
+        });
+        refused("the NSEC is another zone's", &|m| {
+            m.authorities[1] = sig("k.z.test.", T_NSEC, 3, "test.");
+        });
+        refused("the NSEC doesn't cover the name", &|m| {
+            m.authorities[0] = nsec("k.z.test.", "l.z.test.");
+        });
+        refused("an NSEC3 beside it", &|m| {
+            let n3 = NSEC3::new(
+                Nsec3HashAlgorithm::SHA1,
+                false,
+                0,
+                Vec::new(),
+                vec![0; 20],
+                [A],
+            );
+            m.authorities
+                .push(secure("x.z.test.", RData::DNSSEC(DNSSECRData::NSEC3(n3))));
+        });
+        // Two labels below the wildcard: the NSEC must deny the one right below it.
+        let deep = n("a.m.z.test.");
+        let mut m = good();
+        m.answers = vec![
+            secure("a.m.z.test.", address()),
+            sig("a.m.z.test.", A, 2, "z.test."),
+        ];
+        assert!(wildcard_proven(&m, &deep, A));
+        m.authorities = vec![
+            nsec("m.z.test.", "p.z.test."),
+            sig("m.z.test.", T_NSEC, 3, "z.test."),
+        ];
+        assert!(
+            !wildcard_proven(&m, &deep, A),
+            "the name right below the wildcard exists"
+        );
+    }
+
+    /// REQ: DNS-011 (RFC 4035 §5.3.4, RFC 6840 §4.1) — what an NSEC proves about the next closer
+    /// name of a wildcard's answer.
+    #[test]
+    fn dns_011_nsec_covers_the_next_closer_name() {
+        use RecordType::{A, DNAME, NS, NSEC as T_NSEC, RRSIG, SOA};
+        let n = |s: &str| Name::from_ascii(s).unwrap();
+        let zone = n("z.test.");
+        let covers = |owner: &str, next: &str, types: &[RecordType], name: &str| {
+            let nsec = NSEC::new(n(next), types.iter().copied());
+            nsec_covers(&n(owner), &nsec, &zone, &n(name))
+        };
+        let plain = &[A, RRSIG, T_NSEC];
+        assert!(covers("b.z.test.", "d.z.test.", plain, "c.z.test."));
+        assert!(
+            covers("B.z.test.", "D.z.test.", plain, "c.z.TEST."),
+            "case doesn't matter"
+        );
+        // The zone's last NSEC points to the apex; another one doesn't wrap.
+        assert!(covers("x.z.test.", "z.test.", plain, "y.z.test."));
+        assert!(!covers("x.z.test.", "a.z.test.", plain, "y.z.test."));
+        // The name itself exists, or is outside the span.
+        assert!(!covers("c.z.test.", "d.z.test.", plain, "c.z.test."));
+        assert!(!covers("b.z.test.", "c.z.test.", plain, "c.z.test."));
+        assert!(!covers("b.z.test.", "d.z.test.", plain, "e.z.test."));
+        assert!(!covers("x.z.test.", "z.test.", plain, "a.z.test."));
+        // It exists as an empty non-terminal.
+        assert!(!covers("b.z.test.", "x.c.z.test.", plain, "c.z.test."));
+        // Another zone's records.
+        assert!(!covers("b.y.test.", "d.y.test.", plain, "c.y.test."));
+        assert!(!covers("y.test.", "zz.test.", plain, "c.z.test."));
+        // Below a delegation or a DNAME the owner's zone says nothing; beside them it does.
+        let cut = &[NS, RRSIG, T_NSEC];
+        assert!(!covers("b.z.test.", "d.z.test.", cut, "a.b.z.test."));
+        assert!(covers("b.z.test.", "d.z.test.", cut, "c.z.test."));
+        assert!(!covers(
+            "b.z.test.",
+            "d.z.test.",
+            &[DNAME, RRSIG, T_NSEC],
+            "a.b.z.test."
+        ));
+        // The apex has NS and SOA: not a delegation.
+        assert!(covers(
+            "z.test.",
+            "d.z.test.",
+            &[NS, SOA, RRSIG, T_NSEC],
+            "c.z.test."
+        ));
     }
 
     /// REQ: DNS-011 (ADR-098) — only a delegation's NSEC or NSEC3 (NS without SOA or DS)
