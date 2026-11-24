@@ -1854,6 +1854,107 @@ REQ: FLT-006, FLT-005, API-010, CLU-002, CLU-010, OBS-005, AGT-004. Implemented 
 
 **Verification:** `dns_011_opt_out_accepts_parent_apex_and_span`, `dns_011_opt_out_rejects_delegation_nsec3_as_encloser`, `dns_011_opt_out_requires_one_parent_zone`, `dns_011_opt_out_rejected_when_apex_has_own_nsec3`, `dns_011_opt_out_closest_encloser_above_parent_is_not_proof`, `dns_011_cut_nsec3_must_be_in_parent_zone`, `dns_011_insecure_denial_needs_unsigned_tld`, `dns_011_nsec3_iteration_cap_is_not_proof`, `dns_011_ds_denial_returned_as_error_is_not_proof`, `dns_011_proof_hashes_each_name_once`, `dns_011_proven_zone_is_remembered_for_its_proof_ttl`, `dns_011_hash_range_covers`, `dns_011_nsec3_hash_rfc5155_vectors`, `dns_011_ds_denial_by_nsec3_opt_out`; offline: `dns_011_offline_opt_out_unsigned_delegation_is_insecure`, `dns_011_offline_cname_chain_across_opt_out_unsigned_zones_is_insecure`, `dns_011_offline_signed_delegation_stays_validated`, `dns_011_offline_hickory_opt_out_ds_denial_is_secure`, `dns_011_offline_insecure_zone_proof_is_per_group_and_ttl_bounded`.
 
+## ADR-186 — A sweep of private reverse names is its own anomaly kind, `reverse_sweep`, muted on its own; the NXDOMAIN storm is judged on the other names (Proposed)
+
+**Context:**
+- **The report.** In GitHub issue #90, from Michael Roughton, an Unraid host and an LG TV reverse-resolve every address of their private /24 about once an hour. That is 254 lookups of `x.20.0.10.in-addr.arpa` in a minute, 247 NXDOMAIN, 94 % of the device's queries, so each sweep raises an `nxdomain_storm` (ADR-073: at least 30 NXDOMAINs that are at least 50 % of the minute's queries).
+- **The workaround falls short.** Issue #38's answer, a per-device mute (ADR-161), works, but it also hides a real storm from that device. `ignore_domains` can't reach the storm count or name a reverse zone.
+- **What the reporter suggested.** Leave private reverse names out of the count. ADR-161 already rejected that for this pattern, together with a higher threshold and `[exclusions]`: "a device sweeping the same network would go unseen, which is the case the storm check exists for".
+- **The owner's decision (2026-11-23, said on the issue):** split the signal. A sweep of private reverse names becomes its own finding kind, judged and muted on its own, and the storm is judged on the other names.
+- **Two facts shape the design:**
+  - The telemetry crate already has an allocation-free check for RFC 6303 private reverse names (`internal::is_private_reverse`, the list ADR-152 and `[special] private_ptr_nxdomain` use).
+  - The mute table's kind mask is a `u8` that seven kinds already use.
+
+**Decision (proposed):**
+- **What is a private reverse name.** It is what `telltale_telemetry::internal::is_private_reverse` says, made `pub(crate)`. Its ranges are unchanged, and it now matches the zone by labels, as the resolver's copy does (a label that only ends in the bytes of `in-addr` or `ip6` isn't under the zone):
+  - IPv4: `10/8`, `172.16/12`, `192.168/16`, `100.64/10`, `169.254/16`, `127/8`, `0/8`.
+  - IPv6: `fc00::/7`, `fe80::/10`, `::1`.
+  - It decides by name, whatever answered it, as for ADR-152.
+  - The resolver's copy in `telltale-policy/src/special.rs` stays where it is (the telemetry crate doesn't depend on it). A test in `crates/telltale` keeps the two copies' answers equal over the range edges, upper case, and labels that only end like the zone.
+  - Reverse names of public ranges, IPv6 global addresses included, stay in the storm.
+- **Counting.** Beside the storm's per-device minute counters, the engine counts:
+  - the minute's private reverse lookups (`rev_total`),
+  - those answered NXDOMAIN (`rev_nx`),
+  - a 256-bit map of the names answered NXDOMAIN (FNV-1a, a bit per name, popcount as a lower bound on distinct names; names that resolve set no bit),
+  - up to 5 sample names.
+  - Other NXDOMAIN names keep their own samples.
+  - The work runs on the aggregator thread, at most once per event. There is no allocation beyond the existing 5 samples per minute, and the query path is untouched.
+- **The rules, at the minute's close:**
+  - **The minute is a sweep** when `rev_nx ≥ nxdomain_per_minute`, `rev_nx ≥ nxdomain_percent` % of `rev_total`, and the map has at least 16 bits set (`SWEEP_MIN_NAMES`): at least 16 different names answered NXDOMAIN.
+  - **A sweep minute's private reverse lookups leave both the storm's count and its total**, and the storm is judged on the rest. In any other minute everything counts toward the storm, as before. So each lookup is judged by one detector, and padding a storm with a sweep can't dilute it.
+  - **The carve-out depends only on the minute being a sweep.** It doesn't depend on whether the sweep is reported this hour, or on mutes. A second sweep in the hour, or a muted one, never becomes a storm.
+  - **Each kind is reported at most once per device per hour**, on separate clocks.
+  - **The finding:**
+    - `kind = reverse_sweep`, `domain` absent, window 60 s.
+    - `observed` = NXDOMAINs, `baseline` = private reverse lookups, `spread` 0, `threshold` = `nxdomain_per_minute`.
+    - The detail gives the numbers, "at least N different names", and samples.
+- **No new setting.** The sweep reuses `nxdomain_per_minute` (30) and `nxdomain_percent` (50).
+  - Both reported sweeps (#90: 247 of 254; #38: about 225) clear them by 7-8×.
+  - Every minute that raised a storm before raises a sweep, a storm, or both. The exception is a repeat sweep in an hour that already reported one, which raises nothing (the second rule above).
+  - The 16-name floor sits below what a real sweep at the 30-answer bar has, and above a DNS-SD browse (4 or 5 names) or a loop on a few names. Such a loop stays a storm, as before, also beside private names that resolve (they set no bit).
+- **Counted, not informational.** `when = "anomaly"`, the badge, `telltale_anomalies_total{kind}` and the chart's `TelltaleDNSDeviceAnomaly` take it as they take storms. There is no new alert kind.
+- **Mutes.**
+  - `reverse_sweep` is a mute kind like the others, per device and per group. `AnomalyKind` and `Kind` get it as their last variant, so existing ones keep their order.
+  - The mask becomes `u16`, with a compile-time check of at most 16 kinds.
+  - **An existing mute that lists `nxdomain_storm` keeps meaning exactly that** (ADR-161: "an explicit list keeps a new kind visible"), so it no longer covers the sweep.
+    - Instead, a counted sweep that such a mute covers for `nxdomain_storm` records that mute's name (`stormMute`). The lookup is made once, when the finding is created.
+    - The Anomalies page tells an operator what changed, offers **Mute for this device…** with the sweep ticked, and offers **Remove** for the old mute while it still lists only the storm.
+    - The release notes say the same.
+- **Surfaces.**
+  - **API:** `GET /api/v1/analytics/anomalies` gets the kind and an optional `stormMute` (additive). The mute `PUT` accepts the kind.
+  - **MCP:** `find_anomalies` describes sweeps, and `plan_set_anomaly_mute` lists the kind.
+  - **Metrics:** gain the label. The support package shows only counts by kind.
+  - **UI:** the title is "Sweep of local addresses", and the card says "This device looked up the names of many addresses on your network. Network scanners do this, and so do some TVs and NAS boxes, on their own, often once an hour."
+  - No new route, scope, listener, file or network call.
+- **Privacy:** unchanged. The engine is off at query-log privacy level 1 and above. Findings are readable where storms are, `analytics:read` for agents and not by display sessions. The sample names are the ones a storm already shows.
+
+**Alternatives rejected:**
+- **Leaving private reverse names out of the storm** (the reporter's suggestion), `nxdomain_ignore_suffixes`, `ignore_domains` applied to the storm, or `[exclusions]`. Each hides local reconnaissance from every device.
+- **A higher threshold.** It weakens the check for every device and is per node.
+- **Always taking private reverse names out of the storm.** A loop on one private name would then raise nothing.
+- **Classifying by how the name was answered** (`Special::PrivatePtr`). That would tie detection to `[special]` and routes.
+- **An informational kind** like `chatty_loop`. It would drop sweeps from every user's alerts by default.
+- **Letting an `nxdomain_storm` mute also cover `reverse_sweep`.**
+  - The entry would say one thing and do another, and an agent reading it couldn't tell.
+  - "Storms only" couldn't be said.
+  - The reporter's problem would stay unchanged, with nothing to prompt the switch.
+- **Rewriting mutes on upgrade.**
+  - Files and Git can't be rewritten.
+  - Writing the new kind into the shared configuration while older nodes run would make them refuse it.
+  - It would be a silent change.
+- **A separate threshold key now.** No reported case needs it.
+- **Down-converting for older replicas, or a version gate on the write.** ADR-059 defers per-field gating. The documented upgrade order already makes an older primary refuse the kind.
+
+**Consequences:**
+- **For users who muted `nxdomain_storm` to quiet a sweep (#38, #90):** after the upgrade their sweeps count again, and the mute covers only real storms. They need to switch the mute's kind. The page and the notes say how.
+- **Mixed versions:**
+  - An older node lists a newer node's finding under the raw kind (the API carries kinds as strings), and an older primary alerts on it.
+  - During a rollout one sweep can show twice, as `nxdomain_storm` from an older node and `reverse_sweep` from a newer one (the kind is part of the finding ID).
+  - **A shared mute naming `reverse_sweep`:**
+    - It makes an older replica refuse each new version (CLU-010). The replica keeps serving the last version it took, so DNS is unaffected (CLU-004). Until it is upgraded it logs `cluster configuration not applied (will retry)` with `unknown variant reverse_sweep` every 2 s, and its `sync_errors` check and `telltale_cluster_sync_error` show the same. It doesn't say "upgrade this node": that message is only for a newer `SCHEMA` or an unknown section, and this is a new value inside a known one.
+    - An older build won't start with it in its own file.
+    - So name it only once every node runs this version (as with `[clients] router_macs`, ADR-183).
+    - Nothing writes the value unless a mute names it. `SCHEMA` and `PROTOCOL` are unchanged.
+- **Rollback:**
+  - `anomaly.json` gains optional fields only. An older version reads it until a `reverse_sweep` finding is recorded; after that it can't parse the state, and devices learn again (ADR-043's rule for unreadable state).
+  - A mute naming the kind made through the API is skipped by an older version with a warning. One in a file must be removed first.
+- **Memory:** about 64 bytes more per device, inside the 4 KiB budget, and about 64 KiB at 1,024 devices.
+- **Detail:** ADR-073's storm rule now reads "of the device's queries other than a sweep's". The golden fixture is unchanged (it has no NXDOMAINs).
+- **Not covered:**
+  - sweeps slower than 30 NXDOMAINs a minute;
+  - sweeps of dense networks, where most addresses have PTR records and so get few NXDOMAINs;
+  - sweeps of public ranges, IPv6 global addresses included;
+  - a sweep cut evenly across a minute boundary.
+  - These go unseen as before. A distinct-names-per-hour rule or a user-listed range is a follow-up if asked.
+
+**Verification:**
+- **Engine** (`telltale-telemetry`): `obs_009_a_sweep_of_254_private_reverse_names_is_a_reverse_sweep_not_a_storm`, `obs_009_a_storm_of_other_names_is_still_a_storm`, `obs_009_a_storm_padded_with_a_private_reverse_sweep_is_still_a_storm`, `obs_009_a_loop_on_one_private_reverse_name_stays_a_storm`, `obs_009_a_loop_on_one_private_name_beside_resolved_neighbours_stays_a_storm`, `obs_009_a_sweep_of_a_public_range_stays_a_storm`, `obs_009_a_partial_sweep_is_a_sweep_only_over_the_bar`, `obs_009_private_ipv6_reverse_names_make_a_sweep`, `obs_009_a_second_sweep_in_the_hour_is_neither_reported_nor_a_storm`, `obs_009_a_sweep_and_a_storm_in_one_hour_are_each_reported`, `obs_009_sweep_replay_is_deterministic`, `obs_013_state_saved_before_the_split_still_loads`, `obs_013_a_sweep_of_a_whole_16_keeps_the_state_bounded`, `obs_038_muting_reverse_sweep_keeps_nxdomain_storm_live`, `obs_038_an_nxdomain_storm_mute_leaves_a_sweep_counted_and_names_itself_on_it`, `obs_038_every_kind_is_muted_by_itself_alone`; `obs_009_counting_a_sweep_allocates_nothing_per_query` and `obs_009_a_repeated_sample_name_allocates_nothing` (`tests/alloc.rs`), with `obs_009_a_kept_sample_is_recognised_for_any_name`; the golden file is unchanged.
+- **Config and cluster:** `obs_038_a_mute_may_name_reverse_sweep`, `clu_010_the_shared_part_names_reverse_sweep_only_when_a_mute_does`.
+- **Cross-crate:** `obs_009_the_sweep_and_the_resolver_agree_on_private_reverse_names` (the two private-reverse checks agree on every range edge), `obs_038_config_and_engine_kinds_agree`, `agt_005_the_mute_tool_offers_every_finding_kind`, `obs_014_merged_findings_keep_the_storm_mute`, `obs_013_the_anomaly_rule_alerts_on_a_reverse_sweep`.
+- **Playwright:** `obs_038 a sweep is muted on its own and a storm-only mute is pointed out`.
+- **Unchanged:** the hot-path allocation tests, and `make bench-smoke` against a same-binary control.
+- **Sample names:** `obs_009_sweep_sample_names_cut_at_char_boundary` (the sweep's and the storm's samples are cut at a character boundary), and `obs_009_observe_query_takes_any_wire_bytes`, which covers both kinds of samples.
+
 ## ADR-172 — A cluster support package: each node redacts its own part under one key, with labels every node agrees on (Accepted)
 **Context:** GitHub issue #55 (the later phase of #50, ADR-156): in a cluster the problem is often on another node, and a package of the node that answered covers only that one. ADR-156 settled the direction (each node redacts before its data leaves it, the asking node's key travels over the mutually authenticated stream) and left three points: how the key reaches the others, what an older peer does, and the size cap across nodes. One more came up in building it: ADR-156 numbers a name by when it is first met (`device-3`), so two nodes would give one device two labels, and the issue asks that a device have one name on every node.
 **Decision:**
@@ -2023,6 +2124,7 @@ REQ: FLT-006, FLT-005, API-010, CLU-002, CLU-010, OBS-005, AGT-004. Implemented 
 **Consequences:** one more shared section (older replicas skip it, CLU-010, and so don't mute until updated: they would still raise the finding, which is the safe direction); a lookup per finding on the telemetry thread; the muted counter's label set is the finding kinds, as `telltale_anomalies_total`'s.
 **Implementation notes (2026-11-15):** the owner approved the shape ("shared top-level is right, go build it"). Two things were added that the proposal didn't say, for the owner to confirm: the `config:write:anomalies` agent scope above, and `chatty_loop` is a mutable kind like the others (it is informational and never counted, but a muted one is marked and listed the same). A device name must be a `[[client]]` with an IP or network in its `match`; a device known only by the router's DHCP or mDNS name is muted by its address. **Accepted 2026-11-16:** the owner answered "Go on all 5" to the list that named these two additions as the open confirmation, so the scope and the mutable `chatty_loop` stand as built.
 **Verification (planned):** the engine with a mute table (muted and unmuted devices, expiry, kinds, counters, replay); the config checks (unknown kind, empty lists, names that match nothing, MAC refusal); the API and MCP (dry run, `If-Match`, 409 under Git, audit); the UI flow end to end; the cluster path (a mute set on the primary reaches a replica).
+**See also:** ADR-186 (a sweep of private reverse names is its own kind; the storm is judged on the other names).
 
 ## ADR-160 — Top lists and active clients follow the dashboard's time range, by whole hours (Accepted)
 **Context:** OBS-004 (community request 2026-11-15). The dashboard's range picker (15 min to 30 days) changes the charts and totals, but Top domains, Top blocked, Top clients, and the Active clients tile always showed the current clock hour, so they emptied every time the hour turned and never matched the range above them. Each closed hour's top lists are already stored in `hour_top` for 400 days.
@@ -3153,6 +3255,8 @@ Revisit if a profile on real hardware shows syscalls dominating at the owner's t
 **Consequences:**
 - Dictionary-word DGAs and short generated labels aren't caught; some vendor IDs may score high (the UI shows the score, not a verdict).
 - A restart resets list hits; overlap is exact for the active snapshot.
+
+**See also:** ADR-186 (a sweep of private reverse names is its own kind; the storm is judged on the other names).
 
 ## ADR-072 — Event sinks: one bounded buffer per sink, API-shaped JSON, no disk spill (Accepted)
 **Amended by:** ADR-088. Syslog over TLS and a capped disk spill for webhook sinks were added later.

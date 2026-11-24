@@ -917,6 +917,11 @@
           "description": "A steady fast rhythm to one domain (informational).",
           "type": "string",
           "const": "chatty_loop"
+        },
+        {
+          "description": "A sweep of the reverse names of private addresses (scanning the local network). A mute of\n`nxdomain_storm` doesn't cover it.",
+          "type": "string",
+          "const": "reverse_sweep"
         }
       ]
     },

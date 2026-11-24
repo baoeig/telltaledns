@@ -1115,6 +1115,9 @@ pub enum AnomalyKind {
     Dga,
     /// A steady fast rhythm to one domain (informational).
     ChattyLoop,
+    /// A sweep of the reverse names of private addresses (scanning the local network). A mute of
+    /// `nxdomain_storm` doesn't cover it.
+    ReverseSweep,
 }
 
 impl AnomalyKind {
@@ -1129,6 +1132,7 @@ impl AnomalyKind {
             Self::NxdomainStorm => "nxdomain_storm",
             Self::Dga => "dga",
             Self::ChattyLoop => "chatty_loop",
+            Self::ReverseSweep => "reverse_sweep",
         }
     }
 }

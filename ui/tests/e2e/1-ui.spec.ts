@@ -745,6 +745,72 @@ test('obs_038 mute a kind of finding for a device', async () => {
   await page.unroute('**/api/v1/anomaly-mutes/*');
 });
 
+// REQ: OBS-038 (ADR-186) — a sweep of local addresses is its own kind: its card says what it is; a
+// mute of bursts of failed lookups made for it before 0.9 (which no longer covers it) is pointed
+// out; "Mute for this device…" ticks the sweep and the real server takes the kind; and the old
+// mute is removed from the card. A fresh server has no findings, so the finding is stubbed; the
+// mutes are real.
+test('obs_038 a sweep is muted on its own and a storm-only mute is pointed out', async () => {
+  const r = page.request;
+  const csrf = (await (await r.get('/api/v1/auth/status')).json()).csrfToken as string;
+  const h = { 'x-csrf-token': csrf };
+  const old = 'lg-tv-ptr-sweep';
+  const mine = '192-168-1-30-reverse-sweep';
+  const made = await r.put(`/api/v1/anomaly-mutes/${old}`, {
+    headers: h,
+    data: { devices: ['192.168.1.30'], kinds: ['nxdomain_storm'], note: 'hourly reverse-DNS sweep' },
+  });
+  expect(made.status()).toBe(200);
+  const finding = {
+    id: '6a2c0e00a1b2c3d6',
+    kind: 'reverse_sweep',
+    client: '192.168.1.30',
+    clientName: 'lg-tv',
+    windowStart: '2026-11-23T10:14:00.000Z',
+    windowSeconds: 60,
+    observed: 247,
+    baseline: 254,
+    spread: 0,
+    threshold: 30,
+    detail: '247 NXDOMAIN answers to reverse lookups of private addresses in a minute (97% of 254; at least 160 different names), e.g. 1.20.0.10.in-addr.arpa',
+    nodes: [],
+    stormMute: old,
+  };
+  await page.route('**/api/v1/analytics/anomalies?*', (route) => route.fulfill({ json: { items: [finding] } }));
+  try {
+    await page.goto('/#/anomalies');
+    await page.reload();
+    const card = page.getByTestId('anomaly');
+    await expect(card).toContainText('Sweep of local addresses');
+    await expect(card.getByTestId('sweep-explained')).toContainText(
+      'This device looked up the names of many addresses on your network. Network scanners do this, and so do some TVs and NAS boxes, on their own, often once an hour.',
+    );
+    await expect(card).toContainText('Reverse lookups');
+    const hint = page.getByTestId('storm-mute-hint');
+    await expect(hint).toContainText(`${old} mutes Burst of failed lookups for this device`);
+    await expect(hint).toContainText(`Mute the sweep, then remove ${old}`);
+    // The sweep is muted on its own: its kind is ticked, and the real server takes it.
+    await page.getByTestId('mute').click();
+    const form = page.getByTestId('mute-form');
+    await expect(form.getByRole('checkbox', { name: 'Sweep of local addresses' })).toBeChecked();
+    await expect(form.getByRole('checkbox', { name: 'Burst of failed lookups' })).not.toBeChecked();
+    await expect(page.getByTestId('mute-preview')).toBeVisible();
+    await page.getByTestId('mute-save').click();
+    await expect(page.getByTestId('mute-saved')).toBeVisible();
+    const rows = page.getByTestId('mute-row');
+    await expect(rows.filter({ hasText: mine })).toContainText('Sweep of local addresses');
+    await expect(rows.filter({ hasText: old })).toContainText('Burst of failed lookups');
+    // The old mute, removed from the card.
+    await hint.getByRole('button', { name: `Remove ${old}` }).click();
+    await expect(rows.filter({ hasText: old })).toHaveCount(0);
+    await expect(hint).toHaveCount(0);
+    await expect(rows.filter({ hasText: mine })).toHaveCount(1);
+  } finally {
+    for (const name of [mine, old]) await r.delete(`/api/v1/anomaly-mutes/${name}`, { headers: h });
+    await page.unroute('**/api/v1/analytics/anomalies?*');
+  }
+});
+
 // REQ: OPS-011 (ADR-156) — Settings → System → Support package: a preview of what it would hold, a
 // download that is a real gzip, and a pseudonym map that can be fetched once.
 test('ops_011 support package', async () => {
