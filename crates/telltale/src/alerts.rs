@@ -450,7 +450,14 @@ fn observe(
             .cluster()
             .nodes
             .into_iter()
-            .filter(|n| !n.this_node && n.connected && n.config_lag > 0 && !Paused::node(n))
+            // REQ: CLU-008 (ADR-056) — a witness applies no configuration.
+            .filter(|n| {
+                !n.this_node
+                    && !n.witness
+                    && n.connected
+                    && n.config_lag > 0
+                    && !Paused::node(n)
+            })
             .map(|n| {
                 let s = format!(
                     "{} is {} configuration version(s) behind the primary{}",
@@ -1486,6 +1493,68 @@ mod tests {
         fn upstreams(&self) -> Vec<telltale_api::model::UpstreamInfo> {
             Vec::new()
         }
+    }
+
+    /// REQ: CLU-008 (ADR-056) — `sync_lag` names a replica that is behind but never a witness,
+    /// which applies no configuration; a witness that isn't connected still raises `node_down`.
+    #[test]
+    fn clu_008_sync_lag_alert_leaves_a_witness_out() {
+        use telltale_api::model::{ClusterNode, ClusterView};
+        let node = |id: &str, site: &str| ClusterNode {
+            node_id: id.into(),
+            site: site.into(),
+            connected: true,
+            up: true,
+            ..ClusterNode::default()
+        };
+        let mut me = node("id-pi", "home");
+        me.this_node = true;
+        me.role = "primary".into();
+        let mut replica = node("id-hall", "hall");
+        replica.config_lag = 3;
+        // What a healthy witness reports: version 0, so behind for as long as it runs.
+        let mut witness = node("id-attic", "attic");
+        witness.witness = true;
+        witness.config_lag = 12;
+        witness.behind_seconds = Some(86_400);
+        let stub = |nodes: Vec<ClusterNode>| Stub {
+            view: ClusterView {
+                enabled: true,
+                cluster_id: None,
+                name: None,
+                this_node: None,
+                newest_config_seq: 12,
+                healthy: true,
+                checks: Vec::new(),
+                nodes,
+                events: Vec::new(),
+                authority: None,
+                conflicts: Vec::new(),
+                failover: None,
+                source: None,
+                rollout: None,
+                host: None,
+            },
+            probes: Vec::new(),
+            findings: Vec::new(),
+        };
+        let o = |b: &Stub, w: AlertWhen| observe(b, &rule(w, 0), 1000, &[], &Paused::default());
+        let subjects = |found: &Observed| found.iter().map(|(x, _)| x.clone()).collect::<Vec<_>>();
+        let connected = stub(vec![me.clone(), replica.clone(), witness.clone()]);
+        assert_eq!(
+            o(&connected, AlertWhen::SyncLag),
+            [(
+                "hall".to_owned(),
+                "hall is 3 configuration version(s) behind the primary".to_owned()
+            )]
+        );
+        assert_eq!(o(&connected, AlertWhen::NodeDown), Observed::new());
+        // A witness that isn't connected is still reported, by `node_down`.
+        witness.connected = false;
+        witness.up = false;
+        let away = stub(vec![me, replica, witness]);
+        assert_eq!(subjects(&o(&away, AlertWhen::SyncLag)), ["hall"]);
+        assert_eq!(subjects(&o(&away, AlertWhen::NodeDown)), ["attic"]);
     }
 
     /// REQ: OPS-010 (ADR-118) — a node in maintenance raises no `node_down` or probe alert;
