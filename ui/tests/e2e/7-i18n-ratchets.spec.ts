@@ -44,6 +44,7 @@ test('api_012 migrated files conserve their english strings', () => {
   const exceptions = JSON.parse(readFileSync(join(UI, 'tests/i18n-fixtures/ledger-exceptions.json'), 'utf8'));
   const r = checkUi();
   const migrated = (r.files as { rel: string; usesLayer: boolean }[]).filter((f) => f.usesLayer);
+  expect(migrated.map((f) => f.rel)).toContain('lib/format.ts');
   for (const f of migrated) {
     expect(ledger[f.rel], `${f.rel} has a ledger entry`).toBeTruthy();
     expect(lib.conserve(f, ledger[f.rel], exceptions[f.rel] ?? []), f.rel).toEqual([]);

@@ -1,6 +1,6 @@
 // REQ: API-012 (ADR-189) — languages in the web UI, the layer itself, without a browser: messages,
 // plurals, matching, the agreement rule, the pseudo-locale, the runtime's tables, the catalog step,
-// and the pair files. The languages tool is 7-i18n-check.spec.ts, the ratchets and the
+// the pair files and the formats. The languages tool is 7-i18n-check.spec.ts, the ratchets and the
 // English ledger 7-i18n-ratchets.spec.ts, the pages 8-i18n-pages.spec.ts.
 import { expect, test } from '@playwright/test';
 import { interpolate, parts, plural } from '../../src/lib/i18n/message';
@@ -10,6 +10,8 @@ import { LOWER, UPPER, pseudo } from '../../src/lib/i18n/pseudo';
 import { hash } from '../../src/lib/i18n/ident';
 import { PairFileError, merge, parse, skeleton } from '../../src/lib/i18n/pairs';
 import { catalogRuntime, install, load, parseCatalog, tk, tr, type Choice } from '../../src/lib/i18n';
+import * as fmt from '../../src/lib/format';
+import { makeFormat } from '../../src/lib/format';
 
 /** Runs `body` with `c` installed, then English again. */
 function under(c: Choice, body: () => void) {
@@ -377,4 +379,133 @@ test('api_012 the pair-file parser refuses what json would lose', () => {
   expect(merged.c).toEqual([['Holds', 'Qa'], [['{n} file', '{n} files'], { one: '', few: '', other: '' }], ['Open', '', 'verb']]);
   expect(merged['~leftover']).toEqual([['Older', 'Qa-older'], ['Gone', 'Qa-gone']]);
   expect(merge({ c: [['Gone', 'x']] }, skel, key, { prune: true })['~leftover']).toBeUndefined();
+});
+
+// ---------------------------------------------------------------------------------------------
+// The formats
+
+
+/** `ui/src/lib/format.ts` as it was before the factory, with the locale as a parameter where it
+ * used the browser default (`undefined`, or `[]` in the `toLocale*` calls). */
+function frozen(locale: string | undefined) {
+  const at = locale ?? [];
+  const nf = new Intl.NumberFormat(locale);
+  const compact = new Intl.NumberFormat(locale, { notation: 'compact', maximumFractionDigits: 1 });
+  const num = (n: number | undefined | null) => (n == null ? '–' : nf.format(n));
+  const rate2 = new Intl.NumberFormat(locale, { maximumFractionDigits: 2 });
+  const rate1 = new Intl.NumberFormat(locale, { maximumFractionDigits: 1 });
+  const rate0 = new Intl.NumberFormat(locale, { maximumFractionDigits: 0 });
+  const rate = (n: number | undefined | null) => (n == null ? '–' : (n < 10 ? rate2 : n < 100 ? rate1 : rate0).format(n));
+  const short = (n: number | undefined | null) => (n == null ? '–' : n < 10_000 ? nf.format(n) : compact.format(n));
+  const pct = (n: number | undefined | null, digits = 1) => (n == null || Number.isNaN(n) ? '–' : `${n.toFixed(digits)}%`);
+  function ms(n: number | undefined | null): string {
+    if (n == null) return '–';
+    if (n === 0) return '0 ms';
+    if (n < 1) return `${(n * 1000).toFixed(0)} µs`;
+    if (n < 10) return `${n.toFixed(2)} ms`;
+    if (n < 1000) return `${n.toFixed(0)} ms`;
+    return `${(n / 1000).toFixed(2)} s`;
+  }
+  function bytes(n: number | undefined | null): string {
+    if (n == null) return '–';
+    const u = ['B', 'KiB', 'MiB', 'GiB'];
+    let i = 0;
+    while (n >= 1024 && i < u.length - 1) {
+      n /= 1024;
+      i++;
+    }
+    return `${i ? n.toFixed(1) : n} ${u[i]}`;
+  }
+  function duration(secs: number): string {
+    const d = Math.floor(secs / 86400);
+    const h = Math.floor((secs % 86400) / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    if (d) return `${d}d ${h}h`;
+    if (h) return `${h}h ${m}m`;
+    if (m) return `${m}m`;
+    return `${Math.floor(secs)}s`;
+  }
+  function ago(unix: number | undefined | null): string {
+    if (!unix) return 'never';
+    const diff = Date.now() / 1000 - unix;
+    const s = duration(Math.abs(diff));
+    return diff >= 0 ? `${s} ago` : `in ${s}`;
+  }
+  function clock(unixSeconds: number, withSeconds = false): string {
+    return new Date(unixSeconds * 1000).toLocaleTimeString(at, { hour: '2-digit', minute: '2-digit', second: withSeconds ? '2-digit' : undefined });
+  }
+  function dateTime(unixSeconds: number): string {
+    return new Date(unixSeconds * 1000).toLocaleString(locale);
+  }
+  function logTime(rfc3339: string): string {
+    const d = new Date(rfc3339);
+    const t = d.toLocaleTimeString(at, { hour12: false });
+    return `${t}.${String(d.getMilliseconds()).padStart(3, '0')}`;
+  }
+  function logDate(rfc3339: string): string {
+    return new Date(rfc3339).toLocaleDateString(locale);
+  }
+  function endsAt(rfc3339: string | null | undefined): string {
+    if (!rfc3339) return '';
+    const d = new Date(rfc3339);
+    const time = d.toLocaleTimeString(at, { hour: '2-digit', minute: '2-digit' });
+    return d.toDateString() === new Date().toDateString() ? time : `${d.toLocaleDateString(at, { weekday: 'short' })} ${time}`;
+  }
+  return { num, rate, short, pct, ms, bytes, duration, ago, clock, dateTime, logTime, logDate, endsAt };
+}
+
+test('api_012 english formats match the frozen functions', () => {
+  // A fixed clock, so `ago` and `endsAt` see the same "now" in both.
+  const NOW = Date.UTC(2026, 10, 24, 12, 34, 56, 789);
+  const Real = Date;
+  class Fixed extends Real {
+    constructor(...a: ConstructorParameters<typeof Date>) {
+      if (a.length) super(...a);
+      else super(NOW);
+    }
+    static now() {
+      return NOW;
+    }
+  }
+  globalThis.Date = Fixed as DateConstructor;
+  try {
+    const numbers = [undefined, null, 0, 0.0004, 0.5, 1, 9.999, 10, 12.345, 99.95, 100, 999.4, 1000, 1234.5, 9999, 10_000, 123_456, 1e7, -5, -0.25, Number.NaN];
+    const seconds = [0, 1, 59, 60, 61, 3599, 3600, 3661, 86_399, 86_400, 90_061, 1e6];
+    const unix = [undefined, null, 0, NOW / 1000 - 30, NOW / 1000 - 3600, NOW / 1000 - 86_400 * 3, NOW / 1000 + 120, NOW / 1000 + 90_061];
+    const times = ['2026-11-24T12:00:00.007Z', '2026-11-24T23:59:59.999Z', '2026-11-20T03:04:05.060Z', '2025-01-01T00:00:00Z'];
+    for (const locale of [undefined, 'en-US', 'de-DE', 'fr-FR']) {
+      const want = frozen(locale);
+      // The module's own functions (the default instance, before and without install) for the browser
+      // default; and the instance the runtime installs, with English, for each locale.
+      const instances: [string, ReturnType<typeof makeFormat>][] = [['the runtime instance', makeFormat(locale, (ctx) => tr(ctx))]];
+      if (locale === undefined) instances.push(['the exports', fmt]);
+      for (const [name, got] of instances) {
+        const tag = `${locale ?? 'default'} ${name}`;
+        for (const n of numbers) {
+          expect(got.num(n), `${tag} num ${n}`).toBe(want.num(n));
+          expect(got.rate(n), `${tag} rate ${n}`).toBe(want.rate(n));
+          expect(got.short(n), `${tag} short ${n}`).toBe(want.short(n));
+          for (const d of [undefined, 0, 1, 2]) expect(got.pct(n, d), `${tag} pct ${n} ${d}`).toBe(want.pct(n, d));
+          expect(got.ms(n), `${tag} ms ${n}`).toBe(want.ms(n));
+          expect(got.bytes(n), `${tag} bytes ${n}`).toBe(want.bytes(n));
+        }
+        for (const b of [1023, 1024, 1536, 1_048_576, 5e9, 1e13, 1e16]) expect(got.bytes(b), `${tag} bytes ${b}`).toBe(want.bytes(b));
+        for (const s of seconds) expect(got.duration(s), `${tag} duration ${s}`).toBe(want.duration(s));
+        for (const u of unix) expect(got.ago(u), `${tag} ago ${u}`).toBe(want.ago(u));
+        for (const u of [NOW / 1000, NOW / 1000 - 40_000]) {
+          expect(got.clock(u), `${tag} clock ${u}`).toBe(want.clock(u));
+          expect(got.clock(u, true), `${tag} clock ${u} s`).toBe(want.clock(u, true));
+          expect(got.dateTime(u), `${tag} dateTime ${u}`).toBe(want.dateTime(u));
+        }
+        for (const t of times) {
+          expect(got.logTime(t), `${tag} logTime ${t}`).toBe(want.logTime(t));
+          expect(got.logDate(t), `${tag} logDate ${t}`).toBe(want.logDate(t));
+          expect(got.endsAt(t), `${tag} endsAt ${t}`).toBe(want.endsAt(t));
+        }
+        for (const t of [null, undefined, '']) expect(got.endsAt(t), `${tag} endsAt ${t}`).toBe(want.endsAt(t));
+      }
+    }
+  } finally {
+    globalThis.Date = Real;
+  }
 });
