@@ -253,6 +253,11 @@ struct Tld {
     /// `dns_011_offline_links_that_do_not_hold_stay_bogus`: what `s.t.`'s answers are changed to
     /// ([`tamper`]).
     tamper: AtomicUsize,
+    /// `z3.s.t.`'s zone ([`hashed_zone`]): signed with NSEC3 under its own key, its NSEC3 chain
+    /// included.
+    hashed: BTreeMap<(Name, RecordType), Vec<Record>>,
+    /// That chain: each record's hash and owner, in hash order.
+    hashed_chain: Vec<(Vec<u8>, Name)>,
 }
 
 /// Ways to tamper with `s.t.`'s answers.
@@ -282,6 +287,15 @@ mod tampering {
     /// `a.own.w.s.t. A` is answered from `*.w.s.t.`, with the NSEC that covers the name (the one of
     /// `own.w.s.t.`, the name between them).
     pub(super) const REPLAY_WILDCARD_BELOW_NAME: usize = 10;
+    /// As `REPLAY_WILDCARD_BELOW_NAME`, with an unsigned NSEC3 record owned directly below `s.t.`
+    /// beside the NSEC.
+    pub(super) const BESIDE_UNSIGNED_NSEC3: usize = 11;
+    /// A wildcard's answers come with only an unsigned NSEC3 record of the unsigned zone `u.`, and
+    /// `own.w.s.t. A` is answered with the wildcard's address.
+    pub(super) const UNSIGNED_ZONE_NSEC3_PROOF: usize = 12;
+    /// A wildcard's answers come with only `t.`'s signed NSEC3 record covering the name, and
+    /// `own.w.s.t. A` is answered with the wildcard's address.
+    pub(super) const OTHER_ZONE_NSEC3_PROOF: usize = 13;
 }
 
 /// `name`'s NSEC3 hash with `t.`'s parameters.
@@ -313,6 +327,28 @@ fn b32hex(data: &[u8]) -> String {
 /// The owner of `name`'s NSEC3 in `t.`.
 fn h3_owner(name: &Name) -> Name {
     n(&format!("{}.t.", b32hex(&h3(name))))
+}
+
+/// The owner of `name`'s NSEC3 in `zone`, with `t.`'s parameters.
+fn hashed_owner(name: &Name, zone: &str) -> Name {
+    n(&format!("{}.{zone}", b32hex(&h3(name))))
+}
+
+/// An NSEC3 record without a signature, owned directly below `zone` at `name`'s hash.
+fn unsigned_nsec3(name: &Name, zone: &str) -> Record {
+    let nsec3 = NSEC3::new(
+        Nsec3HashAlgorithm::SHA1,
+        false,
+        0,
+        Vec::new(),
+        vec![0xff; 20],
+        [RecordType::A, RecordType::RRSIG],
+    );
+    Record::from_rdata(
+        hashed_owner(name, zone),
+        300,
+        RData::DNSSEC(DNSSECRData::NSEC3(nsec3)),
+    )
 }
 
 fn soa_of(zone: &str) -> SOA {
@@ -389,6 +425,68 @@ const ALIASES: [(&str, &str); 12] = [
     ("parked.s.t.", "www.u.t."),
 ];
 
+/// [`hashed_zone`]: the zone's record sets with their signatures (the NSEC3 chain included), that
+/// chain (each record's hash and owner, in hash order), and the DS for it.
+struct HashedZone {
+    sets: BTreeMap<(Name, RecordType), Vec<Record>>,
+    chain: Vec<(Vec<u8>, Name)>,
+    ds: DS,
+}
+
+/// The zone `z3.s.t.`, delegated from `s.t.` with a DS: signed with NSEC3 under its own key (`t.`'s
+/// parameters, without Opt-Out), with a wildcard address right below its apex.
+fn hashed_zone() -> HashedZone {
+    let apex = n("z3.s.t.");
+    let (signer, dnskey) = zone_signer(&apex);
+    let ds = DS::from_key(dnskey.public_key(), &apex, DigestType::SHA256).unwrap();
+    let mut chain = [
+        (
+            apex.clone(),
+            vec![
+                RecordType::NS,
+                RecordType::SOA,
+                RecordType::RRSIG,
+                RecordType::DNSKEY,
+                RecordType::NSEC3PARAM,
+            ],
+        ),
+        (n("*.z3.s.t."), vec![RecordType::A, RecordType::RRSIG]),
+    ];
+    chain.sort_by_key(|(name, _)| h3(name));
+    let mut rrsets: Vec<(Name, Vec<RData>)> = vec![
+        (apex.clone(), vec![RData::SOA(soa_of("z3.s.t."))]),
+        (apex.clone(), vec![RData::NS(NS(n("ns.z3.s.t.")))]),
+        (
+            apex.clone(),
+            vec![RData::DNSSEC(DNSSECRData::DNSKEY(dnskey))],
+        ),
+        (n("*.z3.s.t."), vec![RData::A(A::new(192, 0, 2, 34))]),
+    ];
+    for (i, (name, types)) in chain.iter().enumerate() {
+        let next = h3(&chain[(i + 1) % chain.len()].0);
+        let nsec3 = NSEC3::new(
+            Nsec3HashAlgorithm::SHA1,
+            false,
+            0,
+            Vec::new(),
+            next,
+            types.iter().copied(),
+        );
+        rrsets.push((
+            hashed_owner(name, "z3.s.t."),
+            vec![RData::DNSSEC(DNSSECRData::NSEC3(nsec3))],
+        ));
+    }
+    HashedZone {
+        sets: signed(rrsets, &signer, 3600),
+        chain: chain
+            .iter()
+            .map(|(name, _)| (h3(name), hashed_owner(name, "z3.s.t.")))
+            .collect(),
+        ds,
+    }
+}
+
 /// `t.`, its SOA and NSEC3 records (what its denials are made of) with TTL `proof_ttl`, the
 /// rest with an hour.
 fn tld(proof_ttl: u32) -> Tld {
@@ -441,6 +539,11 @@ fn tld(proof_ttl: u32) -> Tld {
     }
     let mut sets = signed(rrsets, &signer, 3600);
     sets.extend(signed(denials, &signer, proof_ttl));
+    let HashedZone {
+        sets: hashed,
+        chain: hashed_chain,
+        ds: hashed_ds,
+    } = hashed_zone();
     let mut child_sets = vec![
         (n("s.t."), vec![RData::SOA(soa_of("s.t."))]),
         (n("s.t."), vec![RData::NS(NS(n("ns.s.t.")))]),
@@ -456,6 +559,13 @@ fn tld(proof_ttl: u32) -> Tld {
         // A name below `w.s.t.` that exists, and one below that makes an empty non-terminal.
         (n("own.w.s.t."), vec![RData::A(A::new(192, 0, 2, 32))]),
         (n("x.ent.w.s.t."), vec![RData::A(A::new(192, 0, 2, 33))]),
+        // A signed delegation to `z3.s.t.`, a zone signed with NSEC3. It sorts after every other
+        // name, so of their NSEC records only the last one's (`www.s.t.`'s) changes.
+        (n("z3.s.t."), vec![RData::NS(NS(n("ns.z3.s.t.")))]),
+        (
+            n("z3.s.t."),
+            vec![RData::DNSSEC(DNSSECRData::DS(hashed_ds))],
+        ),
     ];
     for (alias, target) in ALIASES {
         child_sets.push((n(alias), vec![RData::CNAME(CNAME(n(target)))]));
@@ -520,6 +630,8 @@ fn tld(proof_ttl: u32) -> Tld {
         replay: AtomicBool::new(false),
         other_soa: AtomicBool::new(false),
         tamper: AtomicUsize::new(tampering::NONE),
+        hashed,
+        hashed_chain,
     }
 }
 
@@ -544,6 +656,18 @@ impl Tld {
     fn soa(&self) -> Vec<Record> {
         self.sets[&(n("t."), RecordType::SOA)].clone()
     }
+
+    /// The NSEC3 of `z3.s.t.` whose span covers `name`'s hash.
+    fn hashed_covering(&self, name: &Name) -> Vec<Record> {
+        let h = h3(name);
+        let (_, owner) = self
+            .hashed_chain
+            .iter()
+            .rev()
+            .find(|(hash, _)| *hash < h)
+            .unwrap_or_else(|| self.hashed_chain.last().unwrap());
+        self.hashed[&(owner.clone(), RecordType::NSEC3)].clone()
+    }
 }
 
 /// Adds `records` to the authority section unless that record set is there already.
@@ -564,7 +688,9 @@ fn tld_answer(z: &Tld, m: &mut Message, qn: &Name, qt: RecordType) {
         let zone = n(zone);
         zone.zone_of(qn) && !(*qn == zone && qt == RecordType::DS)
     };
-    if below("s.t.") {
+    if below("z3.s.t.") {
+        hashed_answer(z, m, qn, qt);
+    } else if below("s.t.") {
         child_answer(z, m, qn, qt);
     } else if below("u.t.") {
         parked_answer(z, m, qn, qt);
@@ -699,8 +825,13 @@ fn child_link(z: &Tld, m: &mut Message, qn: &Name, qt: RecordType, tamper: usize
             .unwrap_or_else(|| apex.clone())
     };
     let hidden = tamper == tampering::HIDE_TARGET && *qn == n("www.s.t.") && qt == RecordType::A;
-    let replayed =
-        tamper == tampering::REPLAY_WILDCARD && *qn == n("own.w.s.t.") && qt == RecordType::A;
+    let replayed = matches!(
+        tamper,
+        tampering::REPLAY_WILDCARD
+            | tampering::UNSIGNED_ZONE_NSEC3_PROOF
+            | tampering::OTHER_ZONE_NSEC3_PROOF
+    ) && *qn == n("own.w.s.t.")
+        && qt == RecordType::A;
     let exists = z.child.contains_key(&(qn.clone(), RecordType::NSEC));
     if exists && !hidden && !replayed {
         for t in [qt, RecordType::CNAME] {
@@ -725,8 +856,10 @@ fn child_link(z: &Tld, m: &mut Message, qn: &Name, qt: RecordType, tamper: usize
     while encloser != apex && !z.child.keys().any(|(o, _)| encloser.zone_of(o)) {
         encloser = encloser.base_name();
     }
-    let below_name = tamper == tampering::REPLAY_WILDCARD_BELOW_NAME
-        && *qn == n("a.own.w.s.t.")
+    let below_name = matches!(
+        tamper,
+        tampering::REPLAY_WILDCARD_BELOW_NAME | tampering::BESIDE_UNSIGNED_NSEC3
+    ) && *qn == n("a.own.w.s.t.")
         && qt == RecordType::A;
     let wildcard = if below_name {
         n("*.w.s.t.")
@@ -754,7 +887,16 @@ fn child_link(z: &Tld, m: &mut Message, qn: &Name, qt: RecordType, tamper: usize
             match tamper {
                 tampering::NO_WILDCARD_PROOF => {}
                 tampering::OTHER_WILDCARD_PROOF => nsec(m, &n("www.s.t.")),
+                tampering::UNSIGNED_ZONE_NSEC3_PROOF => {
+                    m.add_authorities(vec![unsigned_nsec3(qn, "u.")]);
+                }
+                tampering::OTHER_ZONE_NSEC3_PROOF => {
+                    m.add_authorities(z.covering(qn));
+                }
                 _ => nsec(m, &covering(qn)),
+            }
+            if tamper == tampering::BESIDE_UNSIGNED_NSEC3 {
+                m.add_authorities(vec![unsigned_nsec3(qn, "s.t.")]);
             }
             return match (&rs[0].data, t == qt) {
                 (RData::CNAME(CNAME(target)), false) => Some(target.clone()),
@@ -778,6 +920,28 @@ fn child_link(z: &Tld, m: &mut Message, qn: &Name, qt: RecordType, tamper: usize
         nsec(m, &covering(&wildcard));
     }
     None
+}
+
+/// `z3.s.t.`'s zone, signed with NSEC3: its records; for a name below the apex that has none, the
+/// wildcard's (RFC 4592) with the NSEC3 record covering the next closer name (RFC 5155 §7.2.6);
+/// anything else, the SOA.
+fn hashed_answer(z: &Tld, m: &mut Message, qn: &Name, qt: RecordType) {
+    let apex = n("z3.s.t.");
+    if let Some(rs) = z.hashed.get(&(qn.clone(), qt)) {
+        m.add_answers(rs.clone());
+        return;
+    }
+    let exists = *qn == apex || z.hashed.keys().any(|(o, _)| o == qn);
+    if !exists && let Some(rs) = z.hashed.get(&(n("*.z3.s.t."), qt)) {
+        m.add_answers(rs.iter().cloned().map(|mut r| {
+            r.name = qn.clone();
+            r
+        }));
+        let next_closer = qn.trim_to(usize::from(apex.num_labels()) + 1);
+        m.add_authorities(z.hashed_covering(&next_closer));
+        return;
+    }
+    m.add_authorities(z.hashed[&(apex, RecordType::SOA)].clone());
 }
 
 /// `u.t.`'s server, like a parked domain's: every name has an SOA and NS of its own, a DS
@@ -1408,6 +1572,18 @@ fn answered(bytes: &[u8]) -> Vec<(String, RecordType)> {
         .collect()
 }
 
+/// What is served: the response code, the AD bit and [`answered`].
+type Served = (u16, bool, Vec<(String, RecordType)>);
+
+/// [`Served`]; `None` when there are no bytes.
+fn served(bytes: &[u8]) -> Option<Served> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let ad = telltale_proto::Header::parse(bytes).unwrap().flags.ad();
+    Some((rcode(bytes), ad, answered(bytes)))
+}
+
 /// REQ: DNS-011 (RFC 4035 §5.3.4, §5.4) — a signed answer whose denial is about the target of a
 /// CNAME is validated link by link: a missing type (NSEC, NSEC3, over two links), a missing name,
 /// a wildcard's address behind a CNAME, a wildcard's CNAME; and insecure, not secure, when the
@@ -1997,6 +2173,110 @@ async fn dns_011_offline_wildcard_nodata_is_validated() {
             "the wildcard's NSEC: {name} AAAA"
         );
     }
+    assert_eq!(stats.bogus.load(Ordering::Relaxed), 0);
+}
+
+/// REQ: DNS-011 (RFC 4035 §5.3.4, RFC 5155 §8.8; ADR-188) — the wildcard rule of zones signed with
+/// NSEC is left to NSEC3 only beside a verified NSEC3 record of the zone that signed the answer: an
+/// NSEC3 record that isn't verified, or that is another zone's, doesn't switch the rule off. Each of
+/// these answers stays bogus (EDE 6) over two questions, and nothing is counted secure or insecure:
+/// - `a.own.w.s.t. A` from `*.w.s.t.` with `own.w.s.t.`'s NSEC, and an unsigned NSEC3 record owned
+///   in `s.t.` beside it;
+/// - `own.w.s.t. A` from `*.w.s.t.` with only an unsigned NSEC3 record of the unsigned zone `u.`;
+/// - the same with only `t.`'s signed NSEC3 record covering the name;
+/// - `a.b.c.s.t. A` from the wildcard CNAME `*.c.s.t.` with only that NSEC3 record of `u.`.
+#[tokio::test]
+async fn dns_011_offline_wildcard_rule_stays_on_beside_an_unverified_or_other_zone_nsec3() {
+    let budget = Duration::from_secs(5);
+    let z = Arc::new(zone());
+    let bogus = Some((Verdict::Bogus, telltale_proto::ede::DNSSEC_BOGUS));
+    let (mut got, mut want) = (Vec::new(), Vec::new());
+    for (tamper, name, what) in [
+        (
+            tampering::BESIDE_UNSIGNED_NSEC3,
+            "a.own.w.s.t",
+            "an unsigned NSEC3 of s.t. beside the NSEC",
+        ),
+        (
+            tampering::UNSIGNED_ZONE_NSEC3_PROOF,
+            "own.w.s.t",
+            "only an unsigned NSEC3 of u.",
+        ),
+        (
+            tampering::OTHER_ZONE_NSEC3_PROOF,
+            "own.w.s.t",
+            "only a signed NSEC3 of t.",
+        ),
+        (
+            tampering::UNSIGNED_ZONE_NSEC3_PROOF,
+            "a.b.c.s.t",
+            "a wildcard CNAME with only an unsigned NSEC3 of u.",
+        ),
+    ] {
+        z.tld.tamper.store(tamper, Ordering::Relaxed);
+        let (v, g, _, stats, _dir) = setup_zone(true, Arc::clone(&z)).await;
+        warm_tld(&v, &g).await;
+        let secure = stats.secure.load(Ordering::Relaxed);
+        let mut verdicts = Vec::new();
+        for _ in 1..=2 {
+            let r = v
+                .resolve(&g, question(name, rtype::A), budget, true, false)
+                .await;
+            verdicts.push(r.map(|r| (r.verdict, r.ede)).ok());
+        }
+        got.push((
+            what,
+            verdicts,
+            stats.secure.load(Ordering::Relaxed) - secure,
+            stats.insecure.load(Ordering::Relaxed),
+        ));
+        want.push((what, vec![bogus; 2], 0, 0));
+    }
+    z.tld.tamper.store(tampering::NONE, Ordering::Relaxed);
+    assert_eq!(got, want);
+}
+
+/// REQ: DNS-011 (RFC 5155 §7.2.6, §8.8; ADR-188) — wildcard answers in a zone signed with NSEC3
+/// (`z3.s.t.`), with the zone's signed NSEC3 record covering the next closer name, are secure, with
+/// AD: one label below the wildcard's parent (`a.z3.s.t.`) and two (`a.b.z3.s.t.`).
+#[tokio::test]
+async fn dns_011_offline_wildcard_answers_in_an_nsec3_zone_are_secure() {
+    let (v, g, _, stats, _dir) = setup(true).await;
+    warm_tld(&v, &g).await;
+    let (mut got, mut want) = (Vec::new(), Vec::new());
+    for name in ["a.z3.s.t", "a.b.z3.s.t"] {
+        let r = v
+            .resolve(
+                &g,
+                question(name, rtype::A),
+                Duration::from_secs(5),
+                true,
+                false,
+            )
+            .await;
+        got.push((
+            name,
+            r.ok().map(|r| {
+                let nsec3 = Message::from_vec(&r.bytes).is_ok_and(|msg| {
+                    msg.authorities.iter().any(|rec| {
+                        rec.record_type() == RecordType::NSEC3
+                            && rec.name.base_name() == n("z3.s.t.")
+                    })
+                });
+                (r.verdict, served(&r.bytes), nsec3)
+            }),
+        ));
+        let records = vec![(format!("{name}."), RecordType::A)];
+        want.push((
+            name,
+            Some((
+                Verdict::Secure,
+                Some((telltale_proto::rcode::NOERROR, true, records)),
+                true,
+            )),
+        ));
+    }
+    assert_eq!(got, want);
     assert_eq!(stats.bogus.load(Ordering::Relaxed), 0);
 }
 

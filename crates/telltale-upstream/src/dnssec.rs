@@ -1093,18 +1093,37 @@ fn or_wildcard(
     }
 }
 
-/// REQ: DNS-011 (RFC 4035 §5.3.4, ADR-188) — `m` answers from a wildcard (a secure signature
-/// covering fewer labels than its owner has) in a zone signed with NSEC: there is no NSEC3 record
-/// beside it (those the library checks itself, RFC 5155 §8.8).
+/// REQ: DNS-011 (RFC 4035 §5.3.4, RFC 5155 §8.8; ADR-188) — `m` answers from a wildcard (a secure
+/// signature covering fewer labels than its owner has), and the wildcard rule of zones signed with
+/// NSEC applies to it. Zones signed with NSEC3 are left to the library: the rule is left out only
+/// when, for every zone that signed such a signature, the authority section has a verified NSEC3
+/// record of that zone (owned directly below it). An NSEC3 record that isn't verified, or that is
+/// another zone's, doesn't switch the rule off.
 fn nsec_wildcard_answer(m: &Message) -> bool {
-    m.answers.iter().any(|r| {
+    let mut signers = m.answers.iter().filter_map(expansion_signer).peekable();
+    signers.peek().is_some() && !signers.all(|zone| has_nsec3_of(m, zone))
+}
+
+/// The signer of `r` when it is a secure signature over fewer labels than its owner has: that of a
+/// record made from a wildcard (RFC 4035 §5.3.4).
+fn expansion_signer(r: &Record) -> Option<&Name> {
+    match &r.data {
+        RData::DNSSEC(DNSSECRData::RRSIG(s))
+            if r.proof == Proof::Secure && s.input().num_labels < r.name.num_labels() =>
+        {
+            Some(&s.input().signer_name)
+        }
+        _ => None,
+    }
+}
+
+/// The authority section of `m` has a verified NSEC3 record of `zone`: owned directly below it.
+fn has_nsec3_of(m: &Message, zone: &Name) -> bool {
+    m.authorities.iter().any(|r| {
         r.proof == Proof::Secure
-            && matches!(&r.data, RData::DNSSEC(DNSSECRData::RRSIG(s))
-                if s.input().num_labels < r.name.num_labels())
-    }) && !m
-        .authorities
-        .iter()
-        .any(|r| r.record_type() == RecordType::NSEC3)
+            && r.record_type() == RecordType::NSEC3
+            && r.name.base_name() == *zone
+    })
 }
 
 /// REQ: DNS-011 (RFC 4035 §5.3.4) — a wildcard's answer is authenticated by its signature and
@@ -1965,6 +1984,131 @@ mod depth_tests {
             &[NS, SOA, RRSIG, T_NSEC],
             "c.z.test."
         ));
+    }
+
+    /// REQ: DNS-011 (RFC 4035 §5.3.4, RFC 5155 §8.8; ADR-188) — the wildcard rule of zones signed
+    /// with NSEC applies to an answer made from a wildcard (a secure signature over fewer labels
+    /// than its owner has) unless a secure NSEC3 record of the zone that signed it, owned directly
+    /// below that zone, is beside it: an NSEC3 record that isn't verified, or that is another
+    /// zone's, doesn't switch the rule off.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn dns_011_wildcard_rule_is_left_to_nsec3_only_beside_the_signers_verified_nsec3() {
+        use RecordType::A;
+        use hickory_net::proto::dnssec::Algorithm;
+        use hickory_net::proto::dnssec::Nsec3HashAlgorithm;
+        use hickory_net::proto::dnssec::rdata::{RRSIG, SigInput};
+        use hickory_net::proto::rr::SerialNumber;
+        let owned = |owner: &str, data: RData, proof: Proof| {
+            let mut r = Record::from_rdata(Name::from_ascii(owner).unwrap(), 300, data);
+            r.proof = proof;
+            r
+        };
+        let sig = |labels: u8, signer: &str, proof: Proof| {
+            let input = SigInput {
+                type_covered: A,
+                algorithm: Algorithm::ED25519,
+                num_labels: labels,
+                original_ttl: 300,
+                sig_expiration: SerialNumber::new(2),
+                sig_inception: SerialNumber::new(1),
+                key_tag: 1,
+                signer_name: Name::from_ascii(signer).unwrap(),
+            };
+            let data = RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::from_sig(input, vec![0])));
+            owned("m.z.test.", data, proof)
+        };
+        let nsec3 = |owner: &str, proof: Proof| {
+            let data = NSEC3::new(
+                Nsec3HashAlgorithm::SHA1,
+                false,
+                0,
+                Vec::new(),
+                vec![0; 20],
+                [A],
+            );
+            owned(owner, RData::DNSSEC(DNSSECRData::NSEC3(data)), proof)
+        };
+        // `m.z.test. A` with the given signatures, and the authority section.
+        let answer = |sigs: Vec<Record>, authorities: Vec<Record>| {
+            let address = RData::A(hickory_net::proto::rr::rdata::A::new(192, 0, 2, 1));
+            let mut msg = Message::response(0, OpCode::Query);
+            msg.answers = vec![owned("m.z.test.", address, Proof::Secure)];
+            msg.answers.extend(sigs);
+            msg.authorities = authorities;
+            msg
+        };
+        let wildcard = || vec![sig(2, "z.test.", Proof::Secure)];
+        let beside = |owner: &str, proof: Proof| answer(wildcard(), vec![nsec3(owner, proof)]);
+        let cases = [
+            ("no NSEC3", answer(wildcard(), Vec::new()), true),
+            (
+                "a verified NSEC3 of the signer's zone",
+                beside("h.z.test.", Proof::Secure),
+                false,
+            ),
+            (
+                "the same, in capitals",
+                beside("H.Z.TEST.", Proof::Secure),
+                false,
+            ),
+            (
+                "an NSEC3 that isn't verified",
+                beside("h.z.test.", Proof::Indeterminate),
+                true,
+            ),
+            ("a bogus NSEC3", beside("h.z.test.", Proof::Bogus), true),
+            (
+                "an insecure NSEC3",
+                beside("h.z.test.", Proof::Insecure),
+                true,
+            ),
+            (
+                "a verified NSEC3 of the parent zone",
+                beside("h.test.", Proof::Secure),
+                true,
+            ),
+            (
+                "a verified NSEC3 of another zone",
+                beside("h.y.test.", Proof::Secure),
+                true,
+            ),
+            (
+                "a verified NSEC3 further below the signer",
+                beside("h.k.z.test.", Proof::Secure),
+                true,
+            ),
+            (
+                "two signers, a verified NSEC3 of one",
+                answer(
+                    vec![
+                        sig(2, "z.test.", Proof::Secure),
+                        sig(1, "test.", Proof::Secure),
+                    ],
+                    vec![nsec3("h.z.test.", Proof::Secure)],
+                ),
+                true,
+            ),
+            (
+                "not a wildcard's signature",
+                answer(vec![sig(3, "z.test.", Proof::Secure)], Vec::new()),
+                false,
+            ),
+            (
+                "a wildcard's signature that isn't verified",
+                answer(vec![sig(2, "z.test.", Proof::Indeterminate)], Vec::new()),
+                false,
+            ),
+        ];
+        let got: Vec<(&str, bool)> = cases
+            .iter()
+            .map(|(what, msg, _)| (*what, nsec_wildcard_answer(msg)))
+            .collect();
+        let want: Vec<(&str, bool)> = cases
+            .iter()
+            .map(|(what, _, applies)| (*what, *applies))
+            .collect();
+        assert_eq!(got, want);
     }
 
     /// REQ: DNS-011 (ADR-098) — only a delegation's NSEC or NSEC3 (NS without SOA or DS)
