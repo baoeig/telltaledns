@@ -151,8 +151,9 @@ fn contains(msg: &[u8], needle: &[u8]) -> bool {
 
 /// REQ: DNS-019, UPS-007 (ADR-187) — routes of every kind, added to `CONFIG`: none; a group's own
 /// upstreams (for the device at 10.0.0.7); routes without a suffix (`match_group`, `match_qtype`,
-/// `.`), which match every name; and routes whose suffix covers `resolver.arpa`.
-const ROUTES: [(&str, &str); 8] = [
+/// `.`), which match every name; routes for `resolver.arpa` and a name below it; and a route for
+/// `arpa`, which covers `resolver.arpa` from above.
+const ROUTES: [(&str, &str); 9] = [
     ("no route", ""),
     (
         "the group's own upstreams",
@@ -176,6 +177,10 @@ const ROUTES: [(&str, &str); 8] = [
         "[[route]]\nmatch_suffix = [\"Resolver.ARPA.\"]\nupstream_group = \"lan\"\n",
     ),
     (
+        "a route for _dns.resolver.arpa",
+        "[[route]]\nmatch_suffix = [\"_dns.resolver.arpa\"]\nupstream_group = \"lan\"\n",
+    ),
+    (
         "a route for arpa",
         "[[route]]\nmatch_suffix = [\"arpa\"]\nupstream_group = \"lan\"\n",
     ),
@@ -196,9 +201,11 @@ fn flt_013_explain_agrees_with_the_pipeline() {
         "nas.home.arpa",
         "host.corp.example",
         "localhost",
-        // REQ: DNS-019 (ADR-187) — answered here, not forwarded, unless a route's suffix covers it.
+        // REQ: DNS-019 (ADR-187) — answered here, not forwarded, unless a route for it or a name
+        // below it covers it.
         "_dns.resolver.arpa",
         "resolver.arpa",
+        "8.8.8.8.in-addr.arpa",
     ];
     // REQ: DNS-019, UPS-007 (ADR-187) — with routes of every kind.
     for (routes, extra) in ROUTES {
@@ -236,24 +243,26 @@ fn flt_013_explain_agrees_with_the_pipeline() {
 }
 
 // REQ: DNS-019, UPS-007, FLT-013 (ADR-187) — explain says what the pipeline does with
-// `_dns.resolver.arpa` for routes of every kind: forwarded only by a route whose suffix covers it
-// (in any case); a route without a suffix (a group's own upstreams, `match_group`, `match_qtype`,
-// `.`) sends the device's other names to its upstream group and leaves this one answered here.
+// `_dns.resolver.arpa` for routes of every kind: forwarded only by a route for `resolver.arpa`
+// (in any case) or a name below it; any other route (a group's own upstreams, `match_group`,
+// `match_qtype`, `.`, `arpa`) sends the device's other names to its upstream group and leaves
+// this one answered here.
 #[test]
-fn dns_019_explain_forwards_resolver_arpa_only_by_a_route_with_a_suffix() {
+fn dns_019_explain_forwards_resolver_arpa_only_by_a_route_for_it_or_below() {
     const HERE: Option<&str> = None;
     const LAN: Option<&str> = Some("lan");
     const CLIENTS: [&str; 3] = ["10.0.0.5", "10.0.0.7", "10.0.0.9"];
     // By `ROUTES`: the upstream group `_dns.resolver.arpa` goes to from each of `CLIENTS` (`HERE`:
-    // answered here), and a client whose `www.example.org` the routes send to `lan`.
-    let want: [([Option<&str>; 3], Option<&str>); 8] = [
+    // answered here), and a (client, name) the routes do send to `lan`.
+    let want = [
         ([HERE; 3], None),
-        ([HERE; 3], Some("10.0.0.7")),
-        ([HERE; 3], Some("10.0.0.5")),
-        ([HERE; 3], Some("10.0.0.9")),
-        ([HERE; 3], Some("10.0.0.9")),
+        ([HERE; 3], Some(("10.0.0.7", "www.example.org"))),
+        ([HERE; 3], Some(("10.0.0.5", "www.example.org"))),
+        ([HERE; 3], Some(("10.0.0.9", "www.example.org"))),
+        ([HERE; 3], Some(("10.0.0.9", "www.example.org"))),
         ([LAN; 3], None),
         ([LAN; 3], None),
+        ([HERE; 3], Some(("10.0.0.9", "8.8.8.8.in-addr.arpa"))),
         ([LAN, HERE, HERE], None),
     ];
     let mut wrong = Vec::new();
@@ -273,12 +282,12 @@ fn dns_019_explain_forwards_resolver_arpa_only_by_a_route_with_a_suffix() {
                 ));
             }
         }
-        if let Some(client) = routed {
-            let e = ask(&p, &sources, "www.example.org", client);
+        if let Some((client, name)) = routed {
+            let e = ask(&p, &sources, name, client);
             let group = e.route.as_ref().map(|r| r.group.as_str());
             if group != LAN {
                 wrong.push(format!(
-                    "{routes}: www.example.org from {client}: {group:?}, expected the route's lan"
+                    "{routes}: {name} from {client}: {group:?}, expected the route's lan"
                 ));
             }
         }

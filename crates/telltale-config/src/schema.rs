@@ -2041,11 +2041,11 @@ pub struct SpecialConfig {
     pub refuse_chaos: bool,
     /// REQ: DNS-019 (ADR-187) — `resolver.arpa` and the names below it, such as
     /// `_dns.resolver.arpa` (encrypted-DNS discovery, RFC 9462) → NOERROR with no records, never
-    /// forwarded (RFC 9462 §6.4: a locally served zone), unless a local record or a route whose
-    /// suffix covers them does. On by default. The cluster shares it, and it is not written while
-    /// it is on. Don't write this key, `true` or `false`, until every node runs this version: an
-    /// older node refuses it in its own file, and in a shared configuration (where only `false`
-    /// is written).
+    /// forwarded (RFC 9462 §6.4: a locally served zone), unless a local record or a route for
+    /// `resolver.arpa` or a name below it covers them (a route for `arpa` doesn't). On by default.
+    /// The cluster shares it, and it is not written while it is on. Don't write this key, `true` or
+    /// `false`, until every node runs this version: an older node refuses it in its own file, and
+    /// in a shared configuration (where only `false` is written).
     #[serde(skip_serializing_if = "is_default_resolver_arpa")]
     pub resolver_arpa: bool,
 }

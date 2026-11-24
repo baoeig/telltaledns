@@ -371,13 +371,12 @@ fn dns_019_turning_resolver_arpa_off_is_a_changed_answer() {
 }
 
 // REQ: DNS-019, UPS-007, OBS-024 (ADR-187) — the simulation forwards `resolver.arpa` as the
-// pipeline does: only for a route whose suffix covers it (in any case). A route without a suffix
-// (a group's own upstreams, `match_group`, `match_qtype`, `.`) moves the device's other names to
-// its upstream group (a changed route) and leaves `_dns.resolver.arpa` answered here (unchanged);
-// a route for `resolver.arpa` or `arpa` forwards it (a changed answer), for the route's group
-// only when it names one.
+// pipeline does: only for a route for `resolver.arpa` (in any case) or a name below it, and for
+// the route's group only when it names one (a changed answer). Any other route (a group's own
+// upstreams, `match_group`, `match_qtype`, `.`, `arpa`) moves the device's other names to its
+// upstream group (a changed route) and leaves `_dns.resolver.arpa` answered here (unchanged).
 #[test]
-fn dns_019_simulation_forwards_resolver_arpa_only_by_a_route_with_a_suffix() {
+fn dns_019_simulation_forwards_resolver_arpa_only_by_a_route_for_it_or_below() {
     let _s = serial();
     let lab = Lab::new("");
     // The tablet (10.0.0.5, in kids) and an unknown device (10.0.0.7).
@@ -385,14 +384,16 @@ fn dns_019_simulation_forwards_resolver_arpa_only_by_a_route_with_a_suffix() {
     lab.log("_dns.resolver.arpa", 7, 3, t0_s() - 20, false);
     lab.log("www.example", 5, 4, t0_s() - 40, false);
     lab.log("www.example", 7, 2, t0_s() - 60, false);
-    // (routes, changed answers, changed routes): of 6 + 3 `_dns.resolver.arpa` and 4 + 2 other.
+    lab.log("8.8.8.8.in-addr.arpa", 7, 1, t0_s() - 80, false);
+    // (routes, changed answers, changed routes): of 6 + 3 `_dns.resolver.arpa`, 4 + 2
+    // `www.example`, and the device's one public reverse lookup.
     let cases = [
         (
             "the group's own upstreams",
             "[[group]]\nname = \"tv\"\nupstreams = \"lan\"\n\
              [[client]]\nname = \"tv\"\nmatch = [\"10.0.0.7\"]\ngroups = [\"tv\"]\n",
             0,
-            2,
+            3,
         ),
         (
             "a match_group route",
@@ -404,13 +405,13 @@ fn dns_019_simulation_forwards_resolver_arpa_only_by_a_route_with_a_suffix() {
             "a match_qtype route",
             "[[route]]\nmatch_qtype = [\"A\"]\nupstream_group = \"lan\"\n",
             0,
-            6,
+            7,
         ),
         (
             "a route for `.`",
             "[[route]]\nmatch_suffix = [\".\"]\nupstream_group = \"lan\"\n",
             0,
-            6,
+            7,
         ),
         (
             "a route for resolver.arpa",
@@ -419,10 +420,16 @@ fn dns_019_simulation_forwards_resolver_arpa_only_by_a_route_with_a_suffix() {
             0,
         ),
         (
-            "a route for arpa",
-            "[[route]]\nmatch_suffix = [\"arpa\"]\nupstream_group = \"lan\"\n",
+            "a route for _dns.resolver.arpa",
+            "[[route]]\nmatch_suffix = [\"_dns.resolver.arpa\"]\nupstream_group = \"lan\"\n",
             9,
             0,
+        ),
+        (
+            "a route for arpa",
+            "[[route]]\nmatch_suffix = [\"arpa\"]\nupstream_group = \"lan\"\n",
+            0,
+            1,
         ),
         (
             "a route for resolver.arpa and the group kids",
@@ -440,9 +447,9 @@ fn dns_019_simulation_forwards_resolver_arpa_only_by_a_route_with_a_suffix() {
             s.changed_route.queries,
             s.newly_blocked.queries + s.newly_allowed.queries,
         );
-        if got != (15, answers, moved, 0) {
+        if got != (16, answers, moved, 0) {
             wrong.push(format!(
-                "{routes}: (rows, changed answers, changed routes, blocks) {got:?}, expected (15, {answers}, {moved}, 0)"
+                "{routes}: (rows, changed answers, changed routes, blocks) {got:?}, expected (16, {answers}, {moved}, 0)"
             ));
         }
     }

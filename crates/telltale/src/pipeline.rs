@@ -30,6 +30,20 @@ use telltale_telemetry::{Hub, Metrics, Proto, QueryEvent, Rule, RuleKind, Status
 use telltale_upstream::{Question, Router};
 use tokio::sync::Semaphore;
 
+/// REQ: DNS-019, UPS-007 (ADR-187) — the labels of `resolver.arpa`.
+const RESOLVER_ARPA_LABELS: usize = 2;
+
+/// REQ: DNS-019, UPS-007 (ADR-187) — whether a name in `resolver.arpa` is answered here, given the
+/// label count of the suffix that chose its route (`Selection::suffix_labels`; `None` without an
+/// upstream group). It is forwarded only by a route for `resolver.arpa` or a name below it: a
+/// suffix of at least `resolver.arpa`'s two labels that covers the name. A route for `arpa` (one
+/// label, every reverse lookup) or `.`, and a route without a suffix (a group's own upstreams,
+/// `match_group`, `match_qtype`), don't forward it. The pipeline, explain and the change
+/// simulation decide with this one function.
+pub(crate) fn resolver_arpa_answered_here(suffix_labels: Option<usize>) -> bool {
+    suffix_labels.is_none_or(|n| n < RESOLVER_ARPA_LABELS)
+}
+
 /// Settings derived from config.
 #[derive(Debug, Clone)]
 pub(crate) struct Settings {
@@ -1659,10 +1673,9 @@ impl Pipeline {
         }
         // REQ: DNS-019, UPS-007 (ADR-187) — RFC 9462 §6.4: `resolver.arpa` is a locally served
         // zone: NOERROR with no records (no AD; never cached, validated or forwarded), unless a
-        // route whose suffix covers the name forwards it (§6.1: `resolver.arpa`, a name below it,
-        // or `arpa`). A route without a suffix (a group's own upstreams, `match_group`,
-        // `match_qtype`, `.`) matches every name and doesn't.
-        if special == Some(Special::LocallyServed) && selection.is_none_or(|s| s.suffix_labels == 0)
+        // route for `resolver.arpa` or a name below it forwards it (§6.1).
+        if special == Some(Special::LocallyServed)
+            && resolver_arpa_answered_here(selection.map(|s| s.suffix_labels))
         {
             return self.simple(&q, out, rcode::NOERROR, None, meta);
         }
@@ -4925,17 +4938,18 @@ groups = ["kids"]
     }
 
     /// REQ: DNS-019, UPS-007 (ADR-187) — `resolver.arpa` is forwarded only by a route whose
-    /// suffix covers the name: `resolver.arpa` (in any case, with or without the final dot), a
-    /// name below it that is the name asked, or `arpa`. A route without a suffix matches every
-    /// name, so a group's own `upstreams`, a `match_group` or `match_qtype` route, and a route for
-    /// `.` send the device's other names to their upstream group and leave `_dns.resolver.arpa`
-    /// answered here. A route with a suffix and a group forwards it for that group's devices
-    /// only, and a suffix route wins over the group's own upstreams.
+    /// suffix is `resolver.arpa` (in any case, with or without the final dot) or a name below it
+    /// that covers the name asked. Any other route leaves `_dns.resolver.arpa` answered here
+    /// while it sends the device's other names to its upstream group: a route for `arpa` (every
+    /// reverse lookup), a route for `.`, and routes without a suffix (a group's own `upstreams`, a
+    /// `match_group` or `match_qtype` route). A route for `resolver.arpa` and a group forwards it
+    /// for that group's devices only, and it wins over the group's own upstreams and over a
+    /// route for `arpa`.
     // `too_many_lines`: one table of cases. (Kept off the attribute lines, where spec/trace.py
     // looks for the test's name.)
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn dns_019_resolver_arpa_forwarded_only_by_a_route_with_a_suffix() {
+    async fn dns_019_resolver_arpa_forwarded_only_by_a_route_for_it_or_below() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         const TABLET: &str = "192.168.1.20"; // in `kids`
@@ -5039,7 +5053,7 @@ groups = ["kids"]
         };
         let kids = "[[group]]\nname = \"kids\"\n";
         let ddr = "_dns.resolver.arpa";
-        let (svcb, a) = (rtype::SVCB, rtype::A);
+        let (svcb, a, ptr) = (rtype::SVCB, rtype::A, rtype::PTR);
         // (what, the configuration added, its questions)
         let cases: Vec<(&str, String, Asks)> = vec![
             (
@@ -5103,9 +5117,35 @@ groups = ["kids"]
                 ],
             ),
             (
-                "a route for arpa",
+                "a route for arpa (every reverse lookup)",
                 format!("{kids}[[route]]\nmatch_suffix = [\"arpa\"]\nupstream_group = \"ddr\"\n"),
-                vec![(TABLET, ddr, svcb, Chosen), (OTHER, ddr, svcb, Chosen)],
+                vec![
+                    (OTHER, "8.8.8.8.in-addr.arpa", ptr, Chosen),
+                    (TABLET, ddr, svcb, LOCAL),
+                    (OTHER, ddr, svcb, LOCAL),
+                    (OTHER, "resolver.arpa", a, LOCAL),
+                ],
+            ),
+            (
+                "a route for arpa and one for resolver.arpa to another group",
+                format!(
+                    "{kids}[[route]]\nmatch_suffix = [\"arpa\"]\nupstream_group = \"ddr\"\n\
+                     [[route]]\nmatch_suffix = [\"resolver.arpa\"]\nupstream_group = \"default\"\n"
+                ),
+                vec![
+                    (OTHER, "8.8.8.8.in-addr.arpa", ptr, Chosen),
+                    (OTHER, ddr, svcb, Public),
+                ],
+            ),
+            (
+                "a route for `.` and resolver.arpa together",
+                format!(
+                    "{kids}[[route]]\nmatch_suffix = [\".\", \"resolver.arpa\"]\nupstream_group = \"ddr\"\n"
+                ),
+                vec![
+                    (OTHER, "example.com", a, Chosen),
+                    (OTHER, ddr, svcb, Chosen),
+                ],
             ),
             (
                 "a route for resolver.arpa and the group kids",

@@ -346,11 +346,11 @@ pub(crate) fn explain(
         e.outcome = Outcome::Special;
         e.summary = "private reverse lookup with no [[route]] for it: NXDOMAIN without forwarding (RFC 6303)".into();
     } else if special == Some(Special::LocallyServed)
-        && selection.as_ref().is_none_or(|s| s.suffix_labels == 0)
+        && crate::pipeline::resolver_arpa_answered_here(selection.as_ref().map(|s| s.suffix_labels))
     {
-        // REQ: DNS-019, UPS-007 (ADR-187) — forwarded only by a route whose suffix covers it.
+        // REQ: DNS-019, UPS-007 (ADR-187) — forwarded only by a route for it or a name below it.
         e.outcome = Outcome::Special;
-        e.summary = "resolver.arpa (encrypted-DNS discovery) with no [[route]] whose suffix covers it: NOERROR with no records, without forwarding (RFC 9462)".into();
+        e.summary = "resolver.arpa (encrypted-DNS discovery) with no [[route]] for resolver.arpa or a name below it: NOERROR with no records, without forwarding (RFC 9462)".into();
     } else if let Some(sel) = selection {
         e.route = Some(RouteInfo {
             group: sel.group.name.clone(),
