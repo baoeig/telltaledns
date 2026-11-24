@@ -148,7 +148,8 @@ export type Entry = { readonly ctx: string; readonly english: string | readonly 
 /** A pair file with every entry and nothing translated: `[english, ""]`, or the language's plural
  * categories with empty text. */
 export function skeleton(entries: Iterable<Entry>, categories: readonly string[]): Catalog {
-  const out: Catalog = {};
+  // Null prototype: a context may be called `constructor` or `toString`.
+  const out: Catalog = Object.create(null);
   for (const e of entries) {
     const english = Array.isArray(e.english) ? ([e.english[0], e.english[1]] as [string, string]) : (e.english as string);
     const tx = Array.isArray(e.english) ? Object.fromEntries(categories.map((c) => [c, ''])) : '';
@@ -162,13 +163,13 @@ export function skeleton(entries: Iterable<Entry>, categories: readonly string[]
  * carried over; every other pair of `existing` moved to `~leftover` (or dropped with `prune`). */
 export function merge(existing: Catalog, skel: Catalog, key: (ctx: string, english: Pair[0], note?: string) => string, { prune = false } = {}): Catalog {
   const have = new Map<string, Pair>();
-  const left: Pair[] = [...(existing[LEFTOVER] ?? [])];
+  const left: Pair[] = [...(Object.hasOwn(existing, LEFTOVER) ? existing[LEFTOVER] : [])];
   for (const [ctx, pairs] of Object.entries(existing)) {
     if (ctx === LEFTOVER) continue;
     for (const p of pairs) have.set(key(ctx, p[0], noteOf(p) || undefined), p);
   }
   const used = new Set<string>();
-  const out: Catalog = {};
+  const out: Catalog = Object.create(null);
   for (const [ctx, pairs] of Object.entries(skel)) {
     for (const s of pairs) {
       const k = key(ctx, s[0], noteOf(s) || undefined);

@@ -118,7 +118,8 @@ is shown until the language's owner confirms the new text.
 2. `npm run check:i18n` is green: every translation keeps the placeholders, tags and web addresses
    of its English, every structural token (a URL, a path, `[x]`, `=`, `_`, `$`, `|`, a host and port,
    an IP address, a glossary term), every number, and every word `src/locales/verbatim.json` lists
-   for it; and it has no direction overrides, invisible characters or words that mix scripts.
+   for it; it adds no address, port, path or setting; and it has no direction overrides, invisible
+   characters or words that mix scripts. The added-token lines of the report name no address.
 3. The job summary's **sensitive** lines (messages `src/locales/notes.json` marks sensitive: the
    pull request carries a back-translation of each) and **swap** lines (a new translation equal to
    another message's old one) are explained.

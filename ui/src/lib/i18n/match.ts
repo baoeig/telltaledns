@@ -28,17 +28,7 @@ export function canonical(tag: string): string | null {
  * without one, the script its likely subtags give. */
 export function candidates(tag: string, earlier: readonly string[] = []): string[] {
   const loc = new Intl.Locale(tag);
-  let base = loc;
-  if (!loc.script && !loc.region) {
-    for (const e of earlier) {
-      const prev = new Intl.Locale(e).maximize();
-      if (prev.language === loc.language && prev.script) {
-        base = new Intl.Locale(loc.language, { script: prev.script });
-        break;
-      }
-    }
-  }
-  const max = base.maximize();
+  const max = scripted(tag, earlier).maximize();
   const out = [loc.toString()];
   if (max.script && max.region) out.push(`${max.language}-${max.script}-${max.region}`);
   if (max.script) out.push(`${max.language}-${max.script}`);
@@ -46,8 +36,23 @@ export function candidates(tag: string, earlier: readonly string[] = []): string
   return [...new Set(out)];
 }
 
+/** A request with the script it means: a bare language takes the script of an earlier request of
+ * the same language. */
+function scripted(tag: string, earlier: readonly string[]): Intl.Locale {
+  const loc = new Intl.Locale(tag);
+  if (!loc.script && !loc.region) {
+    for (const e of earlier) {
+      const prev = new Intl.Locale(e).maximize();
+      if (prev.language === loc.language && prev.script) return new Intl.Locale(loc.language, { script: prev.script });
+    }
+  }
+  return loc;
+}
+
 /** The tag to use: a catalog of `locales`, `en`, or the pseudo-locale. The first request with an
- * offered match wins; English matches English at once; nothing matched means English. */
+ * offered match wins; English matches English at once; nothing matched means English. A catalog is
+ * taken only if its likely script is the request's (a `yue` catalog, Traditional, is not taken for
+ * `yue-CN`), whether or not the catalog's tag names a script. */
 export function match(requests: readonly Request[], locales: Readonly<Record<string, Offered>>): string {
   const earlier: string[] = [];
   for (const r of requests) {
@@ -55,8 +60,9 @@ export function match(requests: readonly Request[], locales: Readonly<Record<str
     if (!tag) continue;
     if (tag === PSEUDO && r.source === 'param') return PSEUDO;
     if (new Intl.Locale(tag).language === 'en') return 'en';
+    const want = scripted(tag, earlier).maximize().script;
     for (const c of candidates(tag, earlier)) {
-      if (Object.hasOwn(locales, c) && (locales[c].offered || r.source === 'param')) return c;
+      if (Object.hasOwn(locales, c) && (locales[c].offered || r.source === 'param') && new Intl.Locale(c).maximize().script === want) return c;
     }
     earlier.push(tag);
   }

@@ -23,7 +23,12 @@ async function start() {
   } catch {
     // Storage blocked: the browser's languages decide.
   }
-  const choice = await load(LOCALES, { search: location.search, stored, languages: navigator.languages ?? [] }, fetch);
+  let choice: Choice = { tag: 'en' };
+  try {
+    choice = await load(LOCALES, { search: location.search, stored, languages: navigator.languages ?? [] }, fetch);
+  } catch {
+    // Whatever went wrong in choosing the language, the page is English.
+  }
   const before = earlyCalls();
   const rt = use(choice);
   // For the page tests: messages read before the language was installed (expected: none).

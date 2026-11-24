@@ -10,7 +10,7 @@ import { install, parseCatalog, type Choice } from '../../src/lib/i18n';
 export const UI = resolve(import.meta.dirname, '../..');
 export const FIXTURE = resolve(UI, 'tests/i18n-fixtures/project');
 
-export type Finding = { level: 'fail' | 'report'; rule: string; file: string; msg: string; values?: string[] };
+export type Finding = { level: 'fail' | 'report'; rule: string; check?: string; file: string; msg: string; values?: string[] };
 export type Result = {
   findings: Finding[];
   shipped: Record<string, { json: string }>;

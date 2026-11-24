@@ -5,7 +5,7 @@
 import { expect, test } from '@playwright/test';
 import { interpolate, parts, plural } from '../../src/lib/i18n/message';
 import { candidates, canonical, match, type Request } from '../../src/lib/i18n/match';
-import { agree, agreesAtRuntime, codePoints, tokens, urls } from '../../src/lib/i18n/safe';
+import { agree, agreesAtRuntime, codePoints, schemes, tokens, urls } from '../../src/lib/i18n/safe';
 import { LOWER, UPPER, pseudo } from '../../src/lib/i18n/pseudo';
 import { hash } from '../../src/lib/i18n/ident';
 import { PairFileError, merge, parse, skeleton } from '../../src/lib/i18n/pairs';
@@ -130,6 +130,18 @@ test('api_012 locale matching follows the request order and scripts', () => {
   // The pseudo-locale only from ?lang=.
   expect(match([{ tag: 'en-XA', source: 'param' }], offered)).toBe('en-XA');
   expect(match([{ tag: 'en-XA', source: 'browser' }, { tag: 'zh-CN', source: 'browser' }], offered)).toBe('en');
+  // A catalog whose tag names no script is taken only for a request of its likely script: a `yue`
+  // catalog (Traditional) is not taken for `yue-CN` (Simplified), and no list of languages decides it.
+  const yue = { yue: { offered: true } };
+  expect(match(browser('yue-CN'), yue)).toBe('en');
+  expect(match(browser('yue-Hans'), yue)).toBe('en');
+  expect(match(browser('yue-HK'), yue)).toBe('yue');
+  expect(match(browser('yue'), yue)).toBe('yue');
+  expect(match(browser('yue-CN', 'yue'), yue)).toBe('en');
+  expect(match([{ tag: 'yue-CN', source: 'param' }], yue)).toBe('en');
+  const sr = { 'sr-Latn': { offered: true } };
+  expect(match(browser('sr'), sr)).toBe('en');
+  expect(match(browser('sr-Latn-RS'), sr)).toBe('sr-Latn');
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -149,6 +161,16 @@ test('api_012 url and token extraction', () => {
   // Fullwidth letters and dots in an address are caught.
   expect(failed('See https://example.com/x', '见 https://ｅｖｉｌ．ｃｏｍ/x')).toContain('urls');
   expect(failed('See https://example.com/x', '见 https://ｅｖｉｌ.com/x')).toContain('urls');
+  // An address in capitals is an address.
+  expect(urls('见 HTTPS://Evil.example/x')).toEqual(['HTTPS://Evil.example/x']);
+  expect(failed("Open your router's page", '打开 HTTPS://evil.example')).toContain('urls');
+  expect(failed('See HTTPS://a.example', '见 HTTPS://a.example')).toEqual([]);
+  // A fullwidth scheme (its colon and slashes too) counts as one, though no URL can be read from it.
+  expect(schemes('打开 ｈｔｔｐｓ：／／ｅｖｉｌ．ｅｘａｍｐｌｅ')).toBe(1);
+  expect(failed("Open your router's page", '打开 ｈｔｔｐｓ：／／ｅｖｉｌ．ｅｘａｍｐｌｅ')).toEqual(['urls']);
+  expect(failed('Open https://a.example', '打开 https://a.example 或 ｆｔｐ：／／ｂ')).toEqual(['urls']);
+  expect(agreesAtRuntime("Open your router's page", '打开 ｈｔｔｐｓ：／／ｅｖｉｌ．ｅｘａｍｐｌｅ')).toBe(false);
+  expect(agreesAtRuntime("Open your router's page", '打开 HTTPS://evil.example')).toBe(false);
   // A scheme with a host and port, and its number, must stay.
   expect(failed('Use smtp://host:587 to send', '用邮件服务器发送')).toEqual(['structural', 'digits']);
   // A verbatim word renamed fails; kept as a word (also between CJK letters) it passes.
@@ -170,39 +192,51 @@ test('api_012 url and token extraction', () => {
 
 test('api_012 forbidden code points', () => {
   const named: Record<string, string> = {
-    'U+202A': '‪', 'U+202E': '‮', 'U+2066': '⁦', 'U+2069': '⁩', 'U+200B': '​', 'U+2060': '⁠',
-    'U+2064': '⁤', 'U+FEFF': '﻿', 'U+00AD': '­', 'U+0000': '\u0000', 'U+0009': '\t', 'U+001F': '\u001F',
+    'U+202A': '\u202A', 'U+202E': '\u202E', 'U+2066': '\u2066', 'U+2069': '\u2069', 'U+200B': '\u200B', 'U+2060': '\u2060',
+    'U+2064': '\u2064', 'U+FEFF': '\uFEFF', 'U+00AD': '\u00AD', 'U+0000': '\u0000', 'U+0009': '\t', 'U+001F': '\u001F',
     'U+007F': '\u007F', 'U+0080': '\u0080', 'U+009F': '\u009F',
   };
   for (const [name, c] of Object.entries(named)) expect(codePoints(`a${c}b`), name).toEqual([name]);
+  // Every other format character, the line and paragraph separators, the invisible fillers and
+  // selectors, and the tag characters.
+  const more: Record<string, string> = {
+    'U+2028': '\u{2028}', 'U+2029': '\u{2029}', 'U+180E': '\u180E', 'U+034F': '\u034F', 'U+FE00': '\uFE00', 'U+FE0F': '\uFE0F',
+    'U+115F': '\u115F', 'U+1160': '\u1160', 'U+3164': '\u3164', 'U+FFA0': '\uFFA0', 'U+206A': '\u206A', 'U+206F': '\u206F',
+    'U+E0000': '\u{E0000}', 'U+E0001': '\u{E0001}', 'U+E0041': '\u{E0041}', 'U+E007F': '\u{E007F}', 'U+0600': '\u0600', 'U+2061': '\u2061',
+  };
+  for (const [name, c] of Object.entries(more)) expect(codePoints(`a${c}b`), name).toEqual([name]);
+  expect(agreesAtRuntime('Hello', 'Hel\u{E0041}lo')).toBe(false);
   expect(codePoints('a\nb')).toEqual([]);
   // U+200C/U+200D between letters of a script that needs them; nowhere else.
-  expect(codePoints('می‌خواهم')).toEqual([]);
-  expect(codePoints('क्‍ष')).toEqual([]);
-  expect(codePoints('ab‌cd')).toEqual(['U+200C']);
-  expect(codePoints('‌می')).toEqual(['U+200C']);
-  expect(codePoints('a‍b')).toEqual(['U+200D']);
+  expect(codePoints('می\u200Cخواهم')).toEqual([]);
+  expect(codePoints('क्\u200Dष')).toEqual([]);
+  expect(codePoints('ab\u200Ccd')).toEqual(['U+200C']);
+  expect(codePoints('\u200Cمی')).toEqual(['U+200C']);
+  expect(codePoints('a\u200Db')).toEqual(['U+200D']);
   // U+200E, U+200F and U+061C right to left only.
-  for (const c of ['‎', '‏', '؜']) {
+  for (const c of ['\u200E', '\u200F', '\u061C']) {
     expect(codePoints(`a${c}b`)).toHaveLength(1);
     expect(codePoints(`a${c}b`, 'rtl')).toEqual([]);
   }
-  expect(failed('Hello', 'Hel‮lo')).toEqual(['code-point']);
-  expect(agreesAtRuntime('Hello', 'Hel​lo')).toBe(false);
+  expect(failed('Hello', 'Hel\u202Elo')).toEqual(['code-point']);
+  expect(agreesAtRuntime('Hello', 'Hel\u200Blo')).toBe(false);
 });
 
 test('api_012 findings name the rule the token and its place', () => {
-  const v = agree('See https://a.example/docs and {n} items', 'Qa {n} https://b.example/docs Pаss‮');
+  const v = agree('See https://a.example/docs and {n} items', 'Qa {n} https://b.example/docs Pаss\u202E');
   const pick = (rule: string) => v.fails.filter((f) => f.rule === rule).map(({ token, at, detail }) => ({ token, at, detail }));
   expect(pick('urls')).toEqual([
     { token: 'https://a.example/docs', at: -1, detail: 'missing' },
     { token: 'https://b.example/docs', at: 7, detail: 'added' },
   ]);
-  expect(pick('structural')).toEqual([{ token: 'https://a.example/docs', at: -1, detail: 'missing' }]);
+  expect(pick('structural')).toEqual([
+    { token: 'https://a.example/docs', at: -1, detail: 'missing' },
+    { token: 'https://b.example/docs', at: 7, detail: 'added' },
+  ]);
   expect(pick('mixed-script')).toEqual([{ token: 'Pаss', at: 30, detail: 'mixes Latin with Cyrillic or Greek letters' }]);
   expect(pick('code-point')).toEqual([{ token: 'U+202E', at: 34, detail: 'forbidden' }]);
   // The browser's first-use check is a separate yes or no on the same rules.
-  expect(agreesAtRuntime('See https://a.example/docs and {n} items', 'Qa {n} https://b.example/docs Pаss‮')).toBe(false);
+  expect(agreesAtRuntime('See https://a.example/docs and {n} items', 'Qa {n} https://b.example/docs Pаss\u202E')).toBe(false);
 });
 
 test('api_012 a translation keeps the placeholders tags urls and tokens of english', () => {
@@ -215,7 +249,7 @@ test('api_012 a translation keeps the placeholders tags urls and tokens of engli
   expect(failed('Muted by <b>{who}</b>', '静音 <i>{who}</i>')).toEqual(['tags']);
   expect(failed('See https://a.example/docs', '见 https://a.example/docs')).toEqual([]);
   expect(failed('See https://a.example/docs', '见 https://b.example/docs')).toEqual(['urls', 'structural']);
-  expect(failed('See the docs', '见 https://evil.example')).toEqual(['urls']);
+  expect(failed('See the docs', '见 https://evil.example')).toEqual(['urls', 'structural']);
   expect(failed('Set upstream=1.1.1.1', '设置上游')).toEqual(['structural', 'digits']);
   expect(failed('Path /etc/telltale/ here', '路径 /etc/telltale/')).toEqual([]);
   expect(failed('Path /etc/telltale/ here', '路径')).toEqual(['structural']);
@@ -232,6 +266,61 @@ test('api_012 a translation keeps the placeholders tags urls and tokens of engli
   expect(agreesAtRuntime('See https://a.example', '见 https://b.example')).toBe(false);
   expect(agreesAtRuntime('{n} rows', '行')).toBe(false);
   expect(agreesAtRuntime('Set upstream=1.1.1.1', '设置 upstream=1.1.1.1')).toBe(true);
+});
+
+test('api_012 a translation adds no address port path or setting', () => {
+  const en = "Set your router's DNS to this server";
+  expect(failed(en, '把路由器的 DNS 设为本服务器')).toEqual([]);
+  // An address, a host and port, a path, a setting: none of them is in the English.
+  for (const added of ['8.8.8.8', '1.1.1.1:53', 'dns.example:853', '/etc/resolv.conf/', 'upstream=8.8.8.8', '$HOME', 'a|b', 'tls://dns.example']) {
+    const tx = `把路由器的 DNS 设为 ${added}`;
+    const f = agree(en, tx).fails.filter((x) => x.rule === 'structural');
+    expect(f.map((x) => x.detail), added).toContain('added');
+    expect(agreesAtRuntime(en, tx), added).toBe(false);
+  }
+  // Words, acronyms, numbers and the other tokens a translation adds are only reported.
+  for (const added of ['DNS', 'IPv6', 'rate_limited', '[x]', '53', 'Wi-Fi']) {
+    const v = agree('Holds', `保存 ${added}`);
+    expect(v.fails, added).toEqual([]);
+    expect(v.reports.map((r) => r.rule), added).toEqual(['added']);
+    expect(agreesAtRuntime('Holds', `保存 ${added}`), added).toBe(true);
+  }
+  // An address that is in the English may be repeated.
+  expect(failed('Use 1.1.1.1', '用 1.1.1.1（1.1.1.1）')).toEqual([]);
+});
+
+test('api_012 the agreement rule takes linear time on any text', () => {
+  // A translator's text is read in the check and in the browser: no pattern may backtrack over a
+  // long run. Each of these takes minutes with a quadratic pattern and milliseconds without one.
+  const n = 200_000;
+  const texts = ['a'.repeat(n), `a${'.'.repeat(n)}b`, `https://a${'.'.repeat(n)}b`, `${'a'.repeat(n)}:`, `x${'1'.repeat(n)}`, `{${'a'.repeat(n)}`, `<b>${'a'.repeat(n)}`, `/${'a'.repeat(n)}`, `\`${'a'.repeat(n)}`, 'a:'.repeat(n / 2)];
+  const start = performance.now();
+  for (const tx of texts) {
+    agree('Holds https://a.example', tx);
+    agreesAtRuntime('Holds https://a.example', tx);
+  }
+  expect(performance.now() - start).toBeLessThan(10_000);
+});
+
+test('api_012 plural forms other than other may leave out placeholders', () => {
+  const en: [string, string] = ['{n} file', '{n} files'];
+  const ar = { zero: 'لا ملفات', one: 'ملف واحد', two: 'ملفان', few: '{n} ملفات', many: '{n} ملفًا', other: '{n} ملف' };
+  // The check: `other` keeps every placeholder; another form may hold fewer, never one more.
+  expect(failed(en[0], ar.one, { placeholderSubset: true })).toEqual([]);
+  expect(failed(en[1], ar.two, { placeholderSubset: true })).toEqual([]);
+  expect(failed(en[1], '{n} {x} ملف', { placeholderSubset: true })).toEqual(['placeholders']);
+  expect(failed(en[1], 'ملف')).toEqual(['placeholders']);
+  // Everything else still holds in such a form: a URL, a token, a number.
+  expect(failed('Wait {n} day for https://a.example', 'انتظر https://b.example', { placeholderSubset: true })).toEqual(['urls', 'structural']);
+  // The browser shows such a catalog, and drops one whose `other` or another form breaks the rule.
+  const k = hash('c', en);
+  under({ tag: 'ar', table: table({ [k]: ar }) }, () => {
+    const { tn } = tr('c');
+    expect([0, 1, 2, 3, 11, 100].map((n) => tn(en[0], en[1], n, { n }))).toEqual(['لا ملفات', 'ملف واحد', 'ملفان', '3 ملفات', '11 ملفًا', '100 ملف']);
+  });
+  for (const broken of [{ ...ar, other: 'ملف' }, { ...ar, two: '{n} {x} ملفان' }]) {
+    under({ tag: 'ar', table: table({ [k]: broken }) }, () => expect(tr('c').tn(en[0], en[1], 2, { n: 2 })).toBe('2 files'));
+  }
 });
 
 test('api_012 pseudo text keeps placeholders and tags and accents every letter', () => {
@@ -334,6 +423,13 @@ test('api_012 the catalog step falls back to english', async () => {
   const never = ((_u: string, init?: RequestInit) =>
     new Promise((_, reject) => init?.signal?.addEventListener('abort', () => reject(new Error('aborted'))))) as typeof fetch;
   expect(await load(locales, src(['zh-CN']), never, 20)).toEqual({ tag: 'en' });
+  // A catalog that does not parse, or holds no entry, is English: never a page tagged zh-Hans that
+  // shows only English text in Chinese formats.
+  for (const text of ['not json', '{}', '[]', '{"constructor": "x"}']) {
+    expect(await load(locales, src(['zh-CN']), (async () => new Response(text)) as typeof fetch), text).toEqual({ tag: 'en' });
+  }
+  for (const empty of [undefined, table({}), table({ toString: 'x' })]) expect(install({ tag: 'zh-Hans', table: empty }).lang).toBe('en');
+  install({ tag: 'en' });
   // A provider is asked first; nothing, or a failure, goes on as before.
   expect(await load(locales, src(['en-US']), spy, 4000, () => ({ tag: 'en-XA' }))).toEqual({ tag: 'en-XA' });
   expect(await load(locales, src(['en-US']), spy, 4000, () => null)).toEqual({ tag: 'en' });
@@ -343,6 +439,23 @@ test('api_012 the catalog step falls back to english', async () => {
     }),
   ).toEqual({ tag: 'en' });
   expect(asked).toEqual([]);
+});
+
+test('api_012 the browser re-checks digits only where the build did not ship the catalog', async () => {
+  // A pair a maintainer exempted from the digit rule: the build ships it, and the browser shows it.
+  const entries = { [hash('c', 'Wait 7 days')]: 'Qa-wait a week', [hash('c', 'Read https://a.example')]: 'Qa-read https://b.example' };
+  const locales = Object.assign(Object.create(null), { qaa: { url: '/assets/locales/qaa-00000000.json', dir: 'ltr', offered: true } });
+  const built = await load(locales, { search: '', stored: null, languages: ['qaa'] }, (async () => new Response(JSON.stringify(entries))) as typeof fetch);
+  expect(built.built).toBe(true);
+  under(built, () => {
+    expect(tr('c').t('Wait 7 days')).toBe('Qa-wait a week');
+    // Every other rule still holds in the browser.
+    expect(tr('c').t('Read https://a.example')).toBe('Read https://a.example');
+  });
+  // The same table from anywhere else (a provider: no `built`) is held to the digit rule too.
+  const other = await load(locales, { search: '', stored: null, languages: [] }, fetch, 4000, () => ({ tag: 'qaa', table: table(entries) }));
+  expect(other.built).toBeUndefined();
+  under(other, () => expect(tr('c').t('Wait 7 days')).toBe('Wait 7 days'));
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -379,6 +492,13 @@ test('api_012 the pair-file parser refuses what json would lose', () => {
   expect(merged.c).toEqual([['Holds', 'Qa'], [['{n} file', '{n} files'], { one: '', few: '', other: '' }], ['Open', '', 'verb']]);
   expect(merged['~leftover']).toEqual([['Older', 'Qa-older'], ['Gone', 'Qa-gone']]);
   expect(merge({ c: [['Gone', 'x']] }, skel, key, { prune: true })['~leftover']).toBeUndefined();
+  // A context named like an object member (a file called Constructor.svelte) is just a context.
+  for (const ctx of ['constructor', 'toString', 'valueOf', 'hasOwnProperty', '__proto__']) {
+    const s = skeleton([{ ctx, english: 'Holds' }], ['other']);
+    expect(Object.keys(s), ctx).toEqual([ctx]);
+    const m = merge(parse(`{"${ctx}": [["Holds", "Qa"]]}`) as never, s, key);
+    expect(m[ctx], ctx).toEqual([['Holds', 'Qa']]);
+  }
 });
 
 // ---------------------------------------------------------------------------------------------

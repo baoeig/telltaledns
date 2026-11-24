@@ -19,7 +19,7 @@ test.afterAll(cleanup);
 /** FNV-1a as ADR-189 specifies it, written out independently of `ident.ts`. */
 function reference(context: string, english: string | [string, string], note: string | null): string {
   const norm = (s: string) =>
-    s.normalize('NFC').replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/[–—]/g, '-').replace(/…/g, '...').replace(/ /g, ' ').replace(/\s+/g, ' ').trim();
+    s.normalize('NFC').replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/[–—]/g, '-').replace(/…/g, '...').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
   const e = typeof english === 'string' ? norm(english) : `${norm(english[0])}\u0005${norm(english[1])}`;
   const s = `${context}\u0004${e}${note ? `\u0004${note}` : ''}`;
   let h = 2166136261;
@@ -38,7 +38,7 @@ test('api_012 the runtime and the script hash alike', () => {
     ['cache', 'Café', null, 'd6dab1c2'],
     ['cache', 'It’s “done” – now…', null, 'ac71917f'],
     ['cache', 'It\'s "done" - now...', null, 'ac71917f'],
-    ['cache', '  two   spaces\n', null, '33bdef96'],
+    ['cache', '  two\u00A0\u00A0 spaces\n', null, '33bdef96'],
     ['cache', 'two spaces', null, '33bdef96'],
     ['cache', 'Open', 'verb', '2e45320c'],
     ['cache', ['{n} answer', '{n} answers'], null, 'accd9147'],
@@ -175,8 +175,30 @@ test('api_012 sensitive changes and swaps are reported against the previous vers
   expect(run(project(), { previous: { qaa: before } }).findings.filter((f) => ['sensitive', 'swap', 'not-checked'].includes(f.rule))).toEqual([]);
 });
 
-/** One recorded change per FAIL rule of ADR-189's check, each on its own copy of the fixture. */
-const MISTAKES: [string, string, (d: string) => void][] = [
+test('api_012 a plural form other than other may hold fewer placeholders', () => {
+  const plural = (forms: Record<string, string>) =>
+    project((d) => {
+      put(d, 'src/locales/plurals.json', lib.serializeJson({ qaa: ['one', 'other'] }));
+      qaa(d, (c) => (c.cache[c.cache.length - 1] = [['{n} answer', '{n} answers'], forms]));
+    });
+  const fine = run(plural({ one: 'Qa one answer', other: '{n} qa-answers' }));
+  expect(failRules(fine)).toEqual([]);
+  expect(JSON.parse(fine.shipped.qaa.json)[hash('cache', ['{n} answer', '{n} answers'])]).toEqual({ one: 'Qa one answer', other: '{n} qa-answers' });
+  // Never a placeholder the English lacks, and `other` keeps every one.
+  expect(failRules(run(plural({ one: '{n} {x} qa', other: '{n} qa-answers' })))).toEqual(['agreement']);
+  expect(failRules(run(plural({ one: '{n} qa', other: 'qa-answers' })))).toEqual(['agreement']);
+});
+
+const random = (n: number, seed: number) => {
+  let x = seed;
+  return Array.from({ length: n }, () => String.fromCharCode(97 + ((x = (Math.imul(x, 1103515245) + 12345) >>> 0) >>> 8) % 26)).join('');
+};
+const LONG = "<script lang=\"ts\">\n  import { tr } from '../lib/i18n';\n  const { t } = tr('long');\n</script>\n\n<p>{t('Long')}</p>\n";
+const holds = (d: string, tx: string) => qaa(d, (c) => ((c.cache as [string, string][]).find((p) => p[0] === 'Holds')![1] = tx));
+
+/** One recorded change per FAIL rule of ADR-189's check, each on its own copy of the fixture; for
+ * the agreement rule, also the check inside it that must fail. */
+const MISTAKES: [string, string, (d: string) => void, string?][] = [
   ['a top-level t() in a .ts module', 'top-level', (d) => put(d, 'src/lib/top.ts', "import { tr } from './i18n';\n\nconst { t } = tr('top');\nexport const LABEL = t('Top');\n")],
   [
     'a t() at the top of <script module>',
@@ -212,11 +234,16 @@ const MISTAKES: [string, string, (d: string) => void][] = [
   ['a malformed pair', 'malformed', (d) => qaa(d, (c) => c.cache.push(['Lone']))],
   ['the same English twice in a context', 'malformed', (d) => qaa(d, (c) => c.cache.push(['Holds', 'Qa-holds-again']))],
   ['plural categories other than the language has', 'plural-categories', (d) => qaa(d, (c) => (c.cache[c.cache.length - 1] = [['{n} answer', '{n} answers'], { one: '{n} qa-answer', other: '{n} qa-answers' }]))],
-  ['a pair that disagrees with its English', 'agreement', (d) => edit(d, 'src/locales/qaa.json', (s) => s.replace('Qa-read https://example.com/docs.', 'Qa-read https://evil.example/docs.'))],
-  ['a forbidden code point', 'agreement', (d) => qaa(d, (c) => ((c.cache as [string, string][]).find((p) => p[0] === 'Holds')![1] = 'Qa-holds‮-zeta'))],
+  ['a pair that disagrees with its English', 'agreement', (d) => edit(d, 'src/locales/qaa.json', (s) => s.replace('Qa-read https://example.com/docs.', 'Qa-read https://evil.example/docs.')), 'urls'],
+  ['a forbidden code point', 'agreement', (d) => holds(d, 'Qa-holds\u202E-zeta'), 'code-point'],
+  ['a tag character', 'agreement', (d) => holds(d, 'Qa-holds\u{E0041}-zeta'), 'code-point'],
+  ['an address in fullwidth letters', 'agreement', (d) => holds(d, 'Qa-holds ｈｔｔｐｓ：／／ｅｖｉｌ．ｅｘａｍｐｌｅ'), 'urls'],
+  ['an address in capitals', 'agreement', (d) => holds(d, 'Qa-holds HTTPS://evil.example'), 'urls'],
+  ['an address the English does not have', 'agreement', (d) => holds(d, 'Qa-holds 8.8.8.8'), 'structural'],
   ['a key twice in a locale file', 'malformed', (d) => edit(d, 'src/locales/qaa.json', (s) => s.replace('  "common": [', '  "cache": [\n  ],\n  "common": ['))],
   ['a language without plural rules in the table', 'manifest', (d) => put(d, 'src/locales/plurals.json', '{\n  "zz": [\n    "other"\n  ]\n}\n')],
-  ['a verbatim word renamed', 'agreement', (d) => edit(d, 'src/locales/qaa.json', (s) => s.replace('Qa-choose email / ntfy', 'Qa-choose courriel / ntfy'))],
+  ['a verbatim word renamed', 'agreement', (d) => edit(d, 'src/locales/qaa.json', (s) => s.replace('Qa-choose email / ntfy', 'Qa-choose courriel / ntfy')), 'verbatim'],
+  ['a plural whose English forms name different placeholders', 'plural-forms', (d) => edit(d, 'src/pages/Cache.svelte', (s) => `${s}<p>{tn('One file', '{n} files', n, { n })}</p>\n`)],
   [
     'more than 40 common messages',
     'common-size',
@@ -231,10 +258,8 @@ const MISTAKES: [string, string, (d: string) => void][] = [
     'a language over its size',
     'size',
     (d) => {
-      let x = 7;
-      const big = Array.from({ length: 170_000 }, () => String.fromCharCode(97 + ((x = (Math.imul(x, 1103515245) + 12345) >>> 0) >>> 8) % 26)).join('');
-      put(d, 'src/pages/Long.svelte', "<script lang=\"ts\">\n  import { tr } from '../lib/i18n';\n  const { t } = tr('long');\n</script>\n\n<p>{t('Long')}</p>\n");
-      qaa(d, (c) => (c.long = [['Long', big]]));
+      put(d, 'src/pages/Long.svelte', LONG);
+      qaa(d, (c) => (c.long = [['Long', random(170_000, 7)]]));
     },
   ],
   ['literal text in a file that holds none', 'literal-text', (d) => edit(d, 'src/pages/Cache.svelte', (s) => `${s}<p>Plain words</p>\n`)],
@@ -246,7 +271,12 @@ test('api_012 the check sees each mistake it is for', () => {
   // The fixture project and the UI itself pass.
   expect(failRules(run(project()))).toEqual([]);
   expect(fails(checkUi())).toEqual([]);
-  for (const [name, rule, change] of MISTAKES) expect(failRules(run(project(change))), name).toEqual([rule]);
+  // Soft, so a run without one of the rules names every mistake it then misses.
+  for (const [name, rule, change, inner] of MISTAKES) {
+    const r = run(project(change));
+    expect.soft(failRules(r), name).toEqual([rule]);
+    if (inner) expect.soft(fails(r).map((f) => f.check), name).toContain(inner);
+  }
   // A pair whose English only hashes like a current message is left over: reported, never shipped.
   const r = run(
     project((d) => {

@@ -28,6 +28,9 @@ export type Choice = {
   readonly dir?: 'ltr' | 'rtl';
   /** The locale formats use with a catalog (default: the tag). Never used with English. */
   readonly formatLocale?: string;
+  /** A catalog the build shipped: the check held each pair to the digit rule (with a maintainer's
+   * exemptions), so the browser does not re-check digits. Anything else is re-checked in full. */
+  readonly built?: boolean;
 };
 
 /** One language for the life of the page. */
@@ -88,8 +91,9 @@ export function parseCatalog(json: string): Table {
 }
 
 /** A translated runtime. Each message is looked up once per context and checked against the
- * English literal it would replace; one that disagrees is never shown. */
-export function catalogRuntime(tag: string, table: Table, dir: 'ltr' | 'rtl', locale: string): Runtime {
+ * English literal it would replace; one that disagrees is never shown. `built`: see `Choice`. */
+export function catalogRuntime(tag: string, table: Table, dir: 'ltr' | 'rtl', locale: string, built = false): Runtime {
+  const digits = !built;
   const texts = new Map<string, Map<string, string>>();
   const plurals = new Map<string, Map<string, { lang: string; forms: Forms }>>();
   const memo = <V>(m: Map<string, Map<string, V>>, context: string, id: string, make: () => V): V => {
@@ -109,15 +113,16 @@ export function catalogRuntime(tag: string, table: Table, dir: 'ltr' | 'rtl', lo
       memo(texts, context, english + NOTE + (note ?? ''), () => {
         const k = hash(context, english, note);
         const v = Object.hasOwn(table, k) ? table[k] : undefined;
-        return typeof v === 'string' && v !== '' && agreesAtRuntime(english, v, dir) ? v : english;
+        return typeof v === 'string' && v !== '' && agreesAtRuntime(english, v, dir, { digits }) ? v : english;
       }),
     forms: (context: string, one: string, other: string, note?: string) =>
       memo(plurals, context, one + NOTE + other + NOTE + (note ?? ''), () => {
         const k = hash(context, [one, other], note);
         const v = Object.hasOwn(table, k) ? table[k] : undefined;
         if (v && typeof v === 'object') {
-          // Each form against the English form of its category, or English `other`.
-          const ok = Object.entries(v).every(([c, s]) => s !== '' && agreesAtRuntime(c === 'one' ? one : other, s, dir));
+          // Each form against the English form of its category, or English `other`; a form other
+          // than `other` may leave out placeholders (a dual or a "one" that names no number).
+          const ok = Object.entries(v).every(([c, s]) => s !== '' && agreesAtRuntime(c === 'one' ? one : other, s, dir, { subset: c !== 'other', digits }));
           if (ok) return { lang: tag, forms: v };
         }
         return { lang: 'en', forms: { one, other } };
@@ -134,11 +139,12 @@ function runtime(): Runtime {
   return current;
 }
 
-/** The runtime of a choice. */
+/** The runtime of a choice. A catalog with no entry (none given, empty, or unreadable) is English:
+ * never a page tagged with another language that shows only English text. */
 export function runtimeOf(c: Choice): Runtime {
-  if (c.tag === 'en') return ENGLISH;
   if (c.tag === PSEUDO) return PSEUDO_RUNTIME;
-  return catalogRuntime(c.tag, c.table ?? Object.freeze(Object.create(null)), c.dir ?? 'ltr', c.formatLocale ?? c.tag);
+  if (c.tag === 'en' || !c.table || !Object.keys(c.table).length) return ENGLISH;
+  return catalogRuntime(c.tag, c.table, c.dir ?? 'ltr', c.formatLocale ?? c.tag, c.built);
 }
 
 /** Called before the app mounts (and again only to fall back to English). */
@@ -215,7 +221,9 @@ export async function load(locales: LocaleTable, src: Sources, fetcher: typeof f
   try {
     const res = await fetcher(entry.url, { signal: abort.signal, credentials: 'same-origin' });
     if (!res.ok) return EN;
-    return { tag: pick, table: parseCatalog(await res.text()), dir: entry.dir, formatLocale: formatLocale(pick, src.languages) };
+    const table = parseCatalog(await res.text());
+    if (!Object.keys(table).length) return EN;
+    return { tag: pick, table, dir: entry.dir, formatLocale: formatLocale(pick, src.languages), built: true };
   } catch {
     return EN;
   } finally {

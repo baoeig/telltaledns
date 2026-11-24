@@ -26,7 +26,8 @@ export const LOCALE_BUDGET = 80 * 1024;
 export const LOCALES_BUDGET = 400 * 1024;
 const FOUR = ['aria-label', 'title', 'placeholder', 'alt'];
 const NOT_TEXT_ATTRS = ['translate', 'lang', 'dir'];
-// Languages written in more than one script: a catalog names the script (`zh-Hans`, `sr-Latn`).
+// Languages written in more than one script: a catalog names the script (`zh-Hans`, `sr-Latn`). The
+// matcher also takes a catalog only for a request of the same likely script, list or not.
 const MULTI_SCRIPT = ['az', 'bs', 'ha', 'kk', 'ks', 'ku', 'mn', 'pa', 'sd', 'sr', 'uz', 'zh'];
 const MANIFEST_FIELDS = ['belowSince', 'dir', 'offered', 'owners', 'since'];
 const RESERVED_MANIFEST_FIELDS = ['parent', 'regions'];
@@ -295,6 +296,11 @@ export function analyzeFile(rel, text, context) {
               const english = nEnglish === 2 ? [lits[0].text, lits[1].text] : lits[0].text;
               out.messages.push({ kind: mc.fn, ctx: mc.ctx, english, note: note && isLit(note) ? note.text : undefined, line: line(at(n)) });
             }
+            // A plural's two English forms name the same placeholders: a translation's forms are
+            // checked against them, and a form other than `other` may leave some out.
+            const ph = (s) => [...new Set(s.match(PLACEHOLDER) ?? [])].sort().join(' ');
+            if (mc.fn === 'tn' && lits.length === 2 && lits.every(isLit) && ph(lits[0].text) !== ph(lits[1].text))
+              fail('plural-forms', at(n), `tn()'s two English forms name different placeholders (${JSON.stringify(ph(lits[0].text))} and ${JSON.stringify(ph(lits[1].text))})`);
           }
           if (mc.fn !== 'm') {
             if (unit.module && !inFunction(n)) fail('top-level', at(n), `${mc.fn}() at the top level of a module runs before the language is loaded: call it where the text is shown, or mark it with m()`);
@@ -730,8 +736,8 @@ export function check(root, { previous = null } = {}) {
     if (serializeCatalog(cat) !== text) add({ level: 'fail', rule: 'canonical', file, msg: 'not in canonical form (run `node scripts/i18n.mjs sync ' + tag + '`)' });
     const s = ship(cat, entries, { verbatim, notes, glossary: data.glossary, dir });
     for (const x of s.findings) {
-      const where = `context "${x.ctx}"`;
-      if (x.check) add({ level: x.level, rule: x.rule, file, msg: `${where}: ${x.check}: ${x.detail}${x.at >= 0 ? ` at ${x.at}` : ''}`, values: [x.english, ...(x.translation === undefined ? [] : [x.translation]), x.token] });
+      const where = `context ${JSON.stringify(x.ctx)}`;
+      if (x.check) add({ level: x.level, rule: x.rule, check: x.check, file, msg: `${where}: ${x.check}: ${x.detail}${x.at >= 0 ? ` at ${x.at}` : ''}`, values: [x.english, ...(x.translation === undefined ? [] : [x.translation]), x.token] });
       else add({ level: x.level, rule: x.rule, file, msg: `${where}: ${x.detail}`, values: [show(x.english)] });
     }
     const { table, translated, leftovers } = s;
@@ -806,14 +812,16 @@ export function ship(cat, entries, { verbatim = new Map(), notes = new Map(), gl
       const empty = typeof p[1] === 'string' ? p[1] === '' : Object.values(p[1]).every((x) => x === '');
       if (empty) continue;
       const opts = { verbatim: verbatim.get(id) ?? [], glossary, dir, exemptDigits: !!notes.get(id)?.exemptDigits };
-      const forms = typeof p[1] === 'string' ? [[p[0], p[1]]] : Object.entries(p[1]).map(([c, x]) => [c === 'one' ? p[0][0] : p[0][1], x]);
+      // A plural form against the English form of its category (`one`), else English `other`; a
+      // form other than `other` may leave out placeholders (a dual, or a "one" that names no number).
+      const forms = typeof p[1] === 'string' ? [[p[0], p[1], false]] : Object.entries(p[1]).map(([c, x]) => [c === 'one' ? p[0][0] : p[0][1], x, c !== 'other']);
       let ok = true;
-      for (const [en, tx] of forms) {
+      for (const [en, tx, subset] of forms) {
         if (tx === '') {
           ok = false;
           continue;
         }
-        const v = agree(en, tx, opts);
+        const v = agree(en, tx, { ...opts, placeholderSubset: subset });
         for (const x of v.fails) findings.push({ level: 'fail', rule: 'agreement', ctx, english: en, translation: tx, check: x.rule, token: x.token, at: x.at, detail: x.detail });
         for (const x of v.reports) findings.push({ level: 'report', rule: `agreement-${x.rule}`, ctx, english: en, check: x.rule, token: x.token, at: x.at, detail: x.detail });
         if (v.fails.length) ok = false;
