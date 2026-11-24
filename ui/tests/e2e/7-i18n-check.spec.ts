@@ -218,6 +218,8 @@ const MISTAKES: [string, string, (d: string) => void, string?][] = [
   ['tk() given an object literal', 'non-literal', (d) => edit(d, 'src/lib/labels.ts', (s) => `${s}\nexport function raw(e: string): string {\n  return tk({ c: 'labels', e });\n}\n`)],
   ['a manifest with parent', 'manifest', (d) => manifest(d, (m) => (m.qaa.parent = 'en'))],
   ['a manifest with regions', 'manifest', (d) => manifest(d, (m) => (m.qaa.regions = ['419']))],
+  // (A file not on the layer, so only the map's own rule can trip.)
+  ['a contexts.json name that is not a name', 'context', (d) => put(d, 'src/locales/contexts.json', lib.serializeJson({ 'pages/Old.svelte': 'Not-a-name' }))],
   ['a manifest entry without owners', 'manifest', (d) => manifest(d, (m) => (m.qaa.owners = []))],
   ['an offered right-to-left language', 'manifest', (d) => manifest(d, (m) => Object.assign(m.qaa, { dir: 'rtl', offered: true }))],
   [
@@ -273,7 +275,25 @@ const MISTAKES: [string, string, (d: string) => void, string?][] = [
     },
   ],
   ['literal text in a file that holds none', 'literal-text', (d) => edit(d, 'src/pages/Cache.svelte', (s) => `${s}<p>Plain words</p>\n`)],
+  [
+    // Six languages of about 73 KiB each: each within its 80 KiB, together over 400.
+    'all languages over their size',
+    'size',
+    (d) => {
+      const tags = ['qaa', 'qab', 'qac', 'qad', 'qae', 'qaf'];
+      const big = random(125_000, 11);
+      put(d, 'src/pages/Long.svelte', LONG);
+      put(d, 'src/locales/plurals.json', lib.serializeJson(Object.fromEntries(tags.map((t) => [t, ['other']]))));
+      manifest(d, (m) => {
+        for (const t of tags.slice(1)) m[t] = { ...m.qaa };
+      });
+      qaa(d, (c) => (c.long = [['Long', big]]));
+      for (const t of tags.slice(1)) put(d, `src/locales/${t}.json`, lib.serializeCatalog({ long: [['Long', big]] }));
+    },
+  ],
   ['an Intl call in a file on the layer', 'intl', (d) => edit(d, 'src/pages/Cache.svelte', (s) => s.replace('</script>', '  const f = new Intl.NumberFormat();\n</script>'))],
+  // A file whose baseline allows its Intl call moves to the layer and keeps it: only the layer's rule trips.
+  ['a file on the layer that keeps its Intl call', 'intl', (d) => edit(d, 'src/pages/Old.svelte', (s) => s.replace('<script lang="ts">\n', "<script lang=\"ts\">\n  import { tr } from '../lib/i18n';\n  const { t } = tr('old');\n"))],
   ['a new physical CSS property', 'physical-css', (d) => edit(d, 'src/pages/Old.svelte', (s) => s.replace('margin-left: 4px;', 'margin-left: 4px;\n    padding-right: 1px;'))],
 ];
 

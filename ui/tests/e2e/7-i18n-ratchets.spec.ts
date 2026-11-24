@@ -22,6 +22,10 @@ test('api_012 only format.ts formats', () => {
   expect(failRules(run(project((d) => edit(d, 'src/pages/Old.svelte', (s) => s.replace('</script>', '  const n = (1).toLocaleString();\n</script>')))))).toEqual(['intl']);
   expect(failRules(run(project((d) => edit(d, 'src/lib/labels.ts', (s) => `${s}\nexport const nf = new Intl.NumberFormat();\n`))))).toEqual(['intl']);
   expect(failRules(run(project((d) => put(d, 'src/lib/format.ts', 'export const nf = new Intl.NumberFormat();\n'))))).toEqual([]);
+  // A file whose baseline allows its call moves to the layer: it must be at zero, growth or not.
+  const old = run(project((d) => edit(d, 'src/pages/Old.svelte', (s) => s.replace('<script lang="ts">\n', "<script lang=\"ts\">\n  import { tr } from '../lib/i18n';\n  const { t } = tr('old');\n"))));
+  expect(failRules(old)).toEqual(['intl']);
+  expect(fails(old).map((f) => f.msg)).toEqual(['a file on the translation layer formats through lib/format.ts only']);
 });
 
 test('api_012 migrated files hold no literal text', () => {
