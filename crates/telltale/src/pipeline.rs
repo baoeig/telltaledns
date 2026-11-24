@@ -4931,8 +4931,10 @@ groups = ["kids"]
     /// `.` send the device's other names to their upstream group and leave `_dns.resolver.arpa`
     /// answered here. A route with a suffix and a group forwards it for that group's devices
     /// only, and a suffix route wins over the group's own upstreams.
+    // `too_many_lines`: one table of cases. (Kept off the attribute lines, where spec/trace.py
+    // looks for the test's name.)
     #[tokio::test]
-    #[allow(clippy::too_many_lines)] // one table of cases
+    #[allow(clippy::too_many_lines)]
     async fn dns_019_resolver_arpa_forwarded_only_by_a_route_with_a_suffix() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
