@@ -276,6 +276,9 @@ mod tampering {
     pub(super) const REPLAY_WILDCARD_AT_ENT: usize = 7;
     /// `www.s.t. AAAA` (NODATA) comes with another name's signed address in the answer section.
     pub(super) const EXTRA_RECORD: usize = 8;
+    /// `alias.s.t. NSEC` is answered as if the CNAME were followed: the CNAME, and the target's
+    /// NSEC in the authority section.
+    pub(super) const CNAME_FOR_NSEC: usize = 9;
 }
 
 /// `name`'s NSEC3 hash with `t.`'s parameters.
@@ -646,6 +649,11 @@ fn child_answer(z: &Tld, m: &mut Message, qn: &Name, qt: RecordType) {
         m.add_answers(vec![Record::from_rdata(qn.clone(), 300, cname)]);
         m.add_authorities(z.child[&(n("s.t."), RecordType::SOA)].clone());
         m.add_authorities(z.child[&(n("own.w.s.t."), RecordType::NSEC)].clone());
+        return;
+    }
+    if tamper == tampering::CNAME_FOR_NSEC && *qn == n("alias.s.t.") && qt == RecordType::NSEC {
+        m.add_answers(z.child[&(qn.clone(), RecordType::CNAME)].clone());
+        m.add_authorities(z.child[&(n("www.s.t."), RecordType::NSEC)].clone());
         return;
     }
     // As a recursive resolver: CNAMEs are followed, out of the zone too.
@@ -1752,6 +1760,45 @@ async fn dns_011_offline_composed_answer_keeps_only_the_chain() {
             .any(|r| r.name == n("www.s.t.") && r.record_type() == RecordType::NSEC),
         "the target's denial"
     );
+}
+
+/// REQ: DNS-011 (RFC 4035 §2.3, §2.5; ADR-188) — a question for NSEC doesn't follow a CNAME: the
+/// CNAME's owner has an NSEC of its own. `alias.s.t. NSEC` is secure, with that NSEC; answered as
+/// if the CNAME were followed (the CNAME, and the target's NSEC beside it), it stays bogus: no
+/// answer is made of the CNAME and another name's NSEC.
+#[tokio::test]
+async fn dns_011_offline_nsec_question_does_not_follow_a_cname() {
+    let budget = Duration::from_secs(5);
+    let z = Arc::new(zone());
+    let (v, g, _, _, _dir) = setup_zone(true, Arc::clone(&z)).await;
+    let r = v
+        .resolve(&g, question("alias.s.t", rtype::NSEC), budget, true, false)
+        .await
+        .unwrap();
+    assert_eq!(r.verdict, Verdict::Secure, "alias.s.t. NSEC");
+    assert_eq!(
+        answered(&r.bytes),
+        vec![("alias.s.t.".to_owned(), RecordType::NSEC)],
+        "its own NSEC"
+    );
+    z.tld
+        .tamper
+        .store(tampering::CNAME_FOR_NSEC, Ordering::Relaxed);
+    let (v, g, _, stats, _dir) = setup_zone(true, Arc::clone(&z)).await;
+    warm_tld(&v, &g).await;
+    let secure = stats.secure.load(Ordering::Relaxed);
+    for round in 1..=2 {
+        let r = v
+            .resolve(&g, question("alias.s.t", rtype::NSEC), budget, true, false)
+            .await;
+        assert_eq!(
+            r.map(|r| r.verdict).ok(),
+            Some(Verdict::Bogus),
+            "alias.s.t. NSEC through the CNAME (question {round})"
+        );
+    }
+    assert_eq!(stats.secure.load(Ordering::Relaxed), secure);
+    assert_eq!(stats.insecure.load(Ordering::Relaxed), 0);
 }
 
 /// REQ: DNS-011 (ADR-098, ADR-184) — a signed CNAME into a zone that is unsigned but whose answers

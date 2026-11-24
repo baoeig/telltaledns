@@ -1046,10 +1046,15 @@ fn denied_through_cname(e: &NetError, name: &Name, q: &Question) -> bool {
     follows_cname(q) && starts_with_cname(response, name)
 }
 
-/// Whether a CNAME is followed for this question (not for CNAME itself, DS, RRSIG or ANY).
+/// Whether a CNAME is followed for this question (not for CNAME itself, DS, RRSIG or ANY; nor
+/// for NSEC: a CNAME's owner has an NSEC of its own, RFC 4035 §2.3, §2.5).
 fn follows_cname(q: &Question) -> bool {
     use RecordType::{ANY, CNAME, DS, RRSIG};
-    q.qclass == 1 && !matches!(RecordType::from(q.qtype), ANY | CNAME | DS | RRSIG)
+    q.qclass == 1
+        && !matches!(
+            RecordType::from(q.qtype),
+            ANY | CNAME | DS | RecordType::NSEC | RRSIG
+        )
 }
 
 /// `name` has a CNAME in the answer.
