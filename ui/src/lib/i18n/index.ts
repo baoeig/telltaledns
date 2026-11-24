@@ -28,8 +28,9 @@ export type Choice = {
   readonly dir?: 'ltr' | 'rtl';
   /** The locale formats use with a catalog (default: the tag). Never used with English. */
   readonly formatLocale?: string;
-  /** A catalog the build shipped: the check held each pair to the digit rule (with a maintainer's
-   * exemptions), so the browser does not re-check digits. Anything else is re-checked in full. */
+  /** A catalog the build shipped: the check held each pair to the digit and added-token rules
+   * (with a maintainer's exemptions), so the browser does not re-check those two. Set only by
+   * `load()` for a catalog of the build's table; anything else is re-checked in full. */
   readonly built?: boolean;
 };
 
@@ -93,7 +94,6 @@ export function parseCatalog(json: string): Table {
 /** A translated runtime. Each message is looked up once per context and checked against the
  * English literal it would replace; one that disagrees is never shown. `built`: see `Choice`. */
 export function catalogRuntime(tag: string, table: Table, dir: 'ltr' | 'rtl', locale: string, built = false): Runtime {
-  const digits = !built;
   const texts = new Map<string, Map<string, string>>();
   const plurals = new Map<string, Map<string, { lang: string; forms: Forms }>>();
   const memo = <V>(m: Map<string, Map<string, V>>, context: string, id: string, make: () => V): V => {
@@ -113,7 +113,7 @@ export function catalogRuntime(tag: string, table: Table, dir: 'ltr' | 'rtl', lo
       memo(texts, context, english + NOTE + (note ?? ''), () => {
         const k = hash(context, english, note);
         const v = Object.hasOwn(table, k) ? table[k] : undefined;
-        return typeof v === 'string' && v !== '' && agreesAtRuntime(english, v, dir, { digits }) ? v : english;
+        return typeof v === 'string' && v !== '' && agreesAtRuntime(english, v, dir, { built }) ? v : english;
       }),
     forms: (context: string, one: string, other: string, note?: string) =>
       memo(plurals, context, one + NOTE + other + NOTE + (note ?? ''), () => {
@@ -122,7 +122,7 @@ export function catalogRuntime(tag: string, table: Table, dir: 'ltr' | 'rtl', lo
         if (v && typeof v === 'object') {
           // Each form against the English form of its category, or English `other`; a form other
           // than `other` may leave out placeholders (a dual or a "one" that names no number).
-          const ok = Object.entries(v).every(([c, s]) => s !== '' && agreesAtRuntime(c === 'one' ? one : other, s, dir, { subset: c !== 'other', digits }));
+          const ok = Object.entries(v).every(([c, s]) => s !== '' && agreesAtRuntime(c === 'one' ? one : other, s, dir, { subset: c !== 'other', built }));
           if (ok) return { lang: tag, forms: v };
         }
         return { lang: 'en', forms: { one, other } };
@@ -201,8 +201,9 @@ const EN: Choice = Object.freeze({ tag: 'en' });
 export async function load(locales: LocaleTable, src: Sources, fetcher: typeof fetch, timeoutMs = 4000, provider?: Provider): Promise<Choice> {
   if (provider) {
     try {
+      // Never `built`: only a catalog of the build's table skips the digit and added-token rules.
       const c = await provider();
-      if (c) return c;
+      if (c) return { ...c, built: false };
     } catch {
       // A provider that fails is skipped.
     }

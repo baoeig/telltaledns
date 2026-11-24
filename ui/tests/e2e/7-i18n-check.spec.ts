@@ -190,6 +190,35 @@ test('api_012 a plural form other than other may hold fewer placeholders', () =>
   expect(failRules(run(plural({ one: '{n} qa', other: 'qa-answers' })))).toEqual(['agreement']);
 });
 
+test('api_012 an added-token exemption in notes.json reports what it lets through', () => {
+  const midnight = (exempt: boolean) =>
+    project((d) => {
+      edit(d, 'src/pages/Cache.svelte', (s) => `${s}<p>{t('Until midnight')}</p>\n`);
+      qaa(d, (c) => c.cache.push(['Until midnight', 'Qa-bis 24:00']));
+      if (exempt) {
+        const notes = JSON.parse(readFileSync(join(d, 'src/locales/notes.json'), 'utf8'));
+        notes.cache.push(['Until midnight', { exemptAdded: 'a 24-hour time, as the language writes midnight' }]);
+        put(d, 'src/locales/notes.json', lib.serializeCatalog(notes, 'data'));
+      }
+    });
+  const plain = run(midnight(false));
+  expect(failRules(plain)).toEqual(['agreement']);
+  expect(fails(plain).map((f) => f.check)).toEqual(['structural']);
+  const exempt = run(midnight(true));
+  expect(failRules(exempt)).toEqual([]);
+  expect(exempt.findings.filter((f) => f.rule === 'agreement-added').map((f) => f.values?.at(-1))).toContain('24:00');
+  expect(JSON.parse(exempt.shipped.qaa.json)[hash('cache', 'Until midnight')]).toBe('Qa-bis 24:00');
+  // A note has these four fields only.
+  const odd = run(
+    project((d) => {
+      const notes = JSON.parse(readFileSync(join(d, 'src/locales/notes.json'), 'utf8'));
+      notes.cache[0][1].exemptEverything = true;
+      put(d, 'src/locales/notes.json', lib.serializeCatalog(notes, 'data'));
+    }),
+  );
+  expect(failRules(odd)).toEqual(['malformed']);
+});
+
 const random = (n: number, seed: number) => {
   let x = seed;
   return Array.from({ length: n }, () => String.fromCharCode(97 + ((x = (Math.imul(x, 1103515245) + 12345) >>> 0) >>> 8) % 26)).join('');

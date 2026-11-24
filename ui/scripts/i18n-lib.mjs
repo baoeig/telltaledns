@@ -712,8 +712,8 @@ export function check(root, { previous = null, ratchets = true } = {}) {
     for (const id of m.keys()) if (!entries.has(id)) add({ level: 'report', rule: 'stale', file: `src/locales/${name}`, msg: `an entry of context ${JSON.stringify(id.split('\u0004')[0])} is no longer in the source`, values: [id.split('\u0004')[1]] });
   for (const [id, v] of verbatim) if (!Array.isArray(v) || !v.every((w) => typeof w === 'string' && w)) add({ level: 'fail', rule: 'malformed', file: 'src/locales/verbatim.json', msg: 'a verbatim value is a list of words', values: [id.split('\u0004')[1]] });
   for (const [id, v] of notes)
-    if (!v || typeof v !== 'object' || Array.isArray(v) || Object.keys(v).some((k) => !['text', 'sensitive', 'exemptDigits'].includes(k)))
-      add({ level: 'fail', rule: 'malformed', file: 'src/locales/notes.json', msg: 'a note is { text?, sensitive?, exemptDigits? }', values: [id.split('\u0004')[1]] });
+    if (!v || typeof v !== 'object' || Array.isArray(v) || Object.keys(v).some((k) => !['text', 'sensitive', 'exemptDigits', 'exemptAdded'].includes(k)))
+      add({ level: 'fail', rule: 'malformed', file: 'src/locales/notes.json', msg: 'a note is { text?, sensitive?, exemptDigits?, exemptAdded? }', values: [id.split('\u0004')[1]] });
 
   // Locales.
   const shipped = {};
@@ -849,7 +849,9 @@ export function ship(cat, entries, { verbatim = new Map(), notes = new Map(), gl
       seen.add(id);
       const empty = typeof p[1] === 'string' ? p[1] === '' : Object.values(p[1]).every((x) => x === '');
       if (empty) continue;
-      const opts = { verbatim: verbatim.get(id) ?? [], glossary, dir, exemptDigits: !!notes.get(id)?.exemptDigits };
+      // A maintainer's exemptions (notes.json, reviewed): the digit rule, and the added-token rule
+      // (whose tokens are then reported instead).
+      const opts = { verbatim: verbatim.get(id) ?? [], glossary, dir, exemptDigits: !!notes.get(id)?.exemptDigits, exemptAdded: !!notes.get(id)?.exemptAdded };
       // A plural form against the English form of its category (`one`), else English `other`; a
       // form other than `other` may leave out placeholders (a dual, or a "one" that names no number).
       const forms = typeof p[1] === 'string' ? [[p[0], p[1], false]] : Object.entries(p[1]).map(([c, x]) => [c === 'one' ? p[0][0] : p[0][1], x, c !== 'other']);

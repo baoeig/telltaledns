@@ -123,10 +123,19 @@ scripts/i18n.mjs plurals` writes it from CLDR; review the diff). A tag names the
 language has several (`zh-Hans`, `sr-Latn`); there is no `en-*` catalog (English is built in). The
 translator then runs `node scripts/i18n.mjs sync <tag>`, fills in the empty translations of
 `src/locales/<tag>.json` (pairs of English and translation; a plural lists the language's
-categories), and opens a pull request with that one file.
+categories), and opens a pull request with that one file. A plural form other than `other` may
+leave out `{n}`, but in some languages it is used for more than one number: Russian, Ukrainian and
+Croatian `one` also for 21, 31 or 101, Latvian `zero` also for 10 to 20. Keep `{n}` in those forms.
 After an English edit that keeps the meaning, a maintainer runs `node scripts/i18n.mjs carry
 <context> --from "<old>" --to "<new>"`; otherwise the old pair is reported as left over and English
 is shown until the language's owner confirms the new text.
+
+**Exemptions.** A translation that adds a time, a ratio, a date pattern, a list joined by slashes,
+a grouped number or a price (`24:00`, `16:9`, `TT/MM/JJJJ`, `1.000.000.000`, `$5`) fails as an added
+structural token, naming it. A maintainer may then exempt that message in `src/locales/notes.json`
+with `exemptAdded` (and a translation that writes a number in words with `exemptDigits`), giving
+the reason as the value: the check reports those tokens instead, and the reviewer reads them. The
+browser does not re-check the two rules for a catalog the build shipped, and does for any other.
 
 **Review a catalog pull request by structure.** You do not need to read the language:
 
@@ -135,8 +144,13 @@ is shown until the language's owner confirms the new text.
 2. `npm run check:i18n` is green: every translation keeps the placeholders, tags and web addresses
    of its English, every structural token (a URL, a path, `[x]`, `=`, `_`, `$`, `|`, a host and port,
    an IP address, a glossary term), every number, and every word `src/locales/verbatim.json` lists
-   for it; it adds no address, port, path or setting; and it has no direction overrides, invisible
-   characters or words that mix scripts. The added-token lines of the report name no address.
+   for it; it adds no address, port, path or setting (also written with fullwidth or ideographic
+   punctuation, `８．８．８．８`); and it has no direction overrides, invisible characters or words
+   that mix scripts. The added-token lines of the report name no address.
+   The report cannot see an address written in the language's own script (`例子.公司`; one after a
+   bare `https://` fails), digits of another script (`٨٫٨٫٨٫٨`) or an address with spaces in it
+   (`8 . 8 . 8 . 8`): a `.` between two letters of another script is reported as an added token, and
+   the language's owner reads the text for the rest.
 3. The job summary's **sensitive** lines (messages `src/locales/notes.json` marks sensitive: the
    pull request carries a back-translation of each) and **swap** lines (a new translation equal to
    another message's old one) are explained.

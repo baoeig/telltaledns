@@ -167,8 +167,9 @@ test('api_012 url and token extraction', () => {
   expect(failed('See HTTPS://a.example', '见 HTTPS://a.example')).toEqual([]);
   // A fullwidth scheme (its colon and slashes too) counts as one, though no URL can be read from it.
   expect(schemes('打开 ｈｔｔｐｓ：／／ｅｖｉｌ．ｅｘａｍｐｌｅ')).toBe(1);
-  expect(failed("Open your router's page", '打开 ｈｔｔｐｓ：／／ｅｖｉｌ．ｅｘａｍｐｌｅ')).toEqual(['urls']);
-  expect(failed('Open https://a.example', '打开 https://a.example 或 ｆｔｐ：／／ｂ')).toEqual(['urls']);
+  // (The folded reading also finds the added `://` as a structural token.)
+  expect(failed("Open your router's page", '打开 ｈｔｔｐｓ：／／ｅｖｉｌ．ｅｘａｍｐｌｅ')).toEqual(['urls', 'structural']);
+  expect(failed('Open https://a.example', '打开 https://a.example 或 ｆｔｐ：／／ｂ')).toEqual(['urls', 'structural']);
   expect(agreesAtRuntime("Open your router's page", '打开 ｈｔｔｐｓ：／／ｅｖｉｌ．ｅｘａｍｐｌｅ')).toBe(false);
   expect(agreesAtRuntime("Open your router's page", '打开 HTTPS://evil.example')).toBe(false);
   // A scheme with a host and port, and its number, must stay.
@@ -188,6 +189,21 @@ test('api_012 url and token extraction', () => {
   // A glossary term is structural.
   expect(failed('NXDOMAIN answers', '否定回答', { glossary: ['NXDOMAIN'] })).toEqual(['structural']);
   expect(failed('NXDOMAIN answers', 'NXDOMAIN 回答', { glossary: ['NXDOMAIN'] })).toEqual([]);
+  // A bare scheme followed by a letter of another script is an address in that script.
+  expect(urls('其他：https://例子.公司 网址。')).toEqual(['https://例子']);
+  expect(urls('sent only over https://.')).toEqual(['https://']);
+  expect(failed('Others: the https:// URL.', '其他：https://例子.公司 网址。')).toEqual(['urls']);
+  expect(agreesAtRuntime('Others: the https:// URL.', '其他：https://例子.公司 网址。')).toBe(false);
+  expect(failed('Others: the https:// URL.', '其他：https:// 网址。')).toEqual([]);
+  // Without a scheme, a `.` between two letters of another script is reported (the language's owner
+  // reads it); an ideographic full stop is not.
+  expect(agree('Visit the site', '访问 例子.公司').reports.map((r) => `${r.rule} ${r.token}`)).toEqual(['added 例子.公司']);
+  expect(agree('Done. Next', '完成。下一步').reports).toEqual([]);
+  // A suffix after an address (Turkish) is not part of it.
+  expect(urls("Konu https://ntfy.sh/my-topic'e gider")).toEqual(['https://ntfy.sh/my-topic']);
+  expect(failed('Topic https://ntfy.sh/my-topic', "Konu https://ntfy.sh/my-topic'e gider")).toEqual([]);
+  expect(failed('Topic https://ntfy.sh/my-topic', "Konu https://ntfy.sh/my-topic'ın")).toEqual([]);
+  expect(failed('Topic https://ntfy.sh/my-topic', "Konu https://ntfy.sh/my-topic'e/x")).toEqual(['urls']);
 });
 
 test('api_012 forbidden code points', () => {
@@ -206,6 +222,10 @@ test('api_012 forbidden code points', () => {
   };
   for (const [name, c] of Object.entries(more)) expect(codePoints(`a${c}b`), name).toEqual([name]);
   expect(agreesAtRuntime('Hello', 'Hel\u{E0041}lo')).toBe(false);
+  // Every default-ignorable code point: the supplementary and the Mongolian variation selectors too.
+  for (const [name, c] of Object.entries({ 'U+E0100': '\u{E0100}', 'U+E01EF': '\u{E01EF}', 'U+180B': '\u180B', 'U+180D': '\u180D', 'U+180F': '\u180F' })) {
+    expect(codePoints(`Qa-holds${c.repeat(3)}`), name).toEqual([name, name, name]);
+  }
   expect(codePoints('a\nb')).toEqual([]);
   // U+200C/U+200D between letters of a script that needs them; nowhere else.
   expect(codePoints('می\u200Cخواهم')).toEqual([]);
@@ -287,6 +307,41 @@ test('api_012 a translation adds no address port path or setting', () => {
   }
   // An address that is in the English may be repeated.
   expect(failed('Use 1.1.1.1', '用 1.1.1.1（1.1.1.1）')).toEqual([]);
+  // In fullwidth or ideographic punctuation too: the folded reading sees them.
+  for (const added of ['８．８．８．８', '8。8。8。8', 'ｄｎｓ．ｅｘａｍｐｌｅ：８５３', '／etc／resolv．conf／', 'upstream＝1.1.1.1', '＄HOME', 'a｜b']) {
+    const tx = `把路由器的 DNS 设为 ${added}`;
+    expect(failed(en, tx), added).toEqual(['structural']);
+    expect(agreesAtRuntime(en, tx), added).toBe(false);
+  }
+  // There, a fullwidth colon after a word is no host and port, and `：` or `。` joining addresses
+  // and words the English has adds nothing; an English `8` hides nothing.
+  expect(failed('Holds', '保存 DNS：53')).toEqual([]);
+  expect(agreesAtRuntime('Holds', '保存 DNS：53')).toBe(true);
+  const joined = ['Network application: https://controller:8443. OPNsense: https://opnsense.lan.', '经典 Network 应用：https://controller:8443。OPNsense：https://opnsense.lan。'];
+  expect(failed(joined[0], joined[1])).toEqual([]);
+  expect(agreesAtRuntime(joined[0], joined[1])).toBe(true);
+  expect(failed('Wait 8 hours', '等待 8 小时 ８．８．８．８')).toEqual(['structural']);
+});
+
+test('api_012 a maintainer may exempt an entry from the added-token rule', () => {
+  // Honest translations that add a time, a ratio, a date pattern, a list, a grouped number, a
+  // setting or a price fail, each naming its token; an exemption in notes.json reports them instead.
+  for (const [en, tx, token] of [
+    ['Until midnight', 'Bis 24:00', '24:00'],
+    ['Widescreen', 'Breitbild 16:9', '16:9'],
+    ['Date format', 'Datumsformat TT/MM/JJJJ', 'TT/MM/JJJJ'],
+    ['Day, week, month', 'Tag/Woche/Monat', 'Tag/Woche/Monat'],
+    ['A billion', '1.000.000.000', '1.000.000.000'],
+    ['Set it', 'Setze a=b', 'a=b'],
+    ['Price', 'Preis $5', '$5'],
+  ]) {
+    expect(agree(en, tx).fails.map((f) => `${f.rule} ${f.token} ${f.detail}`), tx).toEqual([`structural ${token} added`]);
+    const v = agree(en, tx, { exemptAdded: true });
+    expect(v.fails, tx).toEqual([]);
+    expect(v.reports.map((r) => r.token), tx).toContain(token);
+  }
+  // An exemption covers added tokens only: an address the English has must stay.
+  expect(failed('See https://a.example', '见 https://b.example', { exemptAdded: true })).toEqual(['urls', 'structural']);
 });
 
 test('api_012 the agreement rule takes linear time on any text', () => {
@@ -294,6 +349,8 @@ test('api_012 the agreement rule takes linear time on any text', () => {
   // long run. Each of these takes minutes with a quadratic pattern and milliseconds without one.
   const n = 200_000;
   const texts = ['a'.repeat(n), `a${'.'.repeat(n)}b`, `https://a${'.'.repeat(n)}b`, `${'a'.repeat(n)}:`, `x${'1'.repeat(n)}`, `{${'a'.repeat(n)}`, `<b>${'a'.repeat(n)}`, `/${'a'.repeat(n)}`, `\`${'a'.repeat(n)}`, 'a:'.repeat(n / 2)];
+  // The folded reading, the address in another script and the suffix after an address.
+  texts.push('８'.repeat(n), '例'.repeat(n), `https://${'例'.repeat(n)}`, '例.'.repeat(n / 2), "a'".repeat(n / 2), `https://a${"'a".repeat(n / 2)}`, '．'.repeat(n), `.${'a'.repeat(n)}`);
   const start = performance.now();
   for (const tx of texts) {
     agree('Holds https://a.example', tx);
@@ -431,7 +488,7 @@ test('api_012 the catalog step falls back to english', async () => {
   for (const empty of [undefined, table({}), table({ toString: 'x' })]) expect(install({ tag: 'zh-Hans', table: empty }).lang).toBe('en');
   install({ tag: 'en' });
   // A provider is asked first; nothing, or a failure, goes on as before.
-  expect(await load(locales, src(['en-US']), spy, 4000, () => ({ tag: 'en-XA' }))).toEqual({ tag: 'en-XA' });
+  expect(await load(locales, src(['en-US']), spy, 4000, () => ({ tag: 'en-XA' }))).toEqual({ tag: 'en-XA', built: false });
   expect(await load(locales, src(['en-US']), spy, 4000, () => null)).toEqual({ tag: 'en' });
   expect(
     await load(locales, src(['en-US']), spy, 4000, () => {
@@ -441,21 +498,33 @@ test('api_012 the catalog step falls back to english', async () => {
   expect(asked).toEqual([]);
 });
 
-test('api_012 the browser re-checks digits only where the build did not ship the catalog', async () => {
-  // A pair a maintainer exempted from the digit rule: the build ships it, and the browser shows it.
-  const entries = { [hash('c', 'Wait 7 days')]: 'Qa-wait a week', [hash('c', 'Read https://a.example')]: 'Qa-read https://b.example' };
+test('api_012 the browser re-checks digits and added tokens only where the build did not ship the catalog', async () => {
+  // Pairs a maintainer exempted from the digit rule and from the added-token rule: the build ships
+  // them, and the browser shows them.
+  const entries = {
+    [hash('c', 'Wait 7 days')]: 'Qa-wait a week',
+    [hash('c', 'Until midnight')]: 'Qa-bis 24:00',
+    [hash('c', 'Read https://a.example')]: 'Qa-read https://b.example',
+  };
   const locales = Object.assign(Object.create(null), { qaa: { url: '/assets/locales/qaa-00000000.json', dir: 'ltr', offered: true } });
   const built = await load(locales, { search: '', stored: null, languages: ['qaa'] }, (async () => new Response(JSON.stringify(entries))) as typeof fetch);
   expect(built.built).toBe(true);
   under(built, () => {
     expect(tr('c').t('Wait 7 days')).toBe('Qa-wait a week');
+    expect(tr('c').t('Until midnight')).toBe('Qa-bis 24:00');
     // Every other rule still holds in the browser.
     expect(tr('c').t('Read https://a.example')).toBe('Read https://a.example');
   });
-  // The same table from anywhere else (a provider: no `built`) is held to the digit rule too.
-  const other = await load(locales, { search: '', stored: null, languages: [] }, fetch, 4000, () => ({ tag: 'qaa', table: table(entries) }));
-  expect(other.built).toBeUndefined();
-  under(other, () => expect(tr('c').t('Wait 7 days')).toBe('Wait 7 days'));
+  // The same table from anywhere else (a provider) is held to both rules, even when the provider
+  // says it is built.
+  for (const provided of [{ tag: 'qaa', table: table(entries) }, { tag: 'qaa', table: table(entries), built: true }]) {
+    const other = await load(locales, { search: '', stored: null, languages: [] }, fetch, 4000, () => provided);
+    expect(other.built).toBe(false);
+    under(other, () => {
+      expect(tr('c').t('Wait 7 days')).toBe('Wait 7 days');
+      expect(tr('c').t('Until midnight')).toBe('Until midnight');
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------------------------
