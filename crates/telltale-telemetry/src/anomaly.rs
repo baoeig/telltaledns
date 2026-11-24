@@ -16,9 +16,10 @@
 //!   the device's other names: the sweep's lookups leave both of its numbers.
 //! - **Sweep of private reverse names** (OBS-009, ADR-186): in one minute, the device's reverse
 //!   lookups of private addresses ([`crate::internal`]'s RFC 6303 check) alone clear the storm's
-//!   bar, over at least [`SWEEP_MIN_NAMES`] different names (a 256-bit map of them): a network
-//!   scan, or a TV or NAS naming its neighbours. Counted like a storm, at most one finding per
-//!   device per hour, on its own clock. One name retried stays a storm.
+//!   bar, over at least [`SWEEP_MIN_NAMES`] different names answered NXDOMAIN (a 256-bit map of
+//!   them): a network scan, or a TV or NAS naming its neighbours. Counted like a storm, at most
+//!   one finding per device per hour, on its own clock. One name retried stays a storm, also
+//!   beside names that resolve.
 //! - **DGA-like names** (T7.14): first-seen registrable domains whose label looks generated
 //!   ([`crate::dga::score`]); one finding per device per hour with at least
 //!   [`DGA_MIN_PER_HOUR`] of them.
@@ -68,8 +69,8 @@ pub const CHATTY_SHARE_PCT: u32 = 80;
 /// ...and that bin between these (1–1.5 s up to 17–25 s).
 pub const CHATTY_BINS: std::ops::RangeInclusive<usize> = 1..=8;
 /// REQ: OBS-009 (ADR-186) — a sweep of private reverse names has at least this many different
-/// names in its minute (bits set in a 256-bit map): below what a sweep at the 30-answer bar has,
-/// above a DNS-SD browse (4 or 5 names) or a loop on a few.
+/// names answered NXDOMAIN in its minute (bits set in a 256-bit map of them): below what a sweep
+/// at the 30-answer bar has, above a DNS-SD browse (4 or 5 names) or a loop on a few.
 pub const SWEEP_MIN_NAMES: u32 = 16;
 
 /// REQ: OBS-031 — rhythm bins per tracked pair.
@@ -451,8 +452,8 @@ struct Client {
     storm_hour: u64,
     /// REQ: OBS-009 (ADR-186) — a sweep of private reverse names: this minute's reverse lookups
     /// of private addresses and their NXDOMAIN answers (also counted in `min_total`/`min_nx`), a
-    /// 256-bit map of their names (bit `(fp ^ fp >> 32) & 255` of the name's FNV-1a), a few of
-    /// the NXDOMAIN names (`nx_samples` keeps the others), and the hour last reported.
+    /// 256-bit map of the names answered NXDOMAIN (bit `(fp ^ fp >> 32) & 255` of the name's
+    /// FNV-1a), a few of those names (`nx_samples` keeps the others), and the hour last reported.
     #[serde(default)]
     rev_total: u32,
     #[serde(default)]
@@ -508,11 +509,13 @@ impl Client {
         // REQ: OBS-009 (ADR-186) — the internal-names list's RFC 6303 check, once per event.
         if crate::internal::is_private_reverse(wire) {
             self.rev_total = self.rev_total.saturating_add(1);
-            let fp = span_fp(wire);
-            let bit = usize::try_from((fp ^ (fp >> 32)) & 255).unwrap_or(0);
-            self.rev_names[bit / 64] |= 1 << (bit % 64);
             if nx {
                 self.rev_nx = self.rev_nx.saturating_add(1);
+                // The map holds the names answered NXDOMAIN: one name retried beside neighbours
+                // that resolve is a loop, not a sweep.
+                let fp = span_fp(wire);
+                let bit = usize::try_from((fp ^ (fp >> 32)) & 255).unwrap_or(0);
+                self.rev_names[bit / 64] |= 1 << (bit % 64);
                 if self.rev_samples.len() < SAMPLES {
                     let name = sample_text(wire);
                     if !self.rev_samples.contains(&name) {

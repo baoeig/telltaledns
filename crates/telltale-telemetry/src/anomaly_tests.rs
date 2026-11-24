@@ -827,6 +827,31 @@ fn obs_009_a_loop_on_one_private_reverse_name_stays_a_storm() {
     assert!(f.detail.contains("5.0.0.10.in-addr.arpa"), "{}", f.detail);
 }
 
+/// REQ: OBS-009 (ADR-186) — the sweep's name map counts the names answered NXDOMAIN: an app
+/// retrying one private reverse name in the same minute as 20 lookups of neighbours that resolve
+/// (a NAS naming its neighbours by their PTR records) is a loop on one name, so it stays a storm.
+#[test]
+fn obs_009_a_loop_on_one_private_name_beside_resolved_neighbours_stays_a_storm() {
+    let mut e = Engine::new(Settings::default());
+    let t = DAY0 + 600;
+    for i in 0..30u64 {
+        e.observe_answer(t + i, ip(1), &wire("5.0.0.10.in-addr.arpa"), Some(3));
+    }
+    for i in 1..=20u64 {
+        e.observe_answer(
+            t + 30 + i,
+            ip(1),
+            &wire(&format!("{i}.1.168.192.in-addr.arpa")),
+            Some(0),
+        );
+    }
+    close(&mut e, t);
+    assert_eq!(kinds(&e), ["nxdomain_storm"], "{:#?}", e.findings());
+    let f = &e.findings()[0];
+    assert_eq!((f.observed, f.baseline), (30.0, 50.0));
+    assert!(f.detail.contains("5.0.0.10.in-addr.arpa"), "{}", f.detail);
+}
+
 /// REQ: OBS-009 (ADR-186) — reverse names of a public range are not private: a sweep of them
 /// stays a storm.
 #[test]

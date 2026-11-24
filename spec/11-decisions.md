@@ -1875,12 +1875,12 @@ REQ: FLT-006, FLT-005, API-010, CLU-002, CLU-010, OBS-005, AGT-004. Implemented 
 - **Counting.** Beside the storm's per-device minute counters, the engine counts:
   - the minute's private reverse lookups (`rev_total`),
   - those answered NXDOMAIN (`rev_nx`),
-  - a 256-bit map of their names (FNV-1a, a bit per name, popcount as a lower bound on distinct names),
+  - a 256-bit map of the names answered NXDOMAIN (FNV-1a, a bit per name, popcount as a lower bound on distinct names; names that resolve set no bit),
   - up to 5 sample names.
   - Other NXDOMAIN names keep their own samples.
   - The work runs on the aggregator thread, at most once per event. There is no allocation beyond the existing 5 samples per minute, and the query path is untouched.
 - **The rules, at the minute's close:**
-  - **The minute is a sweep** when `rev_nx ≥ nxdomain_per_minute`, `rev_nx ≥ nxdomain_percent` % of `rev_total`, and the map has at least 16 bits set (`SWEEP_MIN_NAMES`).
+  - **The minute is a sweep** when `rev_nx ≥ nxdomain_per_minute`, `rev_nx ≥ nxdomain_percent` % of `rev_total`, and the map has at least 16 bits set (`SWEEP_MIN_NAMES`): at least 16 different names answered NXDOMAIN.
   - **A sweep minute's private reverse lookups leave both the storm's count and its total**, and the storm is judged on the rest. In any other minute everything counts toward the storm, as before. So each lookup is judged by one detector, and padding a storm with a sweep can't dilute it.
   - **The carve-out depends only on the minute being a sweep.** It doesn't depend on whether the sweep is reported this hour, or on mutes. A second sweep in the hour, or a muted one, never becomes a storm.
   - **Each kind is reported at most once per device per hour**, on separate clocks.
@@ -1891,7 +1891,7 @@ REQ: FLT-006, FLT-005, API-010, CLU-002, CLU-010, OBS-005, AGT-004. Implemented 
 - **No new setting.** The sweep reuses `nxdomain_per_minute` (30) and `nxdomain_percent` (50).
   - Both reported sweeps (#90: 247 of 254; #38: about 225) clear them by 7-8×.
   - Every minute that raised a storm before raises a sweep, a storm, or both. The exception is a repeat sweep in an hour that already reported one, which raises nothing (the second rule above).
-  - The 16-name floor sits below what a real sweep at the 30-answer bar has, and above a DNS-SD browse (4 or 5 names) or a loop on a few names. Such a loop stays a storm, as before.
+  - The 16-name floor sits below what a real sweep at the 30-answer bar has, and above a DNS-SD browse (4 or 5 names) or a loop on a few names. Such a loop stays a storm, as before, also beside private names that resolve (they set no bit).
 - **Counted, not informational.** `when = "anomaly"`, the badge, `telltale_anomalies_total{kind}` and the chart's `TelltaleDNSDeviceAnomaly` take it as they take storms. There is no new alert kind.
 - **Mutes.**
   - `reverse_sweep` is a mute kind like the others, per device and per group. `AnomalyKind` and `Kind` get it as their last variant, so existing ones keep their order.
@@ -1948,7 +1948,7 @@ REQ: FLT-006, FLT-005, API-010, CLU-002, CLU-010, OBS-005, AGT-004. Implemented 
   - These go unseen as before. A distinct-names-per-hour rule or a user-listed range is a follow-up if asked.
 
 **Verification:**
-- **Engine** (`telltale-telemetry`): `obs_009_a_sweep_of_254_private_reverse_names_is_a_reverse_sweep_not_a_storm`, `obs_009_a_storm_of_other_names_is_still_a_storm`, `obs_009_a_storm_padded_with_a_private_reverse_sweep_is_still_a_storm`, `obs_009_a_loop_on_one_private_reverse_name_stays_a_storm`, `obs_009_a_sweep_of_a_public_range_stays_a_storm`, `obs_009_a_partial_sweep_is_a_sweep_only_over_the_bar`, `obs_009_private_ipv6_reverse_names_make_a_sweep`, `obs_009_a_second_sweep_in_the_hour_is_neither_reported_nor_a_storm`, `obs_009_a_sweep_and_a_storm_in_one_hour_are_each_reported`, `obs_009_sweep_replay_is_deterministic`, `obs_013_state_saved_before_the_split_still_loads`, `obs_013_a_sweep_of_a_whole_16_keeps_the_state_bounded`, `obs_038_muting_reverse_sweep_keeps_nxdomain_storm_live`, `obs_038_an_nxdomain_storm_mute_leaves_a_sweep_counted_and_names_itself_on_it`, `obs_038_every_kind_is_muted_by_itself_alone`; `obs_009_counting_a_sweep_allocates_nothing_per_query` (`tests/alloc.rs`); the golden file is unchanged.
+- **Engine** (`telltale-telemetry`): `obs_009_a_sweep_of_254_private_reverse_names_is_a_reverse_sweep_not_a_storm`, `obs_009_a_storm_of_other_names_is_still_a_storm`, `obs_009_a_storm_padded_with_a_private_reverse_sweep_is_still_a_storm`, `obs_009_a_loop_on_one_private_reverse_name_stays_a_storm`, `obs_009_a_loop_on_one_private_name_beside_resolved_neighbours_stays_a_storm`, `obs_009_a_sweep_of_a_public_range_stays_a_storm`, `obs_009_a_partial_sweep_is_a_sweep_only_over_the_bar`, `obs_009_private_ipv6_reverse_names_make_a_sweep`, `obs_009_a_second_sweep_in_the_hour_is_neither_reported_nor_a_storm`, `obs_009_a_sweep_and_a_storm_in_one_hour_are_each_reported`, `obs_009_sweep_replay_is_deterministic`, `obs_013_state_saved_before_the_split_still_loads`, `obs_013_a_sweep_of_a_whole_16_keeps_the_state_bounded`, `obs_038_muting_reverse_sweep_keeps_nxdomain_storm_live`, `obs_038_an_nxdomain_storm_mute_leaves_a_sweep_counted_and_names_itself_on_it`, `obs_038_every_kind_is_muted_by_itself_alone`; `obs_009_counting_a_sweep_allocates_nothing_per_query` (`tests/alloc.rs`); the golden file is unchanged.
 - **Config and cluster:** `obs_038_a_mute_may_name_reverse_sweep`, `clu_010_the_shared_part_names_reverse_sweep_only_when_a_mute_does`.
 - **Cross-crate:** `obs_009_the_sweep_and_the_resolver_agree_on_private_reverse_names` (the two private-reverse checks agree on every range edge), `obs_038_config_and_engine_kinds_agree`, `agt_005_the_mute_tool_offers_every_finding_kind`, `obs_014_merged_findings_keep_the_storm_mute`, `obs_013_the_anomaly_rule_alerts_on_a_reverse_sweep`.
 - **Playwright:** `obs_038 a sweep is muted on its own and a storm-only mute is pointed out`.
