@@ -105,9 +105,11 @@ file `i18n-baseline.json` holds at zero (in the markup, or in an attribute a rea
 ones). It reports, and never fails on, missing, outdated and left-over translations. A change to
 English alone never fails a language. Until part A of ADR-189 ends, literal text, an `Intl` call or
 a physical property in a file the baseline does not list (one added or moved since) is reported, not
-failed; part A's last commit makes it a failure. Adding, removing or moving a file needs no baseline
-change. After removing text, an `Intl` call or a physical property, `node scripts/i18n.mjs baseline`
-lowers that file's count (it never raises one, and lists a new file only at zero).
+failed, so adding, removing or moving a file needs no baseline change. Part A's last commit makes it
+a failure: from then on a new file holds none of the three, and a moved file that still holds some
+keeps its counts only if its entries in `i18n-baseline.json` are renamed to the new path by hand.
+After removing text, an `Intl` call or a physical property, `node scripts/i18n.mjs baseline` lowers
+that file's count (it never raises one, and lists a new file only at zero).
 
 **An intended English edit** in a file already on the layer: until part A ends, regenerate that
 file's English ledger entry in the same commit, `node scripts/i18n.mjs ledger <file>` (the path under
@@ -149,10 +151,11 @@ two rules for a catalog the build shipped, and does for any other.
    for it; it adds no address, port, path or setting (also written with fullwidth or ideographic
    punctuation, `８．８．８．８`); and it has no direction overrides, invisible characters or words
    that mix scripts. The added-token lines of the report name no address.
-   The report cannot see an address written in the language's own script (`例子.公司`; one after a
-   bare `https://` fails), digits of another script (`٨٫٨٫٨٫٨`) or an address with spaces in it
-   (`8 . 8 . 8 . 8`): a `.` between two letters of another script is reported as an added token, and
-   the language's owner reads the text for the rest.
+   An address written in the language's own script shows only as an added-token line (`例子.公司`,
+   for its `.` between two letters of that script; after a bare `https://` it fails), and with an
+   ideographic full stop (`例子。公司`) not at all. Digits of another script (`٨٫٨٫٨٫٨`) and an
+   address with spaces in it (`8 . 8 . 8 . 8`) are not seen either: the language's owner reads the
+   text for these.
 3. The job summary's **sensitive** lines (messages `src/locales/notes.json` marks sensitive: the
    pull request carries a back-translation of each) and **swap** lines (a new translation equal to
    another message's old one) are explained.
