@@ -64,3 +64,41 @@ fn obs_009_counting_a_sweep_allocates_nothing_per_query() {
     });
     assert_eq!(info.count_total, 0);
 }
+
+/// OBS-009 (ADR-186): a name the minute already keeps as a sample allocates nothing when it is
+/// answered NXDOMAIN again, while fewer than 5 samples are kept: a private reverse name (the
+/// sweep's samples), an ordinary one and one with bytes that aren't UTF-8 (the storm's), asked
+/// over and over.
+#[test]
+fn obs_009_a_repeated_sample_name_allocates_nothing() {
+    use telltale_telemetry::anomaly::{Engine, Settings};
+    fn wire(labels: &[&[u8]]) -> Vec<u8> {
+        let mut w = Vec::new();
+        for l in labels {
+            w.push(u8::try_from(l.len()).unwrap());
+            w.extend_from_slice(l);
+        }
+        w.push(0);
+        w
+    }
+    let client = std::net::Ipv4Addr::new(192, 168, 1, 21)
+        .to_ipv6_mapped()
+        .octets();
+    let t = 1_790_000_000 / 86_400 * 86_400 + 600; // a minute's start
+    let names = [
+        wire(&[b"5", b"0", b"0", b"10", b"in-addr", b"arpa"]),
+        wire(&[b"q", b"bad", b"example"]),
+        wire(&[b"\x80\xffq", b"bad", b"example"]),
+    ];
+    let mut e = Engine::new(Settings::default());
+    // Warm-up: the device exists and each name is kept once.
+    for n in &names {
+        e.observe_answer(t, client, n, Some(3));
+    }
+    let info = allocation_counter::measure(|| {
+        for i in 0..1_000usize {
+            e.observe_answer(t + 30, client, &names[i % names.len()], Some(3));
+        }
+    });
+    assert_eq!(info.count_total, 0);
+}

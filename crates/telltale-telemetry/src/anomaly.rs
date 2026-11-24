@@ -516,19 +516,19 @@ impl Client {
                 let fp = span_fp(wire);
                 let bit = usize::try_from((fp ^ (fp >> 32)) & 255).unwrap_or(0);
                 self.rev_names[bit / 64] |= 1 << (bit % 64);
-                if self.rev_samples.len() < SAMPLES {
-                    let name = sample_text(wire);
-                    if !self.rev_samples.contains(&name) {
-                        self.rev_samples.push(name);
-                    }
+                // A name already kept is found without allocating.
+                if self.rev_samples.len() < SAMPLES
+                    && !self.rev_samples.iter().any(|s| is_sample_of(s, wire))
+                {
+                    self.rev_samples.push(sample_text(wire));
                 }
             }
-        } else if nx && self.nx_samples.len() < SAMPLES {
+        } else if nx
+            && self.nx_samples.len() < SAMPLES
+            && !self.nx_samples.iter().any(|s| is_sample_of(s, wire))
+        {
             // REQ: OBS-009 — cut at a character boundary: a label may hold any bytes.
-            let name = sample_text(wire);
-            if !self.nx_samples.contains(&name) {
-                self.nx_samples.push(name);
-            }
+            self.nx_samples.push(sample_text(wire));
         }
     }
 
@@ -892,6 +892,78 @@ fn sample_text(wire: &[u8]) -> String {
     }
     name.truncate(end);
     name
+}
+
+/// REQ: OBS-009 — whether `sample` is what [`sample_text`] makes of `wire`, found without
+/// allocating: the dotted text is read piece by piece (the labels, the dots, and one U+FFFD for
+/// each run of bytes that isn't UTF-8, as [`String::from_utf8_lossy`] gives them) and cut where
+/// `sample_text` cuts it.
+fn is_sample_of(sample: &str, wire: &[u8]) -> bool {
+    let mut cut = SampleCut {
+        rest: sample.as_bytes(),
+        room: MAX_DOMAIN,
+        done: None,
+    };
+    let mut pos = 0;
+    let mut seen_label = false;
+    while let Some(&len) = wire.get(pos) {
+        let len = usize::from(len);
+        if len == 0 {
+            break;
+        }
+        let Some(label) = wire.get(pos + 1..pos + 1 + len) else {
+            break;
+        };
+        if seen_label {
+            cut.take(".");
+        }
+        seen_label = true;
+        for chunk in label.utf8_chunks() {
+            cut.take(chunk.valid());
+            if !chunk.invalid().is_empty() {
+                cut.take("\u{fffd}");
+            }
+        }
+        pos += 1 + len;
+    }
+    if !seen_label && !wire.is_empty() {
+        cut.take(".");
+    }
+    cut.done.unwrap_or(cut.rest.is_empty())
+}
+
+/// [`is_sample_of`]'s progress: the sample's bytes still to match, the bytes the sample may still
+/// hold, and the answer once it is known.
+struct SampleCut<'a> {
+    rest: &'a [u8],
+    room: usize,
+    done: Option<bool>,
+}
+
+impl SampleCut<'_> {
+    /// Matches the next piece of the dotted name.
+    fn take(&mut self, piece: &str) {
+        if self.done.is_some() {
+            return;
+        }
+        if piece.len() <= self.room {
+            match self.rest.strip_prefix(piece.as_bytes()) {
+                Some(rest) => {
+                    self.rest = rest;
+                    self.room -= piece.len();
+                }
+                None => self.done = Some(false),
+            }
+        } else {
+            // The cut falls in this piece: the sample ends at its last character boundary
+            // within the room left.
+            let mut end = self.room;
+            while !piece.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.done = Some(piece.as_bytes().get(..end) == Some(self.rest));
+        }
+    }
 }
 
 /// The fingerprint of a dotted domain (for `ignore_domains`), as [`span_fp`] computes it.

@@ -1527,3 +1527,41 @@ fn obs_009_sweep_sample_names_cut_at_char_boundary() {
         );
     }
 }
+
+/// REQ: OBS-009 — a sample already kept is recognised without allocating, for names with any
+/// bytes: `is_sample_of` answers as comparing with [`sample_text`]'s text would, for the name's
+/// own sample, one a character shorter or longer, and the samples of other names (some of which
+/// are the same after the cut).
+#[test]
+fn obs_009_a_kept_sample_is_recognised_for_any_name() {
+    let mut rng = Rng(0x00b5_0009_5a3e_1e5d);
+    let mut names: Vec<Vec<u8>> = (0..3_000).map(|_| odd_wire(&mut rng)).collect();
+    let label = vec![b'a'; 63];
+    names.extend([
+        wire_of(&[label.clone(), b"b".to_vec()]),
+        wire_of(&[label.clone(), b"c".to_vec()]),
+        wire_of(&[label, "\u{e9}".as_bytes().to_vec()]),
+        wire("q.example"),
+        vec![0],
+        Vec::new(),
+    ]);
+    let mut same = 0;
+    for (i, w) in names.iter().enumerate() {
+        let own = sample_text(w);
+        assert!(is_sample_of(&own, w), "{w:?}: {own:?}");
+        let mut shorter = own.clone();
+        shorter.pop();
+        assert_eq!(
+            is_sample_of(&shorter, w),
+            shorter == own,
+            "{w:?}: {shorter:?}"
+        );
+        assert!(!is_sample_of(&format!("{own}a"), w), "{w:?}");
+        for step in [1, 7, 3_001] {
+            let other = sample_text(&names[(i + step) % names.len()]);
+            same += usize::from(other == own);
+            assert_eq!(is_sample_of(&other, w), other == own, "{w:?}: {other:?}");
+        }
+    }
+    assert!(same > 0, "some pairs have the same sample");
+}
