@@ -1677,9 +1677,9 @@ test('clu_008 cluster topology', async () => {
   await page.unroute('**/api/v1/cluster/versions');
 });
 
-// REQ: CLU-002, CLU-008 (ADR-056) — a witness only votes: up, it isn't drawn as not ready or
+// REQ: CLU-008 (ADR-056) — a witness only votes: up, it isn't drawn as not ready or
 // behind, and its row says so; a replica in the same state, or a witness that's down, still is.
-test('clu_002 a healthy witness is not shown as a fault', async () => {
+test('clu_008 a healthy witness is not shown as a fault', async () => {
   const node = (o: Record<string, unknown>) => ({
     ephemeral: false, witness: false, protocol: 4, role: 'replica', thisNode: false, eligible: true, version: '0.1.0',
     up: true, connected: true, link: 'inbound', lastSeenSecondsAgo: 1, rttMs: 3, configSeq: 12, configLag: 0, ready: true,

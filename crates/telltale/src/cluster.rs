@@ -708,7 +708,7 @@ fn health_checks(
         .map(|n| n.node_id.as_str())
         .collect();
     let primary_up = nodes.iter().any(|n| n.role == "primary" && n.up);
-    // REQ: CLU-002 (ADR-056) — a witness only votes: it applies no configuration and serves no
+    // REQ: CLU-008 (ADR-056) — a witness only votes: it applies no configuration and serves no
     // DNS, so it is never behind or not serving. It counts for `peers_up` like any node.
     let serving = || counted().filter(|n| !n.witness);
     let lagging: Vec<&str> = serving()
@@ -1615,10 +1615,10 @@ mod tests {
         assert_eq!(failing(&nodes), Vec::<String>::new());
     }
 
-    /// REQ: CLU-002 (ADR-056) — a witness applies no configuration and serves no DNS: it is not
+    /// REQ: CLU-008 (ADR-056) — a witness applies no configuration and serves no DNS: it is not
     /// behind or not serving, but it counts as down when it isn't heard from.
     #[test]
-    fn clu_002_cluster_checks_expect_no_dns_or_configuration_of_a_witness() {
+    fn clu_008_cluster_checks_expect_no_dns_or_configuration_of_a_witness() {
         let failing = |nodes: &[telltale_api::model::ClusterNode]| -> Vec<String> {
             health_checks(nodes, false, 12, None, 300)
                 .into_iter()

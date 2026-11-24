@@ -12,7 +12,7 @@
   export type Health = 'ok' | 'warn' | 'bad';
 
   // REQ: OPS-010 — a node in maintenance is down or not ready on purpose: drawn hatched, not red.
-  // REQ: CLU-002 — a witness only votes: it serves no DNS and applies no configuration.
+  // REQ: CLU-008 (ADR-056) — a witness only votes: it serves no DNS and applies no configuration.
   export const health = (n: Node): Health =>
     n.maintenance ? 'ok' : !n.up ? 'bad' : !n.witness && (!n.ready || n.configLag > 0) ? 'warn' : 'ok';
   const worst = (hs: Health[]): Health => (hs.includes('bad') ? 'bad' : hs.includes('warn') ? 'warn' : 'ok');

@@ -491,7 +491,7 @@ telltale cluster join tt_join_…</pre>
                       {#if n.thisNode}—{:else}{n.link}{#if n.rttMs != null}{' · '}{ms(n.rttMs)} RTT{/if}{#if !n.up}{' · '}seen {duration(n.lastSeenSecondsAgo)} ago{/if}{/if}
                     </div>
                   </td>
-                  <!-- REQ: CLU-002 (ADR-056) — a witness only votes: no configuration, no DNS. -->
+                  <!-- REQ: CLU-008 (ADR-056) — a witness only votes: no configuration, no DNS. -->
                   {#if n.witness}
                     <td class="muted">–</td>
                     <td class="muted">votes only</td>

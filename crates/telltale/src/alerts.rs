@@ -450,7 +450,7 @@ fn observe(
             .cluster()
             .nodes
             .into_iter()
-            // REQ: CLU-002 (ADR-056) — a witness applies no configuration.
+            // REQ: CLU-008 (ADR-056) — a witness applies no configuration.
             .filter(|n| {
                 !n.this_node
                     && !n.witness
