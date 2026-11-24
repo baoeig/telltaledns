@@ -96,9 +96,15 @@ file already has) and write the English as a literal:
 
 `npm run check:i18n` fails on a non-literal message, a context that is not the file's or `common`,
 two files with one context, a hash collision, a translated text misused as above, literal text in a
-file already on the layer, a new `Intl` call outside `lib/format.ts`, and a new physical CSS
+file `i18n-baseline.json` holds at zero, a new `Intl` call outside `lib/format.ts`, and a new physical CSS
 property (`margin-left`, `text-align: right`; use logical ones). It reports, and never fails on,
 missing, outdated and left-over translations. A change to English alone never fails a language.
+Until part A of ADR-189 ends, literal text in a file the baseline does not list (one added since) is
+reported, not failed; part A's last commit makes it a failure.
+
+**An intended English edit** in a file already on the layer: until part A ends, regenerate that
+file's English ledger entry in the same commit, `node scripts/i18n.mjs ledger <file>` (the path under
+`src/`, for example `lib/format.ts`), and say so in the commit message.
 
 **Add a language.** A maintainer adds the tag to `src/locales/manifest.json` (`owners`: the GitHub
 logins of the people who answer for its content; `dir`; `offered: false` until a release turns it

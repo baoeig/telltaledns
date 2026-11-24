@@ -87,7 +87,7 @@ switch (cmd) {
     break;
   }
   case 'baseline': {
-    const result = check(ROOT);
+    const result = check(ROOT, { ratchets: false });
     writeFileSync(join(ROOT, 'i18n-baseline.json'), serializeJson(baselineOf(ROOT, result.files)));
     console.log('i18n baseline: i18n-baseline.json written');
     break;

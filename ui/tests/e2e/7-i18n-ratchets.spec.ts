@@ -30,10 +30,17 @@ test('api_012 migrated files hold no literal text', () => {
   const counts = lib.ratchetCounts(UI, r.files).literal as Record<string, number>;
   const above = Object.entries(counts).filter(([, n]) => n > 0);
   console.log(`files above 0 (moved to the layer in their own batch): ${above.length}\n${above.map(([f, n]) => `  ${f} ${n}`).join('\n')}`);
+  // The baseline lists every source file, zeros too.
+  const base = JSON.parse(readFileSync(join(UI, 'i18n-baseline.json'), 'utf8'));
+  expect(Object.keys(base.literal).sort()).toEqual(r.files.map((f) => f.rel).sort());
   // A file at zero fails on any literal text; a file above zero is only printed.
   expect(failRules(run(project((d) => edit(d, 'src/pages/Cache.svelte', (s) => `${s}<p>Plain words</p>\n`))))).toEqual(['literal-text']);
   expect(failRules(run(project((d) => edit(d, 'src/pages/Cache.svelte', (s) => `${s}<input placeholder="Search" />\n`))))).toEqual(['literal-text']);
-  expect(failRules(run(project((d) => put(d, 'src/pages/New.svelte', '<h1>A new page</h1>\n'))))).toEqual(['literal-text']);
+  // Until part A ends, a file the baseline does not list (new since) is reported, not failed.
+  const fresh = run(project((d) => put(d, 'src/pages/New.svelte', '<h1>A new page</h1>\n')));
+  expect(failRules(fresh)).toEqual([]);
+  expect(fresh.findings.filter((f) => f.rule === 'literal-text' && f.file === 'src/pages/New.svelte').map((f) => f.level)).toEqual(['report']);
+  expect(lib.NEW_FILES_STRICT).toBe(false);
   expect(failRules(run(project((d) => edit(d, 'src/pages/Old.svelte', (s) => `${s}\n<p>More words</p>\n`))))).toEqual([]);
   // Data marked translate="no", and text without letters, are not literal text.
   expect(failRules(run(project((d) => edit(d, 'src/pages/Cache.svelte', (s) => `${s}<p translate="no">example.com</p>\n<p>· — (42)</p>\n`))))).toEqual([]);
@@ -45,10 +52,9 @@ test('api_012 migrated files conserve their english strings', () => {
   const r = checkUi();
   const migrated = (r.files as { rel: string; usesLayer: boolean }[]).filter((f) => f.usesLayer);
   expect(migrated.map((f) => f.rel)).toContain('lib/format.ts');
-  for (const f of migrated) {
-    expect(ledger[f.rel], `${f.rel} has a ledger entry`).toBeTruthy();
-    expect(lib.conserve(f, ledger[f.rel], exceptions[f.rel] ?? []), f.rel).toEqual([]);
-  }
+  expect(ledger['lib/format.ts']).toBeTruthy();
+  // A file with no ledger entry is new since the ledger was written: it had no English to keep.
+  for (const f of migrated) if (Object.hasOwn(ledger, f.rel)) expect(lib.conserve(f, ledger[f.rel], exceptions[f.rel] ?? []), f.rel).toEqual([]);
   for (const rel of Object.keys(exceptions)) expect(migrated.map((f) => f.rel), `exception for ${rel}`).toContain(rel);
   // The rule can fail: a page before and after a migration.
   const before = lib.analyzeFile('pages/X.svelte', '<h1>Holds</h1>\n<p title="Close">Muted by <b>{who}</b>: not counted</p>\n', 'x');

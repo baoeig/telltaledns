@@ -664,7 +664,7 @@ function byIdentity(cat) {
  * - shipped: tag -> { hash: translation } of the current pairs that agree with their English.
  * `previous`: tag -> the text of that locale file one commit back, or null when it cannot be read.
  */
-export function check(root, { previous = null } = {}) {
+export function check(root, { previous = null, ratchets = true } = {}) {
   const findings = [];
   const add = (f) => findings.push(f);
   const data = loadData(root, findings);
@@ -773,16 +773,38 @@ export function check(root, { previous = null } = {}) {
   }
   if (total > LOCALES_BUDGET) add({ level: 'fail', rule: 'size', file: 'src/locales', msg: `all languages: ${(total / 1024).toFixed(1)} KiB gzipped; together they may take ${LOCALES_BUDGET / 1024} KiB` });
 
-  // The ratchets: literal text, Intl outside format.ts, physical CSS.
-  const base = existsSync(join(root, 'i18n-baseline.json')) ? readJson(join(root, 'i18n-baseline.json')) : {};
+  if (ratchets) ratchetFindings(root, files, add);
+  return { findings, entries, shipped, files, data };
+}
+
+/** Until part A ends, literal text in a file that `i18n-baseline.json` does not list (a file new
+ * since the baseline was written) is reported, not failed; part A's last commit sets this to true. */
+export const NEW_FILES_STRICT = false;
+
+/** The ratchets: literal text, Intl outside format.ts, physical CSS. */
+function ratchetFindings(root, files, add) {
+  const src = (rel) => `src/${rel}`;
+  let base = {};
+  if (existsSync(join(root, 'i18n-baseline.json'))) {
+    try {
+      base = readJson(join(root, 'i18n-baseline.json'));
+    } catch (e) {
+      add({ level: 'fail', rule: 'malformed', file: 'i18n-baseline.json', msg: `not acceptable JSON: ${e.message}` });
+      return;
+    }
+  }
   const counts = ratchetCounts(root, files);
   for (const [kind, now] of Object.entries(counts)) {
     const was = base[kind] ?? {};
     for (const [rel, n] of Object.entries(now)) {
-      const b = Object.hasOwn(was, rel) ? was[rel] : 0;
+      const listed = Object.hasOwn(was, rel);
+      const b = listed ? was[rel] : 0;
       const f = files.find((x) => x.rel === rel);
       if (kind === 'literal') {
-        if (n > 0 && b === 0) add({ level: 'fail', rule: 'literal-text', file: src(rel), line: f?.literal[0], msg: `${n} literal text${n === 1 ? '' : 's'} in a file that holds none: use t() (lines ${f?.literal.join(', ')})` });
+        const lines = `lines ${f?.literal.join(', ')}`;
+        if (n > 0 && listed && b === 0) add({ level: 'fail', rule: 'literal-text', file: src(rel), line: f?.literal[0], msg: `${n} literal text${n === 1 ? '' : 's'} in a file the baseline holds at zero: use t() (${lines})` });
+        else if (n > 0 && !listed)
+          add({ level: NEW_FILES_STRICT ? 'fail' : 'report', rule: 'literal-text', file: src(rel), line: f?.literal[0], msg: `${n} literal text${n === 1 ? '' : 's'} in a file i18n-baseline.json does not list: use t() (${lines})` });
       } else if (n > b) add({ level: 'fail', rule: kind === 'intl' ? 'intl' : 'physical-css', file: kind === 'physical' && rel === 'app.css' ? 'src/app.css' : src(rel), msg: kind === 'intl' ? `${n} Intl/toLocale call sites, ${b} allowed: format in lib/format.ts` : `${n} physical CSS properties, ${b} allowed: use logical ones (margin-inline-start, text-align: start)` });
       if (kind === 'intl' && n > 0 && f?.usesLayer && rel !== 'lib/format.ts') add({ level: 'fail', rule: 'intl', file: src(rel), msg: 'a file on the translation layer formats through lib/format.ts only' });
       if (n < b) add({ level: 'report', rule: 'baseline', file: 'i18n-baseline.json', msg: `${kind} ${JSON.stringify(rel)}: ${n}, baseline ${b} (lower it: node scripts/i18n.mjs baseline)` });
@@ -793,7 +815,6 @@ export function check(root, { previous = null } = {}) {
   for (const f of files) {
     if (f.usesLayer && f.scriptText.length) add({ level: 'report', rule: 'script-text', file: src(f.rel), msg: `script strings of two or more words on lines ${f.scriptText.join(', ')}: text the reader sees goes through t()` });
   }
-  return { findings, entries, shipped, files, data };
 }
 
 /**
@@ -928,7 +949,9 @@ export function ratchetCounts(root, files) {
 export function baselineOf(root, files) {
   const counts = ratchetCounts(root, files);
   const out = {};
-  for (const [k, v] of Object.entries(counts)) out[k] = Object.fromEntries(Object.entries(v).filter(([, n]) => n > 0));
+  // Literal text lists every file, zeros too: a file at zero fails on any literal text, and a file
+  // the baseline does not list is new since it was written. The other two omit zeros (growth fails).
+  for (const [k, v] of Object.entries(counts)) out[k] = k === 'literal' ? { ...v } : Object.fromEntries(Object.entries(v).filter(([, n]) => n > 0));
   return out;
 }
 
@@ -987,7 +1010,7 @@ export function summaryMarkdown(result) {
 
 /** Writes the shipped catalogs, the URL table and the list of the files it wrote (all git-ignored;
  * postbuild allows exactly the listed files in `assets/locales/`). With no locale: an empty table. */
-export function prebuild(root, result = check(root)) {
+export function prebuild(root, result = check(root, { ratchets: false })) {
   const outDir = join(root, 'public', 'assets', 'locales');
   rmSync(outDir, { recursive: true, force: true });
   const rows = [];
@@ -1019,7 +1042,7 @@ export function prebuild(root, result = check(root)) {
  * ""]` where it has no translation yet); pairs whose English is gone move to `~leftover` (or go,
  * with `prune`). Plural categories come from `src/locales/plurals.json`. */
 export function sync(root, tag, { prune = false } = {}) {
-  const result = check(root);
+  const result = check(root, { ratchets: false });
   const cats = pluralCategories(tag, result.data.plurals);
   if (cats === null) throw new Error(`src/locales/plurals.json has no plural rules for "${tag}": ask a maintainer to add the language`);
   const p = join(root, 'src', 'locales', `${tag}.json`);

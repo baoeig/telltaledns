@@ -353,6 +353,15 @@ test('api_012 prebuild writes the shipped catalogs and the url table', () => {
   expect(lib.prebuild(dir)).toBe(0);
   expect(existsSync(out)).toBe(false);
   expect(readFileSync(join(dir, 'src/lib/i18n/locales.gen.ts'), 'utf8')).toContain('Object.assign(Object.create(null), {})');
+  // It lists what it wrote, for postbuild.
+  const listed = project();
+  lib.prebuild(listed);
+  const emitted = JSON.parse(readFileSync(join(listed, 'src/lib/i18n/emitted.gen.json'), 'utf8'));
+  expect(emitted).toEqual([{ file: readdirSync(join(listed, 'public/assets/locales'))[0], tag: 'qaa' }]);
+  // Generation needs only what it ships: a broken ratchet baseline fails the check, never dev or build.
+  const broken = project((d) => put(d, 'i18n-baseline.json', '{ "literal": '));
+  expect(lib.prebuild(broken)).toBe(1);
+  expect(failRules(run(broken))).toEqual(['malformed']);
 });
 
 test('api_012 check and sync take plural categories from the committed table', () => {
