@@ -24,7 +24,10 @@ export const COMMON = 'common';
 export const COMMON_MAX = 40;
 export const LOCALE_BUDGET = 80 * 1024;
 export const LOCALES_BUDGET = 400 * 1024;
-const FOUR = ['aria-label', 'title', 'placeholder', 'alt'];
+/** The attributes whose text a reader sees or hears, on any element (and `label` on `<optgroup>`):
+ * read by the literal-text lint, the English ledger, and the codemod's inputs. */
+export const TEXT_ATTRS = ['aria-label', 'title', 'placeholder', 'alt', 'aria-roledescription', 'aria-description', 'aria-valuetext', 'aria-placeholder'];
+const isTextAttr = (element, attr) => TEXT_ATTRS.includes(attr) || (element === 'optgroup' && attr === 'label');
 const NOT_TEXT_ATTRS = ['translate', 'lang', 'dir'];
 // Languages written in more than one script: a catalog names the script (`zh-Hans`, `sr-Latn`). The
 // matcher also takes a catalog only for a request of the same likely script, list or not.
@@ -404,7 +407,7 @@ export function analyzeFile(rel, text, context) {
           if (s === null || NOT_TEXT_ATTRS.includes(a.name)) continue;
           const m = masked(s);
           if (m === null) continue;
-          if (FOUR.includes(a.name)) {
+          if (isTextAttr(n.name, a.name)) {
             out.ledger.markup.push(m);
             out.markupNow.push(m);
             if (!st.translateNo && LETTER.test(m.replace(/\{\}/g, ''))) out.literal.push(line(a.start));

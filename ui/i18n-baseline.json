@@ -119,7 +119,7 @@
     "pages/Explain.svelte": 6,
     "pages/Flow.svelte": 27,
     "pages/Groups.svelte": 31,
-    "pages/Heatmap.svelte": 23,
+    "pages/Heatmap.svelte": 24,
     "pages/Lists.svelte": 43,
     "pages/LocalDns.svelte": 57,
     "pages/Login.svelte": 13,

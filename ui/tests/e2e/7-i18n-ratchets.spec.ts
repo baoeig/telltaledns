@@ -50,6 +50,17 @@ test('api_012 migrated files hold no literal text', () => {
   expect(failRules(run(project((d) => edit(d, 'src/pages/Cache.svelte', (s) => `${s}<p translate="no">example.com</p>\n<p>· — (42)</p>\n`))))).toEqual([]);
 });
 
+test('api_012 the attributes a reader sees or hears are text', () => {
+  expect(lib.TEXT_ATTRS).toEqual(['aria-label', 'title', 'placeholder', 'alt', 'aria-roledescription', 'aria-description', 'aria-valuetext', 'aria-placeholder']);
+  for (const text of ['<div aria-roledescription="heatmap"></div>', '<div aria-description="Busy hours"></div>', '<div role="slider" aria-valuetext="Ten minutes"></div>', '<div aria-placeholder="Type a name"></div>', '<select><optgroup label="Lists"></optgroup></select>']) {
+    expect(failRules(run(project((d) => edit(d, 'src/pages/Cache.svelte', (s) => `${s}${text}\n`)))), text).toEqual(['literal-text']);
+  }
+  // `label` is text on an <optgroup> only.
+  expect(failRules(run(project((d) => edit(d, 'src/pages/Cache.svelte', (s) => `${s}<option label="x"></option>\n`))))).toEqual([]);
+  // The ledger reads them too.
+  expect(lib.analyzeFile('pages/X.svelte', '<div aria-roledescription="heatmap"></div>\n', 'x').ledger.markup).toEqual(['heatmap']);
+});
+
 test('api_012 migrated files conserve their english strings', () => {
   const ledger = JSON.parse(readFileSync(join(UI, 'tests/i18n-fixtures/english-ledger.json'), 'utf8'));
   const exceptions = JSON.parse(readFileSync(join(UI, 'tests/i18n-fixtures/ledger-exceptions.json'), 'utf8'));
