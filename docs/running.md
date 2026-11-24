@@ -1824,19 +1824,22 @@ negative_trust_anchors = ["corp.example"]   # internal zones that aren't signed
   at most 8 proofs run at once, and a name that couldn't be proven isn't tried again for a
   minute: when it can't be proven, the answer stays bogus (or, with no answer at all, stale
   or SERVFAIL as for any upstream failure).
-- **Denials behind a CNAME, and wildcard answers:** the validation library checks a "no such
-  record" or "no such name" proof against the name that was asked, but after a CNAME the proof
-  is about the chain's last name (`www.paypal.com AAAA`); and in zones signed with NSEC it
-  refuses an answer made from a wildcard right above the name (`www.nasa.gov A`). Before
-  refusing such an answer, TelltaleDNS validates it one link at a time, each as a question of
-  its own (the CNAME at each name, then the question at its target), and serves only what those
-  answers validate, with the weakest link's verdict: secure (with AD), or insecure when a link
-  is in a zone proven unsigned as above (`c.pki.goog`). A wildcard's answer is checked the way
-  RFC 4035 §5.3.4 says: the zone's signed NSEC shows that no closer name exists (zones signed
-  with NSEC3 are left to the library). This only looks at answers the library refused, on cache
-  misses, in both modes: at most 8 links, 4 such validations at once, within the same deadline.
-  A link that doesn't validate, or gets no answer in time, leaves the answer bogus, and that
-  question isn't validated this way again for a minute (ADR-188).
+- **Denials behind a CNAME:** the validation library checks a "no such record" or "no such
+  name" proof against the name that was asked, but after a CNAME the proof is about the chain's
+  last name (`www.paypal.com AAAA`). Before refusing such an answer, TelltaleDNS validates it
+  one link at a time, each as a question of its own (the CNAME at each name, then the question
+  at its target), and serves only what those answers validate, with the weakest link's verdict:
+  secure (with AD), or insecure when a link is in a zone proven unsigned as above
+  (`c.pki.goog`). This only looks at answers the library refused, on cache misses, in both
+  modes: at most 8 links, 4 such validations at once, within the same deadline. A link that
+  doesn't validate, or gets no answer in time, leaves the answer bogus, and that question isn't
+  validated this way again for a minute (ADR-188).
+- **Wildcard answers:** in a zone signed with NSEC, an answer made from a wildcard is served
+  only if the zone's signed NSEC shows that no closer name exists (RFC 4035 §5.3.4), whether or
+  not the validation library refused it first; otherwise it is bogus. So an answer from a
+  wildcard right above the name validates (`nasa-gov.go-vip.net A`, and `www.nasa.gov A`
+  through its CNAME). The check reads only the answer itself, on cache misses, in both modes.
+  Zones signed with NSEC3 are left to the library (ADR-188).
 - **Before switching to `validate`:** run `permissive` for a while and read the log; only
   names that are really broken (like `dnssec-failed.org`) should show up.
 - **Non-existent names answered locally** (RFC 8198, `aggressive_nsec`, on by default): a validated "no such name" from a zone signed with NSEC proves a whole range of names absent. A later question inside a proven range is answered from it: NXDOMAIN (or NODATA for a missing type), signed, with AD, and without asking upstream. A typical win is a home network's stray queries for made-up top-level names (`printer.lan`, `wpad.home`), which the root zone's NSEC records cover. Only proofs that validated as secure are used, only for as long as their TTL and the zone's negative TTL allow, and never below a delegation. Zones signed with NSEC3 (hashed names) still ask upstream. Counted in `telltale_dnssec_synthesized_total`; `[dnssec] aggressive_nsec = false` turns it off.
