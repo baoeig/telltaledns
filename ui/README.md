@@ -11,9 +11,15 @@ build output (`dist/`) is embedded in the binary by `telltale-api` (`rust-embed`
 npm ci
 npm run dev        # http://localhost:5173, proxies /api to a server on 127.0.0.1:8053 (TELLTALE_API=...)
 npm run check      # svelte-check (types, a11y)
-npm run build      # dist/ + .gz files; fails over the 400 KiB gzipped budget
+npm run check:i18n # messages, contexts, locale files and the text ratchets (ADR-189)
+npm run build      # dist/ + .gz files; fails over the budgets: the UI with English 400 KiB
+                   # gzipped (everything outside assets/locales/), each language 80, all of them 400
 npm run types      # regenerate src/lib/api-types.ts from ../docs/api/openapi.json (CI checks it's current)
 ```
+
+`dev`, `check`, `build` and `test:e2e` first run `node scripts/i18n.mjs prebuild`, which writes
+`src/lib/i18n/locales.gen.ts`, `src/lib/i18n/emitted.gen.json` and `public/assets/locales/` (all
+git-ignored): a fresh checkout needs no extra step.
 
 Then rebuild the binary (`cargo build -p telltale`) to embed `dist/`. A binary built without
 `dist/` still works and says the UI is missing.
