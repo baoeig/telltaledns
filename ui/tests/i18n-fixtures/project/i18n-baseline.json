@@ -1,0 +1,11 @@
+{
+  "intl": {
+    "pages/Old.svelte": 1
+  },
+  "literal": {
+    "pages/Old.svelte": 2
+  },
+  "physical": {
+    "pages/Old.svelte": 1
+  }
+}
