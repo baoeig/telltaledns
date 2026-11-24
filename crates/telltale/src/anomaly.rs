@@ -315,6 +315,11 @@ mod tests {
         .map(|(a, want)| (v4(a), *want))
         .collect();
         corpus.push(("in-addr.arpa".into(), false));
+        // Upper case (both read lowercased names), and labels that only end in the zone's bytes
+        // (a length byte inside them): not under `in-addr.arpa` or `ip6.arpa`.
+        corpus.push(("1.0.0.10.IN-ADDR.ARPA".into(), true));
+        corpus.push(("1.0.0.10.x\\007in-addr.arpa".into(), false));
+        corpus.push(("1.d.f.x\\003ip6.arpa".into(), false));
         for (top, want) in [
             ("b.f", false),
             ("c.f", true),

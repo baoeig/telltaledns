@@ -1866,11 +1866,11 @@ REQ: FLT-006, FLT-005, API-010, CLU-002, CLU-010, OBS-005, AGT-004. Implemented 
   - The mute table's kind mask is a `u8` that seven kinds already use.
 
 **Decision (proposed):**
-- **What is a private reverse name.** It is what `telltale_telemetry::internal::is_private_reverse` says, made `pub(crate)` with its logic unchanged:
+- **What is a private reverse name.** It is what `telltale_telemetry::internal::is_private_reverse` says, made `pub(crate)`. Its ranges are unchanged, and it now matches the zone by labels, as the resolver's copy does (a label that only ends in the bytes of `in-addr` or `ip6` isn't under the zone):
   - IPv4: `10/8`, `172.16/12`, `192.168/16`, `100.64/10`, `169.254/16`, `127/8`, `0/8`.
   - IPv6: `fc00::/7`, `fe80::/10`, `::1`.
   - It decides by name, whatever answered it, as for ADR-152.
-  - The resolver's copy in `telltale-policy/src/special.rs` stays where it is (the telemetry crate doesn't depend on it). A test in `crates/telltale` keeps the two copies' answers equal over the range edges.
+  - The resolver's copy in `telltale-policy/src/special.rs` stays where it is (the telemetry crate doesn't depend on it). A test in `crates/telltale` keeps the two copies' answers equal over the range edges, upper case, and labels that only end like the zone.
   - Reverse names of public ranges, IPv6 global addresses included, stay in the storm.
 - **Counting.** Beside the storm's per-device minute counters, the engine counts:
   - the minute's private reverse lookups (`rev_total`),
