@@ -364,6 +364,8 @@ test('api_012 the agreement rule takes linear time on any text', () => {
   const texts = ['a'.repeat(n), `a${'.'.repeat(n)}b`, `https://a${'.'.repeat(n)}b`, `${'a'.repeat(n)}:`, `x${'1'.repeat(n)}`, `{${'a'.repeat(n)}`, `<b>${'a'.repeat(n)}`, `/${'a'.repeat(n)}`, `\`${'a'.repeat(n)}`, 'a:'.repeat(n / 2)];
   // The folded reading, the address in another script and the suffix after an address.
   texts.push('８'.repeat(n), '例'.repeat(n), `https://${'例'.repeat(n)}`, '例.'.repeat(n / 2), "a'".repeat(n / 2), `https://a${"'a".repeat(n / 2)}`, '．'.repeat(n), `.${'a'.repeat(n)}`);
+  // Many short tokens in each reading: each is looked up, never searched for in a list.
+  texts.push('a．b '.repeat(2 * n / 5), 'x1．y '.repeat(n / 3));
   const start = performance.now();
   for (const tx of texts) {
     agree('Holds https://a.example', tx);

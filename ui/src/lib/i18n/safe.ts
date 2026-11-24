@@ -130,14 +130,16 @@ const whole = (w: string, flags?: string) => new RegExp(`(?<![A-Za-z0-9_])${w.re
  * stay in (`ｅｖｉｌ．ｈｅｌｐ：８５３` when the English says "help"), and so do its numbers and
  * an address inside a longer one (`２１．１．１．１５` when it says `1.1.1.1`). */
 export function addedStructural(english: string, translation: string): string[] {
-  const te = tokens(english);
+  // Sets, so a long translation is read in linear time.
+  const te = new Set(tokens(english));
   const tt = tokens(translation);
-  const fe = tokens(english, true);
+  const ts = new Set(tt);
+  const fe = new Set(tokens(english, true));
   const own = unique([...te, ...fe])
     .filter((e) => structural(e))
     .sort((a, b) => b.length - a.length);
   const rest = (t: string) => own.reduce((s, e) => s.replace(whole(e, 'g'), ' '), t);
-  return unique([...tt.filter((t) => !te.includes(t) && isAdded(t)), ...tokens(translation, true).filter((t) => !fe.includes(t) && !tt.includes(t) && isAdded(rest(t), DOTTED_HOST_PORT))]);
+  return unique([...tt.filter((t) => !te.has(t) && isAdded(t)), ...tokens(translation, true).filter((t) => !fe.has(t) && !ts.has(t) && isAdded(rest(t), DOTTED_HOST_PORT))]);
 }
 
 // A `.` between two letters of other scripts: an address the ASCII readings cannot see (`例子.公司`).
