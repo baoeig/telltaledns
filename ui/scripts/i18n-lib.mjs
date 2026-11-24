@@ -427,7 +427,7 @@ export function analyzeFile(rel, text, context) {
         out.usesLayer = true;
         if (tAttrs.ctx == null || tAttrs.msg == null || ('note' in tAttrs && tAttrs.note == null))
           fail('non-literal', n.start, "<T> takes ctx, msg and note as literals: ctx=\"name\", msg={'English with {placeholders}'}");
-        else if (tAttrs.ctx !== context) fail('context', n.start, `<T ctx="${tAttrs.ctx}">: a file uses its own context ("${context}")`);
+        else if (tAttrs.ctx !== context) fail('context', n.start, `<T ctx=${JSON.stringify(tAttrs.ctx)}>: a file uses its own context (${JSON.stringify(context)})`);
         else out.messages.push({ kind: 'T', ctx: tAttrs.ctx, english: tAttrs.msg, note: tAttrs.note ?? undefined, line: line(n.start) });
       }
       if (n.fragment) fragment(n.fragment, { translateNo });
@@ -623,8 +623,8 @@ function loadData(root, findings) {
       continue;
     }
     for (const k of Object.keys(e)) {
-      if (RESERVED_MANIFEST_FIELDS.includes(k)) failAt(where, 'manifest', `${JSON.stringify(tag)}: "${k}" is reserved: regional overlays are not built yet, so a regional language is a full catalog`);
-      else if (!MANIFEST_FIELDS.includes(k)) failAt(where, 'manifest', `${JSON.stringify(tag)}: unknown field "${k}"`);
+      if (RESERVED_MANIFEST_FIELDS.includes(k)) failAt(where, 'manifest', `${JSON.stringify(tag)}: ${JSON.stringify(k)} is reserved: regional overlays are not built yet, so a regional language is a full catalog`);
+      else if (!MANIFEST_FIELDS.includes(k)) failAt(where, 'manifest', `${JSON.stringify(tag)}: unknown field ${JSON.stringify(k)}`);
     }
     if (!Array.isArray(e.owners) || !e.owners.length || !e.owners.every((o) => typeof o === 'string' && LOGIN.test(o))) failAt(where, 'manifest', `${JSON.stringify(tag)}: "owners" lists the GitHub logins (plain, without an at-sign) of the people who answer for it`);
     if (e.dir !== 'ltr' && e.dir !== 'rtl') failAt(where, 'manifest', `${JSON.stringify(tag)}: "dir" is "ltr" or "rtl"`);
@@ -679,12 +679,12 @@ export function check(root, { previous = null, ratchets = true } = {}) {
   for (const f of files) {
     for (const x of f.fails) add({ level: 'fail', rule: x.rule, file: src(f.rel), line: x.line, msg: x.msg });
     if (!f.usesLayer) continue;
-    if (!CONTEXT.test(f.context) || f.context === COMMON) add({ level: 'fail', rule: 'context', file: src(f.rel), msg: `"${f.context}" cannot be a file's context: add the file to src/locales/contexts.json` });
+    if (!CONTEXT.test(f.context) || f.context === COMMON) add({ level: 'fail', rule: 'context', file: src(f.rel), msg: `${JSON.stringify(f.context)} cannot be a file's context: add the file to src/locales/contexts.json` });
     byContext.set(f.context, [...(byContext.get(f.context) ?? []), f.rel]);
   }
   for (const [ctx, rels] of byContext)
     if (rels.length > 1) add({ level: 'fail', rule: 'context-collision', file: src(rels[1]), msg: `context ${JSON.stringify(ctx)} belongs to ${rels.map(src).join(' and ')}: give the library file its own name in src/locales/contexts.json` });
-  for (const path of Object.keys(data.contexts)) if (!files.some((f) => f.rel === path)) add({ level: 'report', rule: 'stale', file: 'src/locales/contexts.json', msg: `${path} is not a source file` });
+  for (const path of Object.keys(data.contexts)) if (!files.some((f) => f.rel === path)) add({ level: 'report', rule: 'stale', file: 'src/locales/contexts.json', msg: `${JSON.stringify(path)} is not a source file` });
 
   const entries = new Map();
   for (const f of files)

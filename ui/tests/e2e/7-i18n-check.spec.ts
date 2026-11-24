@@ -354,6 +354,21 @@ test('api_012 the console report prints no line a file controls', () => {
   const out: string = lib.formatReport(r);
   expect(out.split('\n').filter((l) => /^\s*::/.test(l))).toEqual([]);
   expect(out).toContain('"x\\n::error title=t::boom" is not a context name');
+  // Every key a file names is printed the same way: a manifest field, a contexts.json path, a
+  // context in <T ctx> and a file's own context.
+  const keys = run(
+    project((d) => {
+      manifest(d, (m) => (m.qaa['f\n::error::k'] = 1));
+      put(d, 'src/locales/contexts.json', lib.serializeJson({ 'p\n::error::q': 'pq' }));
+      edit(d, 'src/pages/Cache.svelte', (s) => `${s}<T ctx='a"b' msg={'Kept'} />\n`);
+      put(d, 'src/pages/Q"t.svelte', "<script lang=\"ts\">\n  import { tr } from '../lib/i18n';\n  const { t } = tr('qt');\n</script>\n\n<p>{t('Q')}</p>\n");
+    }),
+  );
+  const msgs = keys.findings.map((f) => f.msg);
+  expect(msgs).toContain('"qaa": unknown field "f\\n::error::k"');
+  expect(msgs).toContain('"p\\n::error::q" is not a source file');
+  expect(msgs.filter((m) => m.startsWith('<T ctx='))).toEqual(['<T ctx="a\\"b">: a file uses its own context ("cache")']);
+  expect(msgs.filter((m) => m.includes("cannot be a file's context"))).toEqual(['"q\\"t" cannot be a file\'s context: add the file to src/locales/contexts.json']);
 });
 
 test('api_012 prebuild writes the shipped catalogs and the url table', () => {
