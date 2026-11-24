@@ -321,6 +321,16 @@ test('api_012 a translation adds no address port path or setting', () => {
   expect(failed(joined[0], joined[1])).toEqual([]);
   expect(agreesAtRuntime(joined[0], joined[1])).toBe(true);
   expect(failed('Wait 8 hours', '等待 8 小时 ８．８．８．８')).toEqual(['structural']);
+  // Only the English's addresses are taken out, each where it stands whole: an address built from
+  // its words, a port added to its host, and an address around its own are still added.
+  for (const [english, tx] of [
+    ['Ask for help', '求助 ｅｖｉｌ．ｈｅｌｐ：８５３'],
+    ['Open example.com', '打开 example.com：53'],
+    ['Use 1.1.1.1', '用 1.1.1.1，不用 ２１．１．１．１５'],
+  ]) {
+    expect(agree(english, tx).fails.map((f) => `${f.rule} ${f.detail}`), tx).toEqual(['structural added']);
+    expect(agreesAtRuntime(english, tx), tx).toBe(false);
+  }
 });
 
 test('api_012 a maintainer may exempt an entry from the added-token rule', () => {

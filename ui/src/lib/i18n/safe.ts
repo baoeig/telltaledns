@@ -119,19 +119,23 @@ export function structural(token: string, glossary: readonly string[] = []): boo
  * host-and-port pattern of that reading). */
 const isAdded = (token: string, also = HOST_PORT) => also.test(token) || ADDED.some((re) => re.test(token));
 
+/** `w` as a whole word: not inside a longer run of letters, digits or `_`. */
+const whole = (w: string, flags?: string) => new RegExp(`(?<![A-Za-z0-9_])${w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z0-9_])`, flags);
+
 /** The tokens a translation adds that are an address, a port, a path or a setting: in the prepared
  * reading, then in the folded one. There a token the first reading already judged is left out, and
- * a token is judged without the English's own addresses and words in it, since `：` and `。` also
- * join those (`https://a.example。OPNsense：https://b.lan`). Short tokens and numbers stay in, so
- * an English `8` cannot hide `８．８．８．８`. */
+ * a token is judged without the English's own addresses in it, each where it stands whole, since
+ * `：` and `。` also join those (`https://a.example。OPNsense：https://b.lan`). The English's words
+ * stay in (`ｅｖｉｌ．ｈｅｌｐ：８５３` when the English says "help"), and so do its numbers and
+ * an address inside a longer one (`２１．１．１．１５` when it says `1.1.1.1`). */
 export function addedStructural(english: string, translation: string): string[] {
   const te = tokens(english);
   const tt = tokens(translation);
   const fe = tokens(english, true);
   const own = unique([...te, ...fe])
-    .filter((e) => structural(e) || (e.length > 2 && /[A-Za-z]/.test(e)))
+    .filter((e) => structural(e))
     .sort((a, b) => b.length - a.length);
-  const rest = (t: string) => own.reduce((s, e) => s.split(e).join(' '), t);
+  const rest = (t: string) => own.reduce((s, e) => s.replace(whole(e, 'g'), ' '), t);
   return unique([...tt.filter((t) => !te.includes(t) && isAdded(t)), ...tokens(translation, true).filter((t) => !fe.includes(t) && !tt.includes(t) && isAdded(rest(t), DOTTED_HOST_PORT))]);
 }
 
@@ -224,10 +228,7 @@ function failures(english: string, translation: string, o: AgreeOptions): Findin
   if (!o.exemptAdded) for (const x of addedStructural(english, translation)) add('structural', x, 'added');
   if (!o.exemptDigits) for (const x of missingFrom(digits(english), digits(translation))) add('digits', x, 'missing', -1);
   const prepared = prepare(translation);
-  for (const w of o.verbatim ?? []) {
-    const re = new RegExp(`(?<![A-Za-z0-9_])${w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z0-9_])`);
-    if (!re.test(prepared)) add('verbatim', w, 'missing', -1);
-  }
+  for (const w of o.verbatim ?? []) if (!whole(w).test(prepared)) add('verbatim', w, 'missing', -1);
   for (const m of mixedScript(translation)) add('mixed-script', m.word, 'mixes Latin with Cyrillic or Greek letters', m.at);
   both('code', all(english, CODE_SPAN), all(translation, CODE_SPAN));
   for (const f of forbidden(translation, o.dir)) add('code-point', f.cp, 'forbidden', f.at);
