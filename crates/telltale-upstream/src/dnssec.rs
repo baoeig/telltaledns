@@ -336,7 +336,7 @@ impl Validator {
                 } else if denied_through_cname(&e, &name, &q)
                     && let Some((verdict, message)) = self
                         .validate_links(group, &handle, &name, &q, budget, deadline)
-                        .await?
+                        .await
                 {
                     tracing::debug!(name = %qkey, ?verdict, "DNSSEC: validated link by link");
                     self.stats.count(verdict);
@@ -379,7 +379,7 @@ impl Validator {
             && starts_with_cname(&message, &name)
             && let Some(found) = self
                 .validate_links(group, &handle, &name, &q, budget, deadline)
-                .await?
+                .await
         {
             tracing::debug!(name = %qkey, verdict = ?found.0, "DNSSEC: validated link by link");
             (verdict, message) = found;
@@ -644,7 +644,8 @@ impl Validator {
     /// as a question of its own: the CNAME at a name, then the question at its target, until
     /// the target answers it. The verdict is the weakest of them, and the answer is made of
     /// their validated records only: nothing of the answer that failed is used, it is just the
-    /// reason to look. `None`: not every link holds (the answer stays bogus).
+    /// reason to look. `None`: not every link holds, or one couldn't be checked in time (the
+    /// answer stays bogus).
     ///
     /// NFR-004 — bounded like the unsigned-zone proof: by `deadline`, by a handful at once, and
     /// by a minute's memory of questions that failed; and by [`MAX_LINKS`].
@@ -656,19 +657,18 @@ impl Validator {
         q: &Question,
         budget: Duration,
         deadline: std::time::Instant,
-    ) -> Result<Option<(Verdict, Message)>, ResolveError> {
+    ) -> Option<(Verdict, Message)> {
         // A type and a space first: never the key of an unsigned-zone proof.
         let key = format!("{} {}", q.qtype, zone_key(name));
-        let Some(_slot) = self.proofs.enter(&key) else {
-            return Ok(None);
-        };
+        // No slot, or it failed within the last minute: not proven.
+        let _slot = self.proofs.enter(&key)?;
         let found = self
             .follow_links(group, handle, name, q, budget, deadline)
-            .await?;
+            .await;
         if found.is_none() {
             self.proofs.failed(&key);
         }
-        Ok(found)
+        found
     }
 
     /// [`Self::validate_links`], without its limits on how often and how many.
@@ -680,7 +680,7 @@ impl Validator {
         q: &Question,
         budget: Duration,
         deadline: std::time::Instant,
-    ) -> Result<Option<(Verdict, Message)>, ResolveError> {
+    ) -> Option<(Verdict, Message)> {
         let qtype = RecordType::from(q.qtype);
         let mut worst = Verdict::Secure;
         let mut chain: Vec<Record> = Vec::new();
@@ -689,21 +689,18 @@ impl Validator {
         let mut seen = vec![name.clone()];
         let mut at = name.clone();
         for _ in 0..MAX_LINKS {
-            let Ok(link) = ask(handle, &at, RecordType::CNAME, deadline).await? else {
-                return Ok(None);
+            // REQ: DNS-011 (ADR-188) — a link without an answer in time (a timeout, an upstream
+            // failure) proves nothing: the answer stays bogus.
+            let Some(Ok(link)) = ask(handle, &at, RecordType::CNAME, deadline).await else {
+                return None;
             };
-            let Some(target) = link.answers.iter().find_map(|r| match &r.data {
+            let target = link.answers.iter().find_map(|r| match &r.data {
                 RData::CNAME(c) if r.name == at => Some(c.0.clone()),
                 _ => None,
-            }) else {
-                return Ok(None);
-            };
-            let Some(v) = self
+            })?;
+            let v = self
                 .link_verdict(group, handle, &link, &at, budget, deadline)
-                .await
-            else {
-                return Ok(None);
-            };
+                .await?;
             worst = worst.weakest(v);
             let link = link.into_message();
             chain.extend(link.answers.into_iter().filter(|r| {
@@ -712,27 +709,26 @@ impl Validator {
             }));
             proofs.extend(link.authorities.into_iter().filter(is_denial));
             if seen.contains(&target) {
-                return Ok(None);
+                return None;
             }
             seen.push(target.clone());
             at = target;
-            let end = match ask(handle, &at, qtype, deadline).await? {
+            let end = match ask(handle, &at, qtype, deadline).await {
                 // Another link: what follows it is judged by the questions of its own, not by
                 // this answer (which may end at a CNAME without a proof of what's missing).
-                Ok(end) if starts_with_cname(&end, &at) => continue,
-                Ok(end) => end,
-                Err(e) if denied_through_cname(&e, &at, q) => continue,
-                Err(e) => {
+                Some(Ok(end)) if starts_with_cname(&end, &at) => continue,
+                Some(Ok(end)) => end,
+                Some(Err(e)) if denied_through_cname(&e, &at, q) => continue,
+                Some(Err(e)) => {
                     tracing::debug!(name = %zone_key(&at), "DNSSEC: link by link: {e}");
-                    return Ok(None);
+                    return None;
                 }
+                // REQ: DNS-011 (ADR-188) — no answer in time: as above.
+                None => return None,
             };
-            let Some(v) = self
+            let v = self
                 .link_verdict(group, handle, &end, &at, budget, deadline)
-                .await
-            else {
-                return Ok(None);
-            };
+                .await?;
             let mut m = end.into_message();
             m.queries = vec![Query::query(name.clone(), qtype)];
             chain.append(&mut m.answers);
@@ -742,9 +738,9 @@ impl Validator {
                     m.authorities.push(r);
                 }
             }
-            return Ok(Some((worst.weakest(v), m)));
+            return Some((worst.weakest(v), m));
         }
-        Ok(None)
+        None
     }
 
     /// What one link's answer is worth: secure, or insecure (also when its zone is proven
@@ -891,19 +887,20 @@ fn request(name: &Name, rtype: RecordType) -> DnsRequest {
     DnsRequest::from_query(Query::query(name.clone(), rtype), opts)
 }
 
-/// The validating handle's answer to a question of its own, within `deadline`. The outer error
-/// is the upstream's (no answer in time); the inner one is what the validator found wrong.
+/// The validating handle's answer to a question of its own, within `deadline`: the answer, or
+/// what the validator found wrong with it. `None`: no answer in time (a timeout, or the upstream
+/// failed), which proves nothing.
 async fn ask(
     handle: &DnssecDnsHandle<GroupHandle>,
     name: &Name,
     rtype: RecordType,
     deadline: std::time::Instant,
-) -> Result<Result<DnsResponse, NetError>, ResolveError> {
+) -> Option<Result<DnsResponse, NetError>> {
     let mut s = handle.send(request(name, rtype));
     match tokio::time::timeout(left(deadline), s.next()).await {
-        Ok(Some(Err(e))) if is_transport(&e) => Err(ResolveError::Empty),
-        Ok(Some(r)) => Ok(or_wildcard(r, name, rtype)),
-        Ok(None) | Err(_) => Err(ResolveError::Empty),
+        Ok(Some(Err(e))) if is_transport(&e) => None,
+        Ok(Some(r)) => Some(or_wildcard(r, name, rtype)),
+        Ok(None) | Err(_) => None,
     }
 }
 

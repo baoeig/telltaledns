@@ -45,6 +45,9 @@ struct Zone {
     forge: AtomicBool,
     /// NFR-004 — milliseconds every answer is held back (a slow upstream).
     lag_ms: AtomicU64,
+    /// NFR-004 (ADR-188) — milliseconds the answers to CNAME questions, which only link-by-link
+    /// validation asks, are held back, without holding up the other questions.
+    link_lag_ms: AtomicU64,
     /// ADR-184 — the NSEC3 Opt-Out top-level domain `t.` and the zones below it.
     tld: Tld,
 }
@@ -213,6 +216,7 @@ fn zone_with(proof_ttl: u32) -> Zone {
         key: key_rdata,
         forge: AtomicBool::new(false),
         lag_ms: AtomicU64::new(0),
+        link_lag_ms: AtomicU64::new(0),
         tld,
     }
 }
@@ -833,7 +837,7 @@ fn plain_answer(z: &Zone, m: &mut Message, qn: &Name, qt: RecordType) {
 /// The fake root server: answers from the zone (with signatures), NODATA or NXDOMAIN with the
 /// SOA and the NSEC records that prove it. Counts the questions it gets.
 async fn serve(z: Arc<Zone>, asked: Arc<AtomicUsize>) -> std::net::SocketAddr {
-    let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let s = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let addr = s.local_addr().unwrap();
     tokio::spawn(async move {
         let mut buf = vec![0u8; 4096];
@@ -911,7 +915,21 @@ async fn serve(z: Arc<Zone>, asked: Arc<AtomicUsize>) -> std::net::SocketAddr {
             edns.set_dnssec_ok(true);
             edns.set_max_payload(4096);
             m.set_edns(edns);
-            if let Ok(out) = m.to_vec() {
+            let Ok(out) = m.to_vec() else {
+                continue;
+            };
+            let late = if qt == RecordType::CNAME {
+                z.link_lag_ms.load(Ordering::Relaxed)
+            } else {
+                0
+            };
+            if late > 0 {
+                let s = Arc::clone(&s);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(late)).await;
+                    let _ = s.send_to(&out, from).await;
+                });
+            } else {
                 let _ = s.send_to(&out, from).await;
             }
         }
@@ -1534,19 +1552,93 @@ async fn dns_011_offline_links_that_do_not_hold_stay_bogus() {
             let r = v
                 .resolve(&g, question(name, qtype), budget, true, false)
                 .await;
-            // Bogus, or no answer at all; never secure or insecure.
-            if let Ok(r) = r {
-                assert_eq!(
-                    r.verdict,
-                    Verdict::Bogus,
-                    "{name} {qtype}, tampering {tamper} (question {round})"
-                );
-            }
+            // Bogus: never secure or insecure, and never "no answer" (an upstream failure).
+            assert_eq!(
+                r.map(|r| r.verdict).ok(),
+                Some(Verdict::Bogus),
+                "{name} {qtype}, tampering {tamper} (question {round})"
+            );
         }
         assert_eq!(stats.secure.load(Ordering::Relaxed), secure, "{name}");
         assert_eq!(stats.insecure.load(Ordering::Relaxed), 0, "{name}");
         z.tld.tamper.store(tampering::NONE, Ordering::Relaxed);
     }
+}
+
+/// REQ: DNS-011, NFR-004 (ADR-098, ADR-188) — a link of a link-by-link validation that gets no
+/// answer in time proves nothing, and the answer stays bogus: `Ok` with EDE 6, as for any answer
+/// that doesn't validate. So `validate` answers SERVFAIL with EDE 6 and never a stale answer, and
+/// `permissive` serves the answer, as it does when the validation library refuses an answer itself
+/// (an upstream failure would be stale or SERVFAIL with EDE 22 in both). Only the links' own
+/// questions (CNAME) are slow here: the upstream gives up on them within the group's budget, or
+/// the validation's deadline (two budgets of the question) runs out first, the group's budget being
+/// that of the question that warmed it. Both after the library refused a denial behind a CNAME,
+/// and after it judged a chain into an unsigned zone bogus.
+#[tokio::test]
+async fn dns_011_offline_link_lookup_timeout_stays_bogus() {
+    // Each case's outcome: the verdict and EDE (`None`: no verdict), then the bogus, insecure and
+    // new secure verdicts counted.
+    let (mut got, mut want) = (Vec::new(), Vec::new());
+    for (name, qtype, first, budget_ms, what) in [
+        (
+            "gone.s.t",
+            rtype::A,
+            None,
+            1000,
+            "a denial behind a CNAME; the upstream gives up on the link",
+        ),
+        (
+            "alias.s.t",
+            rtype::AAAA,
+            Some("www.s.t"),
+            300,
+            "a denial behind a CNAME; the deadline runs out",
+        ),
+        (
+            "parked.s.t",
+            rtype::A,
+            Some("x.t"),
+            300,
+            "a chain into an unsigned zone; the deadline runs out",
+        ),
+    ] {
+        let z = Arc::new(zone());
+        z.link_lag_ms.store(60_000, Ordering::Relaxed);
+        let (v, g, _, stats, _dir) = setup_zone(true, Arc::clone(&z)).await;
+        if let Some(first) = first {
+            let r = v
+                .resolve(
+                    &g,
+                    question(first, rtype::A),
+                    Duration::from_secs(5),
+                    true,
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.verdict, Verdict::Secure, "{first} A, signed");
+        }
+        let secure = stats.secure.load(Ordering::Relaxed);
+        let budget = Duration::from_millis(budget_ms);
+        let r = v
+            .resolve(&g, question(name, qtype), budget, true, false)
+            .await;
+        got.push((
+            what,
+            r.ok().map(|r| (r.verdict, r.ede)),
+            stats.bogus.load(Ordering::Relaxed),
+            stats.insecure.load(Ordering::Relaxed),
+            stats.secure.load(Ordering::Relaxed) - secure,
+        ));
+        want.push((
+            what,
+            Some((Verdict::Bogus, telltale_proto::ede::DNSSEC_BOGUS)),
+            1,
+            0,
+            0,
+        ));
+    }
+    assert_eq!(got, want);
 }
 
 /// REQ: DNS-011 (ADR-098, ADR-184) — a signed CNAME into a zone that is unsigned but whose answers
