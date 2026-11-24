@@ -1635,7 +1635,7 @@ Handled before anything else (each can be turned off under `[special]`):
 | `*.invalid` | NXDOMAIN | RFC 6761 |
 | `use-application-dns.net` | NXDOMAIN | stops Firefox from silently switching to its own DoH (`block_firefox_canary`) |
 | CHAOS class (`version.bind`, …) | REFUSED | no fingerprinting (`refuse_chaos`) |
-| reverse lookups for private IPs | NXDOMAIN | never leaks your LAN layout to public resolvers, unless a local record or a `[[route]]` covers it (`private_ptr_nxdomain`) |
+| reverse lookups for private IPs | NXDOMAIN | your LAN layout stays off public resolvers unless a local record, a `[[route]]` or the device's group's own `upstreams` covers it (`private_ptr_nxdomain`) |
 | `resolver.arpa`, `_dns.resolver.arpa`, … | NOERROR, no records | encrypted-DNS discovery (RFC 9462): answered here, never forwarded, unless a local record or a `[[route]]` for `resolver.arpa` or a name below it covers it (`resolver_arpa`) |
 
 `.local` names are passed through unchanged (many Active Directory domains use them; route them with `[[route]]`).
