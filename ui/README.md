@@ -54,3 +54,72 @@ tests/demo/run.sh            # or `tests/demo/run.sh 60` for a quick look
   CSSOM, which CSP allows). The suite fails on any CSP violation.
 - Every chart gets a table view; every page works at 360 px.
 - Filters and tabs live in the URL hash (`#/queries?client=...`).
+
+## Languages
+
+The UI's text goes through a small layer of its own (`src/lib/i18n/`, `spec/11` ADR-189, API-012).
+English is the key: the English stays in the source, and with English active `t()` returns it
+unchanged. Every other language is a data file fetched before the page is drawn; a translation is
+shown only if it agrees with the English it replaces, otherwise English is. No language is offered
+yet; `?lang=en-XA` shows the pseudo-locale (accented, longer English) for one page load.
+
+**Add a string.** In the file that shows it, bind the file's context (its name in lower camel case:
+`pages/Cache.svelte` is `cache`; `src/locales/contexts.json` renames a file whose name another
+file already has) and write the English as a literal:
+
+```svelte
+<script lang="ts">
+  import { tr } from '../lib/i18n';
+  import T from '../lib/i18n/T.svelte';
+  const { t, tn } = tr('cache');
+  const { t: tc } = tr('common'); // bare actions shared by every file (at most 40)
+</script>
+
+<h2>{t('Holds')}</h2>
+<p>{t('{n} entries of {max}', { n: num(count), max: num(limit) })}</p>
+<p>{tn('{n} answer', '{n} answers', n, { n: num(n) })}</p>
+<T ctx="cache" msg={'Kept by <b>{who}</b>'} params={{ who }}>{#snippet b(text)}<b>{text}</b>{/snippet}</T>
+```
+
+- Literals only: the check reads them from the syntax tree. `t('Open', undefined, 'verb')` separates
+  two meanings of the same English in one file.
+- A sentence is one message. Markup inside it goes through `<T>`, whose `msg` is an expression
+  (`msg={'…'}`): in a quoted attribute Svelte would replace `{who}` itself.
+- `tn()` only where the English has two forms; the form follows the language of the text, never the
+  browser's. Numbers are formatted by the caller (`num()`), dates and times by `lib/format.ts`,
+  the only place that calls `Intl`.
+- A `t()` result is text to show: never a key, a comparison operand, a stored value, a URL or part of
+  a request. Keep an identifier beside it.
+- Nothing translates at the top level of a `.ts` module or `<script module>` (it would run before
+  the language is loaded): mark a label there with `m('Lists')` and show it with `tk(label)`.
+- Names, addresses and code shown as data get `translate="no"`.
+
+`npm run check:i18n` fails on a non-literal message, a context that is not the file's or `common`,
+two files with one context, a hash collision, a translated text misused as above, literal text in a
+file already on the layer, a new `Intl` call outside `lib/format.ts`, and a new physical CSS
+property (`margin-left`, `text-align: right`; use logical ones). It reports, and never fails on,
+missing, outdated and left-over translations. A change to English alone never fails a language.
+
+**Add a language.** A maintainer adds the tag to `src/locales/manifest.json` (`owners`: the GitHub
+logins of the people who answer for its content; `dir`; `offered: false` until a release turns it
+on; `since`), and the language to `src/locales/plurals.json` if it is not there (`node
+scripts/i18n.mjs plurals` writes it from CLDR; review the diff). A tag names the script where the
+language has several (`zh-Hans`, `sr-Latn`). The translator then runs `node scripts/i18n.mjs sync
+<tag>`, fills in the empty translations of `src/locales/<tag>.json` (pairs of English and
+translation; a plural lists the language's categories), and opens a pull request with that one file.
+After an English edit that keeps the meaning, a maintainer runs `node scripts/i18n.mjs carry
+<context> --from "<old>" --to "<new>"`; otherwise the old pair is reported as left over and English
+is shown until the language's owner confirms the new text.
+
+**Review a catalog pull request by structure.** You do not need to read the language:
+
+1. The pull request changes that language's file only (and its owners in the manifest, if the
+   owner says so).
+2. `npm run check:i18n` is green: every translation keeps the placeholders, tags and web addresses
+   of its English, every structural token (a URL, a path, `[x]`, `=`, `_`, `$`, `|`, a host and port,
+   an IP address, a glossary term), every number, and every word `src/locales/verbatim.json` lists
+   for it; and it has no direction overrides, invisible characters or words that mix scripts.
+3. The job summary's **sensitive** lines (messages `src/locales/notes.json` marks sensitive: the
+   pull request carries a back-translation of each) and **swap** lines (a new translation equal to
+   another message's old one) are explained.
+4. The language's owner has approved it.
