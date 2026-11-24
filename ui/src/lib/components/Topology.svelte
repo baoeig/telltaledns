@@ -12,8 +12,9 @@
   export type Health = 'ok' | 'warn' | 'bad';
 
   // REQ: OPS-010 — a node in maintenance is down or not ready on purpose: drawn hatched, not red.
+  // REQ: CLU-002 — a witness only votes: it serves no DNS and applies no configuration.
   export const health = (n: Node): Health =>
-    n.maintenance ? 'ok' : !n.up ? 'bad' : !n.ready || n.configLag > 0 ? 'warn' : 'ok';
+    n.maintenance ? 'ok' : !n.up ? 'bad' : !n.witness && (!n.ready || n.configLag > 0) ? 'warn' : 'ok';
   const worst = (hs: Health[]): Health => (hs.includes('bad') ? 'bad' : hs.includes('warn') ? 'warn' : 'ok');
   export const worstOf = (ns: Node[]): Health => worst(ns.map(health));
 
@@ -204,8 +205,8 @@
       `${n.pod ?? n.nodeId} (${n.site}, ${role(n)})`,
       n.kubeNode ? `on Kubernetes node ${n.kubeNode}` : '',
       n.maintenance ? `in maintenance (${n.maintenance.reason})` : '',
-      n.up ? (n.ready ? 'up, serving' : 'up, not ready') : 'down',
-      n.configLag ? `configuration ${n.configLag} behind` : 'in sync',
+      n.up ? (n.witness ? 'up, votes only' : n.ready ? 'up, serving' : 'up, not ready') : 'down',
+      n.witness ? '' : n.configLag ? `configuration ${n.configLag} behind` : 'in sync',
       `${rate(n.qps)} q/s${n.querySharePercent != null ? `, ${n.querySharePercent}% of queries` : ''}`,
       n.cacheHitPercent != null ? `cache ${n.cacheHitPercent}% hits` : '',
       n.restarts ? `${n.restarts} restart${n.restarts === 1 ? '' : 's'}` : '',
