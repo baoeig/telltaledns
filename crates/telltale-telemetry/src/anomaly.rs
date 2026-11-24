@@ -521,8 +521,8 @@ impl Client {
                 }
             }
         } else if nx && self.nx_samples.len() < SAMPLES {
-            let mut name = crate::event::dotted(wire);
-            name.truncate(MAX_DOMAIN);
+            // REQ: OBS-009 — cut at a character boundary: a label may hold any bytes.
+            let name = sample_text(wire);
             if !self.nx_samples.contains(&name) {
                 self.nx_samples.push(name);
             }
