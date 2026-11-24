@@ -172,6 +172,9 @@ pub struct Validator {
     insecure: Mutex<HashMap<(usize, String), std::time::Instant>>,
     /// REQ: DNS-011, NFR-004 (review 03-05) — bounds on the unsigned-zone proof.
     proofs: ProofGate,
+    /// REQ: DNS-011, NFR-004 (ADR-188) — bounds on link-by-link validation, apart from `proofs`
+    /// (which the proofs its links need take from).
+    links: ProofGate,
     pub stats: Arc<Stats>,
 }
 
@@ -198,6 +201,7 @@ impl Validator {
             aggressive: true,
             insecure: Mutex::new(HashMap::new()),
             proofs: ProofGate::default(),
+            links: ProofGate::with_slots(MAX_LINK_WALKS),
             stats,
         }
     }
@@ -238,6 +242,21 @@ impl Validator {
     /// Root trust anchors in use (tests, metrics).
     pub fn anchor_count(&self) -> usize {
         self.anchors.len()
+    }
+
+    /// Test support (`tests/`): takes every free slot of the unsigned-zone proofs but `leave`,
+    /// until the permits are dropped.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn hold_proof_slots(&self, leave: usize) -> Vec<tokio::sync::SemaphorePermit<'_>> {
+        self.proofs.hold(leave)
+    }
+
+    /// Test support (`tests/`): the same for the slots of link-by-link validation.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn hold_link_slots(&self, leave: usize) -> Vec<tokio::sync::SemaphorePermit<'_>> {
+        self.links.hold(leave)
     }
 
     /// Whether `name` (presentation form) is validated: not under a negative trust anchor.
@@ -500,6 +519,10 @@ const LOOKUP_SHARE: (u32, u32) = (3 * VALIDATION_BUDGETS, 4);
 /// Unsigned-zone proofs running at once; a burst of names that can't be validated must not
 /// take every in-flight permit (`spec/02` §8.4). A proof that finds no slot is "not proven".
 const MAX_PROOFS: usize = 8;
+/// REQ: DNS-011, NFR-004 (ADR-188) — link-by-link validations running at once, on slots of their
+/// own: the unsigned-zone proofs their links need take one of `MAX_PROOFS`. One that finds no slot
+/// is "not proven".
+const MAX_LINK_WALKS: usize = 4;
 /// How long a name whose zone couldn't be proven unsigned isn't walked again.
 const UNPROVEN_FOR: Duration = Duration::from_mins(1);
 /// Names remembered as unproven (the map is cleared beyond this).
@@ -507,7 +530,8 @@ const MAX_UNPROVEN: usize = 4096;
 
 /// Limits for the unsigned-zone proof: how many run at once, and which names recently failed
 /// to be proven (the failure cost is per name: names that can't be proven aren't cached as
-/// zones). Both only ever make the answer more conservative (bogus stays bogus).
+/// zones). Both only ever make the answer more conservative (bogus stays bogus). Link-by-link
+/// validation has a gate of its own (ADR-188).
 #[derive(Debug)]
 struct ProofGate {
     slots: tokio::sync::Semaphore,
@@ -516,17 +540,36 @@ struct ProofGate {
 
 impl Default for ProofGate {
     fn default() -> Self {
-        Self {
-            slots: tokio::sync::Semaphore::new(MAX_PROOFS),
-            unproven: Mutex::new(HashMap::new()),
-        }
+        Self::with_slots(MAX_PROOFS)
     }
 }
 
+/// Why [`ProofGate::try_enter`] gave no slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Skipped {
+    /// The name failed within the last minute.
+    Failed,
+    /// Every slot is busy.
+    Busy,
+}
+
 impl ProofGate {
+    /// A gate with `slots` slots.
+    fn with_slots(slots: usize) -> Self {
+        Self {
+            slots: tokio::sync::Semaphore::new(slots),
+            unproven: Mutex::new(HashMap::new()),
+        }
+    }
+
     /// A slot to run a proof for `name`, or `None` when it failed within the last minute or
     /// every slot is busy.
     fn enter(&self, name: &str) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        self.try_enter(name).ok()
+    }
+
+    /// [`Self::enter`], saying why there is no slot.
+    fn try_enter(&self, name: &str) -> Result<tokio::sync::SemaphorePermit<'_>, Skipped> {
         let now = std::time::Instant::now();
         if self
             .unproven
@@ -534,9 +577,9 @@ impl ProofGate {
             .get(name)
             .is_some_and(|until| *until > now)
         {
-            return None;
+            return Err(Skipped::Failed);
         }
-        self.slots.try_acquire().ok()
+        self.slots.try_acquire().map_err(|_| Skipped::Busy)
     }
 
     /// `name` couldn't be proven unsigned.
@@ -547,6 +590,42 @@ impl ProofGate {
         }
         m.insert(name.to_owned(), std::time::Instant::now() + UNPROVEN_FOR);
     }
+
+    /// Takes every free slot but `leave`, until the permits are dropped (tests).
+    fn hold(&self, leave: usize) -> Vec<tokio::sync::SemaphorePermit<'_>> {
+        let n = self.slots.available_permits().saturating_sub(leave);
+        (0..n)
+            .filter_map(|_| self.slots.try_acquire().ok())
+            .collect()
+    }
+}
+
+/// REQ: DNS-011 (ADR-098, ADR-188) — what an unsigned-zone proof came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unsigned {
+    /// The zone is proven unsigned.
+    Proven,
+    /// It isn't: the proof failed, ran out of time, or failed within the last minute.
+    NotProven,
+    /// It wasn't tried: every slot was busy (nothing is remembered).
+    Busy,
+}
+
+impl Unsigned {
+    fn is_proven(self) -> bool {
+        self == Self::Proven
+    }
+}
+
+/// REQ: DNS-011, NFR-004 (ADR-188) — why link-by-link validation gave no verdict; either way the
+/// answer stays bogus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoVerdict {
+    /// A link doesn't hold, or couldn't be checked in time: the question isn't validated link by
+    /// link again for a minute.
+    Fails,
+    /// A proof a link needed found every slot busy: the next question tries again.
+    Busy,
 }
 
 /// What is left of `deadline`.
@@ -617,6 +696,21 @@ impl Validator {
         budget: Duration,
         deadline: std::time::Instant,
     ) -> bool {
+        self.owners_unsigned(group, handle, response, qkey, budget, deadline)
+            .await
+            .is_proven()
+    }
+
+    /// [`Self::all_unsigned`], and when not, what the first owner not proven came to (ADR-188).
+    async fn owners_unsigned(
+        &self,
+        group: &Arc<Group>,
+        handle: &DnssecDnsHandle<GroupHandle>,
+        response: &Message,
+        qkey: &str,
+        budget: Duration,
+        deadline: std::time::Instant,
+    ) -> Unsigned {
         let mut owners: Vec<String> = response
             .answers
             .iter()
@@ -627,14 +721,15 @@ impl Validator {
         owners.sort();
         owners.dedup();
         for o in &owners {
-            if !self
-                .proven_insecure(group, handle, o, budget, deadline)
+            match self
+                .unsigned_proof(group, handle, o, budget, deadline)
                 .await
             {
-                return false;
+                Unsigned::Proven => {}
+                other => return other,
             }
         }
-        true
+        Unsigned::Proven
     }
 
     /// REQ: DNS-011 (RFC 4035 §5.4, RFC 5155 §8) — the validation library proves a denial for
@@ -647,8 +742,9 @@ impl Validator {
     /// reason to look. `None`: not every link holds, or one couldn't be checked in time (the
     /// answer stays bogus).
     ///
-    /// NFR-004 — bounded like the unsigned-zone proof: by `deadline`, by a handful at once, and
-    /// by a minute's memory of questions that failed; and by [`MAX_LINKS`].
+    /// NFR-004 — bounded like the unsigned-zone proof: by `deadline`, by a handful at once (on
+    /// slots of their own, ADR-188), and by a minute's memory of questions that failed; and by
+    /// [`MAX_LINKS`].
     async fn validate_links(
         &self,
         group: &Arc<Group>,
@@ -661,14 +757,19 @@ impl Validator {
         // A type and a space first: never the key of an unsigned-zone proof.
         let key = format!("{} {}", q.qtype, zone_key(name));
         // No slot, or it failed within the last minute: not proven.
-        let _slot = self.proofs.enter(&key)?;
-        let found = self
+        let _slot = self.links.enter(&key)?;
+        match self
             .follow_links(group, handle, name, q, budget, deadline)
-            .await;
-        if found.is_none() {
-            self.proofs.failed(&key);
+            .await
+        {
+            Ok(found) => Some(found),
+            // REQ: NFR-004 (ADR-188) — a proof skipped only for want of a slot: not remembered.
+            Err(NoVerdict::Busy) => None,
+            Err(NoVerdict::Fails) => {
+                self.links.failed(&key);
+                None
+            }
         }
-        found
     }
 
     /// [`Self::validate_links`], without its limits on how often and how many.
@@ -680,7 +781,7 @@ impl Validator {
         q: &Question,
         budget: Duration,
         deadline: std::time::Instant,
-    ) -> Option<(Verdict, Message)> {
+    ) -> Result<(Verdict, Message), NoVerdict> {
         let qtype = RecordType::from(q.qtype);
         let mut worst = Verdict::Secure;
         let mut chain: Vec<Record> = Vec::new();
@@ -692,12 +793,14 @@ impl Validator {
             // REQ: DNS-011 (ADR-188) — a link without an answer in time (a timeout, an upstream
             // failure) proves nothing: the answer stays bogus.
             let Some(Ok(link)) = ask(handle, &at, RecordType::CNAME, deadline).await else {
-                return None;
+                return Err(NoVerdict::Fails);
             };
-            let target = link.answers.iter().find_map(|r| match &r.data {
+            let Some(target) = link.answers.iter().find_map(|r| match &r.data {
                 RData::CNAME(c) if r.name == at => Some(c.0.clone()),
                 _ => None,
-            })?;
+            }) else {
+                return Err(NoVerdict::Fails);
+            };
             let v = self
                 .link_verdict(group, handle, &link, &at, budget, deadline)
                 .await?;
@@ -709,7 +812,7 @@ impl Validator {
             }));
             proofs.extend(link.authorities.into_iter().filter(is_denial));
             if seen.contains(&target) {
-                return None;
+                return Err(NoVerdict::Fails);
             }
             seen.push(target.clone());
             at = target;
@@ -721,10 +824,10 @@ impl Validator {
                 Some(Err(e)) if denied_through_cname(&e, &at, q) => continue,
                 Some(Err(e)) => {
                     tracing::debug!(name = %zone_key(&at), "DNSSEC: link by link: {e}");
-                    return None;
+                    return Err(NoVerdict::Fails);
                 }
                 // REQ: DNS-011 (ADR-188) — no answer in time: as above.
-                None => return None,
+                None => return Err(NoVerdict::Fails),
             };
             let v = self
                 .link_verdict(group, handle, &end, &at, budget, deadline)
@@ -738,13 +841,13 @@ impl Validator {
                     m.authorities.push(r);
                 }
             }
-            return Some((worst.weakest(v), m));
+            return Ok((worst.weakest(v), m));
         }
-        None
+        Err(NoVerdict::Fails)
     }
 
     /// What one link's answer is worth: secure, or insecure (also when its zone is proven
-    /// unsigned); `None` for anything else.
+    /// unsigned); for anything else, why not.
     async fn link_verdict(
         &self,
         group: &Arc<Group>,
@@ -753,14 +856,18 @@ impl Validator {
         owner: &Name,
         budget: Duration,
         deadline: std::time::Instant,
-    ) -> Option<Verdict> {
+    ) -> Result<Verdict, NoVerdict> {
         match verdict(answer) {
-            v @ (Verdict::Secure | Verdict::Insecure) => Some(v),
-            Verdict::Bogus => self
-                .all_unsigned(group, handle, answer, &zone_key(owner), budget, deadline)
+            v @ (Verdict::Secure | Verdict::Insecure) => Ok(v),
+            Verdict::Bogus => match self
+                .owners_unsigned(group, handle, answer, &zone_key(owner), budget, deadline)
                 .await
-                .then_some(Verdict::Insecure),
-            Verdict::Indeterminate => None,
+            {
+                Unsigned::Proven => Ok(Verdict::Insecure),
+                Unsigned::NotProven => Err(NoVerdict::Fails),
+                Unsigned::Busy => Err(NoVerdict::Busy),
+            },
+            Verdict::Indeterminate => Err(NoVerdict::Fails),
         }
     }
 
@@ -820,12 +927,34 @@ impl Validator {
         budget: Duration,
         deadline: std::time::Instant,
     ) -> bool {
+        self.unsigned_proof(group, handle, name, budget, deadline)
+            .await
+            .is_proven()
+    }
+
+    /// [`Self::proven_insecure`], saying why not (ADR-188): a proof skipped because every slot
+    /// was busy is [`Unsigned::Busy`], apart from one that failed, so that link-by-link
+    /// validation doesn't remember it as a failure.
+    async fn unsigned_proof(
+        &self,
+        group: &Arc<Group>,
+        handle: &DnssecDnsHandle<GroupHandle>,
+        name: &str,
+        budget: Duration,
+        deadline: std::time::Instant,
+    ) -> Unsigned {
         if self.known_insecure(Arc::as_ptr(group) as usize, name) {
-            return true;
+            return Unsigned::Proven;
         }
-        let Some(_slot) = self.proofs.enter(name) else {
-            tracing::debug!(%name, "DNSSEC: unsigned-zone proof skipped: recently failed, or too many running");
-            return false;
+        let _slot = match self.proofs.try_enter(name) {
+            Ok(slot) => slot,
+            Err(skipped) => {
+                tracing::debug!(%name, ?skipped, "DNSSEC: unsigned-zone proof skipped: recently failed, or too many running");
+                return match skipped {
+                    Skipped::Failed => Unsigned::NotProven,
+                    Skipped::Busy => Unsigned::Busy,
+                };
+            }
         };
         let proven = tokio::time::timeout(
             left(deadline),
@@ -835,8 +964,9 @@ impl Validator {
         .unwrap_or(false);
         if !proven {
             self.proofs.failed(name);
+            return Unsigned::NotProven;
         }
-        proven
+        Unsigned::Proven
     }
 
     /// The proof itself: the zone candidates from the top, each step limited to what the

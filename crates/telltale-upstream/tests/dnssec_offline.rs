@@ -1641,6 +1641,72 @@ async fn dns_011_offline_link_lookup_timeout_stays_bogus() {
     assert_eq!(got, want);
 }
 
+/// REQ: DNS-011, NFR-004 (ADR-188) — link-by-link validation runs on slots of its own, apart from
+/// the unsigned-zone proofs, so the proof one of its links needs still finds one. `parked.s.t. A`
+/// (a signed CNAME to `www.u.t.`, whose address the validation library judges bogus) needs that
+/// proof for its second link:
+/// 1. with every proof slot taken but one, it is insecure;
+/// 2. with every proof slot taken, it stays bogus, and isn't remembered as failed for that: the
+///    next question, with the slots free again, is insecure;
+/// 3. with every slot of link-by-link validation taken, it stays bogus, and the next question,
+///    with them free again, is insecure.
+#[tokio::test]
+async fn dns_011_link_validation_leaves_slots_for_its_proofs() {
+    async fn round(v: &Validator, g: &Arc<Group>) -> Option<Verdict> {
+        v.resolve(
+            g,
+            question("parked.s.t", rtype::A),
+            Duration::from_secs(5),
+            true,
+            false,
+        )
+        .await
+        .ok()
+        .map(|r| r.verdict)
+    }
+    let (v, g, _, _, _dir) = setup(true).await;
+    warm_tld(&v, &g).await;
+    let held = v.hold_proof_slots(1);
+    assert!(!held.is_empty(), "proof slots held");
+    assert_eq!(
+        round(&v, &g).await,
+        Some(Verdict::Insecure),
+        "every proof slot but one taken"
+    );
+    drop(held);
+
+    let (v, g, _, _, _dir) = setup(true).await;
+    warm_tld(&v, &g).await;
+    let held = v.hold_proof_slots(0);
+    assert_eq!(
+        round(&v, &g).await,
+        Some(Verdict::Bogus),
+        "every proof slot taken"
+    );
+    drop(held);
+    assert_eq!(
+        round(&v, &g).await,
+        Some(Verdict::Insecure),
+        "the slots free again: not remembered as failed"
+    );
+
+    let (v, g, _, _, _dir) = setup(true).await;
+    warm_tld(&v, &g).await;
+    let held = v.hold_link_slots(0);
+    assert!(!held.is_empty(), "link-by-link slots held");
+    assert_eq!(
+        round(&v, &g).await,
+        Some(Verdict::Bogus),
+        "every link-by-link slot taken"
+    );
+    drop(held);
+    assert_eq!(
+        round(&v, &g).await,
+        Some(Verdict::Insecure),
+        "the link-by-link slots free again"
+    );
+}
+
 /// REQ: DNS-011 (ADR-098, ADR-184) — a signed CNAME into a zone that is unsigned but whose answers
 /// the validation library judges bogus (`parked.s.t.` to `www.u.t.`, whose server answers like a
 /// parked domain's) is insecure: served, without AD. The library's verdict on the whole answer is
