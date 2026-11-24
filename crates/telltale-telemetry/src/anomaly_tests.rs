@@ -1335,7 +1335,8 @@ fn odd_label(rng: &mut Rng, len: usize) -> Vec<u8> {
 }
 
 /// A wire name for the property test: labels of 0 to 63 bytes (0 ends the name), at most 255
-/// bytes in all; sometimes bytes after the root, or bytes that aren't a name at all.
+/// bytes in all; sometimes under a private reverse zone, bytes after the root, or bytes that
+/// aren't a name at all.
 fn odd_wire(rng: &mut Rng) -> Vec<u8> {
     if rng.below(16) == 0 {
         let n = usize::try_from(rng.below(300)).unwrap();
@@ -1352,6 +1353,16 @@ fn odd_wire(rng: &mut Rng) -> Vec<u8> {
         w.push(u8::try_from(len).unwrap());
         w.extend(odd_label(rng, len));
     }
+    // REQ: OBS-009 (ADR-186) — under `168.192.in-addr.arpa` or `d.f.ip6.arpa` now and then, so
+    // the sweep's samples see such names too.
+    let zone: &[u8] = match rng.below(8) {
+        0 => b"\x03168\x03192\x07in-addr\x04arpa",
+        1 => b"\x01d\x01f\x03ip6\x04arpa",
+        _ => b"",
+    };
+    if w.len() + zone.len() < 255 {
+        w.extend_from_slice(zone);
+    }
     w.push(0);
     if rng.below(16) == 0 {
         w.extend(odd_label(rng, 8));
@@ -1360,9 +1371,10 @@ fn odd_wire(rng: &mut Rng) -> Vec<u8> {
 }
 
 /// REQ: OBS-009 — the engine takes names with any bytes: 20 000 generated queries (names of
-/// mostly non-ASCII and non-UTF-8 bytes, raw bytes, known and new devices, every answer kind,
-/// times across minutes, an hour and a day, late events and a long gap) leave every NXDOMAIN
-/// sample within [`MAX_DOMAIN`] bytes and every domain text within [`MAX_DOMAIN`] characters.
+/// mostly non-ASCII and non-UTF-8 bytes, some under private reverse zones, raw bytes, known and
+/// new devices, every answer kind, times across minutes, an hour and a day, late events and a
+/// long gap) leave every NXDOMAIN sample, the storm's and the sweep's, within [`MAX_DOMAIN`]
+/// bytes and every domain text within [`MAX_DOMAIN`] characters.
 #[test]
 fn obs_009_observe_query_takes_any_wire_bytes() {
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
@@ -1378,6 +1390,7 @@ fn obs_009_observe_query_takes_any_wire_bytes() {
         engine.observe(start_s - 86_400 - 60, ip(dev), &wire("seed.example"));
     }
     let mut at_us = start_s * 1_000_000;
+    let mut sweep_samples_seen = false;
     for i in 0..20_000u32 {
         at_us += rng.below(60_000);
         if i == 15_000 {
@@ -1405,12 +1418,14 @@ fn obs_009_observe_query_takes_any_wire_bytes() {
         let name = odd_wire(&mut rng);
         engine.observe_query(when, client, &name, rcode);
         if let Some(state) = engine.clients.get(&client) {
-            assert!(state.nx_samples.len() <= SAMPLES);
-            for sample in &state.nx_samples {
+            assert!(state.nx_samples.len() <= SAMPLES && state.rev_samples.len() <= SAMPLES);
+            for sample in state.nx_samples.iter().chain(&state.rev_samples) {
                 assert!(sample.len() <= MAX_DOMAIN, "{sample:?} from {name:?}");
             }
+            sweep_samples_seen |= !state.rev_samples.is_empty();
         }
     }
+    assert!(sweep_samples_seen, "the run keeps sweep samples");
     engine.observe_answer(at_us / 1_000_000 + 7200, ip(9), &wire("x.example"), Some(0));
     let storms = engine
         .findings()
