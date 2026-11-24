@@ -562,6 +562,8 @@ fn tld(proof_ttl: u32) -> Tld {
         (n("*.w.s.t."), vec![RData::A(A::new(192, 0, 2, 31))]),
         (n("*.c.s.t."), vec![RData::CNAME(CNAME(n("www.s.t.")))]),
         (n("*.o.s.t."), vec![RData::CNAME(CNAME(n("out.s.t.")))]),
+        // A wildcard CNAME to a name that doesn't exist, below one that does.
+        (n("*.k.s.t."), vec![RData::CNAME(CNAME(n("a.own.w.s.t.")))]),
         // A name below `w.s.t.` that exists, and one below that makes an empty non-terminal.
         (n("own.w.s.t."), vec![RData::A(A::new(192, 0, 2, 32))]),
         (n("x.ent.w.s.t."), vec![RData::A(A::new(192, 0, 2, 33))]),
@@ -2342,6 +2344,104 @@ async fn dns_011_offline_wildcard_answer_with_a_second_signature_is_indeterminat
     }
     assert_eq!(got, want);
     assert_eq!(stats.bogus.load(Ordering::Relaxed), 0);
+}
+
+/// REQ: DNS-011 (RFC 4035 §5.3.4; ADR-188) — wildcard answers with their proof are secure without
+/// link-by-link validation: with every slot of it taken, `any.w.s.t. A`, `a.b.w.s.t. A` and
+/// `a.b.c.s.t. A` (from the wildcard CNAME `*.c.s.t.`, two labels below its parent, to `www.s.t.`)
+/// are secure, with AD. A wildcard CNAME at the question name that is the answer's only record made
+/// from a wildcard is checked as the CNAME's own record set.
+#[tokio::test]
+async fn dns_011_offline_wildcard_answers_with_their_proof_need_no_link_by_link_validation() {
+    use RecordType::{A, CNAME};
+    let (v, g, _, stats, _dir) = setup(true).await;
+    warm_tld(&v, &g).await;
+    let held = v.hold_link_slots(0);
+    assert!(!held.is_empty(), "link-by-link slots held");
+    let (mut got, mut want) = (Vec::new(), Vec::new());
+    for (name, owners) in [
+        ("any.w.s.t", vec![("any.w.s.t.", A)]),
+        ("a.b.w.s.t", vec![("a.b.w.s.t.", A)]),
+        ("a.b.c.s.t", vec![("a.b.c.s.t.", CNAME), ("www.s.t.", A)]),
+    ] {
+        let r = v
+            .resolve(
+                &g,
+                question(name, rtype::A),
+                Duration::from_secs(5),
+                true,
+                false,
+            )
+            .await;
+        got.push((name, r.ok().map(|r| (r.verdict, served(&r.bytes)))));
+        let records: Vec<(String, RecordType)> = owners
+            .into_iter()
+            .map(|(owner, kind)| (owner.to_owned(), kind))
+            .collect();
+        want.push((
+            name,
+            Some((
+                Verdict::Secure,
+                Some((telltale_proto::rcode::NOERROR, true, records)),
+            )),
+        ));
+    }
+    drop(held);
+    assert_eq!(got, want);
+    assert_eq!(stats.bogus.load(Ordering::Relaxed), 0);
+}
+
+/// REQ: DNS-011 (RFC 4035 §5.3.4; ADR-188) — a wildcard CNAME at the question name with its proof
+/// stands for itself only: when another record of the answer is made from a wildcard, each needs
+/// its own proof. `a.b.k.s.t. A` (from the wildcard CNAME `*.k.s.t.`, to `a.own.w.s.t.`) with the
+/// target answered from `*.w.s.t.` and the NSEC of `own.w.s.t.`, a name that exists between them,
+/// stays bogus (EDE 6) over two questions, with nothing counted secure or insecure. Answered as the
+/// zone answers it, it is a secure NXDOMAIN behind the CNAME.
+#[tokio::test]
+async fn dns_011_offline_wildcard_cname_to_another_wildcard_record_needs_each_proof() {
+    let budget = Duration::from_secs(5);
+    let z = Arc::new(zone());
+    let (v, g, _, _, _dir) = setup_zone(true, Arc::clone(&z)).await;
+    warm_tld(&v, &g).await;
+    let r = v
+        .resolve(&g, question("a.b.k.s.t", rtype::A), budget, true, false)
+        .await;
+    assert_eq!(
+        r.ok().map(|r| (r.verdict, served(&r.bytes))),
+        Some((
+            Verdict::Secure,
+            Some((
+                telltale_proto::rcode::NXDOMAIN,
+                true,
+                vec![("a.b.k.s.t.".to_owned(), RecordType::CNAME)]
+            ))
+        )),
+        "a.b.k.s.t. A, as the zone answers it"
+    );
+    z.tld
+        .tamper
+        .store(tampering::REPLAY_WILDCARD_BELOW_NAME, Ordering::Relaxed);
+    let (v, g, _, stats, _dir) = setup_zone(true, Arc::clone(&z)).await;
+    warm_tld(&v, &g).await;
+    let secure = stats.secure.load(Ordering::Relaxed);
+    let mut verdicts = Vec::new();
+    for _ in 1..=2 {
+        let r = v
+            .resolve(&g, question("a.b.k.s.t", rtype::A), budget, true, false)
+            .await;
+        verdicts.push(r.map(|r| (r.verdict, r.ede)).ok());
+    }
+    z.tld.tamper.store(tampering::NONE, Ordering::Relaxed);
+    let bogus = Some((Verdict::Bogus, telltale_proto::ede::DNSSEC_BOGUS));
+    assert_eq!(
+        (
+            verdicts,
+            stats.secure.load(Ordering::Relaxed) - secure,
+            stats.insecure.load(Ordering::Relaxed)
+        ),
+        (vec![bogus; 2], 0, 0),
+        "a.b.k.s.t. A to a wildcard's address without its proof"
+    );
 }
 
 /// REQ: DNS-011 (ADR-184) — a zone proven unsigned is remembered per upstream group, and no

@@ -1064,10 +1064,12 @@ fn starts_with_cname(m: &Message, name: &Name) -> bool {
         .any(|r| r.record_type() == RecordType::CNAME && r.name == *name)
 }
 
-/// REQ: DNS-011 (RFC 4035 §5.3.4, ADR-188) — what the validator returned, with a wildcard's
-/// answer in a zone signed with NSEC judged by the rule itself ([`wildcard_proven`]): a refused
-/// one that it proves is accepted, and an accepted one that it doesn't prove is bogus (its
-/// records' proofs say so, so it is handled as any bogus answer).
+/// REQ: DNS-011 (RFC 4035 §5.3.4, ADR-188) — what the validator returned, with every wildcard
+/// answer in a zone signed with NSEC checked against the rule itself ([`wildcard_proven`]) before
+/// it is served: one the rule proves is accepted, also when its NSEC proof was refused, and one it
+/// doesn't prove is bogus (its records' proofs say so, so it is handled as any bogus answer). An
+/// answer that wasn't refused and starts with a wildcard CNAME at `name` may instead meet the rule
+/// with the CNAME's record set ([`wildcard_cname_proven`]).
 fn or_wildcard(
     r: Result<DnsResponse, NetError>,
     name: &Name,
@@ -1081,7 +1083,9 @@ fn or_wildcard(
             Ok(*response)
         }
         Ok(mut response)
-            if nsec_wildcard_answer(&response) && !wildcard_proven(&response, name, rtype) =>
+            if nsec_wildcard_answer(&response)
+                && !wildcard_proven(&response, name, rtype)
+                && !wildcard_cname_proven(&response, name, rtype) =>
         {
             tracing::debug!(name = %zone_key(name), "DNSSEC: wildcard expansion without its proof");
             for record in &mut response.answers {
@@ -1140,11 +1144,22 @@ fn has_nsec3_of(m: &Message, zone: &Name) -> bool {
 ///   more): it doesn't exist, nor does anything below it;
 /// - and there is no NSEC3 beside it.
 fn wildcard_proven(m: &Message, name: &Name, rtype: RecordType) -> bool {
+    record_set_proven(m, &m.answers, name, rtype)
+}
+
+/// [`wildcard_proven`] with `answers` as the answer: records of `m`'s answer section, all of them
+/// or those of one name ([`wildcard_cname_proven`]).
+fn record_set_proven<'a>(
+    m: &Message,
+    answers: impl IntoIterator<Item = &'a Record>,
+    name: &Name,
+    rtype: RecordType,
+) -> bool {
     if m.metadata.response_code != ResponseCode::NoError || name.is_wildcard() {
         return false;
     }
-    let mut sigs = Vec::new();
-    for r in &m.answers {
+    let (mut sigs, mut answered) = (Vec::new(), false);
+    for r in answers {
         if r.name != *name {
             return false;
         }
@@ -1156,7 +1171,7 @@ fn wildcard_proven(m: &Message, name: &Name, rtype: RecordType) -> bool {
                     sigs.push((s.input().num_labels, &s.input().signer_name));
                 }
             }
-            _ if r.proof == Proof::Secure && r.record_type() == rtype => {}
+            _ if r.proof == Proof::Secure && r.record_type() == rtype => answered = true,
             _ => return false,
         }
     }
@@ -1164,7 +1179,7 @@ fn wildcard_proven(m: &Message, name: &Name, rtype: RecordType) -> bool {
         return false;
     };
     if sigs.iter().any(|s| *s != (labels, zone))
-        || !m.answers.iter().any(|r| r.record_type() == rtype)
+        || !answered
         || labels >= name.num_labels()
         || zone.num_labels() > labels
         || !zone.zone_of(name)
@@ -1186,6 +1201,25 @@ fn wildcard_proven(m: &Message, name: &Name, rtype: RecordType) -> bool {
             && nsec_signed_by(m, &r.name, zone)
             && nsec_covers(&r.name, nsec, zone, &next_closer)
     })
+}
+
+/// REQ: DNS-011 (RFC 4035 §5.3.4, ADR-188) — `m` answers a question for another type than CNAME
+/// with a CNAME at `name` made from a wildcard, and no record of another name in it is made from a
+/// wildcard: the CNAME's record set at `name`, with its signatures, meets the rule as for a question
+/// for the CNAME ([`record_set_proven`] over the answer's records owned by `name`). The rest of the
+/// chain are records of names that exist, each validated by its own signature.
+fn wildcard_cname_proven(m: &Message, name: &Name, rtype: RecordType) -> bool {
+    rtype != RecordType::CNAME
+        && !m
+            .answers
+            .iter()
+            .any(|r| r.name != *name && expansion_signer(r).is_some())
+        && record_set_proven(
+            m,
+            m.answers.iter().filter(|r| r.name == *name),
+            name,
+            RecordType::CNAME,
+        )
 }
 
 /// The NSEC owned by `owner` has a secure signature, in the authority section, by `zone`.
@@ -2138,6 +2172,116 @@ mod depth_tests {
             .iter()
             .map(|(what, _, applies)| (*what, *applies))
             .collect();
+        assert_eq!(got, want);
+    }
+
+    /// REQ: DNS-011 (RFC 4035 §5.3.4; ADR-188) — a wildcard CNAME at the question name, for a
+    /// question of another type, is checked as the CNAME's own record set when no record of another
+    /// name in the answer is made from a wildcard: its verified signatures, and the zone's NSEC for
+    /// its next closer name. The rest of the chain are records of names that exist.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn dns_011_wildcard_cname_is_checked_as_its_own_record_set() {
+        use RecordType::{A, AAAA, CNAME as T_CNAME, NSEC as T_NSEC, RRSIG as T_RRSIG};
+        use hickory_net::proto::dnssec::Algorithm;
+        use hickory_net::proto::dnssec::rdata::{RRSIG, SigInput};
+        use hickory_net::proto::rr::SerialNumber;
+        use hickory_net::proto::rr::rdata::CNAME;
+        let n = |s: &str| Name::from_ascii(s).unwrap();
+        let secure = |name: &str, data: RData| {
+            let mut r = Record::from_rdata(n(name), 300, data);
+            r.proof = Proof::Secure;
+            r
+        };
+        let sig = |name: &str, covered: RecordType, labels: u8, signer: &str| {
+            let input = SigInput {
+                type_covered: covered,
+                algorithm: Algorithm::ED25519,
+                num_labels: labels,
+                original_ttl: 300,
+                sig_expiration: SerialNumber::new(2),
+                sig_inception: SerialNumber::new(1),
+                key_tag: 1,
+                signer_name: n(signer),
+            };
+            secure(
+                name,
+                RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::from_sig(input, vec![0]))),
+            )
+        };
+        let address = || RData::A(hickory_net::proto::rr::rdata::A::new(192, 0, 2, 1));
+        let nsec = |owner: &str, next: &str| {
+            let data = NSEC::new(n(next), [T_CNAME, T_RRSIG, T_NSEC]);
+            secure(owner, RData::DNSSEC(DNSSECRData::NSEC(data)))
+        };
+        // `m.z.test. CNAME t.z.test.` from `*.z.test.` (two labels), then `t.z.test. A`, with `k`'s
+        // NSEC up to `p`.
+        let good = || {
+            let mut msg = Message::response(0, OpCode::Query);
+            msg.answers = vec![
+                secure("m.z.test.", RData::CNAME(CNAME(n("t.z.test.")))),
+                sig("m.z.test.", T_CNAME, 2, "z.test."),
+                secure("t.z.test.", address()),
+                sig("t.z.test.", A, 3, "z.test."),
+            ];
+            msg.authorities = vec![
+                nsec("k.z.test.", "p.z.test."),
+                sig("k.z.test.", T_NSEC, 3, "z.test."),
+            ];
+            msg
+        };
+        let name = n("m.z.test.");
+        assert!(
+            !wildcard_proven(&good(), &name, A),
+            "not the question's one record set"
+        );
+        let checked = |what: &'static str, rtype: RecordType, change: &dyn Fn(&mut Message)| {
+            let mut msg = good();
+            change(&mut msg);
+            (what, wildcard_cname_proven(&msg, &name, rtype))
+        };
+        let got = [
+            checked("the CNAME with its proof", A, &|_| {}),
+            checked("for another type", AAAA, &|_| {}),
+            checked("a second signature that isn't verified", A, &|msg| {
+                let mut extra = sig("m.z.test.", T_CNAME, 1, "test.");
+                extra.proof = Proof::Indeterminate;
+                msg.answers.push(extra);
+            }),
+            checked("a question for the CNAME itself", T_CNAME, &|_| {}),
+            checked("the target made from a wildcard", A, &|msg| {
+                msg.answers[3] = sig("t.z.test.", A, 2, "z.test.");
+            }),
+            checked("no NSEC", A, &|msg| msg.authorities.clear()),
+            checked("the NSEC doesn't cover the next closer name", A, &|msg| {
+                msg.authorities[0] = nsec("k.z.test.", "l.z.test.");
+            }),
+            checked("another record at the name", A, &|msg| {
+                msg.answers.push(secure("m.z.test.", address()));
+            }),
+            checked("the CNAME isn't verified", A, &|msg| {
+                msg.answers[0].proof = Proof::Bogus;
+            }),
+            checked("its signature isn't verified", A, &|msg| {
+                msg.answers[1].proof = Proof::Indeterminate;
+            }),
+            checked("not a wildcard's CNAME", A, &|msg| {
+                msg.answers[1] = sig("m.z.test.", T_CNAME, 3, "z.test.");
+            }),
+        ];
+        let want = [
+            ("the CNAME with its proof", true),
+            ("for another type", true),
+            ("a second signature that isn't verified", true),
+            ("a question for the CNAME itself", false),
+            ("the target made from a wildcard", false),
+            ("no NSEC", false),
+            ("the NSEC doesn't cover the next closer name", false),
+            ("another record at the name", false),
+            ("the CNAME isn't verified", false),
+            ("its signature isn't verified", false),
+            ("not a wildcard's CNAME", false),
+        ];
         assert_eq!(got, want);
     }
 
