@@ -279,6 +279,9 @@ mod tampering {
     /// `alias.s.t. NSEC` is answered as if the CNAME were followed: the CNAME, and the target's
     /// NSEC in the authority section.
     pub(super) const CNAME_FOR_NSEC: usize = 9;
+    /// `a.own.w.s.t. A` is answered from `*.w.s.t.`, with the NSEC that covers the name (the one of
+    /// `own.w.s.t.`, the name between them).
+    pub(super) const REPLAY_WILDCARD_BELOW_NAME: usize = 10;
 }
 
 /// `name`'s NSEC3 hash with `t.`'s parameters.
@@ -716,8 +719,20 @@ fn child_link(z: &Tld, m: &mut Message, qn: &Name, qt: RecordType, tamper: usize
         }
         return None;
     }
-    // A wildcard one label up (unless the name exists as an empty non-terminal).
-    let wildcard = qn.base_name().prepend_label("*").unwrap();
+    // The wildcard at the closest encloser, the nearest name above that exists (RFC 4592 §3.3.1),
+    // unless the name exists as an empty non-terminal.
+    let mut encloser = qn.base_name();
+    while encloser != apex && !z.child.keys().any(|(o, _)| encloser.zone_of(o)) {
+        encloser = encloser.base_name();
+    }
+    let below_name = tamper == tampering::REPLAY_WILDCARD_BELOW_NAME
+        && *qn == n("a.own.w.s.t.")
+        && qt == RecordType::A;
+    let wildcard = if below_name {
+        n("*.w.s.t.")
+    } else {
+        encloser.prepend_label("*").unwrap()
+    };
     let at_ent = tamper == tampering::REPLAY_WILDCARD_AT_ENT
         && *qn == n("ent.w.s.t.")
         && qt == RecordType::A;
@@ -1865,6 +1880,81 @@ async fn dns_011_offline_wildcard_replayed_at_an_empty_non_terminal_stays_bogus(
             (r.verdict, r.ede),
             (Verdict::Bogus, telltale_proto::ede::DNSSEC_BOGUS),
             "the wildcard's address at an empty non-terminal (question {round})"
+        );
+    }
+    assert_eq!(stats.secure.load(Ordering::Relaxed), secure);
+    assert_eq!(stats.insecure.load(Ordering::Relaxed), 0);
+}
+
+/// REQ: DNS-011 (RFC 4035 §5.3.4, RFC 4592; ADR-188) — wildcard answers with the zone's NSEC
+/// showing that the next closer name doesn't exist are secure, with AD: one label below the
+/// wildcard's parent (`any.w.s.t.`), two labels below it where the name between doesn't exist
+/// (`a.b.w.s.t.`), and a wildcard's CNAME two labels below it (`a.b.c.s.t.`, to `www.s.t.`).
+#[tokio::test]
+async fn dns_011_offline_wildcard_answers_with_their_proof_are_secure() {
+    use RecordType::{A, CNAME};
+    let (v, g, _, stats, _dir) = setup(true).await;
+    warm_tld(&v, &g).await;
+    for (name, owners) in [
+        ("any.w.s.t", vec![("any.w.s.t.", A)]),
+        ("a.b.w.s.t", vec![("a.b.w.s.t.", A)]),
+        ("a.b.c.s.t", vec![("a.b.c.s.t.", CNAME), ("www.s.t.", A)]),
+    ] {
+        let r = v
+            .resolve(
+                &g,
+                question(name, rtype::A),
+                Duration::from_secs(5),
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.verdict, Verdict::Secure, "{name} A");
+        assert_eq!(rcode(&r.bytes), telltale_proto::rcode::NOERROR, "{name} A");
+        let owners: Vec<(String, RecordType)> =
+            owners.into_iter().map(|(o, t)| (o.to_owned(), t)).collect();
+        assert_eq!(answered(&r.bytes), owners, "{name} A");
+        assert!(
+            telltale_proto::Header::parse(&r.bytes).unwrap().flags.ad(),
+            "AD: {name} A"
+        );
+    }
+    assert_eq!(stats.bogus.load(Ordering::Relaxed), 0);
+}
+
+/// REQ: DNS-011 (RFC 4035 §5.3.4; ADR-188) — a wildcard's answer is authenticated only with an NSEC
+/// showing that the next closer name doesn't exist (the name cut to one label below the wildcard's
+/// parent). `a.own.w.s.t. A` answered from `*.w.s.t.` with the NSEC of `own.w.s.t.`, a name that
+/// exists between them, is bogus; answered as the zone answers it, it is a secure NXDOMAIN.
+#[tokio::test]
+async fn dns_011_offline_wildcard_answer_needs_its_next_closer_name_to_be_absent() {
+    let budget = Duration::from_secs(5);
+    let z = Arc::new(zone());
+    let (v, g, _, _, _dir) = setup_zone(true, Arc::clone(&z)).await;
+    let r = v
+        .resolve(&g, question("a.own.w.s.t", rtype::A), budget, true, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        (r.verdict, rcode(&r.bytes)),
+        (Verdict::Secure, telltale_proto::rcode::NXDOMAIN),
+        "a.own.w.s.t. A, as the zone answers it"
+    );
+    z.tld
+        .tamper
+        .store(tampering::REPLAY_WILDCARD_BELOW_NAME, Ordering::Relaxed);
+    let (v, g, _, stats, _dir) = setup_zone(true, Arc::clone(&z)).await;
+    warm_tld(&v, &g).await;
+    let secure = stats.secure.load(Ordering::Relaxed);
+    for round in 1..=2 {
+        let r = v
+            .resolve(&g, question("a.own.w.s.t", rtype::A), budget, true, false)
+            .await;
+        assert_eq!(
+            r.map(|r| (r.verdict, r.ede)).ok(),
+            Some((Verdict::Bogus, telltale_proto::ede::DNSSEC_BOGUS)),
+            "a.own.w.s.t. A from *.w.s.t. (question {round})"
         );
     }
     assert_eq!(stats.secure.load(Ordering::Relaxed), secure);

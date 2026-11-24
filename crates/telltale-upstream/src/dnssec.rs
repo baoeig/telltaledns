@@ -1064,8 +1064,10 @@ fn starts_with_cname(m: &Message, name: &Name) -> bool {
         .any(|r| r.record_type() == RecordType::CNAME && r.name == *name)
 }
 
-/// REQ: DNS-011 — what the validator returned, with a wildcard's answer it refused put right
-/// ([`wildcard_proven`]).
+/// REQ: DNS-011 (RFC 4035 §5.3.4, ADR-188) — what the validator returned, with a wildcard's
+/// answer in a zone signed with NSEC judged by the rule itself ([`wildcard_proven`]): a refused
+/// one that it proves is accepted, and an accepted one that it doesn't prove is bogus (its
+/// records' proofs say so, so it is handled as any bogus answer).
 fn or_wildcard(
     r: Result<DnsResponse, NetError>,
     name: &Name,
@@ -1078,8 +1080,31 @@ fn or_wildcard(
             tracing::debug!(name = %zone_key(name), "DNSSEC: wildcard expansion proven");
             Ok(*response)
         }
+        Ok(mut response)
+            if nsec_wildcard_answer(&response) && !wildcard_proven(&response, name, rtype) =>
+        {
+            tracing::debug!(name = %zone_key(name), "DNSSEC: wildcard expansion without its proof");
+            for record in &mut response.answers {
+                record.proof = Proof::Bogus;
+            }
+            Ok(response)
+        }
         r => r,
     }
+}
+
+/// REQ: DNS-011 (RFC 4035 §5.3.4, ADR-188) — `m` answers from a wildcard (a secure signature
+/// covering fewer labels than its owner has) in a zone signed with NSEC: there is no NSEC3 record
+/// beside it (those the library checks itself, RFC 5155 §8.8).
+fn nsec_wildcard_answer(m: &Message) -> bool {
+    m.answers.iter().any(|r| {
+        r.proof == Proof::Secure
+            && matches!(&r.data, RData::DNSSEC(DNSSECRData::RRSIG(s))
+                if s.input().num_labels < r.name.num_labels())
+    }) && !m
+        .authorities
+        .iter()
+        .any(|r| r.record_type() == RecordType::NSEC3)
 }
 
 /// REQ: DNS-011 (RFC 4035 §5.3.4) — a wildcard's answer is authenticated by its signature and
