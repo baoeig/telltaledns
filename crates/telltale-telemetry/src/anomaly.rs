@@ -585,8 +585,10 @@ impl Client {
                 baseline: f64::from(total),
                 spread: 0.0,
                 threshold: f64::from(s.nxdomain_per_minute),
+                // In a sweep minute the total leaves the sweep's lookups out, and says so.
                 detail: format!(
-                    "{nx} NXDOMAIN answers in a minute ({pct}% of {total} queries), e.g. {}",
+                    "{nx} NXDOMAIN answers in a minute ({pct}% of {total} queries{}), e.g. {}",
+                    if sweep { " besides a sweep's" } else { "" },
                     samples.join(", ")
                 ),
             });

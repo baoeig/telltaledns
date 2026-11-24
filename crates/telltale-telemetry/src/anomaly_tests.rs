@@ -782,11 +782,16 @@ fn obs_009_a_storm_of_other_names_is_still_a_storm() {
         "{}",
         f.detail
     );
+    assert!(
+        f.detail.contains("(80% of 50 queries), e.g."),
+        "no sweep, nothing left out: {}",
+        f.detail
+    );
 }
 
 /// REQ: OBS-009 (ADR-186) — a storm can't hide in a sweep: in a sweep minute the sweep's lookups
-/// leave both of the storm's numbers, so the storm is judged on its own (40 of 50) and the sweep
-/// is reported beside it.
+/// leave both of the storm's numbers, so the storm is judged on its own (40 of 50, "besides a
+/// sweep's" in its detail) and the sweep is reported beside it.
 #[test]
 fn obs_009_a_storm_padded_with_a_private_reverse_sweep_is_still_a_storm() {
     let mut e = Engine::new(Settings::default());
@@ -805,6 +810,13 @@ fn obs_009_a_storm_padded_with_a_private_reverse_sweep_is_still_a_storm() {
     assert!(
         storm.detail.contains("q0.bad.example") && !storm.detail.contains("in-addr.arpa"),
         "the storm's samples are its own names: {}",
+        storm.detail
+    );
+    assert!(
+        storm
+            .detail
+            .contains("(80% of 50 queries besides a sweep's)"),
+        "the storm's total says it leaves the sweep out: {}",
         storm.detail
     );
     let sweep = first(&e, "reverse_sweep");
