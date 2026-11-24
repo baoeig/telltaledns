@@ -1677,6 +1677,52 @@ test('clu_008 cluster topology', async () => {
   await page.unroute('**/api/v1/cluster/versions');
 });
 
+// REQ: CLU-002, CLU-008 (ADR-056) — a witness only votes: up, it isn't drawn as not ready or
+// behind, and its row says so; a replica in the same state, or a witness that's down, still is.
+test('clu_002 a healthy witness is not shown as a fault', async () => {
+  const node = (o: Record<string, unknown>) => ({
+    ephemeral: false, witness: false, protocol: 4, role: 'replica', thisNode: false, eligible: true, version: '0.1.0',
+    up: true, connected: true, link: 'inbound', lastSeenSecondsAgo: 1, rttMs: 3, configSeq: 12, configLag: 0, ready: true,
+    qps: 10, servfailPercent: 0, upstreamP90Ms: 12, uptimeSeconds: 3600, restarts: 0, cacheEntries: null,
+    cacheHitPercent: null, querySharePercent: 50, ...o,
+  });
+  // What a healthy witness reports: version 0, never ready, no uptime.
+  const votes = { eligible: false, configSeq: 0, configLag: 12, behindSeconds: 86400, ready: false, qps: 0, uptimeSeconds: 0, querySharePercent: 0 };
+  const view = (o: Record<string, unknown>) => ({
+    enabled: true, clusterId: 'c1', name: 'home', thisNode: 'id-pi', newestConfigSeq: 12, healthy: true, checks: [],
+    events: [], conflicts: [], authority: 'primary',
+    nodes: [
+      node({ nodeId: 'id-pi', site: 'home', role: 'primary', thisNode: true, link: 'self', rttMs: null }),
+      node({ nodeId: 'id-attic', site: 'attic', ...votes, ...o }),
+    ],
+  });
+  let current = view({ witness: true });
+  await page.route('**/api/v1/cluster', (route) => route.fulfill({ json: current }));
+  await page.route('**/api/v1/cluster/rollout', (route) => route.fulfill({ json: { fromPrimary: true, canaries: [], bakeSecs: 300, stable: '1.12', stage: 'none', nodes: [] } }));
+  await page.route('**/api/v1/cluster/versions', (route) => route.fulfill({ json: { items: [], history: 20 } }));
+  await page.goto('/#/cluster');
+  const topo = page.getByTestId('cluster-topology');
+  const chip = topo.getByRole('button', { name: /id-attic/ });
+  const row = page.locator('#node-id-attic');
+  await expect(chip).toHaveAttribute('aria-label', /up, votes only/);
+  await expect(chip).not.toHaveAttribute('aria-label', /behind|not ready/);
+  await expect(topo.locator('.chip.warn, path.link.warn')).toHaveCount(0);
+  await expect(row).toContainText('votes only');
+  await expect(row).not.toContainText(/behind|not ready/);
+  // A replica in the same state is behind and not ready.
+  current = view({ witness: false });
+  await expect(row).toContainText('not ready', { timeout: 10_000 });
+  await expect(row).toContainText('12 behind');
+  await expect(topo.locator('.chip.warn')).toHaveCount(1);
+  // A witness that's down is red.
+  current = view({ witness: true, up: false, connected: false });
+  await expect(topo.locator('path.link.bad')).toHaveCount(1, { timeout: 10_000 });
+  await expect(row).toContainText('down');
+  await page.unroute('**/api/v1/cluster');
+  await page.unroute('**/api/v1/cluster/rollout');
+  await page.unroute('**/api/v1/cluster/versions');
+});
+
 // REQ: DNS-006, API-005 (T6.13) — the cache: a cached answer shows up in a lookup (the UI
 // card and the API), a flush removes it and says how many, and viewers can look but not flush.
 test('dns_006 cache lookup and flush', async () => {
