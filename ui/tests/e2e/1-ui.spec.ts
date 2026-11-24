@@ -1700,6 +1700,9 @@ test('clu_008 a healthy witness is not shown as a fault', async () => {
   await page.route('**/api/v1/cluster', (route) => route.fulfill({ json: current }));
   await page.route('**/api/v1/cluster/rollout', (route) => route.fulfill({ json: { fromPrimary: true, canaries: [], bakeSecs: 300, stable: '1.12', stage: 'none', nodes: [] } }));
   await page.route('**/api/v1/cluster/versions', (route) => route.fulfill({ json: { items: [], history: 20 } }));
+  // The test before ends on the Cluster page, and a hash change to the page already shown doesn't
+  // open it again (its next read is up to 5 s away): open another page first, so it reads at once.
+  await page.goto('/#/');
   await page.goto('/#/cluster');
   const topo = page.getByTestId('cluster-topology');
   const chip = topo.getByRole('button', { name: /id-attic/ });
