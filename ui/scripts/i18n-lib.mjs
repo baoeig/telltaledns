@@ -120,15 +120,43 @@ export function masked(s) {
   const m = s.replace(PLACEHOLDER, '{}').replace(SPACE, ' ').trim();
   return m.replace(/\{\}/g, '').trim() === '' ? null : m;
 }
-/** The values a variable `name` is declared with in a source file (any scope). */
-function declaredWith(sf, name) {
-  const out = [];
-  const walk = (n) => {
-    if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.name.text === name && n.initializer) out.push(n.initializer);
-    ts.forEachChild(n, walk);
+/** The value the variable an identifier names is declared with: its nearest declaration in the
+ * scopes around it (the block, the function and its parameters, a loop, a catch clause, the file).
+ * A parameter, an import, a function or a destructured name declares no value here. */
+function declaredWith(id) {
+  const name = id.text;
+  const binds = (b) =>
+    ts.isIdentifier(b) ? b.text === name : (ts.isObjectBindingPattern(b) || ts.isArrayBindingPattern(b)) && b.elements.some((el) => !ts.isOmittedExpression(el) && binds(el.name));
+  const inList = (list) => {
+    for (const d of list.declarations) if (binds(d.name)) return ts.isIdentifier(d.name) && d.initializer ? [d.initializer] : [];
+    return null;
   };
-  walk(sf);
-  return out;
+  const imports = (s) => {
+    const cl = s.importClause;
+    if (!cl) return false;
+    if (cl.name?.text === name) return true;
+    const nb = cl.namedBindings;
+    return !!nb && (ts.isNamespaceImport(nb) ? nb.name.text === name : nb.elements.some((el) => el.name.text === name));
+  };
+  const inStatements = (statements) => {
+    for (const s of statements) {
+      if (ts.isVariableStatement(s)) {
+        const r = inList(s.declarationList);
+        if (r) return r;
+      } else if ((ts.isFunctionDeclaration(s) || ts.isClassDeclaration(s) || ts.isEnumDeclaration(s)) && s.name?.text === name) return [];
+      else if (ts.isImportDeclaration(s) && imports(s)) return [];
+    }
+    return null;
+  };
+  for (let p = id.parent; p; p = p.parent) {
+    let r = null;
+    if (ts.isBlock(p) || ts.isSourceFile(p) || ts.isModuleBlock(p) || ts.isCaseClause(p) || ts.isDefaultClause(p)) r = inStatements(p.statements);
+    else if (ts.isFunctionLike(p) && (p.parameters.some((x) => binds(x.name)) || (!ts.isFunctionDeclaration(p) && p.name && ts.isIdentifier(p.name) && p.name.text === name))) r = [];
+    else if ((ts.isForStatement(p) || ts.isForOfStatement(p) || ts.isForInStatement(p)) && p.initializer && ts.isVariableDeclarationList(p.initializer)) r = inList(p.initializer);
+    else if (ts.isCatchClause(p) && p.variableDeclaration && binds(p.variableDeclaration.name)) r = [];
+    if (r) return r;
+  }
+  return [];
 }
 const LETTER = /\p{L}/u;
 const TWO_WORDS = /\p{L}+\s+\p{L}+/u;
@@ -316,15 +344,15 @@ export function analyzeFile(rel, text, context) {
               fail('plural-forms', at(n), `tn()'s two English forms name different placeholders (${JSON.stringify(ph(lits[0].text))} and ${JSON.stringify(ph(lits[1].text))})`);
           } else {
             // tk() shows a message m() marked; an object made in place would escape extraction: in
-            // the call, in either branch of a condition, or as the value a variable of this file
-            // is declared with.
+            // the call, in either branch of a condition, or as the value the variable it names is
+            // declared with (in the scope it is read from).
             const objectLike = (e, depth = 0) => {
               while (e && (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isSatisfiesExpression?.(e) || ts.isTypeAssertionExpression?.(e) || ts.isNonNullExpression(e))) e = e.expression;
               if (!e || depth > 3) return false;
               if (ts.isObjectLiteralExpression(e)) return true;
               if (ts.isConditionalExpression(e)) return objectLike(e.whenTrue, depth + 1) || objectLike(e.whenFalse, depth + 1);
               if (ts.isBinaryExpression(e) && [ts.SyntaxKind.BarBarToken, ts.SyntaxKind.QuestionQuestionToken, ts.SyntaxKind.AmpersandAmpersandToken].includes(e.operatorToken.kind)) return objectLike(e.left, depth + 1) || objectLike(e.right, depth + 1);
-              if (ts.isIdentifier(e)) return declaredWith(unit.sf, e.text).some((v) => objectLike(v, depth + 1));
+              if (ts.isIdentifier(e)) return declaredWith(e).some((v) => objectLike(v, depth + 1));
               return false;
             };
             if (objectLike(args[0])) fail('non-literal', at(n), 'tk() shows a message marked with m(), never an object literal');

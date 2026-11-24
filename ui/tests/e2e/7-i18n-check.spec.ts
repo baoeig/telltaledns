@@ -364,6 +364,16 @@ test('api_012 the check sees each mistake it is for', () => {
   expect(r.shipped.qaa.json).not.toContain('Qa-item-sigma');
 });
 
+test('api_012 the tk() lint reads a name where it is declared', () => {
+  const scoped = (body: string) => run(project((d) => edit(d, 'src/lib/labels.ts', (s) => `${s}\n${body}`)));
+  // A parameter named like another function's object literal is not that object.
+  expect(failRules(scoped("export function show(label: typeof LISTS): string {\n  return tk(label);\n}\n\nexport function other(): object {\n  const label = { c: 'labels', e: 'x' };\n  return label;\n}\n"))).toEqual([]);
+  // Nor is a variable of an inner block the call cannot see.
+  expect(failRules(scoped("export function a(): string {\n  const label = LISTS;\n  {\n    const label = { c: 'labels', e: 'x' };\n    void label;\n  }\n  return tk(label);\n}\n"))).toEqual([]);
+  // The nearest declaration counts: an object literal that shadows a module's label still fails.
+  expect(failRules(scoped("export function b(): string {\n  const label = { c: 'labels', e: 'x' } as never;\n  return tk(label);\n}\nconst label = LISTS;\nvoid label;\n"))).toEqual(['non-literal']);
+});
+
 test('api_012 the shipping step reports structured findings', () => {
   // What the check reports for a locale is built from findings with the token and its place.
   const dir = project((d) => edit(d, 'src/locales/qaa.json', (s) => s.replace('Qa-read https://example.com/docs.', 'Qa-read https://evil.example/docs.')));
