@@ -754,7 +754,7 @@ impl Validator {
         budget: Duration,
         deadline: std::time::Instant,
     ) -> Option<(Verdict, Message)> {
-        // A type and a space first: never the key of an unsigned-zone proof.
+        // One entry per question, its type and name, in this gate's own memory of failures.
         let key = format!("{} {}", q.qtype, zone_key(name));
         // No slot, or it failed within the last minute: not proven.
         let _slot = self.links.enter(&key)?;
