@@ -2502,6 +2502,55 @@ async fn dns_011_offline_wildcard_cname_chain_that_stops_short_is_validated_link
     );
 }
 
+/// REQ: DNS-011 (RFC 4035 §5.3.4, §5.4; ADR-188) — a NODATA behind a wildcard CNAME at the question
+/// name, two labels below the wildcard's parent, is validated link by link: `a.b.c.s.t. AAAA` (from
+/// `*.c.s.t.`, to `www.s.t.`, which has no AAAA) is a secure NODATA with AD, the CNAME in the answer
+/// and `www.s.t.`'s NSEC in the authority section. With every slot of link-by-link validation taken,
+/// it stays bogus (EDE 6).
+#[tokio::test]
+async fn dns_011_offline_nodata_behind_a_wildcard_cname_is_checked_through_the_walk() {
+    let budget = Duration::from_secs(5);
+    let (v, g, _, _, _dir) = setup(true).await;
+    warm_tld(&v, &g).await;
+    let r = v
+        .resolve(&g, question("a.b.c.s.t", rtype::AAAA), budget, true, false)
+        .await;
+    let walked = r.ok().map(|r| {
+        let denial = Message::from_vec(&r.bytes).is_ok_and(|msg| {
+            msg.authorities
+                .iter()
+                .any(|rec| rec.name == n("www.s.t.") && rec.record_type() == RecordType::NSEC)
+        });
+        (r.verdict, served(&r.bytes), denial)
+    });
+    let (v, g, _, stats, _dir) = setup(true).await;
+    warm_tld(&v, &g).await;
+    let secure = stats.secure.load(Ordering::Relaxed);
+    let held = v.hold_link_slots(0);
+    assert!(!held.is_empty(), "link-by-link slots held");
+    let r = v
+        .resolve(&g, question("a.b.c.s.t", rtype::AAAA), budget, true, false)
+        .await;
+    drop(held);
+    let without_a_walk = (
+        r.map(|r| (r.verdict, r.ede)).ok(),
+        stats.secure.load(Ordering::Relaxed) - secure,
+    );
+    let records = vec![("a.b.c.s.t.".to_owned(), RecordType::CNAME)];
+    assert_eq!(
+        (walked, without_a_walk),
+        (
+            Some((
+                Verdict::Secure,
+                Some((telltale_proto::rcode::NOERROR, true, records)),
+                true
+            )),
+            (Some((Verdict::Bogus, telltale_proto::ede::DNSSEC_BOGUS)), 0),
+        ),
+        "a.b.c.s.t. AAAA, a NODATA behind the wildcard CNAME"
+    );
+}
+
 /// REQ: DNS-011 (ADR-184) — a zone proven unsigned is remembered per upstream group, and no
 /// longer than the TTL of the records that proved it (15 minutes at most): through the group
 /// that proved it a later question isn't validated again (no bytes: the pipeline fetches it),
