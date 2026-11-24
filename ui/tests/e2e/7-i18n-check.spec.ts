@@ -196,6 +196,9 @@ const random = (n: number, seed: number) => {
 };
 const LONG = "<script lang=\"ts\">\n  import { tr } from '../lib/i18n';\n  const { t } = tr('long');\n</script>\n\n<p>{t('Long')}</p>\n";
 const holds = (d: string, tx: string) => qaa(d, (c) => ((c.cache as [string, string][]).find((p) => p[0] === 'Holds')![1] = tx));
+/** Gives a language plural rules in the fixture's table, so a manifest case trips only its own rule. */
+const withPlurals = (d: string, lang: string, cats: string[]) =>
+  put(d, 'src/locales/plurals.json', lib.serializeJson({ ...JSON.parse(readFileSync(join(d, 'src/locales/plurals.json'), 'utf8')), [lang]: cats }));
 
 /** One recorded change per FAIL rule of ADR-189's check, each on its own copy of the fixture; for
  * the agreement rule, also the check inside it that must fail. */
@@ -229,6 +232,7 @@ const MISTAKES: [string, string, (d: string) => void, string?][] = [
     (d) => {
       manifest(d, (m) => (m.zh = { dir: 'ltr', offered: false, owners: ['example-owner'], since: '0.9.0' }));
       put(d, 'src/locales/zh.json', '{\n}\n');
+      withPlurals(d, 'zh', ['other']);
     },
   ],
   [
@@ -237,6 +241,7 @@ const MISTAKES: [string, string, (d: string) => void, string?][] = [
     (d) => {
       manifest(d, (m) => (m['en-GB'] = { ...m.qaa }));
       put(d, 'src/locales/en-GB.json', '{\n}\n');
+      withPlurals(d, 'en', ['one', 'other']);
     },
   ],
   ['a data file missing', 'manifest', (d) => rmSync(join(d, 'src/locales/glossary.json'))],
