@@ -1931,7 +1931,7 @@ REQ: FLT-006, FLT-005, API-010, CLU-002, CLU-010, OBS-005, AGT-004. Implemented 
   - An older node lists a newer node's finding under the raw kind (the API carries kinds as strings), and an older primary alerts on it.
   - During a rollout one sweep can show twice, as `nxdomain_storm` from an older node and `reverse_sweep` from a newer one (the kind is part of the finding ID).
   - **A shared mute naming `reverse_sweep`:**
-    - It makes an older replica refuse each new version (CLU-010: it keeps serving its last one and says to upgrade).
+    - It makes an older replica refuse each new version (CLU-010). The replica keeps serving the last version it took, so DNS is unaffected (CLU-004). Until it is upgraded it logs `cluster configuration not applied (will retry)` with `unknown variant reverse_sweep` every 2 s, and its `sync_errors` check and `telltale_cluster_sync_error` show the same. It doesn't say "upgrade this node": that message is only for a newer `SCHEMA` or an unknown section, and this is a new value inside a known one.
     - An older build won't start with it in its own file.
     - So name it only once every node runs this version (as with `[clients] router_macs`, ADR-183).
     - Nothing writes the value unless a mute names it. `SCHEMA` and `PROTOCOL` are unchanged.
