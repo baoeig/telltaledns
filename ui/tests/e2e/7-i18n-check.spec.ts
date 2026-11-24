@@ -143,7 +143,7 @@ test('api_012 missing and outdated translations are reported not failed', () => 
   expect(Object.values(shipped)).not.toContain('Qa-holds-zeta');
   expect(shipped[hash('common', 'Save')]).toBe('Qa-save-omega');
   expect(shipped[hash('cache', ['{n} answer', '{n} answers'])]).toEqual({ other: '{n} qa-answers' });
-  expect(r.findings.find((f) => f.rule === 'coverage')?.msg).toMatch(/^qaa: 7 of 9 messages .*owners: example-owner$/);
+  expect(r.findings.find((f) => f.rule === 'coverage')?.msg).toMatch(/^"qaa": 7 of 9 messages .*owners: example-owner$/);
   // An empty translation is "not translated yet": missing, not a failure.
   const empty = run(project((d) => qaa(d, (c) => (c.common = [['Save', '']]))));
   expect(failRules(empty)).toEqual([]);
@@ -215,6 +215,7 @@ const MISTAKES: [string, string, (d: string) => void, string?][] = [
   ['a t() result compared', 'misuse', (d) => edit(d, 'src/pages/Cache.svelte', (s) => s.replace('</script>', "  const same = t('Holds') === 'x';\n</script>"))],
   ['a t() result as a Map key', 'misuse', (d) => edit(d, 'src/pages/Cache.svelte', (s) => s.replace('</script>', "  new Map().set(t('Holds'), 1);\n</script>"))],
   ['a t() result stored', 'misuse', (d) => edit(d, 'src/pages/Cache.svelte', (s) => s.replace('</script>', "  localStorage.setItem('k', t('Holds'));\n</script>"))],
+  ['tk() given an object literal', 'non-literal', (d) => edit(d, 'src/lib/labels.ts', (s) => `${s}\nexport function raw(e: string): string {\n  return tk({ c: 'labels', e });\n}\n`)],
   ['a manifest with parent', 'manifest', (d) => manifest(d, (m) => (m.qaa.parent = 'en'))],
   ['a manifest with regions', 'manifest', (d) => manifest(d, (m) => (m.qaa.regions = ['419']))],
   ['a manifest entry without owners', 'manifest', (d) => manifest(d, (m) => (m.qaa.owners = []))],
@@ -227,8 +228,17 @@ const MISTAKES: [string, string, (d: string) => void, string?][] = [
       put(d, 'src/locales/zh.json', '{\n}\n');
     },
   ],
+  [
+    'a regional English catalog',
+    'manifest',
+    (d) => {
+      manifest(d, (m) => (m['en-GB'] = { ...m.qaa }));
+      put(d, 'src/locales/en-GB.json', '{\n}\n');
+    },
+  ],
   ['a data file missing', 'manifest', (d) => rmSync(join(d, 'src/locales/glossary.json'))],
   ['a stray file in locales/', 'stray', (d) => put(d, 'src/locales/README.md', 'notes\n')],
+  ['a locale context that is not a context name', 'context', (d) => qaa(d, (c) => (c['Bad\n::error title=x::boom'] = [['Holds', 'Qa']]))],
   ['a hash collision', 'hash-collision', (d) => edit(d, 'src/pages/Cache.svelte', (s) => `${s}<p>{t('Item wfpmrfbz')}{t('Item xygculea')}</p>\n`)],
   ['a non-canonical locale file', 'canonical', (d) => edit(d, 'src/locales/qaa.json', (s) => s.replace('["Holds","Qa-holds-zeta"]', '["Holds", "Qa-holds-zeta"]'))],
   ['a malformed pair', 'malformed', (d) => qaa(d, (c) => c.cache.push(['Lone']))],
@@ -315,6 +325,14 @@ test('api_012 the job summary prints no catalog value outside a fence', () => {
   const values = Object.values(cat).flatMap((pairs) => pairs.flatMap(([e, tx]) => [e, tx].flatMap((v) => (typeof v === 'string' ? [v] : Object.values(v as object)))));
   expect(values).toContain(evil);
   for (const v of values as string[]) for (const piece of [v, ...v.split(/\s+/).filter((w) => w.length >= 5)]) expect(outside, piece).not.toContain(piece);
+});
+
+test('api_012 the console report prints no line a file controls', () => {
+  const r = run(project((d) => qaa(d, (c) => (c['x\n::error title=t::boom'] = [['Holds', 'Qa']]))));
+  expect(failRules(r)).toEqual(['context']);
+  const out: string = lib.formatReport(r);
+  expect(out.split('\n').filter((l) => /^\s*::/.test(l))).toEqual([]);
+  expect(out).toContain('"x\\n::error title=t::boom" is not a context name');
 });
 
 test('api_012 prebuild writes the shipped catalogs and the url table', () => {

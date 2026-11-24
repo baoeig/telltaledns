@@ -279,7 +279,7 @@ export function analyzeFile(rel, text, context) {
           out.usesLayer = true;
           const a = n.arguments[0];
           if (!isLit(a)) fail('non-literal', at(n), 'the context of tr() must be a string literal');
-          else if (isFormat ? a.text !== 'format' : !allowed(a.text)) fail('context', at(n), `context "${a.text}": a file uses its own context ("${context}") or "common"`);
+          else if (isFormat ? a.text !== 'format' : !allowed(a.text)) fail('context', at(n), `context ${JSON.stringify(a.text)}: a file uses its own context (${JSON.stringify(context)}) or "common"`);
         }
         const mc = messageCall(n);
         if (mc) {
@@ -301,6 +301,11 @@ export function analyzeFile(rel, text, context) {
             const ph = (s) => [...new Set(s.match(PLACEHOLDER) ?? [])].sort().join(' ');
             if (mc.fn === 'tn' && lits.length === 2 && lits.every(isLit) && ph(lits[0].text) !== ph(lits[1].text))
               fail('plural-forms', at(n), `tn()'s two English forms name different placeholders (${JSON.stringify(ph(lits[0].text))} and ${JSON.stringify(ph(lits[1].text))})`);
+          } else {
+            // tk() shows a message m() marked; an object made in place would escape extraction.
+            let a0 = args[0];
+            while (a0 && (ts.isParenthesizedExpression(a0) || ts.isAsExpression(a0) || ts.isSatisfiesExpression?.(a0))) a0 = a0.expression;
+            if (a0 && ts.isObjectLiteralExpression(a0)) fail('non-literal', at(n), 'tk() shows a message marked with m(), never an object literal');
           }
           if (mc.fn !== 'm') {
             if (unit.module && !inFunction(n)) fail('top-level', at(n), `${mc.fn}() at the top level of a module runs before the language is loaded: call it where the text is shown, or mark it with m()`);
@@ -555,8 +560,9 @@ function canonicalTagError(tag) {
   if (c !== tag) return `not canonical (write "${c}")`;
   const loc = new Intl.Locale(tag);
   if (!/^[a-z]{2,3}(-[A-Z][a-z]{3})?(-(?:[A-Z]{2}|\d{3}))?$/.test(tag)) return 'a catalog tag is language[-Script][-REGION]';
-  if (loc.language === 'en' && !loc.script && !loc.region) return 'English is built in';
-  if (tag === 'en-XA') return 'the pseudo-locale is computed from English, not a catalog';
+  // Every English request is answered in English (and en-XA is computed from it): an English
+  // catalog would never be chosen.
+  if (loc.language === 'en') return 'English is built in: no catalog of English';
   if (MULTI_SCRIPT.includes(loc.language) && !loc.script) return `"${loc.language}" is written in more than one script: name it (for example "${loc.language}-${new Intl.Locale(loc.language).maximize().script}")`;
   return null;
 }
@@ -608,24 +614,24 @@ function loadData(root, findings) {
   for (const [tag, e] of Object.entries(data.manifest)) {
     const where = rel('manifest.json');
     const err = canonicalTagError(tag);
-    if (err) failAt(where, 'manifest', `${tag}: ${err}`);
+    if (err) failAt(where, 'manifest', `${JSON.stringify(tag)}: ${err}`);
     if (!e || typeof e !== 'object' || Array.isArray(e)) {
-      failAt(where, 'manifest', `${tag}: an entry is an object`);
+      failAt(where, 'manifest', `${JSON.stringify(tag)}: an entry is an object`);
       continue;
     }
     for (const k of Object.keys(e)) {
-      if (RESERVED_MANIFEST_FIELDS.includes(k)) failAt(where, 'manifest', `${tag}: "${k}" is reserved: regional overlays are not built yet, so a regional language is a full catalog`);
-      else if (!MANIFEST_FIELDS.includes(k)) failAt(where, 'manifest', `${tag}: unknown field "${k}"`);
+      if (RESERVED_MANIFEST_FIELDS.includes(k)) failAt(where, 'manifest', `${JSON.stringify(tag)}: "${k}" is reserved: regional overlays are not built yet, so a regional language is a full catalog`);
+      else if (!MANIFEST_FIELDS.includes(k)) failAt(where, 'manifest', `${JSON.stringify(tag)}: unknown field "${k}"`);
     }
-    if (!Array.isArray(e.owners) || !e.owners.length || !e.owners.every((o) => typeof o === 'string' && LOGIN.test(o))) failAt(where, 'manifest', `${tag}: "owners" lists the GitHub logins (plain, without an at-sign) of the people who answer for it`);
-    if (e.dir !== 'ltr' && e.dir !== 'rtl') failAt(where, 'manifest', `${tag}: "dir" is "ltr" or "rtl"`);
-    if (typeof e.offered !== 'boolean') failAt(where, 'manifest', `${tag}: "offered" is true or false`);
-    if (e.dir === 'rtl' && e.offered === true) failAt(where, 'manifest', `${tag}: a right-to-left language is not offered before the right-to-left layout exists`);
-    if (typeof e.since !== 'string' || !VERSION.test(e.since)) failAt(where, 'manifest', `${tag}: "since" is a release version (x.y.z)`);
-    if (e.belowSince !== undefined && (typeof e.belowSince !== 'string' || !VERSION.test(e.belowSince))) failAt(where, 'manifest', `${tag}: "belowSince" is a release version`);
-    if (!Object.hasOwn(data.locales, `${tag}.json`)) failAt(where, 'manifest', `${tag}: src/locales/${tag}.json is missing`);
+    if (!Array.isArray(e.owners) || !e.owners.length || !e.owners.every((o) => typeof o === 'string' && LOGIN.test(o))) failAt(where, 'manifest', `${JSON.stringify(tag)}: "owners" lists the GitHub logins (plain, without an at-sign) of the people who answer for it`);
+    if (e.dir !== 'ltr' && e.dir !== 'rtl') failAt(where, 'manifest', `${JSON.stringify(tag)}: "dir" is "ltr" or "rtl"`);
+    if (typeof e.offered !== 'boolean') failAt(where, 'manifest', `${JSON.stringify(tag)}: "offered" is true or false`);
+    if (e.dir === 'rtl' && e.offered === true) failAt(where, 'manifest', `${JSON.stringify(tag)}: a right-to-left language is not offered before the right-to-left layout exists`);
+    if (typeof e.since !== 'string' || !VERSION.test(e.since)) failAt(where, 'manifest', `${JSON.stringify(tag)}: "since" is a release version (x.y.z)`);
+    if (e.belowSince !== undefined && (typeof e.belowSince !== 'string' || !VERSION.test(e.belowSince))) failAt(where, 'manifest', `${JSON.stringify(tag)}: "belowSince" is a release version`);
+    if (!Object.hasOwn(data.locales, `${tag}.json`)) failAt(where, 'manifest', `${JSON.stringify(tag)}: src/locales/${tag}.json is missing`);
     if (!err && pluralCategories(tag, data.plurals) === null)
-      failAt(where, 'manifest', `${tag}: src/locales/plurals.json has no plural rules for "${new Intl.Locale(tag).language}": ask a maintainer to add the language`);
+      failAt(where, 'manifest', `${JSON.stringify(tag)}: src/locales/plurals.json has no plural rules for "${new Intl.Locale(tag).language}": ask a maintainer to add the language`);
   }
   for (const f of Object.keys(data.locales)) {
     const tag = f.replace(/\.json$/, '');
@@ -635,7 +641,7 @@ function loadData(root, findings) {
     }
   }
   for (const [path, ctx] of Object.entries(data.contexts)) {
-    if (typeof ctx !== 'string' || !CONTEXT.test(ctx) || ctx === COMMON) failAt(rel('contexts.json'), 'context', `${path}: "${ctx}" is not a context name`);
+    if (typeof ctx !== 'string' || !CONTEXT.test(ctx) || ctx === COMMON) failAt(rel('contexts.json'), 'context', `${JSON.stringify(path)}: ${JSON.stringify(ctx)} is not a context name`);
   }
   return data;
 }
@@ -674,7 +680,7 @@ export function check(root, { previous = null } = {}) {
     byContext.set(f.context, [...(byContext.get(f.context) ?? []), f.rel]);
   }
   for (const [ctx, rels] of byContext)
-    if (rels.length > 1) add({ level: 'fail', rule: 'context-collision', file: src(rels[1]), msg: `context "${ctx}" belongs to ${rels.map(src).join(' and ')}: give the library file its own name in src/locales/contexts.json` });
+    if (rels.length > 1) add({ level: 'fail', rule: 'context-collision', file: src(rels[1]), msg: `context ${JSON.stringify(ctx)} belongs to ${rels.map(src).join(' and ')}: give the library file its own name in src/locales/contexts.json` });
   for (const path of Object.keys(data.contexts)) if (!files.some((f) => f.rel === path)) add({ level: 'report', rule: 'stale', file: 'src/locales/contexts.json', msg: `${path} is not a source file` });
 
   const entries = new Map();
@@ -700,7 +706,7 @@ export function check(root, { previous = null } = {}) {
   const notes = byIdentity(data.notes);
   const verbatim = byIdentity(data.verbatim);
   for (const [name, m] of [['notes.json', notes], ['verbatim.json', verbatim]])
-    for (const id of m.keys()) if (!entries.has(id)) add({ level: 'report', rule: 'stale', file: `src/locales/${name}`, msg: `an entry of context "${id.split('\u0004')[0]}" is no longer in the source`, values: [id.split('\u0004')[1]] });
+    for (const id of m.keys()) if (!entries.has(id)) add({ level: 'report', rule: 'stale', file: `src/locales/${name}`, msg: `an entry of context ${JSON.stringify(id.split('\u0004')[0])} is no longer in the source`, values: [id.split('\u0004')[1]] });
   for (const [id, v] of verbatim) if (!Array.isArray(v) || !v.every((w) => typeof w === 'string' && w)) add({ level: 'fail', rule: 'malformed', file: 'src/locales/verbatim.json', msg: 'a verbatim value is a list of words', values: [id.split('\u0004')[1]] });
   for (const [id, v] of notes)
     if (!v || typeof v !== 'object' || Array.isArray(v) || Object.keys(v).some((k) => !['text', 'sensitive', 'exemptDigits'].includes(k)))
@@ -726,13 +732,17 @@ export function check(root, { previous = null } = {}) {
       add({ level: 'fail', rule: 'malformed', file, msg: 'a locale file maps each context to a list of pairs' });
       continue;
     }
+    // A context is a source file's name (or the left-over section): anything else is refused, so no
+    // locale file can carry text that is not data into the report.
+    const badContexts = Object.keys(cat).filter((ctx) => ctx !== LEFTOVER && !CONTEXT.test(ctx));
+    for (const ctx of badContexts) add({ level: 'fail', rule: 'context', file, msg: `context ${JSON.stringify(ctx)} is not a context name (lower camel case, or "~leftover")` });
     const shapeErrors = [];
     for (const [ctx, pairs] of Object.entries(cat)) for (const p of pairs) {
       const err = pairShape(p, cats, ctx);
       if (err) shapeErrors.push({ ctx, err, p });
     }
-    for (const s of shapeErrors) add({ level: 'fail', rule: s.err.startsWith('plural categories') ? 'plural-categories' : 'malformed', file, msg: `context "${s.ctx}": ${s.err}`, values: [JSON.stringify(s.p)] });
-    if (shapeErrors.length) continue;
+    for (const s of shapeErrors) add({ level: 'fail', rule: s.err.startsWith('plural categories') ? 'plural-categories' : 'malformed', file, msg: `context ${JSON.stringify(s.ctx)}: ${s.err}`, values: [JSON.stringify(s.p)] });
+    if (shapeErrors.length || badContexts.length) continue;
     if (serializeCatalog(cat) !== text) add({ level: 'fail', rule: 'canonical', file, msg: 'not in canonical form (run `node scripts/i18n.mjs sync ' + tag + '`)' });
     const s = ship(cat, entries, { verbatim, notes, glossary: data.glossary, dir });
     for (const x of s.findings) {
@@ -747,10 +757,10 @@ export function check(root, { previous = null } = {}) {
     if (missing.length) add({ level: 'report', rule: 'missing', file, msg: `${missing.length} of ${current.length} messages have no translation`, values: missing.map(([, e]) => `${e.ctx}: ${show(e.english)}`) });
     for (const l of leftovers) {
       const near = nearest(l.english, current.filter(([, e]) => e.ctx === l.ctx).map(([, e]) => e.english));
-      add({ level: 'report', rule: 'left-over', file, msg: `context "${l.ctx}": this English is no longer in the source; it is not shipped`, values: near === null ? [show(l.english)] : [show(l.english), `nearest now: ${show(near)}`] });
+      add({ level: 'report', rule: 'left-over', file, msg: `context ${JSON.stringify(l.ctx)}: this English is no longer in the source; it is not shipped`, values: near === null ? [show(l.english)] : [show(l.english), `nearest now: ${show(near)}`] });
     }
     const pct = current.length ? Math.floor((translated.size * 1000) / current.length) / 10 : 100;
-    add({ level: 'report', rule: 'coverage', file, msg: `${tag}: ${translated.size} of ${current.length} messages (${pct}%)${data.baseline ? baselineCoverage(data.baseline, translated) : ''}; owners: ${(meta?.owners ?? []).join(', ')}` });
+    add({ level: 'report', rule: 'coverage', file, msg: `${JSON.stringify(tag)}: ${translated.size} of ${current.length} messages (${pct}%)${data.baseline ? baselineCoverage(data.baseline, translated) : ''}; owners: ${(meta?.owners ?? []).join(', ')}` });
     // Sensitive changes and swaps, against the file one commit back.
     const prev = previous ? previous[tag] : null;
     if (prev === null || prev === undefined) add({ level: 'report', rule: 'not-checked', file, msg: 'sensitive and swap lines: not checked (no previous version of this file)' });
@@ -775,7 +785,7 @@ export function check(root, { previous = null } = {}) {
         if (n > 0 && b === 0) add({ level: 'fail', rule: 'literal-text', file: src(rel), line: f?.literal[0], msg: `${n} literal text${n === 1 ? '' : 's'} in a file that holds none: use t() (lines ${f?.literal.join(', ')})` });
       } else if (n > b) add({ level: 'fail', rule: kind === 'intl' ? 'intl' : 'physical-css', file: kind === 'physical' && rel === 'app.css' ? 'src/app.css' : src(rel), msg: kind === 'intl' ? `${n} Intl/toLocale call sites, ${b} allowed: format in lib/format.ts` : `${n} physical CSS properties, ${b} allowed: use logical ones (margin-inline-start, text-align: start)` });
       if (kind === 'intl' && n > 0 && f?.usesLayer && rel !== 'lib/format.ts') add({ level: 'fail', rule: 'intl', file: src(rel), msg: 'a file on the translation layer formats through lib/format.ts only' });
-      if (n < b) add({ level: 'report', rule: 'baseline', file: 'i18n-baseline.json', msg: `${kind} ${rel}: ${n}, baseline ${b} (lower it: node scripts/i18n.mjs baseline)` });
+      if (n < b) add({ level: 'report', rule: 'baseline', file: 'i18n-baseline.json', msg: `${kind} ${JSON.stringify(rel)}: ${n}, baseline ${b} (lower it: node scripts/i18n.mjs baseline)` });
     }
   }
   const above = Object.values(counts.literal).filter((n) => n > 0).length;
@@ -862,9 +872,9 @@ function sensitiveAndSwaps(prevText, cat, notes, file, add) {
       const id = identity(ctx, p[0], pairNote(p) || undefined);
       const now = JSON.stringify(p[1]);
       if (old.get(id) === now) continue;
-      if (notes.get(id)?.sensitive) add({ level: 'report', rule: 'sensitive', file, msg: `context "${ctx}": a sensitive message changed: its pull request carries a back-translation`, values: [show(p[0])] });
+      if (notes.get(id)?.sensitive) add({ level: 'report', rule: 'sensitive', file, msg: `context ${JSON.stringify(ctx)}: a sensitive message changed: its pull request carries a back-translation`, values: [show(p[0])] });
       const was = oldValues.get(now);
-      if (was && was !== id && now !== '""') add({ level: 'report', rule: 'swap', file, msg: `context "${ctx}": the new translation is the old translation of another message`, values: [show(p[0]), was.split('\u0004')[1]] });
+      if (was && was !== id && now !== '""') add({ level: 'report', rule: 'swap', file, msg: `context ${JSON.stringify(ctx)}: the new translation is the old translation of another message`, values: [show(p[0]), was.split('\u0004')[1]] });
     }
   }
 }
@@ -933,8 +943,11 @@ export function formatReport(result) {
   const fails = result.findings.filter((f) => f.level === 'fail');
   const used = result.files.filter((f) => f.usesLayer);
   lines.push(`i18n: ${result.files.length} source files, ${used.length} on the translation layer, ${result.entries.size} messages; ${Object.keys(result.shipped).length} locale(s) in the manifest`);
+  // No line of the log may start with what a file put in a message (a CI runner reads `::…` lines
+  // as commands): line breaks and other controls in a message or a path are printed escaped.
+  const one = (s) => String(s).replace(/[\u0000-\u001f\u007f-\u009f\u{2028}\u{2029}]/gu, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
   for (const f of result.findings) {
-    lines.push(`${LEVELS[f.level]} ${f.rule} ${f.file}${f.line ? `:${f.line}` : ''}: ${f.msg}`);
+    lines.push(`${LEVELS[f.level]} ${one(f.rule)} ${one(f.file)}${f.line ? `:${f.line}` : ''}: ${one(f.msg)}`);
     for (const v of f.values ?? []) lines.push(`    ${JSON.stringify(v)}`);
   }
   lines.push(fails.length ? `i18n: ${fails.length} failure(s)` : 'i18n: no failures');
