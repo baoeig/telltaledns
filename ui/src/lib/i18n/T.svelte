@@ -1,9 +1,10 @@
 <!-- REQ: API-012 (ADR-189) — a whole sentence with markup inside it, as one message:
-  <T ctx="anomalies" msg="Muted by <b>{who}</b>: not counted" params={{ who }}>
+  <T ctx="anomalies" msg={'Muted by <b>{who}</b>: not counted'} params={{ who }}>
     {#snippet b(text)}<b>{text}</b>{/snippet}
   </T>
-  The message is split on the tags the caller has snippets for; every piece is text or goes through
-  that snippet. Translated text never becomes markup (no {@html}); an unknown tag stays text. -->
+  The message is an expression: in a quoted attribute Svelte would substitute {who} itself. It is
+  split on the tags the caller has snippets for; every piece is text or goes through that snippet.
+  Translated text never becomes markup (no {@html}); an unknown tag stays text. -->
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import { lookup } from './index';

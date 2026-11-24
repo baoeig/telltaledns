@@ -98,8 +98,11 @@ file already has) and write the English as a literal:
 
 `npm run check:i18n` fails on a non-literal message, a context that is not the file's or `common`,
 two files with one context, a hash collision, a translated text misused as above, literal text in a
-file `i18n-baseline.json` holds at zero, a new `Intl` call outside `lib/format.ts`, and a new physical CSS
-property (`margin-left`, `text-align: right`; use logical ones). It reports, and never fails on,
+file `i18n-baseline.json` holds at zero (in the markup, or in an attribute a reader sees or hears:
+`aria-label`, `title`, `placeholder`, `alt`, `aria-roledescription`, `aria-description`,
+`aria-valuetext`, `aria-placeholder`, and `label` on `<optgroup>`), a new `Intl` call outside
+`lib/format.ts`, and a new physical CSS property (`margin-left`, `text-align: right`; use logical
+ones). It reports, and never fails on,
 missing, outdated and left-over translations. A change to English alone never fails a language.
 Until part A of ADR-189 ends, literal text in a file the baseline does not list (one added since) is
 reported, not failed; part A's last commit makes it a failure.
@@ -112,7 +115,7 @@ file's English ledger entry in the same commit, `node scripts/i18n.mjs ledger <f
 logins of the people who answer for its content; `dir`; `offered: false` until a release turns it
 on; `since`), and the language to `src/locales/plurals.json` if it is not there (`node
 scripts/i18n.mjs plurals` writes it from CLDR; review the diff). A tag names the script where the
-language has several (`zh-Hans`, `sr-Latn`). The translator then runs `node scripts/i18n.mjs sync
+language has several (`zh-Hans`, `sr-Latn`); there is no `en-*` catalog (English is built in). The translator then runs `node scripts/i18n.mjs sync
 <tag>`, fills in the empty translations of `src/locales/<tag>.json` (pairs of English and
 translation; a plural lists the language's categories), and opens a pull request with that one file.
 After an English edit that keeps the meaning, a maintainer runs `node scripts/i18n.mjs carry
