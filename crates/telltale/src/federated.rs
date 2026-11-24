@@ -31,6 +31,8 @@ const KIND: &str = "api.read";
 const DEADLINE: Duration = Duration::from_secs(2);
 #[path = "federated_bridge.rs"]
 mod bridge;
+// REQ: CLU-004 (ADR-174) — the bridge for a backend's own async read (the drill-report alert).
+pub(crate) use bridge::read_within;
 #[path = "federated_support.rs"]
 mod support_cluster;
 // REQ: CLU-004 (ADR-174) — the scan that keeps every federating backend call behind `blocking`.
@@ -2146,13 +2148,12 @@ impl Backend for Federated {
         limit: usize,
         offset: usize,
     ) -> BoxFuture<Result<telltale_api::model::DrillPage, Problem>> {
-        let (local, cluster) = (Arc::clone(&self.local), Arc::clone(&self.cluster));
+        // REQ: CLU-004 (ADR-174) — this node's own list is read here, on the caller's thread (the
+        // drill-report alert's is a blocking-pool thread, `alerts::drill_reports`), not on the
+        // runtime with the peers' calls: it reads the stored reports from disk.
+        let (mine, cluster) = (self.local.drills(50, 0), Arc::clone(&self.cluster));
         Box::pin(async move {
-            let mut items = local
-                .drills(50, 0)
-                .await
-                .map(|p| p.items)
-                .unwrap_or_default();
+            let mut items = mine.await.map(|p| p.items).unwrap_or_default();
             let (answers, missing) = crate::drill::ask_all(&cluster, &crate::drill::Op::List).await;
             for (_, body) in answers {
                 if let Ok(v) =
@@ -4151,6 +4152,57 @@ mod bridge_tests {
             rx.recv_timeout(Duration::from_secs(10)).is_ok(),
             "the runtime is stuck"
         );
+    }
+
+    // REQ: CLU-004, CLU-014 (ADR-174's known leftover; GitHub issue #7) — the drill-report alert
+    // reads every node's drill reports through the bridge. With a runtime that works it brings
+    // the primary's report; with the runtime's only worker parked it gives up at its deadline
+    // (no reports this round; a report is sent once, so the next round sends it) and its thread
+    // goes back. Before: `Handle::block_on` with no deadline of the operating system's, so the
+    // alert's thread waited for as long as the runtime couldn't run.
+    #[test]
+    fn clu_004_the_drill_report_alert_gives_up_on_a_wedged_runtime() {
+        let now = crate::pipeline::unix_now();
+        let report = telltale_api::model::DrillSummary {
+            id: "d1".into(),
+            node: "pi".into(),
+            targets: "everyone".into(),
+            by: "schedule".into(),
+            status: "complete".into(),
+            ended: Some(telltale_api::time::format_us((now - 60) * 1_000_000)),
+            ..telltale_api::model::DrillSummary::default()
+        };
+        let list = serde_json::to_vec(&vec![report]).unwrap();
+        let handler: RpcHandler = Arc::new(move |_peer, kind, body| {
+            let list = list.clone();
+            Box::pin(async move {
+                match serde_json::from_slice::<crate::drill::Op>(&body) {
+                    Ok(crate::drill::Op::List) if kind == crate::drill::KIND => Ok(list),
+                    _ => Err("a read this test doesn't ask".to_owned()),
+                }
+            })
+        });
+        let n = two_nodes_answering(handler);
+        // A runtime that works: the primary's report, as the alert words it.
+        let (idle, _unused) = mpsc::channel::<()>();
+        let (seen, _, n) = on_a_thread(n, &idle, move |fed| crate::alerts::drill_reports(fed, now));
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].0, "d1");
+        assert!(
+            seen[0].1.starts_with("scheduled failover drill on pi"),
+            "{}",
+            seen[0].1
+        );
+        // The only worker parked: the read ends at its deadline, empty.
+        let gate = wedge(&n.rt);
+        let (seen, took, n) =
+            on_a_thread(n, &gate, move |fed| crate::alerts::drill_reports(fed, now));
+        let _ = gate.send(());
+        assert!(seen.is_empty(), "{seen:?}");
+        // Bounds only, far from the wait (the 3 s deadline and the bridge's 250 ms grace): no race.
+        assert!(took >= Duration::from_secs(2), "{took:?}: it gave up early");
+        assert!(took < Duration::from_secs(8), "{took:?}");
+        drop(n);
     }
 
     // REQ: CLU-002 (ADR-174) — with a runtime that works, the answers are the peer's, whether

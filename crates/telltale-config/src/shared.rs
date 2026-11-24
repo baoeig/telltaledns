@@ -362,6 +362,78 @@ name = \"pi\"
         );
     }
 
+    // REQ: CLU-010, DNS-019 (ADR-187) — `[special] resolver_arpa` is shared and, like
+    // `router_macs`, not written while it is on: a replica one version behind refuses a
+    // `[special]` key it doesn't know ("unknown field"), so a primary that changes another
+    // special-name rule, with this one at its default, sends exactly the four keys that replica
+    // knows. Off, it is sent and a replica takes it; back on, the replica reads it as on again.
+    #[test]
+    fn clu_010_resolver_arpa_left_out_of_the_shared_part_at_its_default() {
+        let keys = |shared: &Value| -> Vec<String> {
+            let mut k: Vec<String> = shared["special"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            k.sort_unstable();
+            k
+        };
+        let primary = load("[special]\nlocalhost = false\n");
+        let shared = shared_part(&primary);
+        assert_eq!(
+            keys(&shared),
+            [
+                "block_firefox_canary",
+                "localhost",
+                "private_ptr_nxdomain",
+                "refuse_chaos"
+            ],
+            "a primary at the default sends no key an older replica doesn't know"
+        );
+        assert!(
+            shared_part(&load("")).get("special").is_none(),
+            "every rule at its default: the section isn't sent at all"
+        );
+
+        // Off at the primary: the key is sent, and a replica (whatever its own file says) takes it.
+        let off = load("[special]\nresolver_arpa = false\n");
+        let shared_off = shared_part(&off);
+        assert_eq!(shared_off["special"]["resolver_arpa"], false);
+        let merged = with_shared(&load("[node]\nname = \"pi\"\n"), &shared_off).unwrap();
+        assert!(!merged.special.resolver_arpa);
+        assert!(merged.special.localhost);
+
+        // Back at the default: not sent, and the replica reads it as on.
+        let back = with_shared(&merged, &shared).unwrap();
+        assert!(back.special.resolver_arpa);
+        assert!(!back.special.localhost, "the rest is the primary's section");
+        let own_off = load("[special]\nresolver_arpa = false\n");
+        assert!(
+            with_shared(&own_off, &shared)
+                .unwrap()
+                .special
+                .resolver_arpa,
+            "a replica's own `false` gives way to the primary's default"
+        );
+        assert!(
+            ignored_on_replica(&own_off).contains(&"special".to_owned()),
+            "and the node says its own setting is ignored"
+        );
+
+        // What a node does with a `[special]` key it doesn't know (an older one, sent this key):
+        // it refuses the shared configuration, which is why the default is never sent.
+        let mut newer = shared.clone();
+        newer["special"]["from_a_newer_version"] = Value::Bool(false);
+        let e = with_shared(&load(""), &newer)
+            .unwrap_err()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(e.contains("unknown field"), "{e}");
+    }
+
     #[test]
     fn clu_006_local_sections_stay_and_shared_ones_come_from_the_primary() {
         let primary = load(
