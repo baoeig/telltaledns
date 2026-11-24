@@ -1840,7 +1840,8 @@ negative_trust_anchors = ["corp.example"]   # internal zones that aren't signed
   exists, otherwise the answer is bogus and handled as any bogus answer (the unsigned-zone
   proof, then link by link when it starts with a CNAME). So an answer from a wildcard right
   above the name validates (`nasa-gov.go-vip.net A`, and `www.nasa.gov A` through its CNAME),
-  and so does a wildcard CNAME further down, in one lookup. An answer with a second signature
+  and so does a wildcard CNAME further down whose chain ends in an answer, in one lookup (a
+  NODATA behind one is validated link by link). An answer with a second signature
   that isn't verified (during a key or algorithm rollover) is served without AD, as elsewhere.
   The check reads only the answer itself, on cache misses, in both modes. Zones signed with
   NSEC3 are left to the validation library: the check is skipped only beside a verified NSEC3

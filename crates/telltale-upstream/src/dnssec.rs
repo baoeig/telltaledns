@@ -1101,8 +1101,7 @@ fn or_wildcard(
 /// signature covering fewer labels than its owner has), and the wildcard rule of zones signed with
 /// NSEC applies to it. Zones signed with NSEC3 are left to the library: the rule is left out only
 /// when, for every zone that signed such a signature, the authority section has a verified NSEC3
-/// record of that zone (owned directly below it). An NSEC3 record that isn't verified, or that is
-/// another zone's, doesn't switch the rule off.
+/// record of that zone (owned directly below it).
 fn nsec_wildcard_answer(m: &Message) -> bool {
     let mut signers = m.answers.iter().filter_map(expansion_signer).peekable();
     signers.peek().is_some() && !signers.all(|zone| has_nsec3_of(m, zone))
