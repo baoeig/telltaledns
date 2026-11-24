@@ -19,7 +19,9 @@ npm run types      # regenerate src/lib/api-types.ts from ../docs/api/openapi.js
 
 `dev`, `check`, `build` and `test:e2e` first run `node scripts/i18n.mjs prebuild`, which writes
 `src/lib/i18n/locales.gen.ts`, `src/lib/i18n/emitted.gen.json` and `public/assets/locales/` (all
-git-ignored): a fresh checkout needs no extra step.
+git-ignored): a fresh checkout needs no extra step. `scripts/i18n.mjs` needs Node 24 (as CI and the
+Dockerfile use; 22.18 and later also work), which strips TypeScript types: the tool imports the
+runtime's own modules.
 
 Then rebuild the binary (`cargo build -p telltale`) to embed `dist/`. A binary built without
 `dist/` still works and says the UI is missing.

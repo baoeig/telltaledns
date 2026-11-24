@@ -13,10 +13,17 @@
 //   node scripts/i18n.mjs baseline           rewrites i18n-baseline.json from the tree
 //   node scripts/i18n.mjs plurals            for maintainers, once and reviewed: rewrites
 //                                            src/locales/plurals.json from this Node's CLDR data
+// Needs a Node that strips TypeScript types (24, as CI and the Dockerfile use; or 22.18+): the
+// library imports the runtime's own modules in src/lib/i18n/*.ts.
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
-import { baselineOf, carry, check, formatReport, ledgerEntries, pluralTable, prebuild, serializeJson, summaryMarkdown, sync } from './i18n-lib.mjs';
+
+if (!process.features.typescript) {
+  console.error(`scripts/i18n.mjs needs Node 24 (or 22.18 and later), which strips TypeScript types; this is Node ${process.version}`);
+  process.exit(2);
+}
+const { baselineOf, carry, check, formatReport, ledgerEntries, pluralTable, prebuild, serializeJson, summaryMarkdown, sync } = await import('./i18n-lib.mjs');
 
 const ROOT = join(import.meta.dirname, '..');
 const LEDGER = join(ROOT, 'tests', 'i18n-fixtures', 'english-ledger.json');

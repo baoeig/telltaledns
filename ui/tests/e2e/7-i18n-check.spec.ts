@@ -3,6 +3,7 @@
 // itself: canonical files, contexts, what fails and what is only reported, one recorded mistake per
 // FAIL rule, the job summary, what ships, and the committed plural table.
 import { expect, test } from '@playwright/test';
+import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { fnv1a, hash } from '../../src/lib/i18n/ident';
@@ -416,4 +417,16 @@ test('api_012 the ui ships no language yet', () => {
   // The made-up locale lives in the fixtures only; the UI's manifest lists no language.
   expect(existsSync(join(UI, 'src/locales/qaa.json'))).toBe(false);
   expect(JSON.parse(readFileSync(join(UI, 'src/locales/manifest.json'), 'utf8'))).toEqual({});
+});
+
+test('api_012 the languages tool says which node it needs', () => {
+  const r = spawnSync(process.execPath, ['--no-experimental-strip-types', join(UI, 'scripts/i18n.mjs'), 'check'], { encoding: 'utf8' });
+  expect(r.status).toBe(2);
+  expect(r.stderr).toContain('needs Node 24');
+});
+
+test('api_012 npm runs the generation step inside its scripts', () => {
+  // Inside the scripts themselves, too, where `ignore-scripts` would skip a `pre` script.
+  const scripts = JSON.parse(readFileSync(join(UI, 'package.json'), 'utf8')).scripts;
+  for (const s of ['dev', 'build', 'check', 'test:e2e']) expect(scripts[s], s).toMatch(/^node scripts\/i18n\.mjs prebuild && /);
 });
