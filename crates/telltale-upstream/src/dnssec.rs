@@ -1207,7 +1207,8 @@ fn record_set_proven<'a>(
 /// with a CNAME at `name` made from a wildcard, and no record of another name in it is made from a
 /// wildcard: the CNAME's record set at `name`, with its signatures, meets the rule as for a question
 /// for the CNAME ([`record_set_proven`] over the answer's records owned by `name`). The rest of the
-/// chain are records of names that exist, each validated by its own signature.
+/// chain are records of names that exist, each validated by its own signature, and the chain ends
+/// in a record of the question's type ([`chain_ends_in`]).
 fn wildcard_cname_proven(m: &Message, name: &Name, rtype: RecordType) -> bool {
     rtype != RecordType::CNAME
         && !m
@@ -1220,6 +1221,31 @@ fn wildcard_cname_proven(m: &Message, name: &Name, rtype: RecordType) -> bool {
             name,
             RecordType::CNAME,
         )
+        && chain_ends_in(m, name, rtype)
+}
+
+/// REQ: DNS-011 (ADR-188) — the CNAMEs of `m`'s answer section, followed from `name`, end in a
+/// record of `rtype`: not at a name without one, and not in a loop. At most one step per answer
+/// record.
+fn chain_ends_in(m: &Message, name: &Name, rtype: RecordType) -> bool {
+    let mut seen = vec![name];
+    let mut owner = name;
+    for _ in 0..m.answers.len() {
+        let Some(target) = m.answers.iter().find_map(|r| match &r.data {
+            RData::CNAME(c) if r.name == *owner => Some(&c.0),
+            _ => None,
+        }) else {
+            break;
+        };
+        if seen.contains(&target) {
+            return false;
+        }
+        seen.push(target);
+        owner = target;
+    }
+    m.answers
+        .iter()
+        .any(|r| r.name == *owner && r.record_type() == rtype)
 }
 
 /// The NSEC owned by `owner` has a secure signature, in the authority section, by `zone`.
@@ -2179,7 +2205,8 @@ mod depth_tests {
     /// REQ: DNS-011 (RFC 4035 §5.3.4; ADR-188) — a wildcard CNAME at the question name, for a
     /// question of another type, is checked as the CNAME's own record set when no record of another
     /// name in the answer is made from a wildcard: its verified signatures, and the zone's NSEC for
-    /// its next closer name. The rest of the chain are records of names that exist.
+    /// its next closer name. The rest of the chain are records of names that exist, and the chain
+    /// ends in a record of the question's type (a chain that stops short, or loops, doesn't).
     #[test]
     #[allow(clippy::too_many_lines)]
     fn dns_011_wildcard_cname_is_checked_as_its_own_record_set() {
@@ -2211,6 +2238,7 @@ mod depth_tests {
             )
         };
         let address = || RData::A(hickory_net::proto::rr::rdata::A::new(192, 0, 2, 1));
+        let alias = |owner: &str, target: &str| secure(owner, RData::CNAME(CNAME(n(target))));
         let nsec = |owner: &str, next: &str| {
             let data = NSEC::new(n(next), [T_CNAME, T_RRSIG, T_NSEC]);
             secure(owner, RData::DNSSEC(DNSSECRData::NSEC(data)))
@@ -2243,7 +2271,39 @@ mod depth_tests {
         };
         let got = [
             checked("the CNAME with its proof", A, &|_| {}),
-            checked("for another type", AAAA, &|_| {}),
+            checked("for another type", AAAA, &|msg| {
+                let aaaa =
+                    hickory_net::proto::rr::rdata::AAAA::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+                msg.answers[2] = secure("t.z.test.", RData::AAAA(aaaa));
+                msg.answers[3] = sig("t.z.test.", AAAA, 3, "z.test.");
+            }),
+            checked("a type the chain doesn't end in", AAAA, &|_| {}),
+            checked("the target's records left out", A, &|msg| {
+                msg.answers.truncate(2);
+            }),
+            checked("a chain that stops after its second link", A, &|msg| {
+                msg.answers.truncate(2);
+                msg.answers[0] = alias("m.z.test.", "t1.z.test.");
+                msg.answers.push(alias("t1.z.test.", "t2.z.test."));
+                msg.answers.push(sig("t1.z.test.", T_CNAME, 3, "z.test."));
+            }),
+            checked("a chain of two links that ends in the type", A, &|msg| {
+                msg.answers.truncate(2);
+                msg.answers[0] = alias("m.z.test.", "t1.z.test.");
+                msg.answers.push(alias("t1.z.test.", "t2.z.test."));
+                msg.answers.push(sig("t1.z.test.", T_CNAME, 3, "z.test."));
+                msg.answers.push(secure("t2.z.test.", address()));
+                msg.answers.push(sig("t2.z.test.", A, 3, "z.test."));
+            }),
+            checked("a CNAME loop", A, &|msg| {
+                msg.answers.truncate(2);
+                msg.answers.push(alias("t.z.test.", "m.z.test."));
+                msg.answers.push(sig("t.z.test.", T_CNAME, 3, "z.test."));
+            }),
+            checked("a CNAME loop with an address beside it", A, &|msg| {
+                msg.answers.push(alias("t.z.test.", "m.z.test."));
+                msg.answers.push(sig("t.z.test.", T_CNAME, 3, "z.test."));
+            }),
             checked("a second signature that isn't verified", A, &|msg| {
                 let mut extra = sig("m.z.test.", T_CNAME, 1, "test.");
                 extra.proof = Proof::Indeterminate;
@@ -2273,6 +2333,12 @@ mod depth_tests {
         let want = [
             ("the CNAME with its proof", true),
             ("for another type", true),
+            ("a type the chain doesn't end in", false),
+            ("the target's records left out", false),
+            ("a chain that stops after its second link", false),
+            ("a chain of two links that ends in the type", true),
+            ("a CNAME loop", false),
+            ("a CNAME loop with an address beside it", false),
             ("a second signature that isn't verified", true),
             ("a question for the CNAME itself", false),
             ("the target made from a wildcard", false),

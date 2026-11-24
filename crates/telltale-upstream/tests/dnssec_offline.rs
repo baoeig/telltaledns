@@ -302,6 +302,9 @@ mod tampering {
     /// `*.w.s.t.`'s address comes with a second signature, by another key of `s.t.` that isn't in
     /// its key set (as during a key rollover).
     pub(super) const SECOND_SIGNATURE: usize = 14;
+    /// `a.b.c.s.t. A` is answered with the wildcard's CNAME, its signature and NSEC only: the chain
+    /// stops there, without the target's records.
+    pub(super) const CHAIN_CUT_SHORT: usize = 15;
 }
 
 /// `name`'s NSEC3 hash with `t.`'s parameters.
@@ -822,6 +825,13 @@ fn child_answer(z: &Tld, m: &mut Message, qn: &Name, qt: RecordType) {
         }
         let next = child_link(z, m, &name, qt, tamper);
         match next {
+            Some(_)
+                if tamper == tampering::CHAIN_CUT_SHORT
+                    && *qn == n("a.b.c.s.t.")
+                    && qt == RecordType::A =>
+            {
+                return;
+            }
             Some(target) => name = target,
             None => return,
         }
@@ -2441,6 +2451,54 @@ async fn dns_011_offline_wildcard_cname_to_another_wildcard_record_needs_each_pr
         ),
         (vec![bogus; 2], 0, 0),
         "a.b.k.s.t. A to a wildcard's address without its proof"
+    );
+}
+
+/// REQ: DNS-011 (RFC 4035 §5.3.4; ADR-188) — a wildcard CNAME at the question name is checked as its
+/// own record set only when the chain in the answer ends in a record of the question's type.
+/// `a.b.c.s.t. A` answered with the wildcard's CNAME to `www.s.t.`, its signature and NSEC, without
+/// `www.s.t.`'s address, is validated link by link: secure, with AD, and the address is in the
+/// answer, from the target's own question. With every slot of link-by-link validation taken, it
+/// stays bogus (EDE 6).
+#[tokio::test]
+async fn dns_011_offline_wildcard_cname_chain_that_stops_short_is_validated_link_by_link() {
+    use RecordType::{A, CNAME};
+    let budget = Duration::from_secs(5);
+    let z = Arc::new(zone());
+    z.tld
+        .tamper
+        .store(tampering::CHAIN_CUT_SHORT, Ordering::Relaxed);
+    let (v, g, _, _, _dir) = setup_zone(true, Arc::clone(&z)).await;
+    warm_tld(&v, &g).await;
+    let r = v
+        .resolve(&g, question("a.b.c.s.t", rtype::A), budget, true, false)
+        .await;
+    let walked = r.ok().map(|r| (r.verdict, served(&r.bytes)));
+    let (v, g, _, stats, _dir) = setup_zone(true, Arc::clone(&z)).await;
+    warm_tld(&v, &g).await;
+    let secure = stats.secure.load(Ordering::Relaxed);
+    let held = v.hold_link_slots(0);
+    assert!(!held.is_empty(), "link-by-link slots held");
+    let r = v
+        .resolve(&g, question("a.b.c.s.t", rtype::A), budget, true, false)
+        .await;
+    drop(held);
+    let without_a_walk = (
+        r.map(|r| (r.verdict, r.ede)).ok(),
+        stats.secure.load(Ordering::Relaxed) - secure,
+    );
+    z.tld.tamper.store(tampering::NONE, Ordering::Relaxed);
+    let records = vec![("a.b.c.s.t.".to_owned(), CNAME), ("www.s.t.".to_owned(), A)];
+    assert_eq!(
+        (walked, without_a_walk),
+        (
+            Some((
+                Verdict::Secure,
+                Some((telltale_proto::rcode::NOERROR, true, records))
+            )),
+            (Some((Verdict::Bogus, telltale_proto::ede::DNSSEC_BOGUS)), 0),
+        ),
+        "a.b.c.s.t. A, the chain stopping after the CNAME"
     );
 }
 
