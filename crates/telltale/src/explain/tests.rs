@@ -149,9 +149,44 @@ fn contains(msg: &[u8], needle: &[u8]) -> bool {
     msg.windows(needle.len()).any(|w| w == needle)
 }
 
+/// REQ: DNS-019, UPS-007 (ADR-187) — routes of every kind, added to `CONFIG`: none; a group's own
+/// upstreams (for the device at 10.0.0.7); routes without a suffix (`match_group`, `match_qtype`,
+/// `.`), which match every name; and routes whose suffix covers `resolver.arpa`.
+const ROUTES: [(&str, &str); 8] = [
+    ("no route", ""),
+    (
+        "the group's own upstreams",
+        "[[group]]\nname = \"tv\"\nupstreams = \"lan\"\n\
+         [[client]]\nname = \"tv\"\nmatch = [\"10.0.0.7\"]\ngroups = [\"tv\"]\n",
+    ),
+    (
+        "a match_group route",
+        "[[route]]\nmatch_group = [\"kids\"]\nupstream_group = \"lan\"\n",
+    ),
+    (
+        "a match_qtype route",
+        "[[route]]\nmatch_qtype = [\"A\"]\nupstream_group = \"lan\"\n",
+    ),
+    (
+        "a route for `.`",
+        "[[route]]\nmatch_suffix = [\".\"]\nupstream_group = \"lan\"\n",
+    ),
+    (
+        "a route for resolver.arpa",
+        "[[route]]\nmatch_suffix = [\"Resolver.ARPA.\"]\nupstream_group = \"lan\"\n",
+    ),
+    (
+        "a route for arpa",
+        "[[route]]\nmatch_suffix = [\"arpa\"]\nupstream_group = \"lan\"\n",
+    ),
+    (
+        "a route for resolver.arpa and the group kids",
+        "[[route]]\nmatch_suffix = [\"resolver.arpa\"]\nmatch_group = [\"kids\"]\nupstream_group = \"lan\"\n",
+    ),
+];
+
 #[test]
 fn flt_013_explain_agrees_with_the_pipeline() {
-    let (p, sources) = setup();
     let names = [
         "ads.example.com",
         "x.tracker.example.net",
@@ -161,35 +196,94 @@ fn flt_013_explain_agrees_with_the_pipeline() {
         "nas.home.arpa",
         "host.corp.example",
         "localhost",
-        // REQ: DNS-019 (ADR-187) — answered here, not forwarded.
+        // REQ: DNS-019 (ADR-187) — answered here, not forwarded, unless a route's suffix covers it.
         "_dns.resolver.arpa",
+        "resolver.arpa",
     ];
-    for client in ["10.0.0.5", "10.0.0.9", "192.0.2.1"] {
-        for name in names {
-            let e = ask(&p, &sources, name, client);
-            let answer = served(&p, name, client);
-            let label = format!("{name} from {client}: {:?} ({})", e.outcome, e.summary);
-            match e.outcome {
-                Outcome::Resolved | Outcome::Allowed => {
-                    assert!(
-                        answer.is_none(),
-                        "{label}: pipeline answered without forwarding"
-                    );
-                }
-                Outcome::Blocked => {
-                    let a = answer.unwrap_or_else(|| panic!("{label}: pipeline forwarded"));
-                    let list = &e.block.as_ref().unwrap().list;
-                    assert!(
-                        contains(&a, format!("blocked by list {list}").as_bytes()),
-                        "{label}"
-                    );
-                }
-                Outcome::Local | Outcome::Special | Outcome::Refused => {
-                    assert!(answer.is_some(), "{label}: pipeline forwarded");
+    // REQ: DNS-019, UPS-007 (ADR-187) — with routes of every kind.
+    for (routes, extra) in ROUTES {
+        let (p, sources) = setup_with(extra);
+        for client in ["10.0.0.5", "10.0.0.7", "10.0.0.9", "192.0.2.1"] {
+            for name in names {
+                let e = ask(&p, &sources, name, client);
+                let answer = served(&p, name, client);
+                let label = format!(
+                    "{routes}: {name} from {client}: {:?} ({})",
+                    e.outcome, e.summary
+                );
+                match e.outcome {
+                    Outcome::Resolved | Outcome::Allowed => {
+                        assert!(
+                            answer.is_none(),
+                            "{label}: pipeline answered without forwarding"
+                        );
+                    }
+                    Outcome::Blocked => {
+                        let a = answer.unwrap_or_else(|| panic!("{label}: pipeline forwarded"));
+                        let list = &e.block.as_ref().unwrap().list;
+                        assert!(
+                            contains(&a, format!("blocked by list {list}").as_bytes()),
+                            "{label}"
+                        );
+                    }
+                    Outcome::Local | Outcome::Special | Outcome::Refused => {
+                        assert!(answer.is_some(), "{label}: pipeline forwarded");
+                    }
                 }
             }
         }
     }
+}
+
+// REQ: DNS-019, UPS-007, FLT-013 (ADR-187) — explain says what the pipeline does with
+// `_dns.resolver.arpa` for routes of every kind: forwarded only by a route whose suffix covers it
+// (in any case); a route without a suffix (a group's own upstreams, `match_group`, `match_qtype`,
+// `.`) sends the device's other names to its upstream group and leaves this one answered here.
+#[test]
+fn dns_019_explain_forwards_resolver_arpa_only_by_a_route_with_a_suffix() {
+    const HERE: Option<&str> = None;
+    const LAN: Option<&str> = Some("lan");
+    const CLIENTS: [&str; 3] = ["10.0.0.5", "10.0.0.7", "10.0.0.9"];
+    // By `ROUTES`: the upstream group `_dns.resolver.arpa` goes to from each of `CLIENTS` (`HERE`:
+    // answered here), and a client whose `www.example.org` the routes send to `lan`.
+    let want: [([Option<&str>; 3], Option<&str>); 8] = [
+        ([HERE; 3], None),
+        ([HERE; 3], Some("10.0.0.7")),
+        ([HERE; 3], Some("10.0.0.5")),
+        ([HERE; 3], Some("10.0.0.9")),
+        ([HERE; 3], Some("10.0.0.9")),
+        ([LAN; 3], None),
+        ([LAN; 3], None),
+        ([LAN, HERE, HERE], None),
+    ];
+    let mut wrong = Vec::new();
+    for ((routes, extra), (ddr, routed)) in ROUTES.into_iter().zip(want) {
+        let (p, sources) = setup_with(extra);
+        for (client, want) in CLIENTS.into_iter().zip(ddr) {
+            let e = ask(&p, &sources, "_dns.resolver.arpa", client);
+            let got = match e.outcome {
+                Outcome::Special if e.route.is_none() && e.summary.contains("RFC 9462") => HERE,
+                Outcome::Resolved => e.route.as_ref().map(|r| r.group.as_str()),
+                _ => Some("another outcome"),
+            };
+            if got != want {
+                wrong.push(format!(
+                    "{routes}: _dns.resolver.arpa from {client}: {:?} ({}), expected {want:?}",
+                    e.outcome, e.summary
+                ));
+            }
+        }
+        if let Some(client) = routed {
+            let e = ask(&p, &sources, "www.example.org", client);
+            let group = e.route.as_ref().map(|r| r.group.as_str());
+            if group != LAN {
+                wrong.push(format!(
+                    "{routes}: www.example.org from {client}: {group:?}, expected the route's lan"
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 // REQ: DNS-019, FLT-013 (ADR-187) — explain says what the pipeline does with `resolver.arpa`:

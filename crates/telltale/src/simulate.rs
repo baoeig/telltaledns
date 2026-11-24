@@ -940,8 +940,9 @@ impl Decider {
         if special == Some(Special::PrivatePtr) && !selection.as_ref().is_some_and(|s| s.routed) {
             return Verdict::Answered(Arc::from("private reverse lookup: NXDOMAIN"));
         }
-        // REQ: DNS-019 (ADR-187)
-        if special == Some(Special::LocallyServed) && !selection.as_ref().is_some_and(|s| s.routed)
+        // REQ: DNS-019, UPS-007 (ADR-187) — forwarded only by a route whose suffix covers it.
+        if special == Some(Special::LocallyServed)
+            && selection.as_ref().is_none_or(|s| s.suffix_labels == 0)
         {
             return Verdict::Answered(Arc::from("resolver.arpa: NOERROR, no records"));
         }
