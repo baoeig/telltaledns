@@ -175,6 +175,45 @@ test('api_012 migrated files conserve their english strings', () => {
   expect(lib.ledgerProblems([mod('Holds')], ledger, { new: { 'lib/other.ts': ['x'] } })).toEqual(['"new" English for "lib/other.ts": only for a file on the layer without a ledger entry']);
 });
 
+test('api_012 a whole sentence per variant conserves from the file own fragments', () => {
+  const head = "<script lang=\"ts\">\n  import { tr } from '../lib/i18n';\n  import T from '../lib/i18n/T.svelte';\n  const { t, tn } = tr('x');\n</script>\n";
+  const entryOf = (src: string) => {
+    const a = lib.analyzeFile('pages/X.svelte', src, 'x');
+    return { markup: [...a.ledger.markup].sort(), script: [...a.ledger.script].sort() };
+  };
+  const after = (src: string) => lib.analyzeFile('pages/X.svelte', src, 'x');
+  // A sentence with an {#if} in the middle becomes one message per variant; the variants share the
+  // fragments around the block.
+  const before = '<script lang="ts">\n  let { mac, ip } = $props();\n</script>\n<p>Queries from {#if mac}this device (<code>{mac}</code>, now at <code>{ip}</code>){:else}<code>{ip}</code>{/if} will show this name.</p>\n';
+  const entry = entryOf(before);
+  expect(entry.markup).toEqual([')', ', now at', 'Queries from', 'this device (', 'will show this name.']);
+  const v1 = 'Queries from this device (<code>{mac}</code>, now at <code>{ip}</code>) will show this name.';
+  const v2 = 'Queries from <code>{ip}</code> will show this name.';
+  const ok = `${head}<p>{#if mac}<T ctx="x" msg={'${v1}'} params={{ mac, ip }}>{#snippet code(s)}<code>{s}</code>{/snippet}</T>{:else}<T ctx="x" msg={'${v2}'} params={{ ip }}>{#snippet code(s)}<code>{s}</code>{/snippet}</T>{/if}</p>\n`;
+  const variants = [
+    { sentence: v1, fragments: ['Queries from', 'this device (', ', now at', ')', 'will show this name.'] },
+    { sentence: v2, fragments: ['Queries from', 'will show this name.'] },
+  ];
+  expect(lib.conserve(after(ok), entry, variants)).toEqual([]);
+  // A plural made with a suffix: the other form is built from pieces of the file's own strings.
+  const p0 = "<script lang=\"ts\">\n  let { n } = $props();\n  const left = $derived(`${n} voter${n === 1 ? '' : 's'} left`);\n</script>\n<p>{left}</p>\n";
+  const pe = entryOf(p0);
+  expect(pe.script).toEqual(['s', '{} voter{} left']);
+  const p1 = `${head}<p>{tn('{n} voter left', '{n} voters left', n, { n })}</p>\n`;
+  const forms = [
+    { sentence: '{n} voter left', fragments: ['{} voter{} left'] },
+    { sentence: '{n} voters left', fragments: ['voter', 's', 'left'] },
+  ];
+  expect(lib.conserve(after(p1), pe, forms)).toEqual([]);
+  // What still fails: a fragment the file never had, the fragments out of order, a word added, and
+  // a fragment used twice in one sentence (only another exception may share what one took).
+  expect(lib.conserve(after(ok), entry, [variants[0], { sentence: v2, fragments: ['Queries from', 'will show that name.'] }]).join('\n')).toContain('"will show that name." is not in this file\'s ledger entry');
+  expect(lib.conserve(after(ok), entry, [{ ...variants[0], fragments: ['this device (', 'Queries from', ', now at', ')', 'will show this name.'] }, variants[1]]).join('\n')).toContain("not the sentence's pieces");
+  const v3 = v1.replace('this device', 'this very device');
+  expect(lib.conserve(after(ok.replace(v1, v3)), entry, [{ ...variants[0], sentence: v3 }, variants[1]]).join('\n')).toContain("not the sentence's pieces");
+  expect(lib.conserve(after(p1.replace("'{n} voters left'", "'{n} voterss left'")), pe, [forms[0], { sentence: '{n} voterss left', fragments: ['voter', 's', 's', 'left'] }]).join('\n')).toContain('"s" is not in this file\'s ledger entry');
+});
+
 test('api_012 no new physical css properties', () => {
   const r = checkUi();
   expect(fails(r).filter((f) => f.rule === 'physical-css')).toEqual([]);

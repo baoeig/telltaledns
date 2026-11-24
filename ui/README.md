@@ -116,7 +116,10 @@ file's English ledger entry in the same commit, `node scripts/i18n.mjs ledger <f
 `src/`, for example `lib/format.ts`), and say so in the commit message. A file on the layer moved to
 another folder takes its ledger entry with it (rename the key); a new file on the layer shows only
 English some entry already has, or lists its new English under `new` in
-`tests/i18n-fixtures/ledger-exceptions.json` (`{"new": {"lib/x.ts": ["English"]}}`).
+`tests/i18n-fixtures/ledger-exceptions.json` (`{"new": {"lib/x.ts": ["English"]}}`). A sentence the
+migration joins from several pieces of a file (around an inline element, an `{#if}`, a plural's
+suffix) is listed there under the file as `{"sentence": …, "fragments": […]}`: in order, each one of
+the file's ledger strings or a piece of one; the variants of one sentence may share fragments.
 
 **Moving a file to the layer** (part A): `node scripts/i18n-codemod.mjs <file under src/>` (or
 `--all`) prints, per file, what it can move and what it leaves for the hand; `--write` rewrites the

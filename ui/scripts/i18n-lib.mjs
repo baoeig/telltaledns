@@ -1175,12 +1175,32 @@ export function pieces(s) {
     .filter(Boolean);
 }
 
+/** Whether each piece of a sentence is the next pieces of its fragments, run together or one space
+ * apart (`Queries from` + `this device (`; a plural's `voter` + `s`), all of them, in order. */
+function joined(want, got) {
+  let i = 0;
+  for (const p of want) {
+    let s = got[i++] ?? null;
+    while (s !== null && s !== p && i < got.length) {
+      const next = [`${s} ${got[i]}`, `${s}${got[i]}`].find((c) => p.startsWith(c));
+      if (next === undefined) break;
+      s = next;
+      i++;
+    }
+    if (s !== p) return false;
+  }
+  return i === got.length;
+}
+
 /**
  * Whether a file on the layer still shows the English of its ledger entry. Template text left as
  * it is must be ledger text, and every ledger text must still be there: as template text or as a
  * message. Every message must be English the file had (template text or a script string). An
  * exception `{ sentence, fragments }` takes the fragments out of the entry and puts the sentence
- * in; its fragments must be the sentence's own pieces, in order.
+ * in; its fragments, in order, must make the sentence's pieces. A fragment is one of the file's
+ * ledger strings, or a piece of one (a plural's suffix sits between two pieces of one string). A
+ * string an earlier exception took may be used again: each variant of a sentence with an {#if} in
+ * it is a whole message of its own.
  * Returns a list of problems (empty: conserved).
  */
 export function conserve(analysis, entry, exceptions = []) {
@@ -1193,15 +1213,22 @@ export function conserve(analysis, entry, exceptions = []) {
   };
   const markup = [...entry.markup];
   const script = [...entry.script];
+  const own = [...entry.markup, ...entry.script];
+  const ownerOf = (f) => own.find((s) => s === f) ?? own.find((s) => pieces(s).includes(f));
+  const taken = [];
   for (const x of exceptions) {
     if (typeof x?.sentence !== 'string' || !Array.isArray(x.fragments)) {
       problems.push(`malformed exception ${JSON.stringify(x)}`);
       continue;
     }
-    const want = pieces(x.sentence);
-    const got = x.fragments.flatMap((f) => pieces(f));
-    if (JSON.stringify(want) !== JSON.stringify(got)) problems.push(`exception "${x.sentence}": its fragments are not the sentence's pieces`);
-    for (const f of x.fragments) if (!take(markup, f) && !take(script, f)) problems.push(`exception "${x.sentence}": "${f}" is not in this file's ledger entry`);
+    if (!joined(pieces(x.sentence), x.fragments.flatMap((f) => pieces(f)))) problems.push(`exception "${x.sentence}": its fragments are not the sentence's pieces`);
+    const mine = [];
+    for (const f of x.fragments) {
+      const s = ownerOf(f);
+      const ok = s !== undefined && (take(markup, s) || take(script, s) ? mine.push(s) > 0 : taken.includes(s) || (s !== f && mine.includes(s)));
+      if (!ok) problems.push(`exception "${x.sentence}": "${f}" is not in this file's ledger entry`);
+    }
+    taken.push(...mine);
     const m = masked(x.sentence);
     if (m !== null) script.push(m);
   }
