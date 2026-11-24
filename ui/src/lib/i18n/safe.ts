@@ -18,9 +18,10 @@ export type AgreeOptions = {
   readonly dir?: 'ltr' | 'rtl';
   /** A maintainer's exemption from the digit rule (notes file), with its reason. */
   readonly exemptDigits?: boolean;
-  /** A maintainer's exemption from the added-token rule (notes file), with its reason: a time, ratio,
-   * date pattern or price a translation adds (`24:00`, `16:9`, `dd/mm/yyyy`) is reported, not failed. */
-  readonly exemptAdded?: boolean;
+  /** A maintainer's exemption from the added-token rule (notes file): the tokens a translation of
+   * this message may add (a time, ratio, date pattern or price: `["24:00"]`), each reported, not
+   * failed. Any other added token still fails. */
+  readonly exemptAdded?: readonly string[];
   /** A plural form other than `other`: it may leave out some of the English placeholders. */
   readonly placeholderSubset?: boolean;
 };
@@ -225,7 +226,7 @@ function failures(english: string, translation: string, o: AgreeOptions): Findin
   const te = tokens(english);
   const tt = tokens(translation);
   for (const x of unique(te.filter((t) => structural(t, o.glossary)))) if (!tt.includes(x)) add('structural', x, 'missing', -1);
-  if (!o.exemptAdded) for (const x of addedStructural(english, translation)) add('structural', x, 'added');
+  for (const x of addedStructural(english, translation)) if (!o.exemptAdded?.includes(x)) add('structural', x, 'added');
   if (!o.exemptDigits) for (const x of missingFrom(digits(english), digits(translation))) add('digits', x, 'missing', -1);
   const prepared = prepare(translation);
   for (const w of o.verbatim ?? []) if (!whole(w).test(prepared)) add('verbatim', w, 'missing', -1);
@@ -250,10 +251,11 @@ export function agree(english: string, translation: string, o: AgreeOptions = {}
   };
   report('hyphenated', te.filter((t) => HYPHENATED.test(t) && !tt.includes(t)), 'translated');
   report('capitals', te.filter((t) => CAPITALS.test(t) && !glossary.includes(t) && !tt.includes(t)), 'translated');
-  // Added tokens that are not structural (all of them under a maintainer's exemption), and a `.`
+  // Added tokens that are not structural (and those a maintainer's exemption allows), and a `.`
   // between letters of another script, which may be an address the rule cannot read.
   const dots = scriptDots(english);
-  report('added', [...tt.filter((t) => !te.includes(t) && !isAdded(t)), ...(o.exemptAdded ? addedStructural(english, translation) : []), ...scriptDots(translation).filter((w) => !dots.includes(w))], 'added');
+  const exempt = o.exemptAdded ? addedStructural(english, translation).filter((x) => o.exemptAdded?.includes(x)) : [];
+  report('added', [...tt.filter((t) => !te.includes(t) && !isAdded(t)), ...exempt, ...scriptDots(translation).filter((w) => !dots.includes(w))], 'added');
   return { fails, reports };
 }
 

@@ -12,7 +12,7 @@ import ts from 'typescript';
 import { parse as parseSvelte } from 'svelte/compiler';
 import { englishKey, hash, normalize } from '../src/lib/i18n/ident.ts';
 import { agree } from '../src/lib/i18n/safe.ts';
-import { CATEGORIES, LEFTOVER, merge, parse, serialize, shapeError, skeleton } from '../src/lib/i18n/pairs.ts';
+import { CATEGORIES, LEFTOVER, LIMITS, merge, parse, serialize, shapeError, skeleton } from '../src/lib/i18n/pairs.ts';
 
 /** The hash and normalization the runtime uses (one module, `src/lib/i18n/ident.ts`), and the pair
  * files' parser and canonical form (`src/lib/i18n/pairs.ts`). */
@@ -540,6 +540,8 @@ export function analyzeFile(rel, text, context) {
 // The project: data files, locales, the whole check
 
 const readJson = (p) => parse(readFileSync(p, 'utf8'));
+// A note holds one more level than a locale file: the list of tokens of `exemptAdded`.
+const NOTES_LIMITS = { ...LIMITS, depth: LIMITS.depth + 1 };
 const identity = (ctx, english, note) => `${ctx}\u0004${englishKey(english)}\u0004${note ?? ''}`;
 const show = (english) => (Array.isArray(english) ? `${english[0]} | ${english[1]}` : english);
 
@@ -605,7 +607,7 @@ function loadData(root, findings) {
     if (DATA_FILES.includes(f) || OPTIONAL_FILES.includes(f)) {
       let v;
       try {
-        v = parse(text);
+        v = parse(text, f === 'notes.json' ? NOTES_LIMITS : LIMITS);
       } catch (e) {
         failAt(rel(f), 'malformed', `not acceptable JSON: ${e.message}`);
         continue;
@@ -730,9 +732,11 @@ export function check(root, { previous = null, ratchets = true } = {}) {
   for (const [name, m] of [['notes.json', notes], ['verbatim.json', verbatim]])
     for (const id of m.keys()) if (!entries.has(id)) add({ level: 'report', rule: 'stale', file: `src/locales/${name}`, msg: `an entry of context ${JSON.stringify(id.split('\u0004')[0])} is no longer in the source`, values: [id.split('\u0004')[1]] });
   for (const [id, v] of verbatim) if (!Array.isArray(v) || !v.every((w) => typeof w === 'string' && w)) add({ level: 'fail', rule: 'malformed', file: 'src/locales/verbatim.json', msg: 'a verbatim value is a list of words', values: [id.split('\u0004')[1]] });
+  // `exemptAdded` lists the tokens a translation of the message may add (`["24:00"]`), never "all".
+  const tokenList = (x) => Array.isArray(x) && x.length > 0 && x.every((w) => typeof w === 'string' && w);
   for (const [id, v] of notes)
-    if (!v || typeof v !== 'object' || Array.isArray(v) || Object.keys(v).some((k) => !['text', 'sensitive', 'exemptDigits', 'exemptAdded'].includes(k)))
-      add({ level: 'fail', rule: 'malformed', file: 'src/locales/notes.json', msg: 'a note is { text?, sensitive?, exemptDigits?, exemptAdded? }', values: [id.split('\u0004')[1]] });
+    if (!v || typeof v !== 'object' || Array.isArray(v) || Object.keys(v).some((k) => !['text', 'sensitive', 'exemptDigits', 'exemptAdded'].includes(k)) || (Object.hasOwn(v, 'exemptAdded') && !tokenList(v.exemptAdded)))
+      add({ level: 'fail', rule: 'malformed', file: 'src/locales/notes.json', msg: 'a note is { text?, sensitive?, exemptDigits?, exemptAdded? } (exemptAdded: the tokens it allows, ["24:00"])', values: [id.split('\u0004')[1]] });
 
   // Locales.
   const shipped = {};
@@ -868,9 +872,10 @@ export function ship(cat, entries, { verbatim = new Map(), notes = new Map(), gl
       seen.add(id);
       const empty = typeof p[1] === 'string' ? p[1] === '' : Object.values(p[1]).every((x) => x === '');
       if (empty) continue;
-      // A maintainer's exemptions (notes.json, reviewed): the digit rule, and the added-token rule
-      // (whose tokens are then reported instead).
-      const opts = { verbatim: verbatim.get(id) ?? [], glossary, dir, exemptDigits: !!notes.get(id)?.exemptDigits, exemptAdded: !!notes.get(id)?.exemptAdded };
+      // A maintainer's exemptions (notes.json, reviewed): the digit rule, and the tokens the
+      // added-token rule allows (then reported instead).
+      const ea = notes.get(id)?.exemptAdded;
+      const opts = { verbatim: verbatim.get(id) ?? [], glossary, dir, exemptDigits: !!notes.get(id)?.exemptDigits, exemptAdded: Array.isArray(ea) ? ea : undefined };
       // A plural form against the English form of its category (`one`), else English `other`; a
       // form other than `other` may leave out placeholders (a dual, or a "one" that names no number).
       const forms = typeof p[1] === 'string' ? [[p[0], p[1], false]] : Object.entries(p[1]).map(([c, x]) => [c === 'one' ? p[0][0] : p[0][1], x, c !== 'other']);
@@ -1102,7 +1107,7 @@ export function carry(root, ctx, from, to) {
   for (const f of files) {
     const p = join(dir, f);
     if (!existsSync(p)) continue;
-    const cat = readJson(p);
+    const cat = parse(readFileSync(p, 'utf8'), f === 'notes.json' ? NOTES_LIMITS : LIMITS);
     for (const pr of cat[ctx] ?? []) {
       if (typeof pr[0] === 'string' && normalize(pr[0]) === normalize(from)) {
         pr[0] = to;

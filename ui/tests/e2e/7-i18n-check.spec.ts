@@ -191,23 +191,30 @@ test('api_012 a plural form other than other may hold fewer placeholders', () =>
 });
 
 test('api_012 an added-token exemption in notes.json reports what it lets through', () => {
-  const midnight = (exempt: boolean) =>
+  const midnight = (exempt: unknown, tx = 'Qa-bis 24:00') =>
     project((d) => {
       edit(d, 'src/pages/Cache.svelte', (s) => `${s}<p>{t('Until midnight')}</p>\n`);
-      qaa(d, (c) => c.cache.push(['Until midnight', 'Qa-bis 24:00']));
-      if (exempt) {
+      qaa(d, (c) => c.cache.push(['Until midnight', tx]));
+      if (exempt !== undefined) {
         const notes = JSON.parse(readFileSync(join(d, 'src/locales/notes.json'), 'utf8'));
-        notes.cache.push(['Until midnight', { exemptAdded: 'a 24-hour time, as the language writes midnight' }]);
+        notes.cache.push(['Until midnight', { exemptAdded: exempt, text: 'a 24-hour time, as the language writes midnight' }]);
         put(d, 'src/locales/notes.json', lib.serializeCatalog(notes, 'data'));
       }
     });
-  const plain = run(midnight(false));
+  const plain = run(midnight(undefined));
   expect(failRules(plain)).toEqual(['agreement']);
   expect(fails(plain).map((f) => f.check)).toEqual(['structural']);
-  const exempt = run(midnight(true));
+  const exempt = run(midnight(['24:00']));
   expect(failRules(exempt)).toEqual([]);
   expect(exempt.findings.filter((f) => f.rule === 'agreement-added').map((f) => f.values?.at(-1))).toContain('24:00');
   expect(JSON.parse(exempt.shipped.qaa.json)[hash('cache', 'Until midnight')]).toBe('Qa-bis 24:00');
+  // The exemption names the tokens it allows: another language's added address still fails.
+  const other = run(midnight(['24:00'], 'Qa-bis 24:00 8.8.8.8'));
+  expect(failRules(other)).toEqual(['agreement']);
+  expect(fails(other).map((f) => [f.check, f.values?.at(-1)])).toEqual([['structural', '8.8.8.8']]);
+  expect(JSON.parse(other.shipped.qaa.json)[hash('cache', 'Until midnight')]).toBeUndefined();
+  // It is a list of tokens: a reason alone, or an empty list, exempts nothing and is malformed.
+  for (const bad of ['a 24-hour time', [], [''], true]) expect(failRules(run(midnight(bad))), JSON.stringify(bad)).toEqual(['agreement', 'malformed']);
   // A note has these four fields only.
   const odd = run(
     project((d) => {

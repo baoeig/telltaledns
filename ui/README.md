@@ -132,10 +132,12 @@ is shown until the language's owner confirms the new text.
 
 **Exemptions.** A translation that adds a time, a ratio, a date pattern, a list joined by slashes,
 a grouped number or a price (`24:00`, `16:9`, `TT/MM/JJJJ`, `1.000.000.000`, `$5`) fails as an added
-structural token, naming it. A maintainer may then exempt that message in `src/locales/notes.json`
-with `exemptAdded` (and a translation that writes a number in words with `exemptDigits`), giving
-the reason as the value: the check reports those tokens instead, and the reviewer reads them. The
-browser does not re-check the two rules for a catalog the build shipped, and does for any other.
+structural token, naming it. A maintainer may then allow that token for that message in
+`src/locales/notes.json`: `exemptAdded` lists the tokens a translation may add (`"exemptAdded":
+["24:00"]`, with the reason in `text`), and any other token it adds still fails. A translation that
+writes a number in words is exempted with `exemptDigits` (the reason as the value). The check
+reports the allowed tokens instead, and the reviewer reads them. The browser does not re-check the
+two rules for a catalog the build shipped, and does for any other.
 
 **Review a catalog pull request by structure.** You do not need to read the language:
 

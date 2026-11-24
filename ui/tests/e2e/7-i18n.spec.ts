@@ -346,12 +346,15 @@ test('api_012 a maintainer may exempt an entry from the added-token rule', () =>
     ['Price', 'Preis $5', '$5'],
   ]) {
     expect(agree(en, tx).fails.map((f) => `${f.rule} ${f.token} ${f.detail}`), tx).toEqual([`structural ${token} added`]);
-    const v = agree(en, tx, { exemptAdded: true });
+    const v = agree(en, tx, { exemptAdded: [token] });
     expect(v.fails, tx).toEqual([]);
     expect(v.reports.map((r) => r.token), tx).toContain(token);
+    // The exemption names its tokens: any other the translation adds still fails.
+    expect(agree(en, `${tx} 8.8.8.8`, { exemptAdded: [token] }).fails.map((f) => `${f.rule} ${f.token} ${f.detail}`), tx).toEqual(['structural 8.8.8.8 added']);
+    expect(failed(en, tx, { exemptAdded: ['00:00'] }), tx).toEqual(['structural']);
   }
   // An exemption covers added tokens only: an address the English has must stay.
-  expect(failed('See https://a.example', '见 https://b.example', { exemptAdded: true })).toEqual(['urls', 'structural']);
+  expect(failed('See https://a.example', '见 https://b.example', { exemptAdded: ['https://b.example'] })).toEqual(['urls', 'structural']);
 });
 
 test('api_012 the agreement rule takes linear time on any text', () => {
