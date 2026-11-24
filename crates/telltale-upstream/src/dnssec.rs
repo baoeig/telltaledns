@@ -834,6 +834,9 @@ impl Validator {
                 .await?;
             let mut m = end.into_message();
             m.queries = vec![Query::query(name.clone(), qtype)];
+            // REQ: DNS-011 (ADR-188) — of the last answer, the records of the name it answers and
+            // their signatures: the chain's, nothing of other names.
+            m.answers.retain(|r| r.name == at);
             chain.append(&mut m.answers);
             m.answers = chain;
             for r in proofs {

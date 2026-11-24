@@ -274,6 +274,8 @@ mod tampering {
     /// `ent.w.s.t. A` (an empty non-terminal) is answered with the wildcard's address and the
     /// NSEC that covers the name.
     pub(super) const REPLAY_WILDCARD_AT_ENT: usize = 7;
+    /// `www.s.t. AAAA` (NODATA) comes with another name's signed address in the answer section.
+    pub(super) const EXTRA_RECORD: usize = 8;
 }
 
 /// `name`'s NSEC3 hash with `t.`'s parameters.
@@ -701,6 +703,9 @@ fn child_link(z: &Tld, m: &mut Message, qn: &Name, qt: RecordType, tamper: usize
         }
         add_once(m, z.child[&(apex.clone(), RecordType::SOA)].clone());
         nsec(m, qn);
+        if tamper == tampering::EXTRA_RECORD && *qn == n("www.s.t.") && qt == RecordType::AAAA {
+            m.add_answers(z.child[&(n("own.w.s.t."), RecordType::A)].clone());
+        }
         return None;
     }
     // A wildcard one label up (unless the name exists as an empty non-terminal).
@@ -1704,6 +1709,48 @@ async fn dns_011_link_validation_leaves_slots_for_its_proofs() {
         round(&v, &g).await,
         Some(Verdict::Insecure),
         "the link-by-link slots free again"
+    );
+}
+
+/// REQ: DNS-011 (ADR-188) — an answer validated link by link is made of the chain's records: of
+/// the last answer, only those owned by the name it answers, and their signatures. With
+/// `www.s.t. AAAA` (NODATA) answered with another name's signed address beside its NSEC,
+/// `alias.s.t. AAAA` is still a secure NODATA behind the CNAME, without that address.
+#[tokio::test]
+async fn dns_011_offline_composed_answer_keeps_only_the_chain() {
+    let z = Arc::new(zone());
+    z.tld
+        .tamper
+        .store(tampering::EXTRA_RECORD, Ordering::Relaxed);
+    let (v, g, _, _, _dir) = setup_zone(true, Arc::clone(&z)).await;
+    warm_tld(&v, &g).await;
+    let r = v
+        .resolve(
+            &g,
+            question("alias.s.t", rtype::AAAA),
+            Duration::from_secs(5),
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.verdict, Verdict::Secure, "alias.s.t. AAAA");
+    assert_eq!(rcode(&r.bytes), telltale_proto::rcode::NOERROR);
+    assert_eq!(
+        answered(&r.bytes),
+        vec![("alias.s.t.".to_owned(), RecordType::CNAME)],
+        "the CNAME only"
+    );
+    let m = Message::from_vec(&r.bytes).unwrap();
+    assert!(
+        m.answers.iter().all(|r| r.name == n("alias.s.t.")),
+        "no signature of another name"
+    );
+    assert!(
+        m.authorities
+            .iter()
+            .any(|r| r.name == n("www.s.t.") && r.record_type() == RecordType::NSEC),
+        "the target's denial"
     );
 }
 
