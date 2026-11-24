@@ -746,7 +746,7 @@ fn health_checks(
             "in_sync",
             lagging.is_empty(),
             if lagging.is_empty() {
-                format!("Every reachable node runs configuration version {newest}")
+                format!("Every reachable node that serves DNS runs configuration version {newest}")
             } else {
                 format!("Behind for over {LAG_WARN_SECS} s: {}", lagging.join(", "))
             },
@@ -765,7 +765,7 @@ fn health_checks(
             "serving",
             not_serving.is_empty(),
             if not_serving.is_empty() {
-                "Every reachable node is serving DNS".into()
+                "Every reachable node that serves DNS is ready".into()
             } else {
                 format!("Not serving DNS: {}", not_serving.join(", "))
             },
@@ -1645,6 +1645,37 @@ mod tests {
         // A witness that's down is still reported.
         witness.up = false;
         assert_eq!(failing(&[primary, witness]), ["peers_up"]);
+    }
+
+    /// REQ: CLU-008 (ADR-056) — with a witness in the cluster, the passing `in_sync` and
+    /// `serving` checks say what they cover: the nodes that serve DNS.
+    #[test]
+    fn clu_008_check_summaries_cover_the_nodes_that_serve_dns() {
+        let mut primary = pod("home", "pi", 50);
+        primary.role = "primary".into();
+        let mut witness = pod("attic", "witness", 0);
+        witness.witness = true;
+        witness.ready = false;
+        witness.config_lag = 12;
+        witness.behind_seconds = Some(86_400);
+        let checks = health_checks(&[primary, witness], false, 12, None, 300);
+        let summary = |id: &str| {
+            checks
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| (c.ok, c.summary.as_str()))
+        };
+        assert_eq!(
+            summary("in_sync"),
+            Some((
+                true,
+                "Every reachable node that serves DNS runs configuration version 12"
+            ))
+        );
+        assert_eq!(
+            summary("serving"),
+            Some((true, "Every reachable node that serves DNS is ready"))
+        );
     }
 
     /// REQ: CLU-008 (T6.14) — shares add up over the nodes that are up; a site's pods are

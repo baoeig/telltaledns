@@ -1712,11 +1712,17 @@ test('clu_008 a healthy witness is not shown as a fault', async () => {
   await expect(topo.locator('.chip.warn, path.link.warn')).toHaveCount(0);
   await expect(row).toContainText('votes only');
   await expect(row).not.toContainText(/behind|not ready/);
+  // Its second line says so in place of queries it doesn't answer, and the legend says what
+  // green means for a witness.
+  await expect(chip.locator('text.sub')).toHaveText('votes only · 3 ms');
+  await expect(topo.locator('.legend')).toContainText('it only votes');
   // A replica in the same state is behind and not ready.
   current = view({ witness: false });
   await expect(row).toContainText('not ready', { timeout: 10_000 });
   await expect(row).toContainText('12 behind');
   await expect(topo.locator('.chip.warn')).toHaveCount(1);
+  await expect(chip.locator('text.sub')).toHaveText('0 q/s · 0% · 3 ms');
+  await expect(topo.locator('.legend')).not.toContainText('only votes');
   // A witness that's down is red.
   current = view({ witness: true, up: false, connected: false });
   await expect(topo.locator('path.link.bad')).toHaveCount(1, { timeout: 10_000 });
