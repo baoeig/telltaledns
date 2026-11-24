@@ -2159,7 +2159,9 @@ telltale cluster set-failover auto
 - **A witness only votes.** What covers the whole cluster (the dashboard and the other views,
   pausing blocking, the cache's table and flushes, drills, simulations, a cluster support
   package) leaves it out, and never lists it as a node that didn't answer, up or down. The
-  Cluster page and the node-down alert still show it.
+  Cluster page and the node-down alert still show it. The Cluster page shows it as *votes
+  only*, never counted as behind or not serving DNS, and the `sync_lag` alert leaves it out; a
+  witness that's down still fails the `peers_up` check and raises the node-down alert.
 - **Manual promotion is refused while automatic failover runs**; `telltale cluster
   set-failover manual` on the primary switches back. With fewer than three voters, `auto` acts
   as `manual`, and the Cluster page says so.
@@ -3297,7 +3299,7 @@ Rules watch:
 | `servfail_rate` | SERVFAIL above `threshold` % (default 5) over 5 minutes, at least 50 queries | node |
 | `anomaly` | a [device anomaly](#device-anomalies) is found, unless it is acknowledged or [muted](#muting-a-kind-of-finding-for-a-device) | finding |
 | `update_available` | a newer TelltaleDNS build is out | version |
-| `sync_lag` | a replica is behind the primary's configuration (set `for_secs`, say 300, so a normal sync stays quiet) | node |
+| `sync_lag` | a replica (never a witness) is behind the primary's configuration (set `for_secs`, say 300, so a normal sync stays quiet) | node |
 | `new_device` | a device TelltaleDNS has never seen starts asking, on any node (quiet for the first day after a fresh start, while every device is new) | device |
 | `disk_full` | a node's data disk is more than `threshold` % full (default 90) | node |
 | `plan_pending` | an AI agent's change waits for approval (`[agents] require_approval`) | plan |
