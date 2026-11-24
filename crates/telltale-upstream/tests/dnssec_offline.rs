@@ -1583,10 +1583,12 @@ async fn dns_011_offline_links_that_do_not_hold_stay_bogus() {
 /// that doesn't validate. So `validate` answers SERVFAIL with EDE 6 and never a stale answer, and
 /// `permissive` serves the answer, as it does when the validation library refuses an answer itself
 /// (an upstream failure would be stale or SERVFAIL with EDE 22 in both). Only the links' own
-/// questions (CNAME) are slow here: the upstream gives up on them within the group's budget, or
-/// the validation's deadline (two budgets of the question) runs out first, the group's budget being
-/// that of the question that warmed it. Both after the library refused a denial behind a CNAME,
-/// and after it judged a chain into an unsigned zone bogus.
+/// questions (CNAME) are slow here: the upstream gives up on them within the group's budget (the
+/// first question's, 1 s), or the validation's deadline (two budgets of the question, 1.9 s) runs
+/// out before the group's only member gives up on its attempt (2 s after it starts), the group's
+/// budget being that of the question that warmed it (5 s). The question's main lookup may take
+/// one and a half budgets (1.4 s). Both after the library refused a denial behind a CNAME, and
+/// after it judged a chain into an unsigned zone bogus.
 #[tokio::test]
 async fn dns_011_offline_link_lookup_timeout_stays_bogus() {
     // Each case's outcome: the verdict and EDE (`None`: no verdict), then the bogus, insecure and
@@ -1604,14 +1606,14 @@ async fn dns_011_offline_link_lookup_timeout_stays_bogus() {
             "alias.s.t",
             rtype::AAAA,
             Some("www.s.t"),
-            300,
+            950,
             "a denial behind a CNAME; the deadline runs out",
         ),
         (
             "parked.s.t",
             rtype::A,
             Some("x.t"),
-            300,
+            950,
             "a chain into an unsigned zone; the deadline runs out",
         ),
     ] {
