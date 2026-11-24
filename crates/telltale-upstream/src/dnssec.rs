@@ -1131,9 +1131,11 @@ fn has_nsec3_of(m: &Message, zone: &Name) -> bool {
 /// covering the wildcard, which can't be there when that wildcard gave the answer, so it calls
 /// the answer bogus wherever the wildcard stands right above the name. This checks the rule
 /// itself, over records the library validated. True only when:
-/// - the answer is one record set, the question's, and it and its signatures are secure;
-/// - every signature covers fewer labels than `name` has, all the same number of them, by one
-///   signer, a zone `name` is in: the wildcard one label above that many;
+/// - the answer is one record set, the question's, secure, with its signatures: at least one of
+///   them verified, and a signature of it that isn't verified (a second key or algorithm during a
+///   rollover, RFC 6840 §5.4) left out;
+/// - every verified signature covers fewer labels than `name` has, all the same number of them, by
+///   one signer, a zone `name` is in: the wildcard one label above that many;
 /// - a secure NSEC signed by that zone covers the next closer name (`name`, cut to one label
 ///   more): it doesn't exist, nor does anything below it;
 /// - and there is no NSEC3 beside it.
@@ -1143,14 +1145,18 @@ fn wildcard_proven(m: &Message, name: &Name, rtype: RecordType) -> bool {
     }
     let mut sigs = Vec::new();
     for r in &m.answers {
-        if r.proof != Proof::Secure || r.name != *name {
+        if r.name != *name {
             return false;
         }
         match &r.data {
+            // REQ: DNS-011 (RFC 6840 §5.4, ADR-188) — one verified signature proves the record set;
+            // another one that isn't verified says nothing either way.
             RData::DNSSEC(DNSSECRData::RRSIG(s)) if s.input().type_covered == rtype => {
-                sigs.push((s.input().num_labels, &s.input().signer_name));
+                if r.proof == Proof::Secure {
+                    sigs.push((s.input().num_labels, &s.input().signer_name));
+                }
             }
-            _ if r.record_type() == rtype => {}
+            _ if r.proof == Proof::Secure && r.record_type() == rtype => {}
             _ => return false,
         }
     }
@@ -1919,6 +1925,30 @@ mod depth_tests {
             m.authorities
                 .push(secure("x.z.test.", RData::DNSSEC(DNSSECRData::NSEC3(n3))));
         });
+        refused("a signature of another type that isn't verified", &|m| {
+            let mut extra = sig("m.z.test.", AAAA, 2, "z.test.");
+            extra.proof = Proof::Indeterminate;
+            m.answers.push(extra);
+        });
+        // RFC 6840 §5.4 — a second signature that isn't verified (a key or algorithm rollover) is
+        // left out: neither its label count nor its signer counts, and it is no reason to refuse.
+        // Without a verified one there is no proof ("the signature isn't secure", above).
+        let unverified = |labels: u8, signer: &str, proof: Proof| {
+            let mut m = good();
+            let mut extra = sig("m.z.test.", A, labels, signer);
+            extra.proof = proof;
+            m.answers.push(extra);
+            (labels, wildcard_proven(&m, &name, A))
+        };
+        assert_eq!(
+            [
+                unverified(2, "z.test.", Proof::Indeterminate),
+                unverified(1, "test.", Proof::Indeterminate),
+                unverified(3, "y.test.", Proof::Bogus),
+            ],
+            [(2, true), (1, true), (3, true)],
+            "a second signature that isn't verified"
+        );
         // Two labels below the wildcard: the NSEC must deny the one right below it.
         let deep = n("a.m.z.test.");
         let mut m = good();

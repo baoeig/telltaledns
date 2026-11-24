@@ -253,6 +253,9 @@ struct Tld {
     /// `dns_011_offline_links_that_do_not_hold_stay_bogus`: what `s.t.`'s answers are changed to
     /// ([`tamper`]).
     tamper: AtomicUsize,
+    /// A signature of `*.w.s.t.`'s address by another key of `s.t.`, one that isn't in its key set
+    /// ([`tampering::SECOND_SIGNATURE`]).
+    second_signature: Record,
     /// `z3.s.t.`'s zone ([`hashed_zone`]): signed with NSEC3 under its own key, its NSEC3 chain
     /// included.
     hashed: BTreeMap<(Name, RecordType), Vec<Record>>,
@@ -296,6 +299,9 @@ mod tampering {
     /// A wildcard's answers come with only `t.`'s signed NSEC3 record covering the name, and
     /// `own.w.s.t. A` is answered with the wildcard's address.
     pub(super) const OTHER_ZONE_NSEC3_PROOF: usize = 13;
+    /// `*.w.s.t.`'s address comes with a second signature, by another key of `s.t.` that isn't in
+    /// its key set (as during a key rollover).
+    pub(super) const SECOND_SIGNATURE: usize = 14;
 }
 
 /// `name`'s NSEC3 hash with `t.`'s parameters.
@@ -602,6 +608,17 @@ fn tld(proof_ttl: u32) -> Tld {
             )));
         }
     }
+    // A second signature of `*.w.s.t.`'s address, by another key of `s.t.` (not in its key set).
+    let (other_signer, _) = zone_signer(&n("s.t."));
+    let second_signature = signed(
+        vec![(n("*.w.s.t."), vec![RData::A(A::new(192, 0, 2, 31))])],
+        &other_signer,
+        3600,
+    )
+    .into_values()
+    .flatten()
+    .find(|r| r.record_type() == RecordType::RRSIG)
+    .unwrap();
     let mut plain = BTreeMap::new();
     for (name, d) in [
         (n("v.t."), RData::SOA(soa_of("v.t."))),
@@ -630,6 +647,7 @@ fn tld(proof_ttl: u32) -> Tld {
         replay: AtomicBool::new(false),
         other_soa: AtomicBool::new(false),
         tamper: AtomicUsize::new(tampering::NONE),
+        second_signature,
         hashed,
         hashed_chain,
     }
@@ -884,6 +902,14 @@ fn child_link(z: &Tld, m: &mut Message, qn: &Name, qt: RecordType, tamper: usize
                 }
                 r
             }));
+            if tamper == tampering::SECOND_SIGNATURE
+                && wildcard == n("*.w.s.t.")
+                && t == RecordType::A
+            {
+                let mut second = z.second_signature.clone();
+                second.name = qn.clone();
+                m.add_answers(vec![second]);
+            }
             match tamper {
                 tampering::NO_WILDCARD_PROOF => {}
                 tampering::OTHER_WILDCARD_PROOF => nsec(m, &n("www.s.t.")),
@@ -2273,6 +2299,44 @@ async fn dns_011_offline_wildcard_answers_in_an_nsec3_zone_are_secure() {
                 Verdict::Secure,
                 Some((telltale_proto::rcode::NOERROR, true, records)),
                 true,
+            )),
+        ));
+    }
+    assert_eq!(got, want);
+    assert_eq!(stats.bogus.load(Ordering::Relaxed), 0);
+}
+
+/// REQ: DNS-011 (RFC 4035 §5.3.4, RFC 6840 §5.4; ADR-188) — a wildcard's answer whose record set has
+/// a second signature that isn't verified (by another key of the zone, as during a key rollover) is
+/// judged by the signature that is: with its NSEC it is indeterminate (served without AD), as an
+/// answer with such a signature is, and not bogus. One label below the wildcard's parent
+/// (`any.w.s.t.`) and two (`a.b.w.s.t.`).
+#[tokio::test]
+async fn dns_011_offline_wildcard_answer_with_a_second_signature_is_indeterminate() {
+    let z = Arc::new(zone());
+    z.tld
+        .tamper
+        .store(tampering::SECOND_SIGNATURE, Ordering::Relaxed);
+    let (v, g, _, stats, _dir) = setup_zone(true, Arc::clone(&z)).await;
+    warm_tld(&v, &g).await;
+    let (mut got, mut want) = (Vec::new(), Vec::new());
+    for name in ["any.w.s.t", "a.b.w.s.t"] {
+        let r = v
+            .resolve(
+                &g,
+                question(name, rtype::A),
+                Duration::from_secs(5),
+                true,
+                false,
+            )
+            .await;
+        got.push((name, r.ok().map(|r| (r.verdict, served(&r.bytes)))));
+        let records = vec![(format!("{name}."), RecordType::A)];
+        want.push((
+            name,
+            Some((
+                Verdict::Indeterminate,
+                Some((telltale_proto::rcode::NOERROR, false, records)),
             )),
         ));
     }
