@@ -1886,6 +1886,8 @@ groups, query log, and live query stream cover every node:
   - query-log rows interleave by time, and each row shows the node that answered it.
 - A node that doesn't answer within 2 seconds is left out, and the page says so ("Partial
   results: pi didn't answer"). It never hangs. The API lists those nodes in `missingNodes`.
+  A witness (see automatic failover, below) holds no data, so it is never asked and never
+  listed.
 - Other nodes are asked about a range of time up to a limit: a request for more than 256
   windows of 240 buckets a node (over 17 hours of seconds, 42 days of minutes, or 7 years of
   hours) is answered from this node alone, with the other nodes in `missingNodes`. Every range
@@ -2158,6 +2160,10 @@ telltale cluster set-failover auto
 - **Seeing it:** the Cluster page's **Failover** line (voters reachable, the lease, the latest
   vote) and the `failover` check. Metrics: `telltale_cluster_primary`, `telltale_cluster_epoch`,
   `telltale_cluster_failover_auto`, `telltale_cluster_lease_held`.
+- **A witness only votes.** What covers the whole cluster (the dashboard and the other views,
+  pausing blocking, the cache's table and flushes, drills, simulations, a cluster support
+  package) leaves it out, and never lists it as a node that didn't answer, up or down. The
+  Cluster page and the node-down alert still show it.
 - **Manual promotion is refused while automatic failover runs**; `telltale cluster
   set-failover manual` on the primary switches back. With fewer than three voters, `auto` acts
   as `manual`, and the Cluster page says so.
