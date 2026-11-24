@@ -131,7 +131,7 @@ export function duration(secs: number): string {
   return f.duration(secs);
 }
 
-/** "5 min ago" / "in 2 h" from Unix seconds. */
+/** "5m ago" / "in 2h" from Unix seconds. */
 export function ago(unix: number | undefined | null): string {
   return f.ago(unix);
 }

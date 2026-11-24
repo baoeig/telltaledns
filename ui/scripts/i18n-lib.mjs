@@ -120,6 +120,16 @@ export function masked(s) {
   const m = s.replace(PLACEHOLDER, '{}').replace(SPACE, ' ').trim();
   return m.replace(/\{\}/g, '').trim() === '' ? null : m;
 }
+/** The values a variable `name` is declared with in a source file (any scope). */
+function declaredWith(sf, name) {
+  const out = [];
+  const walk = (n) => {
+    if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.name.text === name && n.initializer) out.push(n.initializer);
+    ts.forEachChild(n, walk);
+  };
+  walk(sf);
+  return out;
+}
 const LETTER = /\p{L}/u;
 const TWO_WORDS = /\p{L}+\s+\p{L}+/u;
 const I18N_MODULE = /(^|\/)i18n(\/index(\.ts)?)?$/;
@@ -305,10 +315,19 @@ export function analyzeFile(rel, text, context) {
             if (mc.fn === 'tn' && lits.length === 2 && lits.every(isLit) && ph(lits[0].text) !== ph(lits[1].text))
               fail('plural-forms', at(n), `tn()'s two English forms name different placeholders (${JSON.stringify(ph(lits[0].text))} and ${JSON.stringify(ph(lits[1].text))})`);
           } else {
-            // tk() shows a message m() marked; an object made in place would escape extraction.
-            let a0 = args[0];
-            while (a0 && (ts.isParenthesizedExpression(a0) || ts.isAsExpression(a0) || ts.isSatisfiesExpression?.(a0))) a0 = a0.expression;
-            if (a0 && ts.isObjectLiteralExpression(a0)) fail('non-literal', at(n), 'tk() shows a message marked with m(), never an object literal');
+            // tk() shows a message m() marked; an object made in place would escape extraction: in
+            // the call, in either branch of a condition, or as the value a variable of this file
+            // is declared with.
+            const objectLike = (e, depth = 0) => {
+              while (e && (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isSatisfiesExpression?.(e) || ts.isTypeAssertionExpression?.(e) || ts.isNonNullExpression(e))) e = e.expression;
+              if (!e || depth > 3) return false;
+              if (ts.isObjectLiteralExpression(e)) return true;
+              if (ts.isConditionalExpression(e)) return objectLike(e.whenTrue, depth + 1) || objectLike(e.whenFalse, depth + 1);
+              if (ts.isBinaryExpression(e) && [ts.SyntaxKind.BarBarToken, ts.SyntaxKind.QuestionQuestionToken, ts.SyntaxKind.AmpersandAmpersandToken].includes(e.operatorToken.kind)) return objectLike(e.left, depth + 1) || objectLike(e.right, depth + 1);
+              if (ts.isIdentifier(e)) return declaredWith(unit.sf, e.text).some((v) => objectLike(v, depth + 1));
+              return false;
+            };
+            if (objectLike(args[0])) fail('non-literal', at(n), 'tk() shows a message marked with m(), never an object literal');
           }
           if (mc.fn !== 'm') {
             if (unit.module && !inFunction(n)) fail('top-level', at(n), `${mc.fn}() at the top level of a module runs before the language is loaded: call it where the text is shown, or mark it with m()`);

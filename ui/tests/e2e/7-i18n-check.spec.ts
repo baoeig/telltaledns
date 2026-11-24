@@ -249,6 +249,8 @@ const MISTAKES: [string, string, (d: string) => void, string?][] = [
   ['a t() result as a Map key', 'misuse', (d) => edit(d, 'src/pages/Cache.svelte', (s) => s.replace('</script>', "  new Map().set(t('Holds'), 1);\n</script>"))],
   ['a t() result stored', 'misuse', (d) => edit(d, 'src/pages/Cache.svelte', (s) => s.replace('</script>', "  localStorage.setItem('k', t('Holds'));\n</script>"))],
   ['tk() given an object literal', 'non-literal', (d) => edit(d, 'src/lib/labels.ts', (s) => `${s}\nexport function raw(e: string): string {\n  return tk({ c: 'labels', e });\n}\n`)],
+  ['tk() given an object literal in a condition', 'non-literal', (d) => edit(d, 'src/lib/labels.ts', (s) => `${s}\nexport function raw(e: string): string {\n  return tk(e ? ({ c: 'labels', e } as never) : LISTS);\n}\n`)],
+  ['tk() given a variable made from an object literal', 'non-literal', (d) => edit(d, 'src/lib/labels.ts', (s) => `${s}\nexport function raw(e: string): string {\n  const made = { c: 'labels', e };\n  return tk(<never>made!);\n}\n`)],
   ['a manifest with parent', 'manifest', (d) => manifest(d, (m) => (m.qaa.parent = 'en'))],
   ['a manifest with regions', 'manifest', (d) => manifest(d, (m) => (m.qaa.regions = ['419']))],
   // (A file not on the layer, so only the map's own rule can trip.)
@@ -475,7 +477,10 @@ test('api_012 the languages tool says which node it needs', () => {
 });
 
 test('api_012 npm runs the generation step inside its scripts', () => {
-  // Inside the scripts themselves, too, where `ignore-scripts` would skip a `pre` script.
+  // Inside the scripts themselves, where `ignore-scripts` cannot skip it, and once: no `pre` script.
   const scripts = JSON.parse(readFileSync(join(UI, 'package.json'), 'utf8')).scripts;
-  for (const s of ['dev', 'build', 'check', 'test:e2e']) expect(scripts[s], s).toMatch(/^node scripts\/i18n\.mjs prebuild && /);
+  for (const s of ['dev', 'build', 'check', 'test:e2e']) {
+    expect(scripts[s], s).toMatch(/^node scripts\/i18n\.mjs prebuild && /);
+    expect(scripts[`pre${s}`], `pre${s}`).toBeUndefined();
+  }
 });
