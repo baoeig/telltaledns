@@ -1390,3 +1390,103 @@ fn obs_009_observe_query_takes_any_wire_bytes() {
         assert!(state.new_samples.iter().all(|text| within(text)));
     }
 }
+
+/// REQ: OBS-009 (ADR-186) — the sample names a fresh engine keeps for a sweep whose first
+/// NXDOMAIN answer is for `name` (40 reverse names of 10.0.20.0/24 follow in the same minute),
+/// checked against the sweep finding they end up in.
+fn sweep_samples(name: &[u8]) -> Vec<String> {
+    let mut e = Engine::new(Settings::default());
+    let t = DAY0 + 600;
+    e.observe_answer(t, ip(1), name, Some(3));
+    for i in 1..=40u64 {
+        e.observe_answer(
+            t + i,
+            ip(1),
+            &wire(&format!("{i}.20.0.10.in-addr.arpa")),
+            Some(3),
+        );
+    }
+    let state = &e.clients[&ip(1)];
+    assert!(state.nx_samples.is_empty(), "{:?}", state.nx_samples);
+    let kept = state.rev_samples.clone();
+    close(&mut e, t);
+    assert_eq!(kinds(&e), ["reverse_sweep"], "{:#?}", e.findings());
+    let detail = &e.findings()[0].detail;
+    assert!(
+        detail.ends_with(&format!("e.g. {}", kept.join(", "))),
+        "{detail}"
+    );
+    kept
+}
+
+/// REQ: OBS-009 (ADR-186) — a sweep's sample names are cut at a character boundary, valid for
+/// any name, like the other NXDOMAIN samples: with a character of each width (a byte that shows
+/// as U+FFFD, and valid 2-, 3- and 4-byte ones) at every offset around the cut, a reverse name
+/// of a private address (under `168.192.in-addr.arpa` or `d.f.ip6.arpa`) is kept in the sweep's
+/// samples, and the same name under `example` in the storm's, as the longest prefix of its
+/// dotted text that is at most [`MAX_DOMAIN`] bytes and ends on a character.
+#[test]
+fn obs_009_sweep_sample_names_cut_at_char_boundary() {
+    let shapes: [(&[u8], &str); 4] = [
+        (b"\x80", "\u{fffd}"),
+        ("\u{e9}".as_bytes(), "\u{e9}"),
+        ("\u{20ac}".as_bytes(), "\u{20ac}"),
+        ("\u{1f600}".as_bytes(), "\u{1f600}"),
+    ];
+    let suffixes = [
+        ("1.168.192.in-addr.arpa", true),
+        ("d.f.ip6.arpa", true),
+        ("example", false),
+    ];
+    for (bytes, shown) in shapes {
+        let per_label = 63 / bytes.len();
+        // Where the cut fell inside a character (bytes after its start).
+        let mut inside = std::collections::BTreeSet::new();
+        for filler in 0..=70usize {
+            let letters: Vec<u8> = (0..filler)
+                .map(|i| b'a' + u8::try_from(i % 26).unwrap())
+                .collect();
+            for (suffix, private) in suffixes {
+                let mut labels: Vec<Vec<u8>> = letters.chunks(63).map(<[u8]>::to_vec).collect();
+                labels.extend([bytes.repeat(per_label), bytes.repeat(per_label)]);
+                labels.extend(suffix.split('.').map(|l| l.as_bytes().to_vec()));
+                let w = wire_of(&labels);
+                let mut parts: Vec<String> = letters
+                    .chunks(63)
+                    .map(|c| std::str::from_utf8(c).unwrap().to_owned())
+                    .collect();
+                parts.extend([
+                    shown.repeat(per_label),
+                    shown.repeat(per_label),
+                    suffix.to_owned(),
+                ]);
+                let full = parts.join(".");
+                assert_eq!(crate::event::dotted(&w), full, "the test's own name");
+                assert!(full.len() > MAX_DOMAIN);
+                assert_eq!(crate::internal::is_private_reverse(&w), private, "{full}");
+                let longest = (0..=MAX_DOMAIN)
+                    .rev()
+                    .find(|&b| full.is_char_boundary(b))
+                    .unwrap();
+                if longest < MAX_DOMAIN {
+                    inside.insert(MAX_DOMAIN - longest);
+                }
+                let samples = if private {
+                    sweep_samples(&w)
+                } else {
+                    storm_samples(&[w.as_slice()])
+                };
+                assert_eq!(
+                    samples.first().map(String::as_str),
+                    Some(&full[..longest]),
+                    "{shown:?} after {filler} letters, under {suffix}: {samples:?}"
+                );
+            }
+        }
+        assert_eq!(
+            inside,
+            (1..shown.len()).collect::<std::collections::BTreeSet<_>>(),
+            "every offset inside {shown:?}"
+        );
+    }
+}
