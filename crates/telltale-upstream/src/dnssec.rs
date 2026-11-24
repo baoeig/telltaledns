@@ -1841,8 +1841,9 @@ mod depth_tests {
 
     /// REQ: DNS-011 (RFC 4035 §5.3.4) — a wildcard's answer, built by hand: accepted with the
     /// signed zone's NSEC for the next closer name, and not when any part of that is missing.
+    // One case per condition.
     #[test]
-    #[allow(clippy::too_many_lines)] // one case per condition
+    #[allow(clippy::too_many_lines)]
     fn dns_011_wildcard_answer_needs_its_proof() {
         use RecordType::{A, AAAA, NSEC as T_NSEC, RRSIG as T_RRSIG};
         use hickory_net::proto::dnssec::Algorithm;
