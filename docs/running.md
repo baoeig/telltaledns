@@ -1830,16 +1830,21 @@ negative_trust_anchors = ["corp.example"]   # internal zones that aren't signed
   one link at a time, each as a question of its own (the CNAME at each name, then the question
   at its target), and serves only what those answers validate, with the weakest link's verdict:
   secure (with AD), or insecure when a link is in a zone proven unsigned as above
-  (`c.pki.goog`). This only looks at answers the library refused, on cache misses, in both
-  modes: at most 8 links, 4 such validations at once, within the same deadline. A link that
-  doesn't validate, or gets no answer in time, leaves the answer bogus, and that question isn't
-  validated this way again for a minute (ADR-188).
-- **Wildcard answers:** in a zone signed with NSEC, an answer made from a wildcard is served
-  only if the zone's signed NSEC shows that no closer name exists (RFC 4035 §5.3.4), whether or
-  not the validation library refused it first; otherwise it is bogus. So an answer from a
-  wildcard right above the name validates (`nasa-gov.go-vip.net A`, and `www.nasa.gov A`
-  through its CNAME). The check reads only the answer itself, on cache misses, in both modes.
-  Zones signed with NSEC3 are left to the library (ADR-188).
+  (`c.pki.goog`). This only looks at answers the library refused or found bogus (also those
+  the wildcard check below marks bogus), on cache misses, in both modes: at most 8 links, 4 such
+  validations at once, within the same deadline. A link that doesn't validate, or gets no
+  answer in time, leaves the answer bogus, and that question isn't validated this way again
+  for a minute (ADR-188).
+- **Wildcard answers:** every wildcard answer in a zone signed with NSEC is checked against
+  RFC 4035 §5.3.4 before it is served: the zone's signed NSEC must show that no closer name
+  exists, otherwise the answer is bogus and handled as any bogus answer (the unsigned-zone
+  proof, then link by link when it starts with a CNAME). So an answer from a wildcard right
+  above the name validates (`nasa-gov.go-vip.net A`, and `www.nasa.gov A` through its CNAME),
+  and so does a wildcard CNAME further down, in one lookup. An answer with a second signature
+  that isn't verified (during a key or algorithm rollover) is served without AD, as elsewhere.
+  The check reads only the answer itself, on cache misses, in both modes. Zones signed with
+  NSEC3 are left to the validation library: the check is skipped only beside a verified NSEC3
+  record of the zone that signed the answer (ADR-188).
 - **Before switching to `validate`:** run `permissive` for a while and read the log; only
   names that are really broken (like `dnssec-failed.org`) should show up.
 - **Non-existent names answered locally** (RFC 8198, `aggressive_nsec`, on by default): a validated "no such name" from a zone signed with NSEC proves a whole range of names absent. A later question inside a proven range is answered from it: NXDOMAIN (or NODATA for a missing type), signed, with AD, and without asking upstream. A typical win is a home network's stray queries for made-up top-level names (`printer.lan`, `wpad.home`), which the root zone's NSEC records cover. Only proofs that validated as secure are used, only for as long as their TTL and the zone's negative TTL allow, and never below a delegation. Zones signed with NSEC3 (hashed names) still ask upstream. Counted in `telltale_dnssec_synthesized_total`; `[dnssec] aggressive_nsec = false` turns it off.
