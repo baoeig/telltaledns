@@ -1741,13 +1741,13 @@ async fn dns_011_offline_composed_answer_keeps_only_the_chain() {
         vec![("alias.s.t.".to_owned(), RecordType::CNAME)],
         "the CNAME only"
     );
-    let m = Message::from_vec(&r.bytes).unwrap();
+    let msg = Message::from_vec(&r.bytes).unwrap();
     assert!(
-        m.answers.iter().all(|r| r.name == n("alias.s.t.")),
+        msg.answers.iter().all(|r| r.name == n("alias.s.t.")),
         "no signature of another name"
     );
     assert!(
-        m.authorities
+        msg.authorities
             .iter()
             .any(|r| r.name == n("www.s.t.") && r.record_type() == RecordType::NSEC),
         "the target's denial"
