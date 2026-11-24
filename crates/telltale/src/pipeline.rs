@@ -1764,8 +1764,10 @@ impl Pipeline {
         }
     }
 
-    /// Answers with `rc` and no records; NXDOMAIN/NOERROR carry a synthetic SOA so clients can
-    /// cache the negative answer briefly.
+    /// Answers with `rc` and no records. Only NXDOMAIN carries a synthetic SOA (with AA), so
+    /// clients can cache it briefly; NOERROR and the other codes carry none. That SOA is owned by
+    /// the query name: a NOERROR answer that ever needs one (`resolver.arpa`'s, ADR-187) must use
+    /// an SOA owned by its zone (`resolver.arpa`), with AA, not this one.
     fn simple(
         &self,
         q: &Query<'_>,
