@@ -259,7 +259,7 @@ const BUDGET = {
   coverage: { approximate: true, hidden: ['names_hidden'], partialNodes: ['pi'], topListsFromHours: 24 },
   timeline: ['homelab', 'pi'].flatMap((node) => [0, 1, 2].map((i) => ({ answered: 1000, bad: 10, budgetSpentPct: 2, node, start: T0, startUnixSeconds: 1_764_021_600 + i * 3600 }))),
 };
-const DRILL = { by: 'admin', coveragePercent: 80, elsewhere: 0, ended: T0, followed: 1, id: 'd-1', medianFailoverMs: 2300, missingNodes: [], node: 'pi', p90FailoverMs: 4100, quiet: 1, reason: 'monthly', since: T0, status: 'complete', stuck: 1, targets: 'everyone', until: T0, viaBalancer: true };
+const DRILL = { by: 'admin', coveragePercent: 80, elsewhere: 0, ended: T0, followed: 1, id: 'd-1', medianFailoverMs: 2300, missingNodes: [], node: 'pi', p90FailoverMs: 4100, quiet: 1, reason: 'monthly', since: T0, status: 'complete', stuck: 1, targets: 'clients:work-pc', until: T0, viaBalancer: true };
 const DRILLS = { items: [{ ...DRILL, id: 'd-r', status: 'running' }, DRILL, { ...DRILL, id: 'd-c', status: 'cancelled' }], missingNodes: ['attic'] };
 const REPORT = {
   ...DRILL, balancerSwitchMs: 3400, baseline: 6, overflow: 0, missingNodes: ['attic'], nodes: [{ node: 'pi', queries: 3, devices: 1 }],
@@ -340,7 +340,7 @@ test('api_012 pseudo locale leaves no literal text: drills and a machine', async
   await page.route('**/api/v1/cluster', (r) => r.fulfill({ json: CLUSTER }));
   await page.route('**/api/v1/drills?**', (r) => r.fulfill({ json: DRILLS }));
   await page.route('**/api/v1/drills/d-1', (r) => r.fulfill({ json: REPORT }));
-  await page.route('**/api/v1/nodes/pi/drill', (r) => r.fulfill({ json: { by: 'admin', devicesDropped: 2, dropped: 40, id: 'd-r', node: 'pi', reason: 'monthly', secondsLeft: 90, since: T0, targets: 'everyone', until: T0 } }));
+  await page.route('**/api/v1/nodes/pi/drill', (r) => r.fulfill({ json: { by: 'admin', devicesDropped: 2, dropped: 40, id: 'd-r', node: 'pi', reason: 'monthly', secondsLeft: 90, since: T0, targets: 'clients:work-pc', until: T0 } }));
   await signIn(page);
   await open(page, '/cluster?tab=drills', '[data-testid="drill-counters"]');
   await page.getByTestId('drill-open').first().click();
@@ -970,5 +970,395 @@ test('api_012 pseudo locale leaves no literal text: the anomalies of every kind,
   await page.reload();
   await expect(page.locator('.empty').first()).toBeVisible();
   expect(await leftovers(page), 'nothing unusual').toEqual([]);
+  await clean(page, sent);
+});
+
+// A1f: what the Devices and the Filtering & DNS pages show only with data a one-node test server does not
+// have (workloads, routers with keys in every state, groups with every line, lists of every state, rules
+// of every kind, a quality table, local names and zones) and in the forms that write.
+const ITEMS = (items: unknown[], o: Record<string, unknown> = {}) => ({ items, ...o });
+const wload = (o: Record<string, unknown>) => ({
+  blocked24h: 12, group: 'kids', groupFrom: 'pod_label', key: 'media/deploy/plex', kind: 'deploy', labels: {}, lastSeen: T0, name: 'media/deploy/plex', namespace: 'media',
+  pods: [{ name: 'plex-1', addresses: ['10.42.0.5'] }, { name: 'plex-2', addresses: ['10.42.0.6'], terminating: true }], queries24h: 4000, workloadName: 'plex', ...o,
+});
+const WLOADS = [
+  wload({}),
+  wload({ key: 'shop/sts/db', name: 'shop/sts/db', namespace: 'shop', kind: 'sts', groupFrom: 'namespace_label', lastSeen: null, pods: [] }),
+  wload({ key: 'shop/job/seed', name: 'shop/job/seed', namespace: 'shop', kind: 'job', group: null, groupFrom: 'none' }),
+  wload({ key: 'shop/weird/y', name: 'shop/weird/y', namespace: 'shop', kind: 'weird', groupFrom: 'brand_new' }),
+];
+const ENTRY = (kind: string, name: string, source: string, definition: unknown, credentials: unknown = null) => ({ kind, name, source, definition, credentials });
+const ROUTERS = [
+  ENTRY('router', 'edge-one', 'added', { type: 'unifi', url: 'https://192.168.1.1' }, { api_key: 'saved' }),
+  ENTRY('router', 'edge-two', 'added', { type: 'opnsense', url: 'https://opnsense.lan' }, { api_key: 'missing', api_secret: 'missing' }),
+  ENTRY('router', 'edge-three', 'override', { type: 'unifi', url: 'https://10.0.0.1' }, { api_key: 'file_missing' }),
+  ENTRY('router', 'edge-four', 'added', { type: 'unifi', url: 'https://10.0.0.2' }, { password: 'not_used' }),
+  ENTRY('router', 'edge-five', 'file', { type: 'unifi', url: 'https://10.0.0.3' }, {}),
+  ENTRY('router', 'edge-six', 'hidden', null),
+];
+const GROUP_ENTRIES = [ENTRY('group', 'kids', 'added', { networks: ['192.168.2.0/24'], lists: ['ads', 'porn'] }), ENTRY('group', 'guests', 'override', { lists: ['ads'] }), ENTRY('group', 'plain', 'file', {}), ENTRY('group', 'old', 'hidden', null)];
+const SCHEDULE_ENTRIES = [ENTRY('schedule', 'bedtime', 'added', { action: 'block_all', window: [{ days: ['weekdays'], start: '21:00', end: '07:00' }] }), ENTRY('schedule', 'empty', 'file', {})];
+const LIST_ENTRIES = [ENTRY('list', 'ads-list', 'added', { url: 'https://example.org/hosts.txt', enabled: false }), ENTRY('list', 'own-list', 'file', { rules: ['ads.example.com'], kind: 'allow' })];
+const UPSTREAM_ENTRIES = [ENTRY('upstream', 'quad-nine', 'added', { url: 'tls://9.9.9.9' }), ENTRY('upstream', 'router-up', 'file', {})];
+const UPGROUP_ENTRIES = [ENTRY('upstream_group', 'fast-group', 'added', { members: ['quad-nine'], strategy: 'fastest' })];
+const entriesOf: Record<string, unknown[]> = { router: ROUTERS, group: GROUP_ENTRIES, schedule: SCHEDULE_ENTRIES, list: LIST_ENTRIES, upstream: UPSTREAM_ENTRIES, upstream_group: UPGROUP_ENTRIES };
+const change = (o: Record<string, unknown> = {}) => ({ applied: true, configVersion: 7, impact: 'Changes the configuration as shown.', keepInGit: null, warnings: [], recentQueries: 0, ...o });
+const problemH = (status: number, detail: string, hint: string) => ({ status, json: { type: 'about:blank', title: detail, status, code: 'invalid_request', detail, hint } });
+
+/** The editors' answers: the entries by kind, a dry run (the name `warn-…` has warnings, `bad-…` is refused), an apply. */
+async function editors(page: Page, failing: { value: boolean } = { value: false }) {
+  await page.route('**/api/v1/config/entries?**', (r) => r.fulfill({ json: ITEMS(entriesOf[new URL(r.request().url()).searchParams.get('kind') ?? ''] ?? []) }));
+  await page.route(/\/api\/v1\/(routers|groups|schedules|lists|upstreams|upstream-groups)\/[^/]+(\?.*)?$/, (r) => {
+    const req = r.request();
+    const u = new URL(req.url());
+    const name = decodeURIComponent(u.pathname.split('/').pop() ?? '');
+    if (req.method() === 'DELETE') return r.fulfill({ json: change({ keepInGit: '[[x]]\nname = "x"\n' }) });
+    if (name.startsWith('bad-')) return r.fulfill(problemH(422, `${name}: the address must start with tls:// or https://`, 'Check the address and try again.'));
+    const dry = u.searchParams.get('dryRun') === 'true';
+    if (!dry && failing.value) return r.fulfill(problem(500, 'the change could not be saved'));
+    if (dry) return r.fulfill({ json: change({ applied: false, impact: name.startsWith('warn-') ? 'Adds one entry; nothing else changes.' : '', warnings: name.startsWith('warn-') ? ['A self-signed certificate is not checked.'] : [] }) });
+    return r.fulfill({ json: change({ keepInGit: name.startsWith('git-') ? '[[x]]\nname = "x"\n' : null }) });
+  });
+}
+const GROUP_CARDS = {
+  items: [
+    { blockAnswerIps: [], blockMode: 'null_ip', blockTtlSeconds: 60, blocked24h: 2400, blockedServices: [], color: '#4c9ffe', devicesThisHour: 8, dns64: false, dns64Prefix: null, filterAaaa: false, lists: null, name: 'default', networks: [], pausedUntilUnixSeconds: null, priority: 0, queries24h: 12000, rebindingProtection: false, rewrites: [], safeSearch: false, schedules: [], schedulesOn: [], upstreams: null, youtubeRestrict: null },
+    {
+      blockAnswerIps: ['203.0.113.0/24'], blockMode: 'nxdomain', blockTtlSeconds: 30, blocked24h: 1500, blockedServices: ['streamco', 'chatapp'], color: '#e8590c', devicesThisHour: 3, dns64: true, dns64Prefix: null, filterAaaa: true, lists: ['ads', 'porn'], name: 'kids',
+      networks: ['192.168.2.0/24'], pausedUntilUnixSeconds: Date.parse(T0) / 1000 + 1800, priority: 10, queries24h: 6000, rebindingProtection: true, rewrites: [{ domain: 'nas.lan', answer: '192.168.1.5' }], safeSearch: true, schedules: ['bedtime', 'homework'], schedulesOn: ['bedtime'], upstreams: 'quad9-only', youtubeRestrict: 'moderate',
+    },
+    { blockAnswerIps: ['10.0.0.0/8'], blockMode: 'null_ip', blockTtlSeconds: 60, blocked24h: 0, blockedServices: [], color: '#2f9e44', devicesThisHour: 0, dns64: true, dns64Prefix: '64:ff9b:1::/96', filterAaaa: false, lists: [], name: 'guests', networks: [], pausedUntilUnixSeconds: null, priority: 5, queries24h: 0, rebindingProtection: false, rewrites: [], safeSearch: true, schedules: [], schedulesOn: [], upstreams: null, youtubeRestrict: 'off' },
+  ],
+};
+const WL_MANY = Array.from({ length: 10 }, (_, i) => wload({ key: `work/deploy/app${i}`, name: `work/deploy/app${i}`, namespace: 'work', group: 'kids', pods: [{ name: `app${i}-0`, addresses: [`10.43.0.${i + 1}`] }] }));
+
+test('api_012 pseudo locale leaves no literal text: clients, with workloads, routers and a device drawer', async ({ page }) => {
+  const sent = await watch(page);
+  await page.addInitScript(() => localStorage.setItem('telltale.mode.admin', 'advanced'));
+  await editors(page);
+  await page.route('**/api/v1/clients', (r) =>
+    r.fulfill({
+      json: ITEMS([
+        { name: 'work-pc', match: ['192.168.1.20', 'a4:5e:60:12:34:56'], groups: ['kids'], effectiveGroups: ['kids'], groupsFrom: 'client', source: 'api', identity: null, kind: null },
+        { name: 'den-tv', match: ['192.168.1.30'], groups: [], effectiveGroups: [], groupsFrom: 'network', source: 'file', identity: null, kind: null },
+        { name: 'hall-cam', match: ['192.168.1.31'], groups: [], effectiveGroups: ['guests'], groupsFrom: 'default', source: 'api', identity: null, kind: null },
+      ]),
+    }),
+  );
+  await page.route('**/api/v1/stats/top?**', (r) =>
+    r.fulfill({ json: ITEMS([topItem('192.168.1.20', 1500, { name: 'work-pc', groups: ['kids'] }), topItem('192.168.1.21', 400, { name: null, groups: [] })], { missingNodes: ['attic'] }) }),
+  );
+  await page.route('**/api/v1/dhcp/leases', (r) =>
+    r.fulfill({ json: ITEMS([{ ip: '192.168.1.40', mac: 'a4:5e:60:12:34:60', hostname: 'ring-bell', source: 'router', clientName: null, expiresUnixSeconds: 0 }, { ip: '192.168.1.20', mac: 'a4:5e:60:12:34:56', hostname: 'work-pc', source: 'mdns', clientName: 'work-pc', expiresUnixSeconds: 0 }]) }),
+  );
+  await page.route('**/api/v1/kubernetes/status', (r) => r.fulfill({ json: { addressesDropped: 0, enabled: true, lastError: null, lastSyncSecondsAgo: 3, namespacesWatched: [], pods: 4, role: 'primary', source: 'in-cluster', watching: true, workloads: WLOADS.length } }));
+  await page.route('**/api/v1/kubernetes/workloads**', (r) => r.fulfill({ json: { items: WLOADS, nextCursor: null, total: WLOADS.length } }));
+  await page.route('**/api/v1/clients/affinity?**', (r) =>
+    r.fulfill({
+      json: {
+        caveat: 'x', missingNodes: [], windowDays: 7,
+        items: [{ client: '192.168.1.20', label: 'mostly pi', name: 'work-pc', nodes: [{ node: 'pi', queries: 90 }, { node: 'homelab', queries: 10 }], queries: 100, topNode: 'pi', topSharePercent: 90 }],
+      },
+    }),
+  );
+  await page.route('**/api/v1/clients/*/rhythm', (r) => r.fulfill({ json: { available: false, binsS: [], client: '192.168.1.20', domains: [], missingNodes: [], reason: null } }));
+  await signIn(page);
+  await open(page, '/clients', '[data-testid="seen-missing"]');
+  await expect(page.getByTestId('affinity-head')).toBeVisible();
+  expect(await leftovers(page), 'the last hour, a node not answering, the servers column').toEqual([]);
+  await open(page, '/clients?tab=devices', 'table tbody tr');
+  expect(await leftovers(page), 'the devices').toEqual([]);
+  await open(page, '/clients?tab=workloads', '[data-testid="workload-row"]');
+  await page.getByTestId('workload-namespace').selectOption('shop');
+  expect(await leftovers(page), 'the workloads of one namespace').toEqual([]);
+  await open(page, '/clients?tab=discovered', '[data-testid="editor-router"]');
+  await expect(page.getByTestId('entry-status').first()).toBeVisible();
+  expect(await leftovers(page), 'the discovered devices and routers with every state of a key').toEqual([]);
+  for (const [i, what] of ['key saved', 'key missing', 'key file missing', 'key not used'].entries()) {
+    await page.locator('[data-testid="editor-router"] [data-testid="entry-row"]').nth(i).locator('button.link').first().click();
+    await expect(page.locator('.drawer form.form').first()).toBeVisible();
+    expect(await leftovers(page), `a router with a ${what}`).toEqual([]);
+    await page.keyboard.press('Escape');
+  }
+  await page.locator('[data-testid="editor-router"] .head > button').click();
+  await page.locator('form.form input.mono').first().fill('warn-router');
+  await page.locator('form.form button.primary').click();
+  await expect(page.getByTestId('entry-preview')).toBeVisible();
+  expect(await leftovers(page), 'a router checked, with a warning').toEqual([]);
+  await page.keyboard.press('Escape');
+  await open(page, '/clients?device=192.168.1.20', '.drawer .empty');
+  expect(await leftovers(page), 'a device whose rhythm is not measured').toEqual([]);
+  await clean(page, sent);
+});
+
+test('api_012 pseudo locale leaves no literal text: groups, every line of a card, the group and schedule forms', async ({ page }) => {
+  const sent = await watch(page);
+  await page.addInitScript(() => localStorage.setItem('telltale.mode.admin', 'advanced'));
+  const failing = { value: false };
+  await editors(page, failing);
+  await page.route('**/api/v1/groups', (r) => r.fulfill({ json: GROUP_CARDS }));
+  await page.route('**/api/v1/stats/top?**', (r) => {
+    const u = new URL(r.request().url());
+    const blocked = u.searchParams.get('kind') === 'blocked';
+    return r.fulfill({ json: ITEMS(blocked ? (u.searchParams.get('group') === 'kids' ? [topItem('track.example.net', 330)] : []) : [topItem('cdn.example.net', 700), topItem('www.example.org', 120)]) });
+  });
+  await page.route('**/api/v1/services', (r) => r.fulfill({ json: ITEMS([{ id: 'streamco', name: 'StreamCo', category: 'streaming', domains: ['streamco.example'] }]) }));
+  await page.route('**/api/v1/kubernetes/status', (r) => r.fulfill({ json: { addressesDropped: 0, enabled: true, lastError: null, lastSyncSecondsAgo: 3, namespacesWatched: [], pods: 10, role: 'primary', source: 'in-cluster', watching: true, workloads: WL_MANY.length } }));
+  await page.route('**/api/v1/kubernetes/workloads**', (r) => r.fulfill({ json: { items: WL_MANY, nextCursor: null, total: WL_MANY.length } }));
+  await signIn(page);
+  await open(page, '/groups', '[data-testid="group-workloads"]');
+  for (const id of ['group-safe-search', 'group-schedules', 'group-services', 'group-answers', 'group-rewrites', 'group-upstreams', 'group-dns64', 'group-filter-aaaa']) await expect(page.getByTestId(id).first()).toBeVisible();
+  expect(await leftovers(page), 'the cards of three groups, the settings table').toEqual([]);
+  await page.locator('[data-testid="editor-group"] .head > button').click();
+  await expect(page.locator('.drawer form.form').first()).toBeVisible();
+  expect(await leftovers(page), 'the group form, advanced').toEqual([]);
+  await page.locator('form.form input.mono').first().fill('bad-group');
+  await page.locator('form.form button.primary').click();
+  await expect(page.locator('.drawer [role="alert"]').first()).toBeVisible();
+  expect(await leftovers(page), 'a group refused, with a hint').toEqual([]);
+  await page.locator('form.form input.mono').first().fill('git-group');
+  await page.locator('form.form button.primary').click();
+  await page.locator('form.form button.primary').click();
+  await expect(page.getByTestId('keep-in-git')).toBeVisible();
+  expect(await leftovers(page), 'a group saved, to keep in git').toEqual([]);
+  await page.keyboard.press('Escape');
+  await page.locator('[data-testid="editor-schedule"] .head > button').click();
+  await page.locator('form.form input.mono').first().fill('night');
+  await page.locator('form.form button.primary').click();
+  await expect(page.locator('.drawer [role="alert"]').first()).toBeVisible();
+  expect(await leftovers(page), 'a schedule with no window').toEqual([]);
+  await page.locator('form.form textarea').first().fill('tomorrow evening');
+  await page.locator('form.form button.primary').click();
+  expect(await leftovers(page), 'a schedule with a window that makes no sense').toEqual([]);
+  await page.locator('form.form textarea').first().fill('weekdays 21:00-07:00');
+  await page.locator('form.form button.primary').click();
+  await expect(page.getByTestId('entry-preview')).toBeVisible();
+  expect(await leftovers(page), 'a schedule checked').toEqual([]);
+  failing.value = true;
+  await page.locator('form.form button.primary').click();
+  await expect(page.locator('.drawer [role="alert"]').first()).toBeVisible();
+  expect(await leftovers(page), 'a schedule that could not be saved').toEqual([]);
+  await clean(page, sent);
+});
+
+const LIST_ROWS = {
+  items: [
+    { bytes: 2_400_000, enabled: true, entries: 120_000, error: null, hits: 5000, kind: 'block', lastChangedUnixSeconds: 1_700_000_000, lastCheckedUnixSeconds: 1_700_000_500, lines: 125_000, mode: 'enforce', name: 'ads-main', overlap: [{ list: 'tracking-main', names: 118_000 }], regexSkipped: 3, source: 'https://example.org/hosts.txt', staleDays: 45, state: 'ok', unique: 90_000 },
+    { bytes: 100, enabled: false, entries: 12, error: null, hits: 0, kind: 'allow', lastChangedUnixSeconds: null, lastCheckedUnixSeconds: null, lines: 12, mode: 'enforce', name: 'allow-mine', overlap: [], regexSkipped: 1, source: 'inline', staleDays: null, state: 'ok', unique: 12 },
+    { bytes: 100, enabled: true, entries: 40_000, error: 'download failed: 503', hits: 0, kind: 'block', lastChangedUnixSeconds: null, lastCheckedUnixSeconds: null, lines: 0, mode: 'shadow', name: 'shadow-trackers', overlap: [], regexSkipped: 0, source: 'https://broken.example/list.txt', staleDays: null, state: 'error', unique: 100 },
+  ],
+};
+
+test('api_012 pseudo locale leaves no literal text: lists of every state, shadow lists, over-blocking and the list test', async ({ page }) => {
+  const sent = await watch(page);
+  await page.addInitScript(() => localStorage.setItem('telltale.mode.admin', 'advanced'));
+  await editors(page);
+  await page.route('**/api/v1/lists', (r) => r.fulfill({ json: LIST_ROWS }));
+  await page.route('**/api/v1/analytics/shadow-lists', (r) =>
+    r.fulfill({
+      json: ITEMS([
+        { list: 'shadow-trackers', hits: 1, devices: 1, since: '2026-11-22T22:00:00Z', lastHitAt: '2026-11-24T21:00:00Z', topNames: [{ name: 't.example.com', count: 5 }], nodes: [] },
+        { list: 'shadow-two', hits: 12, devices: 3, since: null, lastHitAt: null, topNames: [], nodes: [] },
+        { list: 'shadow-three', hits: 7, devices: 1, since: null, lastHitAt: '2026-11-24T21:00:00Z', topNames: [], nodes: [] },
+        { list: 'shadow-four', hits: 1, devices: 2, since: '2026-11-22T22:00:00Z', lastHitAt: null, topNames: [], nodes: [] },
+      ]),
+    }),
+  );
+  await page.route('**/api/v1/analytics/overblocking?**', (r) => r.fulfill({ json: ITEMS([{ allowedAfterBlock: 14, devices: 3, lastSeen: '2026-11-24T21:30:00Z', lists: ['ads-main', 'tracking-main'], name: 'cdn.example.net', retryBursts: 6 }]) }));
+  let n = 0;
+  await page.route('**/api/v1/checks/list', (r) => {
+    n++;
+    if (n === 1) return r.fulfill({ json: { ok: true, detail: '1,200 names', elapsedMs: 340, warnings: ['line 4: not a domain'], rules: 1200 } });
+    if (n === 2) return r.fulfill({ json: { ok: false, detail: 'HTTP 404', elapsedMs: 120, error: 'the server answered 404', warnings: [], rules: null } });
+    return r.fulfill({ json: { ok: true, detail: '1,198 names', elapsedMs: 410, warnings: [], rules: 1198 } });
+  });
+  await signIn(page);
+  await open(page, '/lists', '[data-testid="shadow-lists"]');
+  await expect(page.getByTestId('overblocking')).toBeVisible();
+  await expect(page.getByTestId('list-stale')).toBeVisible();
+  expect(await leftovers(page), 'lists of every state, shadow lists, over-blocking').toEqual([]);
+  await page.locator('[data-testid="editor-list"] .head > button').click();
+  await page.locator('form.form input.mono').first().fill('try-list');
+  await page.locator('form.form input[aria-label]').nth(1).fill('https://example.org/x.txt');
+  for (const what of ['works, with a line it cannot use', 'does not work', 'works']) {
+    await page.locator('form.form button:not(.primary)').last().click();
+    await expect(page.getByTestId('form-action-result')).toBeVisible();
+    expect(await leftovers(page), `the list test: ${what}`).toEqual([]);
+  }
+  await page.keyboard.press('Escape');
+  await page.locator('[data-testid="editor-list"] button.link:not(.danger)').first().click();
+  await expect(page.locator('.drawer form.form').first()).toBeVisible();
+  expect(await leftovers(page), 'a list edited').toEqual([]);
+  await clean(page, sent);
+});
+
+const RULE_ROWS = {
+  items: [
+    { action: 'block', created: '2026-11-24T20:00:00Z', createdBy: 'admin', devices: [], domain: 'ads.example.com', expires: null, expiresInSeconds: null, groups: [], id: 'r-1', note: null, source: 'api' },
+    { action: 'allow', created: '2026-11-24T20:00:00Z', createdBy: 'admin', devices: ['work-pc'], domain: 'game.example.com', expires: '2026-11-24T23:00:00Z', expiresInSeconds: 3600, groups: [], id: 'r-2', note: 'a game', source: 'api' },
+    { action: 'block', created: null, createdBy: null, devices: [], domain: 'social.example', expires: '2026-11-24T21:59:00Z', expiresInSeconds: 0, groups: ['kids'], id: 'r-3', note: null, source: 'api' },
+    { action: 'allow', created: '2026-11-24T20:00:00Z', createdBy: 'admin', devices: ['work-pc', 'den-tv'], domain: 'school.example', expires: null, expiresInSeconds: null, groups: [], id: 'r-4', note: null, source: 'api' },
+    { action: 'block', created: null, createdBy: null, devices: [], domain: 'file.example', expires: null, expiresInSeconds: null, groups: [], id: 'r-5', note: null, source: 'file' },
+  ],
+};
+
+test('api_012 pseudo locale leaves no literal text: quick rules of every kind, their edit form and a failed removal', async ({ page }) => {
+  const sent = await watch(page);
+  let removeFails = false;
+  await page.route('**/api/v1/rules', (r) => r.fulfill({ json: RULE_ROWS }));
+  await page.route('**/api/v1/rules/*', (r) => {
+    if (r.request().method() === 'DELETE') return r.fulfill(removeFails ? problem(409, 'the rule is held by the config file') : { json: change({}) });
+    return r.fulfill({ json: change({ impact: 'Allows game.example.com for work-pc.' }) });
+  });
+  await signIn(page);
+  await open(page, '/rules', '[data-testid="rules-table"]');
+  expect(await leftovers(page), 'rules of every kind: forever, in an hour, expired, several devices, from the file').toEqual([]);
+  await page.locator('[data-testid="rules-table"] button.link:not([disabled])').nth(2).click();
+  await expect(page.getByTestId('rule-edit-row')).toBeVisible();
+  expect(await leftovers(page), 'a rule edited').toEqual([]);
+  await page.locator('[data-testid="rule-edit-row"] button.primary').click();
+  await expect(page.getByTestId('rule-edited')).toBeVisible();
+  expect(await leftovers(page), 'a rule saved').toEqual([]);
+  removeFails = true;
+  await page.locator('[data-testid="rules-table"] button.link:not([disabled])').nth(1).click();
+  await expect(page.locator('[role="alert"]').first()).toBeVisible();
+  expect(await leftovers(page), 'a rule that could not be removed').toEqual([]);
+  await open(page, '/rules', '[data-testid="rules-table"]');
+  await page.route('**/api/v1/rules', (r) => r.fulfill({ json: ITEMS([]) }));
+  await page.reload();
+  await expect(page.locator('.empty').first()).toBeVisible();
+  expect(await leftovers(page), 'no rules').toEqual([]);
+  await clean(page, sent);
+});
+
+const FK = (o: Record<string, number>) => ({ badResponse: 0, network: 0, otherRcode: 0, refused: 0, servfail: 0, timeout: 0, unresolved: 0, ...o });
+const UP_ROWS = {
+  items: [
+    { id: 1, name: 'quad-nine', breaker: 'closed', endpoint: 'tls://9.9.9.9', failures: 0, failuresByKind: FK({}), groups: ['default'], latencyEwmaMs: 21, requests: 600 },
+    { id: 2, name: 'cloud-two', breaker: 'open', endpoint: 'https://1.1.1.1/dns-query', failures: 12, failuresByKind: FK({ timeout: 5, network: 3, badResponse: 1, unresolved: 1, servfail: 1, refused: 1 }), groups: ['default'], latencyEwmaMs: 48, requests: 200 },
+  ],
+};
+const QUALITY_ROW = (node: string | null) => ({
+  node, enabled: true, sampleEvery: 1000, reference: 'cloud-two',
+  upstreams: [
+    { upstream: 'quad-nine', same: 10, differentAddresses: 3, differentRcode: 1, filtered: 2, unanswered: 1, dnssecSecure: 5, dnssecInsecure: 2, dnssecBogus: 1, dnssecIndeterminate: 1, ede: [{ code: 15, name: 'Blocked', count: 4 }] },
+    { upstream: 'cloud-two', same: 0, differentAddresses: 0, differentRcode: 0, filtered: 0, unanswered: 0, dnssecSecure: 0, dnssecInsecure: 0, dnssecBogus: 0, dnssecIndeterminate: 0, ede: [] },
+  ],
+  recent: [
+    { answer: '192.0.2.1', at: T0, name: 'cdn.example.net', qtype: 'A', reference: 'cloud-two', referenceAnswer: '192.0.2.9', result: 'different_addresses', upstream: 'quad-nine' },
+    { answer: '0.0.0.0', at: T0, name: 'bad.example', qtype: 'A', reference: 'cloud-two', referenceAnswer: '192.0.2.9', result: 'filtered', upstream: 'quad-nine' },
+  ],
+});
+
+test('api_012 pseudo locale leaves no literal text: upstreams, the quality table of a cluster and the forms', async ({ page }) => {
+  const sent = await watch(page);
+  await page.addInitScript(() => localStorage.setItem('telltale.mode.admin', 'advanced'));
+  await editors(page);
+  let phase: 'cluster' | 'off' | 'none' = 'cluster';
+  await page.route('**/api/v1/upstreams', (r) => r.fulfill({ json: UP_ROWS }));
+  await page.route('**/api/v1/stats/latency?**', (r) => r.fulfill({ json: ITEMS([lrow('quad-nine', 600, 14, 41, 90, 210), lrow('cloud-two', 200, 30, 80, 150, 300)]) }));
+  await page.route('**/api/v1/stats/latency/heatmap?**', (r) => r.fulfill({ json: HEAT('upstream', ['quad-nine', 'cloud-two']) }));
+  await page.route('**/api/v1/stats/latency/exemplars?**', (r) => r.fulfill({ json: EXEMPLARS }));
+  await page.route('**/api/v1/analytics/upstream-checks', (r) =>
+    r.fulfill({
+      json: ITEMS(
+        phase === 'cluster'
+          ? [QUALITY_ROW('pi'), QUALITY_ROW('attic')]
+          : [{ ...QUALITY_ROW(null), enabled: phase !== 'off', upstreams: phase === 'none' ? [] : QUALITY_ROW(null).upstreams, recent: [] }],
+      ),
+    }),
+  );
+  let tests = 0;
+  await page.route('**/api/v1/checks/upstream', (r) => (++tests === 1 ? r.fulfill({ json: { ok: true, detail: 'tls://9.9.9.9 answered NOERROR', elapsedMs: 31, warnings: [] } }) : r.fulfill({ json: { ok: false, detail: 'timed out', elapsedMs: 2000, error: 'no answer within 2 seconds', warnings: [] } })));
+  await signIn(page);
+  await open(page, '/upstreams', '[data-testid="upstream-quality"] table');
+  await expect(page.locator('ul.disagreements').first()).toBeVisible();
+  expect(await leftovers(page), 'the table with its failures, the quality of two nodes, the latest disagreements').toEqual([]);
+  phase = 'off';
+  await page.reload();
+  await expect(page.locator('[data-testid="upstream-quality"] p.muted').first()).toBeVisible();
+  expect(await leftovers(page), 'second opinions off').toEqual([]);
+  phase = 'none';
+  await page.reload();
+  await expect(page.locator('[data-testid="upstream-quality"] .empty')).toBeVisible();
+  expect(await leftovers(page), 'nothing to show in the quality table').toEqual([]);
+  await page.locator('[data-testid="editor-upstream"] .head > button').click();
+  await page.locator('form.form input.mono').first().fill('try-upstream');
+  await page.locator('form.form input.mono').nth(1).fill('tls://9.9.9.9');
+  for (const what of ['works', 'does not work']) {
+    await page.locator('form.form button:not(.primary)').last().click();
+    await expect(page.getByTestId('form-action-result')).toBeVisible();
+    expect(await leftovers(page), `the upstream test: ${what}`).toEqual([]);
+  }
+  await page.keyboard.press('Escape');
+  await page.locator('[data-testid="editor-upstream_group"] .head > button').click();
+  await page.locator('form.form input.mono').first().fill('bad-group');
+  await page.locator('form.form button.primary').click();
+  await expect(page.locator('.drawer [role="alert"]').first()).toBeVisible();
+  expect(await leftovers(page), 'an upstream group refused').toEqual([]);
+  await clean(page, sent);
+});
+
+test('api_012 pseudo locale leaves no literal text: names on my network, its zones, forwards and forms', async ({ page }) => {
+  const sent = await watch(page);
+  await page.addInitScript(() => localStorage.setItem('telltale.mode.admin', 'advanced'));
+  let saveFails: 'no' | 'hint' | 'plain' = 'no';
+  await page.route('**/api/v1/records', (r) =>
+    r.fulfill({ json: ITEMS([{ name: 'nas.home.arpa', source: 'api', records: [{ type: 'A', value: '192.168.1.10', ttl: null }, { type: 'AAAA', value: 'fd00::10', ttl: 300 }] }, { name: 'printer.home.arpa', source: 'file', records: [{ type: 'TXT', value: 'hello', ttl: null }] }]) }),
+  );
+  await page.route('**/api/v1/forwards', (r) => r.fulfill({ json: ITEMS([{ domain: 'corp.example', servers: ['10.0.0.53'], source: 'api', stub: false }, { domain: 'lab.example', servers: ['10.1.0.1'], source: 'file', stub: true }]) }));
+  await page.route('**/api/v1/zones', (r) => r.fulfill({ json: ITEMS([{ name: 'corp.example', records: 12, groups: [], file: 'zones/corp.zone', negativeTtlSeconds: 60 }, { name: 'kids.example', records: 3, groups: ['kids'], file: null, negativeTtlSeconds: 60 }]) }));
+  await page.route(/\/api\/v1\/(records|forwards)\/[^/]+$/, (r) => {
+    if (r.request().method() === 'DELETE') return r.fulfill(problem(409, 'the record is held by the config file'));
+    if (saveFails === 'hint') return r.fulfill(problemH(422, 'nas.home.arpa already has a CNAME', 'A name with a CNAME has no other records.'));
+    if (saveFails === 'plain') return r.fulfill(problem(500, 'the change could not be saved'));
+    return r.fulfill({ json: change({}) });
+  });
+  await signIn(page);
+  await open(page, '/local-dns', 'table tbody tr');
+  await expect(page.getByTestId('zones')).toBeVisible();
+  expect(await leftovers(page), 'names, zones and forwards, advanced').toEqual([]);
+  await page.locator('td.nowrap button.link').nth(1).click();
+  await expect(page.locator('[role="alert"]').first()).toBeVisible();
+  expect(await leftovers(page), 'a name that could not be removed').toEqual([]);
+  await page.locator('.actions button.primary').click();
+  expect(await leftovers(page), 'the wizard, step one').toEqual([]);
+  await page.locator('.drawer button.primary').click();
+  await page.locator('input[name="label"]').fill('den-nas');
+  await page.locator('input[name="value"]').fill('192.168.1.10');
+  await expect(page.getByTestId('change-preview')).toBeVisible();
+  expect(await leftovers(page), 'the wizard, step two, with the preview').toEqual([]);
+  for (const type of ['AAAA', 'CNAME', 'PTR', 'TXT', 'MX', 'SRV']) {
+    await page.locator('select[name="type"]').selectOption(type);
+    expect(await leftovers(page), `a ${type} record`).toEqual([]);
+  }
+  saveFails = 'hint';
+  await page.locator('form.stack button.primary[type="submit"]').click();
+  await expect(page.locator('.drawer .notice.bad')).toBeVisible();
+  expect(await leftovers(page), 'a record refused, with a hint').toEqual([]);
+  saveFails = 'no';
+  await page.locator('form.stack button.primary[type="submit"]').click();
+  await expect(page.locator('.drawer .notice.ok')).toBeVisible();
+  expect(await leftovers(page), 'a record saved').toEqual([]);
+  await page.keyboard.press('Escape');
+  await page.locator('td.nowrap button.link').first().click();
+  await expect(page.locator('.drawer input[name="name"]')).toHaveAttribute('readonly', '');
+  expect(await leftovers(page), 'a name edited (the name is read only)').toEqual([]);
+  await page.keyboard.press('Escape');
+  await page.locator('.actions button').last().click();
+  await page.locator('input[name="domain"]').fill('corp.example');
+  await page.locator('input[name="servers"]').fill('10.0.0.53');
+  await page.locator('input[name="stub"]').check();
+  expect(await leftovers(page), 'the forward form, a stub zone').toEqual([]);
+  saveFails = 'plain';
+  await page.locator('form.stack button.primary[type="submit"]').click();
+  await expect(page.locator('.drawer .notice.bad')).toBeVisible();
+  expect(await leftovers(page), 'a forward that could not be saved').toEqual([]);
+  await page.keyboard.press('Escape');
+  await page.route('**/api/v1/records', (r) => r.fulfill({ json: ITEMS([]) }));
+  await page.route('**/api/v1/forwards', (r) => r.fulfill({ json: ITEMS([]) }));
+  await page.reload();
+  await expect(page.locator('.empty').first()).toBeVisible();
+  expect(await leftovers(page), 'nothing yet').toEqual([]);
   await clean(page, sent);
 });
