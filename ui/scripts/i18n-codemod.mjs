@@ -16,7 +16,9 @@
 //   `<optgroup>`) become `name={t('…')}` with their value as it is;
 // - the file gets `import { tr } from '…/lib/i18n'` and `const { t } = tr('<context>')` once.
 // It lists, per file and never edits: text in one sentence with an expression (`{n} rows`), with an
-// inline element or a block that carries text (`Read the <a>docs</a>`), attributes and component
+// inline element or a block that carries text (`Read the <a>docs</a>`), words cut by an element with
+// no text (`Dots: <span class="key"></span> first, <span class="key"></span> next`: the `split`
+// class; moved one by one they would become several messages), attributes and component
 // properties with text, `<pre>` and `<textarea>` content, text with braces, plural ternaries
 // (`n === 1 ? 'row' : 'rows'`: `tn()` takes the English `one` form for -1 too, so each comes with
 // the count's range), script strings that read as text, strings used as identifiers or keys,
@@ -305,6 +307,38 @@ export function transform(rel, text, { context = contextName(rel) } = {}) {
         return isComponent(n) ? !QUIET_COMPONENTS.has(n.name) : false;
     }
   };
+  /** An element that sits inside a sentence and shows no text of its own: a swatch (`<span
+   * class="key"></span>`), an inline image or `<svg>`, an icon or another quiet component. It does
+   * not join the words around it (no text to list), yet it splits them. */
+  const splitter = (n) => (n.type === 'RegularElement' && (!SEPARATORS.has(n.name) || n.name === 'svg' || n.name === 'img') && !carriesText(n)) || (isComponent(n) && QUIET_COMPONENTS.has(n.name));
+  /** The runs of text, expressions and splitters in a fragment that read as one sentence cut in
+   * pieces: two parts with a word or an expression in them, one or more splitters between them, and
+   * a word somewhere. Moved one text at a time they would become several messages with no trace. */
+  const splitRuns = (nodes) => {
+    const runs = [];
+    let cur = [];
+    const end = () => {
+      if (cur.length) runs.push(cur);
+      cur = [];
+    };
+    for (const x of nodes) {
+      if (x.type === 'Text' || x.type === 'ExpressionTag' || splitter(x)) cur.push(x);
+      else end();
+    }
+    end();
+    return runs.filter((r) => {
+      let content = false;
+      let cut = false;
+      let joined = false;
+      for (const x of r) {
+        if (isText(x) || x.type === 'ExpressionTag') {
+          if (content && cut) joined = true;
+          content = true;
+        } else if (splitter(x) && content) cut = true;
+      }
+      return joined && r.some(isText);
+    });
+  };
   const attributes = (n, st) => {
     for (const a of n.attributes ?? []) {
       if (a.type !== 'Attribute') {
@@ -411,6 +445,14 @@ export function transform(rel, text, { context = contextName(rel) } = {}) {
       }
       return;
     }
+    // A sentence cut by elements with no text: listed whole, its words left for the hand (their
+    // expressions and the elements' attributes are still read).
+    const split = new Set();
+    for (const r of splitRuns(nodes)) {
+      const shown = r.filter((x) => x.type !== 'Text' || x.data.trim() !== '');
+      if (!quiet) list('split', line(shown[0].start), excerpt(text.slice(shown[0].start, shown[shown.length - 1].end), 120));
+      for (const x of r) split.add(x);
+    }
     let run = [];
     const flush = () => {
       if (run.some((x) => x.type === 'ExpressionTag') && run.some(isText)) {
@@ -420,6 +462,12 @@ export function transform(rel, text, { context = contextName(rel) } = {}) {
       run = [];
     };
     for (const x of nodes) {
+      if (split.has(x)) {
+        flush();
+        if (x.type === 'ExpressionTag') expr(x.expression);
+        else if (x.type !== 'Text') visitNode(x, st);
+        continue;
+      }
       if (x.type === 'Text' || x.type === 'ExpressionTag') {
         run.push(x);
         continue;
@@ -493,7 +541,7 @@ export function transform(rel, text, { context = contextName(rel) } = {}) {
 // ---------------------------------------------------------------------------------------------
 // The command
 
-const CLASSES = ['expression', 'inline', 'attribute', 'prop', 'pre', 'braces', 'plural', 'script', 'identifier', 'key', 'canvas', 'intl', 'other'];
+const CLASSES = ['expression', 'inline', 'split', 'attribute', 'prop', 'pre', 'braces', 'plural', 'script', 'identifier', 'key', 'canvas', 'intl', 'other'];
 /** Files the codemod reads: every source file but the layer, the generated ones and `lib/format.ts`. */
 export function codemodFiles(root) {
   return sourceFiles(root).filter((f) => f.rel !== 'lib/format.ts');

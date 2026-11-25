@@ -150,6 +150,47 @@ test('api_012 the codemod lists what it cannot move safely', () => {
   expect(ts.listed.map((l: { class: string; text: string }) => `${l.class} ${l.text}`)).toEqual(['script Blocked by a list']);
 });
 
+test('api_012 the codemod lists a sentence that elements with no text split', () => {
+  // The DeviceTimeline legend: swatches (spans with no text) between the words of one sentence. The
+  // words were moved one by one before (five messages, no listing); now the run is listed whole and
+  // the hand writes one message for it.
+  const legend =
+    '<p class="muted small">Dots above: <span class="key hollow"></span> first contact, <span class="key warn"></span> anomaly, <span class="key bad"></span> blocked burst.</p>\n';
+  const r = cm.transform('lib/components/Legend.svelte', legend);
+  expect(r.code).toBe(legend);
+  expect(r.handled).toEqual([]);
+  expect(r.listed.map((l: { class: string; line: number }) => `${l.line} ${l.class}`)).toEqual(['1 split']);
+  expect(r.listed[0].text.startsWith('Dots above: <span class="key hollow"></span> first contact, <span class="key warn">')).toBe(true);
+  // The same for an icon component, a swatch beside an expression, and an inline image.
+  const more = [
+    '<p>Saved <Icon name="ok" /> at noon</p>',
+    '<p>{n} <span class="dot"></span> rows</p>',
+    '<p>Click <img src="/gear.svg" alt="" /> to open the settings</p>',
+    '',
+  ].join('\n');
+  const m = cm.transform('lib/components/Legend.svelte', `<script lang="ts">\n  import Icon from './Icon.svelte';\n  let { n = 2 } = $props();\n</script>\n${more}`);
+  expect(m.handled).toEqual([]);
+  expect(m.listed.map((l: { class: string; line: number }) => `${l.line} ${l.class}`)).toEqual(['5 split', '6 split', '7 split']);
+  // What is not a split: one label beside an icon or a swatch, a line break between two lines, a
+  // block between two paragraphs, a sentence with text inside its element (listed as `inline`), and
+  // text the page marks as data.
+  const fine = [
+    '<script lang="ts">',
+    "  import Icon from './Icon.svelte';",
+    '</script>',
+    '<button><Icon name="x" /> Close</button>',
+    '<p><span class="key"></span> blocked</p>',
+    '<p>Pay now<br />or later</p>',
+    '<div>First<div class="bar"></div>Second</div>',
+    '<p>Read the <a href="/docs">docs</a> <span class="key"></span> first</p>',
+    '<p translate="no">one <span class="key"></span> two</p>',
+    '',
+  ].join('\n');
+  const f = cm.transform('lib/components/Legend.svelte', fine);
+  expect(f.listed.map((l: { class: string; line: number }) => `${l.line} ${l.class}`)).toEqual(['8 inline']);
+  expect(f.handled.map((h: { english: string }) => h.english)).toEqual(['Close', 'blocked', 'Pay now', 'or later', 'First', 'Second']);
+});
+
 test('api_012 the codemod output renders the same english', async () => {
   const r = cm.transform('pages/Shop.svelte', SHOP);
   expect(r.handled.map((h: { english: string }) => h.english)).toEqual([

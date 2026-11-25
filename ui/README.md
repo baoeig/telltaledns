@@ -129,7 +129,8 @@ around a tag: the snapshots of the page's English decide it, in the states they 
 `--all`) prints, per file, what it can move and what it leaves for the hand; `--write` rewrites the
 file. Each template text and each attribute a reader sees or hears becomes `t('…')` (the text as
 the browser shows it), and the file gets its `tr()` line. It lists, with the line, and never edits:
-a sentence with an expression, an inline element or a block inside, `<pre>`, script strings, plural
+a sentence with an expression, an inline element or a block inside, words cut by an element with no
+text (a colour key, an icon: class `split`; one message for the whole run), `<pre>`, script strings, plural
 ternaries (`tn()` takes the `one` form for -1), labels used as keys, canvas text and `Intl` calls.
 
 **Add a language.** A maintainer adds the tag to `src/locales/manifest.json` (`owners`: the GitHub
