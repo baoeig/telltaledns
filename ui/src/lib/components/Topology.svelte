@@ -257,6 +257,7 @@
         {#each s.chips as c (c.node.nodeId)}
           {@const b = badge(c.node)}
           {@const bw = badgeW(c.node)}
+          {@const said = describe(c.node)}
           <g
             class="chip {health(c.node)}"
             class:me={c.node.thisNode}
@@ -264,12 +265,12 @@
             class:canary={canaries.includes(c.node.nodeId) || (c.node.role === 'primary' && canaries.length > 0)}
             role="button"
             tabindex="0"
-            aria-label={describe(c.node)}
+            aria-label={said}
             data-testid="topology-node"
             onclick={() => onselect?.(c.node)}
             onkeydown={(e) => key(e, c.node)}
           >
-            <title>{describe(c.node)}</title>
+            <title>{said}</title>
             <rect x={c.x} y={c.y} width={c.w} height={c.h} rx="8" />
             {#if b.kind === 'primary'}<rect class="stripe" x={c.x + 3} y={c.y + 6} width="3" height={c.h - 12} rx="1.5" />{/if}
             <circle class="dot" cx={c.x + 14} cy={c.y + 14} r="4" />
@@ -289,18 +290,19 @@
           {#each g.pods as p, i (p.node?.nodeId ?? `more-${i}`)}
             {@const n = p.node ?? p.more?.[0]}
             {#if n}
+              {@const said = p.more ? null : describe(n)}
               <g
                 class="pod {p.more ? worstOf(p.more) : health(n)}"
                 class:maint={!p.more && !!n.maintenance}
                 class:canary={!p.more && canaries.includes(n.nodeId)}
                 role="button"
                 tabindex="0"
-                aria-label={p.more ? t('{n} more pods on {where}', { n: p.more.length, where: name }) : describe(n)}
+                aria-label={p.more ? t('{n} more pods on {where}', { n: p.more.length, where: name }) : said}
                 data-testid="topology-pod"
                 onclick={() => onselect?.(n)}
                 onkeydown={(e) => key(e, n)}
               >
-                <title>{p.more ? t('{n} more pods', { n: p.more.length }) : describe(n)}</title>
+                <title>{p.more ? t('{n} more pods', { n: p.more.length }) : said}</title>
                 <rect x={p.x} y={p.y} width={p.w} height={p.h} rx="5" />
                 <text x={p.x + p.w / 2} y={p.y + 15} text-anchor="middle">{p.more ? `+${p.more.length}` : podLabel(n)}</text>
               </g>

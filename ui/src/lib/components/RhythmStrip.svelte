@@ -42,6 +42,8 @@
     if (i === 0) return t('under {n}', { n: s(binsS[0]) });
     return i >= binsS.length ? t('{n} and longer', { n: s(binsS[binsS.length - 1]) }) : t('{from}–{to}', { from: s(binsS[i - 1]), to: s(binsS[i]) });
   };
+  // The words of the N cells are the same for every row: made once for the bins, not once per cell.
+  const labels = $derived(Array.from({ length: N }, (_, i) => label(i)));
   // Where a period sits on the axis (log within its bin).
   function x(secs: number): number {
     const i = binsS.findIndex((e) => secs < e);
@@ -84,7 +86,7 @@
     <div class="scroll">
       <table data-testid="rhythm-table">
         <thead>
-          <tr><th>{t('Domain')}</th>{#each Array(N) as _, i (i)}<th class="num" title={label(i)}>{i}</th>{/each}</tr>
+          <tr><th>{t('Domain')}</th>{#each Array(N) as _, i (i)}<th class="num" title={labels[i]}>{i}</th>{/each}</tr>
         </thead>
         <tbody>
           {#each rows as r (r.domain)}
@@ -120,7 +122,7 @@
                 class:dominant={c.i === top.i && top.share >= 0.5}
                 data-bin={c.i}
                 data-n={c.n}
-              ><title>{t('{label}: {n} ({share} %)', { label: label(c.i), n: num(c.n), share: Math.round(c.share * 100) })}</title></rect>
+              ><title>{t('{label}: {n} ({share} %)', { label: labels[c.i] ?? label(c.i), n: num(c.n), share: Math.round(c.share * 100) })}</title></rect>
             {/each}
           </svg>
           <span class="small period">

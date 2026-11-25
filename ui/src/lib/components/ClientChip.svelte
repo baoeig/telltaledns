@@ -1,3 +1,38 @@
+<script module lang="ts">
+  // REQ: API-012 — the binder and the device kinds' names are made once for the file, not once per
+  // chip: the chip is a row of the query log, and the kinds are read only in the name drawer's list.
+  import { tk, tr, type Msg } from '../i18n';
+  import T from '../i18n/T.svelte';
+  const { t, m } = tr('clientChip');
+
+  const kinds = ['phone', 'tablet', 'laptop', 'desktop', 'tv', 'streaming', 'speaker', 'console', 'camera', 'doorbell', 'plug', 'bulb', 'thermostat', 'hub', 'vacuum', 'printer', 'nas', 'network', 'appliance', 'wearable', 'car', 'other', 'unknown'];
+  /** How each kind is named in the list (the value sent stays the kind). */
+  const KIND_TEXT: Record<string, Msg> = {
+    phone: m('phone'),
+    tablet: m('tablet'),
+    laptop: m('laptop'),
+    desktop: m('desktop'),
+    tv: m('tv'),
+    streaming: m('streaming'),
+    speaker: m('speaker'),
+    console: m('console'),
+    camera: m('camera'),
+    doorbell: m('doorbell'),
+    plug: m('plug'),
+    bulb: m('bulb'),
+    thermostat: m('thermostat'),
+    hub: m('hub'),
+    vacuum: m('vacuum'),
+    printer: m('printer'),
+    nas: m('nas'),
+    network: m('network'),
+    appliance: m('appliance'),
+    wearable: m('wearable'),
+    car: m('car'),
+    other: m('other'),
+  };
+</script>
+
 <script lang="ts">
   // REQ: API-010 — a device anywhere in the UI (top clients, query log, live tail): a menu with
   // "Name this device…", "Add to group…", and "Show queries". Naming stores a device through
@@ -11,9 +46,6 @@
   import Icon from './Icon.svelte';
   import { groupFromText, loadWorkloads, podAt, workloadOf } from '../workloads.svelte';
   import { isMac, listsMac, normMac, sameIp } from '../macKeys';
-  import { tk, tr, type Msg } from '../i18n';
-  import T from '../i18n/T.svelte';
-  const { t, m } = tr('clientChip');
 
   let {
     ip,
@@ -101,32 +133,6 @@
   const who = $derived(macChosen ? t('this device ({mac}, now at {ip})', { mac, ip }) : ip);
   /** An English article goes with the product's name: one message for each (REQ: API-012). */
   const an = (p: string) => /^[aeiou]/i.test(p);
-  const kinds = ['phone', 'tablet', 'laptop', 'desktop', 'tv', 'streaming', 'speaker', 'console', 'camera', 'doorbell', 'plug', 'bulb', 'thermostat', 'hub', 'vacuum', 'printer', 'nas', 'network', 'appliance', 'wearable', 'car', 'other', 'unknown'];
-  /** How each kind is named in the list (the value sent stays the kind). */
-  const KIND_TEXT: Record<string, Msg> = {
-    phone: m('phone'),
-    tablet: m('tablet'),
-    laptop: m('laptop'),
-    desktop: m('desktop'),
-    tv: m('tv'),
-    streaming: m('streaming'),
-    speaker: m('speaker'),
-    console: m('console'),
-    camera: m('camera'),
-    doorbell: m('doorbell'),
-    plug: m('plug'),
-    bulb: m('bulb'),
-    thermostat: m('thermostat'),
-    hub: m('hub'),
-    vacuum: m('vacuum'),
-    printer: m('printer'),
-    nas: m('nas'),
-    network: m('network'),
-    appliance: m('appliance'),
-    wearable: m('wearable'),
-    car: m('car'),
-    other: m('other'),
-  };
   let busy = $state(false);
   // The form appears only once its data is in, so a slow load can't wipe what was typed.
   let loading = $state(false);
