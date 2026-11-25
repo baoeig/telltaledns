@@ -1,4 +1,22 @@
 {
+  "App.svelte": [
+    {
+      "fragments": [
+        "Client IPs appear masked.",
+        "{}% of the last {} queries came from {}, which look like infrastructure (a Kubernetes node, a Docker bridge, or a router forwarding DNS) rather than devices. Per-device statistics and rules see those addresses instead of your devices.",
+        "How to fix it"
+      ],
+      "sentence": "<strong>Client IPs appear masked.</strong> {share}% of the last {n} queries came from {sources}, which look like infrastructure (a Kubernetes node, a Docker bridge, or a router forwarding DNS) rather than devices. Per-device statistics and rules see those addresses instead of your devices. <fix>How to fix it</fix>"
+    },
+    {
+      "fragments": [
+        "This node is in maintenance",
+        "({}): it reports not ready and keeps answering DNS; its alerts are paused.",
+        "Cluster"
+      ],
+      "sentence": "<strong>This node is in maintenance</strong> ({reason}): it reports not ready and keeps answering DNS; its alerts are paused. <cluster>Cluster</cluster>"
+    }
+  ],
   "lib/components/AgentInbox.svelte": [
     {
       "fragments": [

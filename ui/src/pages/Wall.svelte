@@ -31,6 +31,8 @@
     screenClassStable,
     type ScreenClass,
   } from '../lib/wall';
+  import { tr } from '../lib/i18n';
+  const { t } = tr('wall');
 
   const panels = $derived(parsePanels(route.params.get('panels')));
   const every = $derived(parseEvery(route.params.get('every')));
@@ -75,14 +77,14 @@
   $effect(() => {
     void turn;
     if (paused || !rotating) return;
-    const t = setTimeout(() => step(1, null), every * 1000);
-    return () => clearTimeout(t);
+    const timer = setTimeout(() => step(1, null), every * 1000);
+    return () => clearTimeout(timer);
   });
   $effect(() => {
     void hero;
     titleShown = true;
-    const t = setTimeout(() => (titleShown = false), 3000);
-    return () => clearTimeout(t);
+    const timer = setTimeout(() => (titleShown = false), 3000);
+    return () => clearTimeout(timer);
   });
   // A new address or a new layout starts each slot from its first panel.
   // REQ: OBS-035 (#69) — keyed on strings, not on `layout`: the layout object is made again
@@ -175,7 +177,7 @@
   <div class="corner">
     <Logo />
     <span class="clock" data-testid="wall-clock">{clock(now)}</span>
-    {#if paused}<span class="paused" data-testid="wall-paused">paused</span>{/if}
+    {#if paused}<span class="paused" data-testid="wall-paused">{t('paused')}</span>{/if}
   </div>
   {#if single && hero}
     <h1 class="title" class:fade={motion && !titleShown} class:gone={!motion && !titleShown}>{tk(PANEL_TITLE[hero])}</h1>
@@ -208,7 +210,7 @@
       </section>
     {/each}
   </div>
-  <ol class="dots" aria-label="Panels" data-testid="wall-order">
+  <ol class="dots" aria-label={t('Panels')} data-testid="wall-order">
     {#each panels as p (p)}<li class:on={p === hero} data-panel={p}></li>{/each}
   </ol>
   {#if !paused && rotating}
@@ -218,9 +220,9 @@
   {/if}
   <div class="tail" data-testid="wall-tail" data-side={layout.tailSide ? 'yes' : 'no'}>
     {#each rows as r, i (i)}
-      <span class="item s-{r.status}">{r.clientName ?? r.client} → {r.name} · {r.status}</span>
+      <span class="item s-{r.status}" translate="no">{r.clientName ?? r.client} → {r.name} · {r.status}</span>
     {:else}
-      <span class="muted">Waiting for queries…</span>
+      <span class="muted">{t('Waiting for queries…')}</span>
     {/each}
   </div>
   <span hidden data-testid="wall-hero-list">{heroList.join(',')}</span>

@@ -114,7 +114,7 @@
     "pages/Wall.svelte": 0
   },
   "literal": {
-    "App.svelte": 30,
+    "App.svelte": 0,
     "lib/annotations.svelte.ts": 0,
     "lib/api-types.ts": 0,
     "lib/api.ts": 0,
@@ -226,7 +226,7 @@
     "pages/Setup.svelte": 0,
     "pages/Traffic.svelte": 0,
     "pages/Upstreams.svelte": 0,
-    "pages/Wall.svelte": 3
+    "pages/Wall.svelte": 0
   },
   "physical": {
     "App.svelte": 5,
