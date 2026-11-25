@@ -584,6 +584,22 @@
       "sentence": "Could also be a {product}"
     }
   ],
+  "lib/components/LatencyHeatmap.svelte": [
+    {
+      "fragments": [
+        "via {}",
+        "at",
+        ": open this query"
+      ],
+      "sentence": "{latency} {path} via {upstream} at {time}: open this query"
+    },
+    {
+      "fragments": [
+        "{} {}{} at {}: open this query"
+      ],
+      "sentence": "{latency} {path} at {time}: open this query"
+    }
+  ],
   "lib/components/MaintenanceForm.svelte": [
     {
       "fragments": [
@@ -746,6 +762,105 @@
         ")."
       ],
       "sentence": "{address} (shown in the log as <bdi>{seen}</bdi>)."
+    }
+  ],
+  "lib/components/SimulationCard.svelte": [
+    {
+      "fragments": [
+        "Over",
+        "logged queries",
+        "since {}",
+        ":",
+        "none would have been answered differently."
+      ],
+      "sentence": "Over {rows} logged queries since {since}: none would have been answered differently."
+    },
+    {
+      "fragments": [
+        "Over",
+        "logged queries",
+        "since {}",
+        ":",
+        "{} would have been answered differently."
+      ],
+      "sentence": "Over {rows} logged queries since {since}: {n} would have been answered differently."
+    },
+    {
+      "fragments": [
+        "Over {} logged queries{}: {}",
+        "none would have been answered differently."
+      ],
+      "sentence": "Over {rows} logged queries: none would have been answered differently."
+    },
+    {
+      "fragments": [
+        "Over {} logged queries{}: {}",
+        "{} would have been answered differently."
+      ],
+      "sentence": "Over {rows} logged queries: {n} would have been answered differently."
+    },
+    {
+      "fragments": [
+        "Partial:",
+        "the time or row limit was reached, so older queries weren't replayed."
+      ],
+      "sentence": "<b>Partial:</b> the time or row limit was reached, so older queries weren't replayed."
+    },
+    {
+      "fragments": [
+        "{} device{}"
+      ],
+      "sentence": "{n} device"
+    },
+    {
+      "fragments": [
+        "device",
+        "s"
+      ],
+      "sentence": "{n} devices"
+    },
+    {
+      "fragments": [
+        "quer",
+        "y"
+      ],
+      "sentence": "{n} query"
+    },
+    {
+      "fragments": [
+        "quer",
+        "ies"
+      ],
+      "sentence": "{n} queries"
+    },
+    {
+      "fragments": [
+        "device"
+      ],
+      "sentence": "{n} device"
+    },
+    {
+      "fragments": [
+        "device",
+        "s"
+      ],
+      "sentence": "{n} devices"
+    },
+    {
+      "fragments": [
+        ","
+      ],
+      "sentence": "{queries}, {devices}"
+    }
+  ],
+  "lib/components/SloCard.svelte": [
+    {
+      "fragments": [
+        "Objectives are off (",
+        "[slo] enabled = false",
+        ")."
+      ],
+      "sentence": "Objectives are off (<code>[slo] enabled = false</code>)."
     }
   ],
   "lib/components/SupportPackage.svelte": [
