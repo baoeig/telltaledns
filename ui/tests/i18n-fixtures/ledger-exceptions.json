@@ -1032,5 +1032,43 @@
       ],
       "sentence": "{all} of all · {part} of {name}"
     }
+  ],
+  "pages/DashboardCalm.svelte": [
+    {
+      "fragments": [
+        "last {}{}"
+      ],
+      "sentence": "last {range}"
+    },
+    {
+      "fragments": [
+        "last {}{}",
+        "· {}"
+      ],
+      "sentence": "last {range} · {scope}"
+    },
+    {
+      "fragments": [
+        "Objectives are off (",
+        "[slo] enabled = false",
+        ")."
+      ],
+      "sentence": "Objectives are off (<code>[slo] enabled = false</code>)."
+    }
+  ],
+  "pages/DashboardLegacy.svelte": [
+    {
+      "fragments": [
+        "last {}{}",
+        "· {}"
+      ],
+      "sentence": "last {range} · {scope}"
+    },
+    {
+      "fragments": [
+        "last {}{}"
+      ],
+      "sentence": "last {range}"
+    }
   ]
 }
