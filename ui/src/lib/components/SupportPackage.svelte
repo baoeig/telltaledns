@@ -168,8 +168,8 @@
               {#if mapGone}<span class="muted">{t('(given out; make another package to get a new one)')}</span>{/if}
               <T
                 ctx="supportPackage"
-                msg={'It lists what each pseudonym stands for, so it has your real names and addresses: keep it to yourself, and tell a maintainer what <mono>device-3</mono> was only if you want to.'}
-                >{#snippet mono(text: string)}<span class="mono" translate="no">{text}</span>{/snippet}</T
+                msg={'It lists what each pseudonym stands for, so it has your real names and addresses: keep it to yourself, and tell a maintainer what <pseudonym/> was only if you want to.'}
+                >{#snippet pseudonym()}<span class="mono" translate="no">device-3</span>{/snippet}</T
               >
             </p>
           {/if}

@@ -369,8 +369,8 @@
             )}{/if}
           <T
             ctx="clientChip"
-            msg={'This adds a rule for exactly this workload; a <code>telltaledns.io/group</code> label on its pods or namespace still wins, and is the way to do it from Git.'}
-            >{#snippet code(text: string)}<code translate="no">{text}</code>{/snippet}</T
+            msg={'This adds a rule for exactly this workload; a <groupkey/> label on its pods or namespace still wins, and is the way to do it from Git.'}
+            >{#snippet groupkey()}<code translate="no">telltaledns.io/group</code>{/snippet}</T
           ><HelpButton id="kubernetes-workloads" />
         </p>
         <label>

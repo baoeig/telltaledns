@@ -58,7 +58,7 @@
     <text x="73" y="124" text-anchor="middle" class="flow-sub">{t('asks for a name')}</text>
     <path d="M138 110 H226" class="flow-line" class:flow-on={highlight !== 'refused'} marker-end="url(#flow-arrow)" />
     <rect x="228" y="80" width="150" height="60" rx="12" class="flow-core" />
-    <text x="303" y="107" text-anchor="middle" class="flow-core-text">{t('TelltaleDNS')}</text>
+    <text x="303" y="107" text-anchor="middle" class="flow-core-text" translate="no">TelltaleDNS</text>
     <text x="303" y="125" text-anchor="middle" class="flow-core-sub">{highlight === 'refused' ? t('refused') : t('decides')}</text>
     {#each outs as o, i (o.id)}
       <path

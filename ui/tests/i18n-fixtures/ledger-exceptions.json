@@ -102,10 +102,9 @@
     {
       "fragments": [
         "This adds a rule for exactly this workload; a",
-        "telltaledns.io/group",
         "label on its pods or namespace still wins, and is the way to do it from Git."
       ],
-      "sentence": "This adds a rule for exactly this workload; a <code>telltaledns.io/group</code> label on its pods or namespace still wins, and is the way to do it from Git."
+      "sentence": "This adds a rule for exactly this workload; a <groupkey/> label on its pods or namespace still wins, and is the way to do it from Git."
     },
     {
       "fragments": [
@@ -946,10 +945,9 @@
     {
       "fragments": [
         "It lists what each pseudonym stands for, so it has your real names and addresses: keep it to yourself, and tell a maintainer what",
-        "device-3",
         "was only if you want to."
       ],
-      "sentence": "It lists what each pseudonym stands for, so it has your real names and addresses: keep it to yourself, and tell a maintainer what <mono>device-3</mono> was only if you want to."
+      "sentence": "It lists what each pseudonym stands for, so it has your real names and addresses: keep it to yourself, and tell a maintainer what <pseudonym/> was only if you want to."
     }
   ],
   "lib/components/Topology.svelte": [
