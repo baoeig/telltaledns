@@ -41,6 +41,9 @@
     const n = nodes.find((x) => x.nodeId === id);
     return n ? (n.pod ?? n.site) : id.slice(0, 8);
   };
+  // REQ: API-012 — the waiting sentence with a start time reads "come online(since …)", with no space
+  // before the parenthesis: the page always showed it so (Svelte trims the space at the start of an
+  // {#if} block), and the English stays as it was.
   const when = (iso: string) => `${logDate(iso)} ${logTime(iso)}`;
   const outcome: Record<string, [string, string]> = {
     stable: [t('stable'), 'ok'],
@@ -173,7 +176,7 @@
       </div>
     {:else if status.stage === 'waiting'}
       <p class="notice warn small" data-testid="rollout-waiting">
-        {#if status.waitingSince}{t('A change waits for a canary node to come online (since {when}); after a minute it goes to every node at once.', { when: when(status.waitingSince) })}{:else}{t('A change waits for a canary node to come online; after a minute it goes to every node at once.')}{/if}
+        {#if status.waitingSince}{t('A change waits for a canary node to come online(since {when}); after a minute it goes to every node at once.', { when: when(status.waitingSince) })}{:else}{t('A change waits for a canary node to come online; after a minute it goes to every node at once.')}{/if}
       </p>
     {:else if status.stage !== 'pinned'}
       <p class="small">{t('Every node runs version {stable}.', { stable: status.stable })}</p>

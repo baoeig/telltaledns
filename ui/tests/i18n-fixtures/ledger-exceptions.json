@@ -812,7 +812,7 @@
         "(since {})",
         "; after a minute it goes to every node at once."
       ],
-      "sentence": "A change waits for a canary node to come online (since {when}); after a minute it goes to every node at once."
+      "sentence": "A change waits for a canary node to come online(since {when}); after a minute it goes to every node at once."
     },
     {
       "fragments": [
