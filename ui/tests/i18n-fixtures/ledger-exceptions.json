@@ -1049,6 +1049,24 @@
       "sentence": "{all} of all · {part} of {name}"
     }
   ],
+  "pages/AgentChanges.svelte": [
+    {
+      "fragments": [
+        "AI agents connected over MCP don't change anything directly: they make a plan, shown here with what it would do. With",
+        ", a plan waits for an operator before the agent can apply it. Plans expire after 10 minutes."
+      ],
+      "sentence": "AI agents connected over MCP don't change anything directly: they make a plan, shown here with what it would do. With <requireapproval/>, a plan waits for an operator before the agent can apply it. Plans expire after 10 minutes."
+    }
+  ],
+  "pages/Alerts.svelte": [
+    {
+      "fragments": [
+        "Alerts for",
+        "are paused during maintenance until {} ({})."
+      ],
+      "sentence": "Alerts for <strong>{node}</strong> are paused during maintenance until {until} ({reason})."
+    }
+  ],
   "pages/Anomalies.svelte": [
     {
       "fragments": [
@@ -1156,6 +1174,206 @@
         "(terminating)"
       ],
       "sentence": "{name} {addresses} (terminating)"
+    }
+  ],
+  "pages/Cluster.svelte": [
+    {
+      "fragments": [
+        "This node is in maintenance",
+        "until {} ({}, by {}): it reports not ready, so load balancers send it no new queries, and it keeps answering what still arrives. Its alerts and health conditions are paused."
+      ],
+      "sentence": "<strong>This node is in maintenance</strong> until {until} ({reason}, by {by}): it reports not ready, so load balancers send it no new queries, and it keeps answering what still arrives. Its alerts and health conditions are paused."
+    },
+    {
+      "fragments": [
+        "Git:",
+        "@ {},"
+      ],
+      "sentence": "Git: <mono>{repo}</mono> @ {ref}, <mono>{path}</mono>"
+    },
+    {
+      "fragments": [
+        "Make {} the primary again?",
+        "The emergency primary ({}) steps down by itself, and this node publishes from Git again, continuing from version {}."
+      ],
+      "sentence": "<strong>Make {site} the primary again?</strong> The emergency primary ({sites}) steps down by itself, and this node publishes from Git again, continuing from version {n}."
+    },
+    {
+      "fragments": [
+        "Make {} the primary?",
+        "Use this only when the primary is gone. This node continues from version {}; if the old primary comes back, it steps down, and anything it changed in the meantime is listed under Conflicts."
+      ],
+      "sentence": "<strong>Make {site} the primary?</strong> Use this only when the primary is gone. This node continues from version {n}; if the old primary comes back, it steps down, and anything it changed in the meantime is listed under Conflicts."
+    },
+    {
+      "fragments": [
+        "The cluster is pinned to version {}",
+        "by {}: {}. Configuration changes wait until it's unpinned.",
+        "Rollouts"
+      ],
+      "sentence": "<strong>The cluster is pinned to version {to}</strong> by {by}: {reason}. Configuration changes wait until it's unpinned. <rollouts>Rollouts</rollouts>"
+    },
+    {
+      "fragments": [
+        "pod",
+        "on"
+      ],
+      "sentence": "pod <mono>{pod}</mono> on <mono>{node}</mono>"
+    },
+    {
+      "fragments": [
+        "pod"
+      ],
+      "sentence": "pod"
+    },
+    {
+      "fragments": [
+        ": {} resolver pod{}"
+      ],
+      "sentence": "<strong>{site}</strong>: {n} resolver pod"
+    },
+    {
+      "fragments": [
+        ": {} resolver pod{}",
+        "s"
+      ],
+      "sentence": "<strong>{site}</strong>: {n} resolver pods"
+    },
+    {
+      "fragments": [
+        "No other node has connected yet. On another node:",
+        "with a token from",
+        "."
+      ],
+      "sentence": "No other node has connected yet. On another node: <joincmd/> with a token from <tokencmd/>."
+    },
+    {
+      "fragments": [
+        "Last hour: {} joined · {} pod{} gone · {} restart{}"
+      ],
+      "sentence": "Last hour: {joined} joined · {expired} pod gone · {restarted} restart"
+    },
+    {
+      "fragments": [
+        "Last hour: {} joined · {} pod{} gone · {} restart{}",
+        "s"
+      ],
+      "sentence": "Last hour: {joined} joined · {expired} pod gone · {restarted} restarts"
+    },
+    {
+      "fragments": [
+        "Last hour:",
+        "joined ·",
+        "pod",
+        "s",
+        "gone ·",
+        "restart"
+      ],
+      "sentence": "Last hour: {joined} joined · {expired} pods gone · {restarted} restart"
+    },
+    {
+      "fragments": [
+        "Last hour:",
+        "joined ·",
+        "pod",
+        "s",
+        "gone ·",
+        "restart",
+        "s"
+      ],
+      "sentence": "Last hour: {joined} joined · {expired} pods gone · {restarted} restarts"
+    },
+    {
+      "fragments": [
+        "by {}",
+        ", {}",
+        ", signed by {}"
+      ],
+      "sentence": "by {author}, {date}, signed by {signer}"
+    },
+    {
+      "fragments": [
+        "by {}",
+        ", {}"
+      ],
+      "sentence": "by {author}, {date}"
+    },
+    {
+      "fragments": [
+        "by {}",
+        ", signed by {}"
+      ],
+      "sentence": "by {author}, signed by {signer}"
+    },
+    {
+      "fragments": [
+        "by {}"
+      ],
+      "sentence": "by {author}"
+    },
+    {
+      "fragments": [
+        "by {}"
+      ],
+      "sentence": "by {by}"
+    },
+    {
+      "fragments": [
+        "{}{} RTT"
+      ],
+      "sentence": "{rtt} RTT"
+    },
+    {
+      "fragments": [
+        "{}seen {} ago"
+      ],
+      "sentence": "seen {time} ago"
+    },
+    {
+      "fragments": [
+        "{} q/s",
+        "({} of queries)",
+        "· {} SERVFAIL · upstream p90 {}"
+      ],
+      "sentence": "{rate} q/s ({share} of queries) · {servfail} SERVFAIL · upstream p90 {p90}"
+    },
+    {
+      "fragments": [
+        "{} q/s",
+        "· {} SERVFAIL · upstream p90 {}"
+      ],
+      "sentence": "{rate} q/s · {servfail} SERVFAIL · upstream p90 {p90}"
+    },
+    {
+      "fragments": [
+        "cache:",
+        "{} hits",
+        "·",
+        "entries"
+      ],
+      "sentence": "cache: {hits} hits · {n} entries"
+    },
+    {
+      "fragments": [
+        "cache:",
+        "no lookups",
+        "·",
+        "entries"
+      ],
+      "sentence": "cache: no lookups · {n} entries"
+    },
+    {
+      "fragments": [
+        "{} restart{}"
+      ],
+      "sentence": "{n} restart"
+    },
+    {
+      "fragments": [
+        "{} restart{}",
+        "s"
+      ],
+      "sentence": "{n} restarts"
     }
   ],
   "pages/DashboardCalm.svelte": [
