@@ -764,6 +764,78 @@
       "sentence": "{address} (shown in the log as <bdi>{seen}</bdi>)."
     }
   ],
+  "lib/components/RolloutPanel.svelte": [
+    {
+      "fragments": [
+        "The cluster is pinned to version {}",
+        "since {} by {}: {}. Every node serves that version, and configuration changes wait until it's unpinned."
+      ],
+      "sentence": "<strong>The cluster is pinned to version {to}</strong> since {since} by {by}: {reason}. Every node serves that version, and configuration changes wait until it's unpinned."
+    },
+    {
+      "fragments": [
+        "Canaries:",
+        ". A change reaches them and the primary first, and every other node after {} if nothing fails."
+      ],
+      "sentence": "Canaries: <strong>{canaries}</strong>. A change reaches them and the primary first, and every other node after {bake} if nothing fails."
+    },
+    {
+      "fragments": [
+        "Version",
+        "runs on {} and the primary; the others stay on {}."
+      ],
+      "sentence": "Version <strong>{version}</strong> runs on {nodes} and the primary; the others stay on {stable}."
+    },
+    {
+      "fragments": [
+        "left."
+      ],
+      "sentence": "<strong>{time}</strong> left."
+    },
+    {
+      "fragments": [
+        "Unpinning publishes the current configuration",
+        ", to the canary nodes first",
+        "."
+      ],
+      "sentence": "Unpinning publishes the current configuration, to the canary nodes first."
+    },
+    {
+      "fragments": [
+        "Unpinning publishes the current configuration{}."
+      ],
+      "sentence": "Unpinning publishes the current configuration."
+    },
+    {
+      "fragments": [
+        "A change waits for a canary node to come online",
+        "(since {})",
+        "; after a minute it goes to every node at once."
+      ],
+      "sentence": "A change waits for a canary node to come online (since {when}); after a minute it goes to every node at once."
+    },
+    {
+      "fragments": [
+        "A change waits for a canary node to come online",
+        "; after a minute it goes to every node at once."
+      ],
+      "sentence": "A change waits for a canary node to come online; after a minute it goes to every node at once."
+    },
+    {
+      "fragments": [
+        "Every node changes: {}.",
+        "{} Configuration changes wait until you unpin."
+      ],
+      "sentence": "Every node changes: {changes}. Configuration changes wait until you unpin."
+    },
+    {
+      "fragments": [
+        "The configuration is the same; the filter snapshot may differ.",
+        "{} Configuration changes wait until you unpin."
+      ],
+      "sentence": "The configuration is the same; the filter snapshot may differ. Configuration changes wait until you unpin."
+    }
+  ],
   "lib/components/SimulationCard.svelte": [
     {
       "fragments": [
@@ -878,6 +950,41 @@
         "was only if you want to."
       ],
       "sentence": "It lists what each pseudonym stands for, so it has your real names and addresses: keep it to yourself, and tell a maintainer what <mono>device-3</mono> was only if you want to."
+    }
+  ],
+  "lib/components/Topology.svelte": [
+    {
+      "fragments": [
+        "{} q/s{}",
+        ", {}% of queries"
+      ],
+      "sentence": "{rate} q/s, {share}% of queries"
+    },
+    {
+      "fragments": [
+        "{} restart{}"
+      ],
+      "sentence": "{n} restart"
+    },
+    {
+      "fragments": [
+        "restart",
+        "s"
+      ],
+      "sentence": "{n} restarts"
+    },
+    {
+      "fragments": [
+        "replica pod"
+      ],
+      "sentence": "{n} replica pod"
+    },
+    {
+      "fragments": [
+        "replica pod",
+        "s"
+      ],
+      "sentence": "{n} replica pods"
     }
   ],
   "lib/components/WallDisplays.svelte": [
