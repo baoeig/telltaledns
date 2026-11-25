@@ -218,14 +218,14 @@
     "pages/Groups.svelte": 0,
     "pages/Heatmap.svelte": 0,
     "pages/Lists.svelte": 0,
-    "pages/LocalDns.svelte": 57,
+    "pages/LocalDns.svelte": 0,
     "pages/Login.svelte": 13,
     "pages/Queries.svelte": 0,
     "pages/Rules.svelte": 0,
     "pages/Settings.svelte": 239,
     "pages/Setup.svelte": 8,
     "pages/Traffic.svelte": 0,
-    "pages/Upstreams.svelte": 39,
+    "pages/Upstreams.svelte": 0,
     "pages/Wall.svelte": 3
   },
   "physical": {

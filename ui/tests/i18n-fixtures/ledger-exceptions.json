@@ -1412,6 +1412,67 @@
       "sentence": "Shadow lists never block. When the names above are ones you'd want blocked, switch the list to <enforce/>."
     }
   ],
+  "pages/LocalDns.svelte": [
+    {
+      "fragments": [
+        "Every device that asks for {} gets {}, answered by TelltaleDNS itself{}."
+      ],
+      "sentence": "Every device that asks for {name} gets {what}, answered by TelltaleDNS itself."
+    },
+    {
+      "fragments": [
+        "Every device that asks for",
+        "gets",
+        ", answered by TelltaleDNS itself",
+        ", and a reverse lookup of the address finds the name",
+        "."
+      ],
+      "sentence": "Every device that asks for {name} gets {what}, answered by TelltaleDNS itself, and a reverse lookup of the address finds the name."
+    },
+    {
+      "fragments": [
+        "No local names yet. “Set up my home domain” gives your NAS, printer, or server a name like",
+        "that every device can use."
+      ],
+      "sentence": "No local names yet. “Set up my home domain” gives your NAS, printer, or server a name like <nasexample/> that every device can use."
+    },
+    {
+      "fragments": [
+        "TelltaleDNS answers everything under these domains itself, from the configuration files (",
+        "): names it doesn't have get “no such name”. A zone limited to groups is seen only by their devices."
+      ],
+      "sentence": "TelltaleDNS answers everything under these domains itself, from the configuration files (<zoneentry/>): names it doesn't have get “no such name”. A zone limited to groups is seen only by their devices."
+    },
+    {
+      "fragments": [
+        "Pick the domain your devices' names end with.",
+        "is reserved for exactly this (RFC 8375), so it never clashes with the internet; use a domain you own if you have one."
+      ],
+      "sentence": "Pick the domain your devices' names end with. <homearpa/> is reserved for exactly this (RFC 8375), so it never clashes with the internet; use a domain you own if you have one."
+    },
+    {
+      "fragments": [
+        "Its full name will be",
+        "."
+      ],
+      "sentence": "Its full name will be <code>{name}</code>."
+    },
+    {
+      "fragments": [
+        "Several servers: separate them with spaces (tried in order). Encrypted:",
+        "."
+      ],
+      "sentence": "Several servers: separate them with spaces (tried in order). Encrypted: <tlsexample/>."
+    },
+    {
+      "fragments": [
+        "A",
+        "stub zone",
+        ": the servers are asked directly (by IP address) and their hand-offs are followed, as BIND's stub zones do. Use it when the servers refuse other questions."
+      ],
+      "sentence": "A <em>stub zone</em>: the servers are asked directly (by IP address) and their hand-offs are followed, as BIND's stub zones do. Use it when the servers refuse other questions."
+    }
+  ],
   "pages/Queries.svelte": [
     {
       "fragments": [
@@ -1494,6 +1555,35 @@
         "this hour"
       ],
       "sentence": "this hour"
+    }
+  ],
+  "pages/Upstreams.svelte": [
+    {
+      "fragments": [
+        "Health:",
+        "Healthy",
+        "= answering,",
+        "Benched",
+        "= stopped asking it after failures,",
+        "Probing",
+        "= a trial query is checking whether it has recovered. Percentiles cover this hour. Hover a badge for the circuit breaker's own word."
+      ],
+      "sentence": "Health: <strong>Healthy</strong> = answering, <strong>Benched</strong> = stopped asking it after failures, <strong>Probing</strong> = a trial query is checking whether it has recovered. Percentiles cover this hour. Hover a badge for the circuit breaker's own word."
+    },
+    {
+      "fragments": [
+        "Second opinions are off. With",
+        ", one forwarded question in 1,000 is asked again of another upstream and the answers compared (that upstream sees those names)."
+      ],
+      "sentence": "Second opinions are off. With <samplekey/>, one forwarded question in 1,000 is asked again of another upstream and the answers compared (that upstream sees those names)."
+    },
+    {
+      "fragments": [
+        "To send one domain to a different server (a work network, your router), add a forwarded domain on the",
+        "Names on my network",
+        "page."
+      ],
+      "sentence": "To send one domain to a different server (a work network, your router), add a forwarded domain on the <link>Names on my network</link> page."
     }
   ]
 }
