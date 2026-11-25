@@ -3,13 +3,15 @@
   // approximate row shows its error bound as a faint extension.
   import type { S } from '../api';
   import { num } from '../format';
+  import { tr } from '../i18n';
+  const { t } = tr('barList');
 
   let {
     title,
     rows,
     link,
     testid,
-    empty = 'Nothing here.',
+    empty = t('Nothing here.'),
   }: {
     title: string;
     rows: S['AttributionRow'][];
@@ -26,14 +28,14 @@
 <section class="card bars-card" data-testid={testid}>
   <div class="card-head">
     <h3>{title}</h3>
-    <button class="link small" onclick={() => (table = !table)} aria-pressed={table}>{table ? 'Bars' : 'Table'}</button>
+    <button class="link small" onclick={() => (table = !table)} aria-pressed={table}>{table ? t('Bars') : t('Table')}</button>
   </div>
   {#if rows.length === 0}
     <p class="empty small">{empty}</p>
   {:else if table}
     <div class="table-wrap">
       <table class="compact">
-        <thead><tr><th>{title}</th><th class="num">Bad</th><th class="num">Share</th>{#if rows.some((r) => !r.exact)}<th class="num">± up to</th>{/if}</tr></thead>
+        <thead><tr><th>{title}</th><th class="num">{t('Bad')}</th><th class="num">{t('Share')}</th>{#if rows.some((r) => !r.exact)}<th class="num">{t('± up to')}</th>{/if}</tr></thead>
         <tbody>
           {#each rows as r (r.key)}
             {@const to = link?.(r)}
@@ -55,7 +57,7 @@
           <div class="row">
             <span class="key">{#if to}<a href={to}>{label(r)}</a>{:else}{label(r)}{/if}</span>
             <span class="spacer"></span>
-            <span class="muted small">{num(r.bad)} · {r.sharePct}%{#if !r.exact && r.errorMax} (± up to {num(r.errorMax)}){/if}</span>
+            <span class="muted small">{num(r.bad)} · {r.sharePct}%{#if !r.exact && r.errorMax} {t('(± up to {max})', { max: num(r.errorMax) })}{/if}</span>
           </div>
           <div class="bar">
             <span style:width={`${(r.bad / max) * 100}%`}></span>

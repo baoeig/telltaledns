@@ -1,4 +1,61 @@
 {
+  "lib/components/BudgetAttribution.svelte": [
+    {
+      "fragments": [
+        "bad of {} answers since {}; the target ({}%) allows {}:",
+        "overspent",
+        "."
+      ],
+      "sentence": "<strong>{bad}</strong> bad of {answered} answers since {since}; the target ({target}%) allows {allowed}: <span>overspent</span>."
+    },
+    {
+      "fragments": [
+        "bad of {} answers since {}; the target ({}%) allows {}:",
+        "{}% of the budget left",
+        "."
+      ],
+      "sentence": "<strong>{bad}</strong> bad of {answered} answers since {since}; the target ({target}%) allows {allowed}: {left}% of the budget left."
+    }
+  ],
+  "lib/components/CacheCard.svelte": [
+    {
+      "fragments": [
+        "Nothing cached for",
+        "."
+      ],
+      "sentence": "Nothing cached for <span>{name}</span>."
+    },
+    {
+      "fragments": [
+        "{} · {} answer{}"
+      ],
+      "sentence": "{rcode} · {n} answer"
+    },
+    {
+      "fragments": [
+        "·",
+        "answer",
+        "s"
+      ],
+      "sentence": "{rcode} · {n} answers"
+    },
+    {
+      "fragments": [
+        "Removed {} {}",
+        "entry",
+        "."
+      ],
+      "sentence": "Removed {n} entry{errors}."
+    },
+    {
+      "fragments": [
+        "Removed {} {}",
+        "entries",
+        "."
+      ],
+      "sentence": "Removed {n} entries{errors}."
+    }
+  ],
   "lib/components/ClientChip.svelte": [
     {
       "fragments": [
@@ -98,6 +155,35 @@
       "sentence": "<b>What this will do:</b> {impact}"
     }
   ],
+  "lib/components/DeviceTimeline.svelte": [
+    {
+      "fragments": [
+        "{} · {} · {} queries, {} blocked{}"
+      ],
+      "sentence": "{span} · {domain} · {n} queries, {blocked} blocked"
+    },
+    {
+      "fragments": [
+        "{} · {} · {} queries, {} blocked{}",
+        ", {} slow"
+      ],
+      "sentence": "{span} · {domain} · {n} queries, {blocked} blocked, {slow} slow"
+    },
+    {
+      "fragments": [
+        "{} · {} queries · p99 {}",
+        "–"
+      ],
+      "sentence": "{span} · {n} queries · p99 –"
+    },
+    {
+      "fragments": [
+        "{} · {} queries · p99 {}",
+        "{} ms"
+      ],
+      "sentence": "{span} · {n} queries · p99 {p99} ms"
+    }
+  ],
   "lib/components/DrillForm.svelte": [
     {
       "fragments": [
@@ -105,6 +191,196 @@
         "For a short time it stops answering the devices you choose, while the other nodes keep serving. Devices with a working second DNS server switch to it; a report then shows who followed and who was stuck."
       ],
       "sentence": "<strong>Run a failover drill on {label}?</strong> For a short time it stops answering the devices you choose, while the other nodes keep serving. Devices with a working second DNS server switch to it; a report then shows who followed and who was stuck."
+    }
+  ],
+  "lib/components/DrillPanel.svelte": [
+    {
+      "fragments": [
+        "Not answering",
+        "({})."
+      ],
+      "sentence": "Not answering <strong>{targets}</strong> ({reason})."
+    },
+    {
+      "fragments": [
+        "{} queries unanswered from {} device{} · {} left"
+      ],
+      "sentence": "{n} queries unanswered from {devices} device · {left} left"
+    },
+    {
+      "fragments": [
+        "queries unanswered from",
+        "device",
+        "s",
+        "·",
+        "left"
+      ],
+      "sentence": "{n} queries unanswered from {devices} devices · {left} left"
+    },
+    {
+      "fragments": [
+        "A drill makes one node stop answering chosen devices for up to five minutes, then shows which devices switched to another node (they have a working second DNS server) and which were stuck. Start one with",
+        "Drill…",
+        "on a node's row."
+      ],
+      "sentence": "A drill makes one node stop answering chosen devices for up to five minutes, then shows which devices switched to another node (they have a working second DNS server) and which were stuck. Start one with <em>Drill…</em> on a node's row."
+    },
+    {
+      "fragments": [
+        "median failover",
+        ", p90 {} s"
+      ],
+      "sentence": "median failover, p90 {n} s"
+    },
+    {
+      "fragments": [
+        "median failover"
+      ],
+      "sentence": "median failover"
+    },
+    {
+      "fragments": [
+        "stayed on {}",
+        "the other node"
+      ],
+      "sentence": "stayed on the other node"
+    },
+    {
+      "fragments": [
+        "stayed on {}"
+      ],
+      "sentence": "stayed on {nodes}"
+    },
+    {
+      "fragments": [
+        "{}{}: {} queries from {} devices"
+      ],
+      "sentence": "{node}: {queries} queries from {devices} devices"
+    }
+  ],
+  "lib/components/HostCard.svelte": [
+    {
+      "fragments": [
+        "{}swap {} of {}"
+      ],
+      "sentence": "swap {used} of {total}"
+    },
+    {
+      "fragments": [
+        "{}{} cores"
+      ],
+      "sentence": "{n} cores"
+    },
+    {
+      "fragments": [
+        "{}limit {} cores"
+      ],
+      "sentence": "limit {n} cores"
+    },
+    {
+      "fragments": [
+        "{}query log {}"
+      ],
+      "sentence": "query log {size}"
+    },
+    {
+      "fragments": [
+        "{}lists {}"
+      ],
+      "sentence": "lists {size}"
+    },
+    {
+      "fragments": [
+        "{}writes {}/s"
+      ],
+      "sentence": "writes {size}/s"
+    },
+    {
+      "fragments": [
+        "{}{} threads"
+      ],
+      "sentence": "{n} threads"
+    },
+    {
+      "fragments": [
+        "of"
+      ],
+      "sentence": "{open} of {max}"
+    },
+    {
+      "fragments": [
+        "{} s {}",
+        "ahead"
+      ],
+      "sentence": "{n} s ahead"
+    },
+    {
+      "fragments": [
+        "{} s {}",
+        "behind"
+      ],
+      "sentence": "{n} s behind"
+    }
+  ],
+  "lib/components/IdentityLine.svelte": [
+    {
+      "fragments": [
+        "Set as",
+        "an"
+      ],
+      "sentence": "Set as an {kind}"
+    },
+    {
+      "fragments": [
+        "Set as",
+        "a"
+      ],
+      "sentence": "Set as a {kind}"
+    },
+    {
+      "fragments": [
+        "Looks like",
+        "an",
+        "(",
+        ")"
+      ],
+      "sentence": "Looks like an {product} ({level})"
+    },
+    {
+      "fragments": [
+        "Looks like",
+        "a",
+        "(",
+        ")"
+      ],
+      "sentence": "Looks like a {product} ({level})"
+    },
+    {
+      "fragments": [
+        "MAC vendor {}{}"
+      ],
+      "sentence": "MAC vendor {vendor}"
+    },
+    {
+      "fragments": [
+        "MAC vendor {}{}",
+        "({})"
+      ],
+      "sentence": "MAC vendor {vendor} ({prefix})"
+    },
+    {
+      "fragments": [
+        "Could also be {} {}",
+        "an"
+      ],
+      "sentence": "Could also be an {product}"
+    },
+    {
+      "fragments": [
+        "Could also be",
+        "a"
+      ],
+      "sentence": "Could also be a {product}"
     }
   ],
   "lib/components/MaintenanceForm.svelte": [
