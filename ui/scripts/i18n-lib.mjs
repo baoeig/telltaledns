@@ -1214,7 +1214,8 @@ export function conserve(analysis, entry, exceptions = []) {
   const markup = [...entry.markup];
   const script = [...entry.script];
   const own = [...entry.markup, ...entry.script];
-  const ownerOf = (f) => own.find((s) => s === f) ?? own.find((s) => pieces(s).includes(f));
+  // A piece belongs to a string this sentence or an earlier one already uses, before any other.
+  const ownerOf = (f, mine) => own.find((s) => s === f) ?? [...mine, ...taken, ...own].find((s) => pieces(s).includes(f));
   const taken = [];
   for (const x of exceptions) {
     if (typeof x?.sentence !== 'string' || !Array.isArray(x.fragments)) {
@@ -1224,7 +1225,7 @@ export function conserve(analysis, entry, exceptions = []) {
     if (!joined(pieces(x.sentence), x.fragments.flatMap((f) => pieces(f)))) problems.push(`exception "${x.sentence}": its fragments are not the sentence's pieces`);
     const mine = [];
     for (const f of x.fragments) {
-      const s = ownerOf(f);
+      const s = ownerOf(f, mine);
       const ok = s !== undefined && (take(markup, s) || take(script, s) ? mine.push(s) > 0 : taken.includes(s) || (s !== f && mine.includes(s)));
       if (!ok) problems.push(`exception "${x.sentence}": "${f}" is not in this file's ledger entry`);
     }

@@ -195,11 +195,14 @@ test('api_012 a whole sentence per variant conserves from the file own fragments
     { sentence: v2, fragments: ['Queries from', 'will show this name.'] },
   ];
   expect(lib.conserve(after(ok), entry, variants)).toEqual([]);
-  // A plural made with a suffix: the other form is built from pieces of the file's own strings.
-  const p0 = "<script lang=\"ts\">\n  let { n } = $props();\n  const left = $derived(`${n} voter${n === 1 ? '' : 's'} left`);\n</script>\n<p>{left}</p>\n";
+  // A plural made with a suffix: the other form is built from pieces of the file's own strings. A
+  // piece belongs to a string the sentence (or an earlier one) already uses, so another string with
+  // the same piece ("{} left") is still there for its own message.
+  const p0 =
+    "<script lang=\"ts\">\n  let { n } = $props();\n  const left = $derived(`${n} voter${n === 1 ? '' : 's'} left`);\n  const spare = $derived(`${n} left`);\n</script>\n<p>{left}</p>\n<p>{spare}</p>\n";
   const pe = entryOf(p0);
-  expect(pe.script).toEqual(['s', '{} voter{} left']);
-  const p1 = `${head}<p>{tn('{n} voter left', '{n} voters left', n, { n })}</p>\n`;
+  expect(pe.script).toEqual(['s', '{} left', '{} voter{} left']);
+  const p1 = `${head}<p>{tn('{n} voter left', '{n} voters left', n, { n })}</p>\n<p>{t('{n} left', { n })}</p>\n`;
   const forms = [
     { sentence: '{n} voter left', fragments: ['{} voter{} left'] },
     { sentence: '{n} voters left', fragments: ['voter', 's', 'left'] },
