@@ -6,6 +6,8 @@
   import { poll } from '../../poll';
   import { fold, layout, type FlowLink, type FlowNode } from '../../sankey';
   import { Particles, frameHub } from '../../wall';
+  import { tr } from '../../i18n';
+  const { t } = tr('wallFlow');
 
   let { motion }: { motion: boolean } = $props();
   let data = $state<S['QueryFlow'] | null>(null);
@@ -69,7 +71,7 @@
 
 <div class="flow" bind:clientWidth={w} bind:clientHeight={h} data-testid="wall-flow">
   {#if placed}
-    <svg bind:this={svg} width={w} height={h} viewBox="0 0 {w} {h}" aria-label="Where queries went in the last hour">
+    <svg bind:this={svg} width={w} height={h} viewBox="0 0 {w} {h}" aria-label={t('Where queries went in the last hour')}>
       {#each placed.links as l (l.source + l.target)}
         <path class="band" class:bad={l.failure} d={l.d} stroke-width={Math.max(1, l.width)} />
       {/each}

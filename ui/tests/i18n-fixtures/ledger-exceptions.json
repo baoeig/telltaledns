@@ -687,6 +687,22 @@
       "sentence": "{n} voters left; automatic failover stays off (it needs 3)."
     }
   ],
+  "lib/components/PauseControl.svelte": [
+    {
+      "fragments": [
+        "{} group{} paused"
+      ],
+      "sentence": "{n} group paused"
+    },
+    {
+      "fragments": [
+        "group",
+        "s",
+        "paused"
+      ],
+      "sentence": "{n} groups paused"
+    }
+  ],
   "lib/components/QuickRuleForm.svelte": [
     {
       "fragments": [
