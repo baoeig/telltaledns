@@ -129,7 +129,7 @@
             <tr data-testid="drill-row">
               <td class="small">{when(d.since)}</td>
               <td>{d.node}{#if d.viaBalancer}<span class="muted small"> {t('· via balancer')}</span>{/if}</td>
-              <td class="small">{d.targets}</td>
+              <td class="small" translate="no">{d.targets}</td>
               <td class="small">{own(statusText, d.status) ?? d.status}</td>
               <td class="num">{d.coveragePercent != null ? pct(d.coveragePercent) : '–'}</td>
               <td class="num">{d.followed}</td>
