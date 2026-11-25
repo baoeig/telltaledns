@@ -1346,6 +1346,72 @@
       "sentence": "Stronger colour = more queries; bars at the right and bottom sum each row and column."
     }
   ],
+  "pages/Lists.svelte": [
+    {
+      "fragments": [
+        "No lists are configured. Add",
+        "entries (URLs, files, or inline rules)."
+      ],
+      "sentence": "No lists are configured. Add <listentry/> entries (URLs, files, or inline rules)."
+    },
+    {
+      "fragments": [
+        "regex",
+        "rule",
+        "left out (over the limit of",
+        ", or too large to compile)"
+      ],
+      "sentence": "{n} regex rule left out (over the limit of <maxregexes/>, or too large to compile)"
+    },
+    {
+      "fragments": [
+        "regex",
+        "rules",
+        "left out (over the limit of",
+        ", or too large to compile)"
+      ],
+      "sentence": "{n} regex rules left out (over the limit of <maxregexes/>, or too large to compile)"
+    },
+    {
+      "fragments": [
+        "query",
+        "from",
+        "device"
+      ],
+      "sentence": "{n} query from {m} device"
+    },
+    {
+      "fragments": [
+        "query",
+        "from",
+        "devices"
+      ],
+      "sentence": "{n} query from {m} devices"
+    },
+    {
+      "fragments": [
+        "queries",
+        "from",
+        "device"
+      ],
+      "sentence": "{n} queries from {m} device"
+    },
+    {
+      "fragments": [
+        "queries",
+        "from",
+        "devices"
+      ],
+      "sentence": "{n} queries from {m} devices"
+    },
+    {
+      "fragments": [
+        "Shadow lists never block. When the names above are ones you'd want blocked, switch the list to",
+        "."
+      ],
+      "sentence": "Shadow lists never block. When the names above are ones you'd want blocked, switch the list to <enforce/>."
+    }
+  ],
   "pages/Queries.svelte": [
     {
       "fragments": [
