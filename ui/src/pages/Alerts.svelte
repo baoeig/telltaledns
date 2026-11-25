@@ -27,6 +27,8 @@
   }
   $effect(() => poll(load, 15_000));
 
+  // The words of the delivery rows are read once, here: the language is fixed for the life of the page.
+  const words = { delivered: t('delivered'), failed: t('failed') };
   const kinds = ['email', 'ntfy', 'gotify', 'slack', 'webhook'];
   const destinationFields: Field[] = [
     { key: 'type', label: t('Type'), type: 'select', options: kinds, initial: 'email',
@@ -103,7 +105,7 @@
             {#each status.deliveries as d (d.destination)}
               <tr>
                 <td><strong translate="no">{d.destination}</strong></td>
-                <td>{#if d.ok}<span class="badge ok">{t('delivered')}</span>{:else}<span class="badge bad">{t('failed')}</span>{/if}</td>
+                <td>{#if d.ok}<span class="badge ok">{words.delivered}</span>{:else}<span class="badge bad">{words.failed}</span>{/if}</td>
                 <td class="small muted">{dateTime(d.unixSeconds)}</td>
                 <td class="small">{d.error ?? ''}</td>
               </tr>

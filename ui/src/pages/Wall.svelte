@@ -225,7 +225,7 @@
       <span class="muted">{t('Waiting for queries…')}</span>
     {/each}
   </div>
-  <span hidden data-testid="wall-hero-list">{heroList.join(',')}</span>
+  <span hidden data-testid="wall-hero-list" translate="no">{heroList.join(',')}</span>
 </div>
 
 <style>

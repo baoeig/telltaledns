@@ -42,6 +42,11 @@
     }
   }
 
+  // The words of a plan's card are read once, here (a card is drawn for every plan, every 5 s).
+  const words = {
+    why: t('Why'), askedBy: t('Asked by'), when: t('When'), decidedBy: t('Decided by'), change: t('Change'), whatItDoes: t('What it does:'), beforeAfter: t('Before and after'),
+    before: t('Before'), after: t('After'), approve: t('Approve'), reject: t('Reject'),
+  };
   const pending = $derived(plans.filter((p) => p.state === 'pending'));
   const others = $derived(plans.filter((p) => p.state !== 'pending'));
   const label: Record<string, [string, string]> = {
@@ -79,33 +84,33 @@
         <span class="badge {cls}">{text}</span>
       </div>
       <dl class="small">
-        <dt>{t('Why')}</dt><dd translate="no">{p.reason}</dd>
-        <dt>{t('Asked by')}</dt><dd class="mono" translate="no">{p.requestedBy}</dd>
-        <dt>{t('When')}</dt>
+        <dt>{words.why}</dt><dd translate="no">{p.reason}</dd>
+        <dt>{words.askedBy}</dt><dd class="mono" translate="no">{p.requestedBy}</dd>
+        <dt>{words.when}</dt>
         <dd>
           {ago(p.createdUnixSeconds)}
           {#if p.state === 'pending' || p.state === 'ready' || p.state === 'approved'}
             {t('· expires in {time}', { time: duration(Math.max(0, p.expiresUnixSeconds - now)) })}
           {/if}
         </dd>
-        {#if p.decidedBy}<dt>{t('Decided by')}</dt><dd translate="no">{p.decidedBy}</dd>{/if}
-        <dt>{t('Change')}</dt><dd class="mono" translate="no">{p.method} {p.path}</dd>
+        {#if p.decidedBy}<dt>{words.decidedBy}</dt><dd translate="no">{p.decidedBy}</dd>{/if}
+        <dt>{words.change}</dt><dd class="mono" translate="no">{p.method} {p.path}</dd>
       </dl>
-      {#if pv.impact}<p class="small"><b>{t('What it does:')}</b> <span translate="no">{pv.impact}</span></p>{/if}
+      {#if pv.impact}<p class="small"><b>{words.whatItDoes}</b> <span translate="no">{pv.impact}</span></p>{/if}
       {#each pv.warnings ?? [] as w (w)}<p class="small warn-text" translate="no">{w}</p>{/each}
       <!-- REQ: OBS-024 — what the plan would have done to the logged queries, when the agent asked. -->
       {#if pv.simulation}<SimulationCard result={pv.simulation} />{/if}
       <details class="small">
-        <summary>{t('Before and after')}</summary>
+        <summary>{words.beforeAfter}</summary>
         <div class="diff">
-          <div><div class="muted">{t('Before')}</div><pre class="mono" translate="no">{JSON.stringify(pv.before ?? null, null, 2)}</pre></div>
-          <div><div class="muted">{t('After')}</div><pre class="mono" translate="no">{JSON.stringify(pv.after ?? null, null, 2)}</pre></div>
+          <div><div class="muted">{words.before}</div><pre class="mono" translate="no">{JSON.stringify(pv.before ?? null, null, 2)}</pre></div>
+          <div><div class="muted">{words.after}</div><pre class="mono" translate="no">{JSON.stringify(pv.after ?? null, null, 2)}</pre></div>
         </div>
       </details>
       {#if p.state === 'pending' && writable}
         <div class="row">
-          <button class="primary" disabled={busy === p.id} onclick={() => decide(p.id, true)}>{t('Approve')}</button>
-          <button disabled={busy === p.id} onclick={() => decide(p.id, false)}>{t('Reject')}</button>
+          <button class="primary" disabled={busy === p.id} onclick={() => decide(p.id, true)}>{words.approve}</button>
+          <button disabled={busy === p.id} onclick={() => decide(p.id, false)}>{words.reject}</button>
         </div>
       {/if}
     </section>

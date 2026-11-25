@@ -62,6 +62,7 @@
 
   // The words read in the rows are read once, here: the language is fixed for the life of the page.
   const thisNode = t('this node');
+  const rowWords = { lookItUp: t('Look it up below'), dnssecOk: t('(DO)'), validated: t('validated') };
   const label = (s: { node?: string | null }) => s.node ?? thisNode;
   const colors = ['--s-cached', '--s-forwarded', '--s-local', '--s-blocked', '--s-other'];
 
@@ -361,9 +362,9 @@
             <tbody>
               {#each merged as m (m.key)}
                 <tr class:open={expanded === m.key}>
-                  <td class="mono"><button class="link" onclick={() => (lookupName = m.name)} title={t('Look it up below')}><span translate="no">{m.name}</span></button></td>
-                  <td>{m.qtype}{#if m.dnssecOk}<span class="muted small">{t('(DO)')}</span>{/if}</td>
-                  <td class="small">{m.rcode} · {m.answers}{#if m.authentic}<span class="badge ok">{t('validated')}</span>{/if}</td>
+                  <td class="mono"><button class="link" onclick={() => (lookupName = m.name)} title={rowWords.lookItUp}><span translate="no">{m.name}</span></button></td>
+                  <td><span translate="no">{m.qtype}</span>{#if m.dnssecOk}<span class="muted small">{rowWords.dnssecOk}</span>{/if}</td>
+                  <td class="small"><span translate="no">{m.rcode} · {m.answers}</span>{#if m.authentic}<span class="badge ok">{rowWords.validated}</span>{/if}</td>
                   <td class="small {m.ttlMax < 0 ? 'muted' : ''}">{ttlShort(m.ttlMin) === ttlShort(m.ttlMax) ? ttl(m.ttlMin) : t('{from} to {to}', { from: ttlShort(m.ttlMin), to: ttlShort(m.ttlMax) })}</td>
                   {#if multi}
                     <td class="small">
