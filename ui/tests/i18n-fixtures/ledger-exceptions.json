@@ -1842,6 +1842,264 @@
       "sentence": "Explains how this query would be handled now; lists or settings may have changed since {time}. Logged as <strong>{status}</strong> by {list}."
     }
   ],
+  "pages/Settings.svelte": [
+    {
+      "fragments": [
+        "Save these recovery codes now.",
+        "Each works once if you lose your phone; they won't be shown again."
+      ],
+      "sentence": "<strong>Save these recovery codes now.</strong> Each works once if you lose your phone; they won't be shown again."
+    },
+    {
+      "fragments": [
+        "Add this account to an authenticator app: on a phone,",
+        "open it in the app",
+        ", or enter the key by hand:"
+      ],
+      "sentence": "Add this account to an authenticator app: on a phone, <app>open it in the app</app>, or enter the key by hand:"
+    },
+    {
+      "fragments": [
+        "For scripts, dashboards, and AI agents: send",
+        ". A token never has more rights than you."
+      ],
+      "sentence": "For scripts, dashboards, and AI agents: send <authheader/>. A token never has more rights than you."
+    },
+    {
+      "fragments": [
+        "Agents must give a reason for every change, are limited to 120 requests a minute, show as",
+        "in the audit log, and stop at once with",
+        "."
+      ],
+      "sentence": "Agents must give a reason for every change, are limited to 120 requests a minute, show as <agentname/> in the audit log, and stop at once with <agentsoff/>."
+    },
+    {
+      "fragments": [
+        "Anyone on these networks is still shown the sign-in form, not just the machines you name. To limit it to the machines you manage from, list each as a single address, such as",
+        "."
+      ],
+      "sentence": "Anyone on these networks is still shown the sign-in form, not just the machines you name. To limit it to the machines you manage from, list each as a single address, such as <singleaddr/>."
+    },
+    {
+      "fragments": [
+        "If a reverse proxy on this machine serves this page, add",
+        "to",
+        "under",
+        ". Until then everyone it serves looks like this machine and can use a password."
+      ],
+      "sentence": "If a reverse proxy on this machine serves this page, add <loopbackaddr/> to <trustedproxies/> under <apisection/>. Until then everyone it serves looks like this machine and can use a password."
+    },
+    {
+      "fragments": [
+        "Change it with",
+        "under",
+        "in the configuration file, then restart. See",
+        "Users and sign-in",
+        "in the guide."
+      ],
+      "sentence": "Change it with <adminnets/> under <authoidc/> in the configuration file, then restart. See <guide>Users and sign-in</guide> in the guide."
+    },
+    {
+      "fragments": [
+        "Chain intact: {} entries. Head",
+        "{}…"
+      ],
+      "sentence": "Chain intact: {entries} entries. Head <mono>{hash}…</mono>"
+    },
+    {
+      "fragments": [
+        "Chain broken at entry {}",
+        ": the log was changed outside TelltaleDNS."
+      ],
+      "sentence": "<strong>Chain broken at entry {seq}</strong>: the log was changed outside TelltaleDNS."
+    },
+    {
+      "fragments": [
+        "API reference:",
+        "(OpenAPI 3.1)."
+      ],
+      "sentence": "API reference: <openapi/> (OpenAPI 3.1)."
+    },
+    {
+      "fragments": [
+        "No results yet (the first round runs a few seconds after start), or probes are off (",
+        ")."
+      ],
+      "sentence": "No results yet (the first round runs a few seconds after start), or probes are off (<probesoff/>)."
+    },
+    {
+      "fragments": [
+        "SHA-256"
+      ],
+      "sentence": "SHA-256 <mono>{sha}</mono>"
+    },
+    {
+      "fragments": [
+        "Every 30 s each node asks each of its listeners a question through the listener's own protocol, the way a device would. With HTTPS on the web UI (",
+        "), it's checked too: compare its SHA-256 fingerprint with the one your browser shows before trusting a self-signed certificate."
+      ],
+      "sentence": "Every 30 s each node asks each of its listeners a question through the listener's own protocol, the way a device would. With HTTPS on the web UI (<apitls/>), it's checked too: compare its SHA-256 fingerprint with the one your browser shows before trusting a self-signed certificate."
+    },
+    {
+      "fragments": [
+        "· commit",
+        "· {} channel"
+      ],
+      "sentence": "<strong>{version}</strong> · commit <code>{commit}</code> · {channel} channel"
+    },
+    {
+      "fragments": [
+        "Not checked (",
+        ")"
+      ],
+      "sentence": "Not checked (<updatescheck/>)"
+    },
+    {
+      "fragments": [
+        "One file with your settings, users and API tokens, the devices and names you added here, the audit log, and statistics history. Restore it on a new machine with",
+        "."
+      ],
+      "sentence": "One file with your settings, users and API tokens, the devices and names you added here, the audit log, and statistics history. Restore it on a new machine with <restorecmd/>."
+    },
+    {
+      "fragments": [
+        "It holds password hashes, so keep it private. The query log isn't included; for that, run",
+        "on the server."
+      ],
+      "sentence": "It holds password hashes, so keep it private. The query log isn't included; for that, run <createcmd/> on the server."
+    },
+    {
+      "fragments": [
+        "Hit rates, what's cached, settings, lookups, and flushing are on the",
+        "Cache page",
+        "."
+      ],
+      "sentence": "Hit rates, what's cached, settings, lookups, and flushing are on the <cachepage>Cache page</cachepage>."
+    },
+    {
+      "fragments": [
+        "Their queries are still answered and still counted in",
+        ", but left out of the query log, the live view, the dashboard and top lists, anomalies, and exports, on every node. Queries logged before stay."
+      ],
+      "sentence": "Their queries are still answered and still counted in <metrics/>, but left out of the query log, the live view, the dashboard and top lists, anomalies, and exports, on every node. Queries logged before stay."
+    },
+    {
+      "fragments": [
+        "Changes reach",
+        "(and the primary) first, and the rest after",
+        "{} minutes",
+        "if nothing fails."
+      ],
+      "sentence": "Changes reach {named} (and the primary) first, and the rest after {n} minutes if nothing fails."
+    },
+    {
+      "fragments": [
+        "Changes reach",
+        "(and the primary) first, and the rest after",
+        "{} s",
+        "if nothing fails."
+      ],
+      "sentence": "Changes reach {named} (and the primary) first, and the rest after {n} s if nothing fails."
+    },
+    {
+      "fragments": [
+        "canary entr",
+        "y",
+        "; bake",
+        "s"
+      ],
+      "sentence": "{n} canary entry; bake {secs} s"
+    },
+    {
+      "fragments": [
+        "canary entr",
+        "ies",
+        "; bake",
+        "s"
+      ],
+      "sentence": "{n} canary entries; bake {secs} s"
+    },
+    {
+      "fragments": [
+        "{} · {} names"
+      ],
+      "sentence": "{snapshot} · {n} names"
+    },
+    {
+      "fragments": [
+        "none yet",
+        "{} · {} names"
+      ],
+      "sentence": "none yet · {n} names"
+    },
+    {
+      "fragments": [
+        "No changes recorded",
+        "that match",
+        "in the last 90 days."
+      ],
+      "sentence": "No changes recorded that match in the last 90 days."
+    },
+    {
+      "fragments": [
+        "No changes recorded{} in the last 90 days."
+      ],
+      "sentence": "No changes recorded in the last 90 days."
+    },
+    {
+      "fragments": [
+        "Newer than the published {} build{}",
+        "({})"
+      ],
+      "sentence": "Newer than the published {channel} build ({version})"
+    },
+    {
+      "fragments": [
+        "Newer than the published {} build{}"
+      ],
+      "sentence": "Newer than the published {channel} build"
+    },
+    {
+      "fragments": [
+        "Not known yet{}",
+        ": {}"
+      ],
+      "sentence": "Not known yet: {error}"
+    },
+    {
+      "fragments": [
+        "Not known yet{}"
+      ],
+      "sentence": "Not known yet"
+    },
+    {
+      "fragments": [
+        "off:",
+        "{}{} names, {} devices"
+      ],
+      "sentence": "off: {names} names, {devices} devices"
+    },
+    {
+      "fragments": [
+        "{}{} names, {} devices"
+      ],
+      "sentence": "{names} names, {devices} devices"
+    },
+    {
+      "fragments": [
+        "on, {} by default; agents' plans {}",
+        "always simulate"
+      ],
+      "sentence": "on, {window} by default; agents' plans always simulate"
+    },
+    {
+      "fragments": [
+        "on, {} by default; agents' plans {}",
+        "simulate when asked"
+      ],
+      "sentence": "on, {window} by default; agents' plans simulate when asked"
+    }
+  ],
   "pages/Setup.svelte": [
     {
       "fragments": [
