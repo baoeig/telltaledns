@@ -8,7 +8,8 @@
   import { api, type S } from '../lib/api';
   import { changes } from '../lib/annotations.svelte';
   import { change, DashData, remember } from '../lib/dash/data.svelte';
-  import { tk, tr } from '../lib/i18n';
+  import { own, tk, tr } from '../lib/i18n';
+  import { objectiveTitle } from '../lib/objectives';
   import DashHead from '../lib/dash/DashHead.svelte';
   import SmoothChart from '../lib/dash/SmoothChart.svelte';
   import Stat from '../lib/dash/Stat.svelte';
@@ -89,7 +90,6 @@
 
   // Service level (OBS-016). The objectives' names and alert levels come from the server: read with
   // `Object.hasOwn`; one the UI doesn't know shows as it is.
-  const sloTitles: Record<string, string> = { availability: t('Answers that work'), latency: t('Answers that are quick') };
   const sloAlerts: Record<string, { text: string; tone: string; tip: string }> = {
     fast: {
       text: t('burning fast'),
@@ -136,7 +136,6 @@
     dot: t('DNS over TLS (port 853), e.g. Android Private DNS'),
     doh: t('DNS over HTTPS, e.g. browsers or Apple devices with a profile'),
   };
-  const own = (table: Record<string, string>, key: string | undefined) => (key !== undefined && Object.hasOwn(table, key) ? table[key] : undefined);
   // A wait stage's row is keyed `wait: <stage>`; the key stays an identifier, the row says it in words.
   const WAIT = 'wait: ';
   const rowName = (key: string) => (key.startsWith(WAIT) ? t('wait: {stage}', { stage: key.slice(WAIT.length) }) : key);
@@ -203,10 +202,10 @@
         <div class="objs">
           {#each d.slo.objectives as o (o.name)}
             {@const left = o.budgetRemainingPercent}
-            {@const level = o.alert && Object.hasOwn(sloAlerts, o.alert) ? sloAlerts[o.alert] : null}
+            {@const level = own(sloAlerts, o.alert) ?? null}
             <div class="obj" data-testid={`slo-${o.name}`}>
               <div class="oh">
-                <strong>{Object.hasOwn(sloTitles, o.name) ? sloTitles[o.name] : o.name}</strong>
+                <strong>{objectiveTitle(o.name)}</strong>
                 {#if level}
                   <Tip text={level.tip}><span class="badge {level.tone}">{level.text}</span></Tip>
                 {:else if o.total > 0}

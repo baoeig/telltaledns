@@ -11,6 +11,7 @@
   import ErrorNote from './ErrorNote.svelte';
   import HelpButton from './HelpButton.svelte';
   import { tr } from '../i18n';
+  import { objectiveTitle } from '../objectives';
   import T from '../i18n/T.svelte';
   const { t } = tr('budgetAttribution');
 
@@ -68,7 +69,6 @@
   }
   const hidden = (w: string) => data?.coverage.hidden?.includes(w) ?? false;
   const nothing = $derived(data != null && data.budget.bad === 0);
-  const titles: Record<string, string> = { availability: t('Answers that work'), latency: t('Answers that are quick') };
   // REQ: API-012 — the summary is one sentence per variant (overspent, or the share left); the date
   // through lib/format.ts (the browser's default locale, as before).
   const sum = $derived(
@@ -86,7 +86,7 @@
     <span class="spacer"></span>
     <div class="seg" role="group" aria-label={t('Objective')}>
       {#each ['availability', 'latency'] as o (o)}
-        <button aria-pressed={objective === o} onclick={() => navigate('/analyze', { tab: 'budget', objective: o })}>{titles[o]}</button>
+        <button aria-pressed={objective === o} onclick={() => navigate('/analyze', { tab: 'budget', objective: o })}>{objectiveTitle(o)}</button>
       {/each}
     </div>
   </div>

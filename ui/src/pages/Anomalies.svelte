@@ -16,7 +16,7 @@
   import RhythmStrip from '../lib/components/RhythmStrip.svelte';
   import MuteForm from '../lib/components/MuteForm.svelte';
   import KeepInGit from '../lib/components/KeepInGit.svelte';
-  import { tr } from '../lib/i18n';
+  import { own, tr } from '../lib/i18n';
   import T from '../lib/i18n/T.svelte';
   const { t, tn } = tr('anomalies');
 
@@ -69,7 +69,7 @@
     reverse_sweep: t('Sweep of local addresses'),
     dga: t('Machine-generated-looking domains'),
   };
-  const title = (kind: string) => (Object.hasOwn(titles, kind) ? titles[kind] : kind);
+  const title = (kind: string) => (own(titles, kind) ?? kind);
   // Findings measured against an absolute bar, not the device's usual value.
   const absolute = new Set(['nxdomain_storm', 'reverse_sweep', 'dga']);
   // The mute of bursts that a counted sweep names (`stormMute`), while it still lists

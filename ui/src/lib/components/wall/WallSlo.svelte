@@ -6,6 +6,7 @@
   import { poll } from '../../poll';
   import { num } from '../../format';
   import { tr } from '../../i18n';
+  import { objectiveTitle } from '../../objectives';
   const { t } = tr('wallSlo');
 
   let slo = $state<S['SloStatus'] | null>(null);
@@ -31,9 +32,6 @@
   // The hour's burn rate: 1 spends exactly the budget; 6 and up is a slow-burn alert's pace.
   const burnTone = (r: number | null) => (r == null || r < 1 ? '' : r < 6 ? 'warn' : 'bad');
   const tone = (left: number | null | undefined) => (left == null ? 'muted' : left < 25 ? 'bad' : left < 50 ? 'warn' : 'ok');
-  // The objectives' names come from the server: read with `Object.hasOwn`; one the UI doesn't know shows as it is.
-  const titles: Record<string, string> = { availability: t('Answers that work'), latency: t('Answers that are quick') };
-  const title = (name: string) => (Object.hasOwn(titles, name) ? titles[name] : name);
 </script>
 
 <div class="slo" data-testid="wall-slo" bind:clientWidth={w} bind:clientHeight={h}>
@@ -48,7 +46,7 @@
             <circle cx="50" cy="50" r={R} class="left" stroke-dasharray="{(Math.max(0, Math.min(100, left ?? 0)) / 100) * C} {C}" transform="rotate(-90 50 50)" />
             <text x="50" y="62" text-anchor="middle" class="big">{left == null ? '–' : `${Math.round(left)}%`}</text>
           </svg>
-          <figcaption>{title(o.name)}<br /><span class="muted"><span class="burn {burnTone(r)}" data-testid="wall-burn">{t('burn {n}×', { n: r == null ? '–' : r.toFixed(1) })}</span> {t('· {value}', { value: o.sliPercent == null ? '–' : `${o.sliPercent.toFixed(2)} %` })}</span></figcaption>
+          <figcaption>{objectiveTitle(o.name)}<br /><span class="muted"><span class="burn {burnTone(r)}" data-testid="wall-burn">{t('burn {n}×', { n: r == null ? '–' : r.toFixed(1) })}</span> {t('· {value}', { value: o.sliPercent == null ? '–' : `${o.sliPercent.toFixed(2)} %` })}</span></figcaption>
         </figure>
       {/each}
     </div>

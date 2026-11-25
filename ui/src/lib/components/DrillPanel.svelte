@@ -10,7 +10,7 @@
   import Drawer from './Drawer.svelte';
   import ErrorNote from './ErrorNote.svelte';
   import HelpButton from './HelpButton.svelte';
-  import { tr } from '../i18n';
+  import { own, tr } from '../i18n';
   import T from '../i18n/T.svelte';
   // REQ: API-012 — `devicesDropped` is a count (u32 on the server): tn() gives the ternary's English.
   const { t, tn } = tr('drillPanel');
@@ -82,7 +82,6 @@
   const verdictClass: Record<string, string> = { followed: 'ok', stuck: 'bad', quiet: '', elsewhere: '' };
   /** A status or a verdict comes from the server: read with `Object.hasOwn` (one the UI doesn't know
    * shows as it is). */
-  const own = (m: Record<string, string>, k: string) => (Object.hasOwn(m, k) ? m[k] : undefined);
   const when = (t: string) => `${logDate(t)} ${logTime(t)}`;
   const maxTtf = $derived(Math.max(1, ...(report?.devices.map((d) => d.timeToFailoverMs ?? 0) ?? [1])));
 </script>

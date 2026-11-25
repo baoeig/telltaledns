@@ -6,7 +6,7 @@
   import { dateTime, num } from '../format';
   import ErrorNote from './ErrorNote.svelte';
   import HelpButton from './HelpButton.svelte';
-  import { tr } from '../i18n';
+  import { own, tr } from '../i18n';
   import T from '../i18n/T.svelte';
   // REQ: API-012 — the counts are u64 on the server (never negative): tn() gives the ternaries' English.
   const { t, tn } = tr('simulationCard');
@@ -73,9 +73,9 @@
   // The reason and the notes come from the server: read with `Object.hasOwn`; one the UI doesn't know shows as it is.
   const why = (reason: string | null | undefined) => {
     const k = reason ?? '';
-    return Object.hasOwn(reasons, k) ? reasons[k] : t('Not simulated: {reason}', { reason: String(reason) });
+    return own(reasons, k) ?? t('Not simulated: {reason}', { reason: String(reason) });
   };
-  const noteText = (note: string) => (Object.hasOwn(notes, note) ? notes[note] : note);
+  const noteText = (note: string) => (own(notes, note) ?? note);
 
   const total = (s: S['Simulation']) =>
     s.newlyBlocked.queries + s.newlyAllowed.queries + s.changedRoute.queries + s.changedAnswer.queries;

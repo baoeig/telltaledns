@@ -188,6 +188,12 @@ export function tk(msg: Msg, params?: Params | null): string {
   return interpolate(runtime().text(msg.c, msg.e, msg.n), params);
 }
 
+/** The entry of a table keyed by the server's words, when the key is the table's own and else `undefined`
+ * (`constructor` and `__proto__` are never entries). */
+export function own<V>(table: Readonly<Record<string, V>>, key: string | null | undefined): V | undefined {
+  return key != null && Object.hasOwn(table, key) ? table[key] : undefined;
+}
+
 /** Where the request comes from: the page's own address, the stored choice and the browser. */
 export type Sources = { readonly search: string; readonly stored: string | null; readonly languages: readonly string[] };
 

@@ -4,7 +4,7 @@
   import type { S } from '../api';
   import { bytes, duration, num, pct } from '../format';
   import HelpButton from './HelpButton.svelte';
-  import { tr } from '../i18n';
+  import { own, tr } from '../i18n';
   const { t } = tr('hostCard');
 
   let { title, sub = '', host }: { title: string; sub?: string; host: S['HostReport'] } = $props();
@@ -35,7 +35,7 @@
   };
   // REQ: API-012 — a part the server names: read with `Object.hasOwn` (one the UI doesn't know shows
   // as it is). Each part of a line between the " · " is a message of its own.
-  const part = (u: string) => (Object.hasOwn(unavailable, u) ? unavailable[u] : u);
+  const part = (u: string) => (own(unavailable, u) ?? u);
 </script>
 
 <article class="card host" data-testid="host-card">

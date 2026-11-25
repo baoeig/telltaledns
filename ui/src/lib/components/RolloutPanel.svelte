@@ -9,7 +9,7 @@
   import { duration, logDate, logTime, num, pct } from '../format';
   import ErrorNote from './ErrorNote.svelte';
   import HelpButton from './HelpButton.svelte';
-  import { tr } from '../i18n';
+  import { own, tr } from '../i18n';
   import T from '../i18n/T.svelte';
   const { t } = tr('rolloutPanel');
 
@@ -55,7 +55,7 @@
     pinned_to: [t('pin'), 'warn'],
   };
   /** A version's outcome as the server sends it: one the UI doesn't know shows as it is. */
-  const outcomeOf = (o: string): [string, string] => (Object.hasOwn(outcome, o) ? outcome[o] : [o, '']);
+  const outcomeOf = (o: string): [string, string] => (own(outcome, o) ?? [o, '']);
   const readings = (r: S['GuardReadings']) =>
     t('SERVFAIL {before} before, {after} during ({n} answers)', { before: r.beforePercent != null ? pct(r.beforePercent) : '–', after: r.afterPercent != null ? pct(r.afterPercent) : '–', n: num(r.answers) });
 

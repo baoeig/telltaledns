@@ -5,7 +5,7 @@
   import StatusBadge from './StatusBadge.svelte';
   import FlowDiagram from './FlowDiagram.svelte';
   import type { FlowPath } from '../help';
-  import { tr } from '../i18n';
+  import { own, tr } from '../i18n';
   import T from '../i18n/T.svelte';
   const { t } = tr('explainView');
 
@@ -19,7 +19,6 @@
   };
   /** REQ: API-012 — a tier and a MAC's source come from the server: read with `Object.hasOwn` (one
    * the UI doesn't know shows as it is). */
-  const own = (m: Record<string, string>, k: string) => (Object.hasOwn(m, k) ? m[k] : k);
 
   // REQ: FLT-013, FLT-006 (ADR-183) — how the device was recognized, when it was by its MAC address,
   // and where the MAC comes from: said as the server says it (`macFrom`), no more: "from your router"
@@ -35,7 +34,7 @@
   const by = $derived.by(() => {
     const b = x.client.identifiedBy;
     if (b !== 'router_mac' && b !== 'neighbor_mac') return b;
-    const from = x.client.macFrom ? own(macFromLabel, x.client.macFrom) : b === 'router_mac' ? t('from a router') : '';
+    const from = x.client.macFrom ? (own(macFromLabel, x.client.macFrom) ?? x.client.macFrom) : b === 'router_mac' ? t('from a router') : '';
     return from ? t('its MAC address, {from}', { from }) : t('its MAC address');
   });
 
@@ -84,7 +83,7 @@
     <dl>
       <dt>{t('Address')}</dt>
       <dd class="mono" translate="no">{x.client.ip}</dd>
-      {#if x.client.mac}<dt>{t('MAC')}</dt><dd><span class="mono" translate="no">{x.client.mac}</span>{#if x.client.macFrom} <span class="muted small" data-testid="explain-mac-from">({own(macFromLabel, x.client.macFrom)})</span>{/if}</dd>{/if}
+      {#if x.client.mac}<dt>{t('MAC')}</dt><dd><span class="mono" translate="no">{x.client.mac}</span>{#if x.client.macFrom} <span class="muted small" data-testid="explain-mac-from">({(own(macFromLabel, x.client.macFrom) ?? x.client.macFrom)})</span>{/if}</dd>{/if}
       <dt>{t('Device')}</dt>
       <dd>{x.client.device ?? t('not a configured device')} <span class="muted small" data-testid="explain-identified-by">{t('(by {by})', { by })}</span></dd>
       <dt>{t('Groups')}</dt>
@@ -121,7 +120,7 @@
           <li class:winner={r.winner} class:off={!r.enabled}>
             <div class="row">
               <span class="mark">{r.winner ? '★' : ''}</span>
-              <span class="badge {r.tier.includes('allow') ? 'ok' : 'bad'}">{own(tierLabel, r.tier)}</span>
+              <span class="badge {r.tier.includes('allow') ? 'ok' : 'bad'}">{own(tierLabel, r.tier) ?? r.tier}</span>
               <strong>{r.list}</strong>
               <!-- REQ: OBS-018 — a shadow list's rule is counted, never enforced. -->
               {#if r.shadow}<span class="badge info" title={t('This list is in shadow mode: it never blocks')}>{t('shadow')}</span>{/if}

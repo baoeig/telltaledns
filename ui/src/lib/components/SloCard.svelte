@@ -6,7 +6,8 @@
   import { href } from '../router.svelte';
   import HelpButton from './HelpButton.svelte';
   import Tip from './Tip.svelte';
-  import { tr } from '../i18n';
+  import { own, tr } from '../i18n';
+  import { objectiveTitle } from '../objectives';
   import T from '../i18n/T.svelte';
   const { t } = tr('sloCard');
 
@@ -14,10 +15,6 @@
 
   // The objectives' names and alert levels come from the server: read with `Object.hasOwn`; one the
   // UI doesn't know shows as it is.
-  const titles: Record<string, string> = {
-    availability: t('Answers that work'),
-    latency: t('Answers that are quick'),
-  };
   const alerts: Record<string, { text: string; tone: string; tip: string }> = {
     fast: {
       text: t('burning fast'),
@@ -66,10 +63,10 @@
     <div class="objectives">
       {#each slo.objectives as o (o.name)}
         {@const left = o.budgetRemainingPercent}
-        {@const level = o.alert && Object.hasOwn(alerts, o.alert) ? alerts[o.alert] : null}
+        {@const level = own(alerts, o.alert) ?? null}
         <div class="objective" data-testid={`slo-${o.name}`}>
           <div class="row">
-            <strong>{Object.hasOwn(titles, o.name) ? titles[o.name] : o.name}</strong>
+            <strong>{objectiveTitle(o.name)}</strong>
             <span class="spacer"></span>
             {#if level}
               <Tip text={level.tip}><span class="badge {level.tone}">{level.text}</span></Tip>

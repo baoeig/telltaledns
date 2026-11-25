@@ -6,7 +6,7 @@
   import { health } from '../health.svelte';
   import { dateTime } from '../format';
   import Icon from './Icon.svelte';
-  import { tr } from '../i18n';
+  import { own, tr } from '../i18n';
   import T from '../i18n/T.svelte';
   // REQ: API-012 — the counts are lengths (never negative): tn() gives the ternaries' English.
   const { t, tn } = tr('healthIcon');
@@ -43,7 +43,7 @@
     severe: t('Severe'),
   };
   /** The level comes from the server: read with `Object.hasOwn` (one the UI doesn't know shows as it is). */
-  const word = (l: string) => (Object.hasOwn(words, l) ? words[l] : undefined);
+  const word = (l: string) => own(words, l);
   // The button's label lowercases the level's word, as it always did (one message for every level).
   const label = $derived(
     h === null

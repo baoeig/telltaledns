@@ -11,7 +11,7 @@
   import { changes } from '../annotations.svelte';
   import { strength } from '../heatmap';
   import ErrorNote from './ErrorNote.svelte';
-  import { tr } from '../i18n';
+  import { own, tr } from '../i18n';
   const { t } = tr('latencyHeatmap');
 
   let {
@@ -30,7 +30,7 @@
   const PATHS = ['cache', 'upstream', 'local', 'synthesized'];
   // The paths' words, by id (an exemplar's path comes from the server: read with `Object.hasOwn`).
   const PATH_LABEL: Record<string, string> = { cache: t('cache'), upstream: t('upstream'), local: t('local names'), synthesized: t('blocked & special') };
-  const pathLabel = (p: string) => (Object.hasOwn(PATH_LABEL, p) ? PATH_LABEL[p] : p);
+  const pathLabel = (p: string) => (own(PATH_LABEL, p) ?? p);
   const PATH_COLOR: Record<string, string> = { cache: '--s-cached', upstream: '--s-forwarded', local: '--s-local', synthesized: '--s-blocked' };
 
   // REQ: OBS-035 — on the wall: the last hour, no controls, refreshed every 30 s.

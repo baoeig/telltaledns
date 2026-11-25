@@ -20,7 +20,7 @@
   import LatencyHeatmap from '../lib/components/LatencyHeatmap.svelte';
   import { changes } from '../lib/annotations.svelte';
   import { currentMode } from '../lib/mode.svelte';
-  import { tr } from '../lib/i18n';
+  import { own, tr } from '../lib/i18n';
   const { t } = tr('dashboardLegacy');
 
   const ranges = [
@@ -69,7 +69,6 @@
     dot: t('DNS over TLS (port 853), e.g. Android Private DNS'),
     doh: t('DNS over HTTPS, e.g. browsers or Apple devices with a profile'),
   };
-  const own = (table: Record<string, string>, key: string | undefined) => (key !== undefined && Object.hasOwn(table, key) ? table[key] : undefined);
   // A wait stage's row is keyed `wait: <stage>`; the key stays an identifier, the row says it in words.
   const WAIT = 'wait: ';
   const rowName = (key: string) => (key.startsWith(WAIT) ? t('wait: {stage}', { stage: key.slice(WAIT.length) }) : key);
