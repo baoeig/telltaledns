@@ -141,7 +141,7 @@
             {:else}
               <!-- REQ: OBS-039 (ADR-167) — the name's mark; nothing when icons are off. -->
               <DomainIcon name={target} quiet={kind === 'blocked'} />
-              <a class="dom" href={link(target, merged)} title={p?.note || it.key} aria-label={target} translate="no">{#if sub}<span class="sub">{sub}</span>{/if}{#if tail}<span class="head">{head}</span><span class="tail">{tail}</span>{:else}<span class="base">{base}</span>{/if}</a>
+              <a class="dom" href={link(target, merged)} title={p?.note || it.key} aria-label={target}>{#if sub}<span class="sub" translate="no">{sub}</span>{/if}{#if tail}<span class="head" translate="no">{head}</span><span class="tail" translate="no">{tail}</span>{:else}<span class="base" translate="no">{base}</span>{/if}</a>
               {#if tag}<span class="tag">{tag}</span>{/if}
             {/if}
           </span>

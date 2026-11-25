@@ -401,7 +401,7 @@
               <tr>
                 <td class="nowrap" title={logDate(r.time)}>
                   {logTime(r.time)}
-                  {#if r.node}<div class="muted small" title={nodeTip} translate="no">{r.node}</div>{/if}
+                  {#if r.node}<div class="muted small" title={nodeTip}><span translate="no">{r.node}</span></div>{/if}
                 </td>
                 <td class="nowrap">
                   <ClientChip ip={r.client} name={r.clientName} onchanged={(n) => renamed(r.client, n)} />
