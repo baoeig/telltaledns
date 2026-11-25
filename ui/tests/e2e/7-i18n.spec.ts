@@ -717,8 +717,11 @@ test('api_012 english formats match the frozen functions', () => {
 test('api_012 formats moved into format.ts keep their english', () => {
   // The expressions other files held (A1b: lib/dash/smooth.ts, SmoothChart.svelte, Stat.svelte,
   // lib/heatmap.ts; A1c: Chart.svelte, whose axis date is A1b's monthDay expression,
-  // DeviceTimeline.svelte, BudgetAttribution.svelte), copied as they were, with the locale as a
-  // parameter where they used `[]` (or nothing).
+  // DeviceTimeline.svelte, BudgetAttribution.svelte; A1d: Kpi.svelte, Tabs.svelte, and the counts of
+  // RolloutPanel.svelte and SimulationCard.svelte (`toLocaleString()`), LatencyHeatmap.svelte's axis
+  // date (A1b's monthDay expression), NodeCompare.svelte's weekday and time, SimulationCard.svelte's
+  // window start), copied as they were, with the locale as a parameter where they used `[]` (or
+  // nothing).
   const old = (locale: string | undefined) => {
     const at = locale ?? [];
     return {
@@ -729,6 +732,9 @@ test('api_012 formats moved into format.ts keep their english', () => {
       timelineHm: (t: number) => new Date(t * 1000).toLocaleTimeString(at, { hour: '2-digit', minute: '2-digit' }),
       timelineDay: (t: number) => new Date(t * 1000).toLocaleDateString(at, { weekday: 'short', day: 'numeric', month: 'short' }),
       budgetSince: (s: string) => new Date(s).toLocaleDateString(locale),
+      nodeSince: (s: string) => new Date(s).toLocaleString(at, { weekday: 'short', hour: '2-digit', minute: '2-digit' }),
+      simulationFrom: (s: string) => new Date(s).toLocaleString(locale),
+      count: (n: number) => n.toLocaleString(locale),
     };
   };
   const at = [Date.UTC(2026, 10, 24, 12, 34, 56) / 1000, Date.UTC(2026, 0, 1, 0, 0, 0) / 1000, Date.UTC(2025, 6, 4, 23, 59, 59) / 1000];
@@ -746,8 +752,11 @@ test('api_012 formats moved into format.ts keep their english', () => {
         expect(got.weekdayDate(t), `${tag} timeline day ${t}`).toBe(want.timelineDay(t));
         const rfc = new Date(t * 1000).toISOString();
         expect(got.logDate(rfc), `${tag} budget since ${rfc}`).toBe(want.budgetSince(rfc));
+        expect(got.weekdayTime(rfc), `${tag} node odd since ${rfc}`).toBe(want.nodeSince(rfc));
+        expect(got.dateTime(Date.parse(rfc) / 1000), `${tag} simulation window ${rfc}`).toBe(want.simulationFrom(rfc));
       }
       for (const p of [100, 100.4, 999.5, 1234.4, 98_765.6]) expect(got.num(Math.round(p)), `${tag} whole ${p}`).toBe(want.whole(p));
+      for (const n of [0, 7, 999, 1000, 1234, 1_234_567, 12_345_678]) expect(got.num(n), `${tag} count ${n}`).toBe(want.count(n));
     }
   }
 });
