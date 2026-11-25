@@ -57,6 +57,12 @@ export const DATA: Readonly<Record<string, string>> = {
   // The health level the wall's tile shows as it is (WallKpi.svelte). HealthIcon.svelte compares with
   // the same word.
   severe: 'lib/components/wall/WallKpi.svelte',
+  // The name of the user who made a quick rule, which the rules table shows beside the rule (Rules.svelte, in
+  // the same cell as its own words). Settings.svelte has the same word as a role.
+  admin: 'pages/Rules.svelte',
+  // The label uPlot gives the x series of a chart that Chart.svelte names none (the legend's first row).
+  // Settings.svelte has the same word as a column header.
+  Time: 'lib/components/Chart.svelte',
 };
 
 export type RuleInput = {

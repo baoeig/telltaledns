@@ -1690,3 +1690,373 @@ test('api_012 pseudo locale leaves no literal text: the cache of seven nodes, th
   expect(await leftovers(page), 'nothing cached that is still fresh').toEqual([]);
   await clean(page, sent);
 });
+
+// ---- the Settings page: every tab, with what a one-node test server cannot show
+/** The same page again, as the mocks answer now (`open` to the address the page is on is no new load). */
+async function reopen(page: Page, ready: string) {
+  await page.reload();
+  await expect(page.locator('html')).toHaveAttribute('lang', 'en-XA');
+  await expect(page.locator(ready).first()).toBeVisible();
+}
+const ST_ADMIN = (o: Record<string, unknown> = {}) =>
+  STATUS({ csrfToken: 'x', user: { allowBasicApi: false, display: null, id: 1, recoveryCodesLeft: 0, role: 'admin', totpEnabled: false, username: 'admin', via: 'password', ...o } });
+const ST_TOKEN = (o: Record<string, unknown> = {}) => ({ createdUnixSeconds: NOW - 86_400, expiresUnixSeconds: null, group: null, id: 'a1b2c3', kind: 'user', lastUsedUnixSeconds: NOW - 60, name: 'grafana', ratePerMinute: null, scope: 'read', ...o });
+
+test('api_012 pseudo locale leaves no literal text: settings, the account, the two-factor flow and the icon preferences', async ({ page }) => {
+  const sent = await watch(page);
+  let on = false;
+  let wrongCode = false;
+  let passwordFails = false;
+  await signIn(page);
+  await page.route('**/api/v1/auth/status', (r) => r.fulfill({ json: ST_ADMIN({ totpEnabled: on, recoveryCodesLeft: on ? 4 : 0 }) }));
+  await page.route('**/api/v1/auth/password', (r) => r.fulfill(passwordFails ? coded(403, 'forbidden', 'the current password is wrong') : { json: {} }));
+  await page.route('**/api/v1/auth/totp/setup', (r) =>
+    r.fulfill({ json: { otpauthUrl: 'otpauth://totp/TelltaleDNS:admin?secret=JBSWY3DPEHPK3PXP&issuer=TelltaleDNS', secretBase32: 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP' } }),
+  );
+  await page.route('**/api/v1/auth/totp/enable', (r) => {
+    if (wrongCode) return r.fulfill(coded(422, 'invalid_request', 'that code is not right'));
+    on = true;
+    return r.fulfill({ json: { codes: ['k3f9a-2xq7m', 'p8d1z-77ncw', 'vb40e-hh2yu', 'c6rr5-m1t3j'] } });
+  });
+  await page.route('**/api/v1/auth/totp/disable', (r) => r.fulfill(coded(403, 'forbidden', 'the password is wrong')));
+  await open(page, '/settings', '[data-testid="icons-card"]');
+  expect(await leftovers(page), 'the account, two-factor off, the icon preferences').toEqual([]);
+  const form = 'form.stack:has(h3)';
+  await page.locator(`${form} input[autocomplete="current-password"]`).fill('the old password');
+  await page.locator(`${form} input[autocomplete="new-password"]`).fill('a brand new password');
+  await page.locator(`${form} button.primary`).click();
+  await expect(page.locator(`${form} .notice.ok`)).toBeVisible();
+  expect(await leftovers(page), 'a password changed').toEqual([]);
+  passwordFails = true;
+  await page.locator(`${form} input[autocomplete="current-password"]`).fill('the old password');
+  await page.locator(`${form} input[autocomplete="new-password"]`).fill('a brand new password');
+  await page.locator(`${form} button.primary`).click();
+  await expect(page.locator(`${form} [role="alert"]`)).toBeVisible();
+  expect(await leftovers(page), 'a password refused').toEqual([]);
+  // The two-factor card: the key, a wrong code, the recovery codes, then on.
+  const card = page.locator('section.stack-card').first();
+  await card.locator('button:not(.help-btn)').first().click();
+  await expect(card.locator('ol.steps')).toBeVisible();
+  expect(await leftovers(page), 'the key to enter in an authenticator app').toEqual([]);
+  wrongCode = true;
+  await card.locator('input[inputmode="numeric"]').fill('000000');
+  await card.locator('form.row button.primary').click();
+  await expect(card.locator('[role="alert"]')).toBeVisible();
+  expect(await leftovers(page), 'a code that is not right').toEqual([]);
+  wrongCode = false;
+  await card.locator('input[inputmode="numeric"]').fill('123456');
+  await card.locator('form.row button.primary').click();
+  await expect(card.locator('.notice.warn ul.codes')).toBeVisible();
+  expect(await leftovers(page), 'the recovery codes, and two-factor on').toEqual([]);
+  await card.locator('input[type="password"]').fill('the password');
+  await card.locator('button.danger').click();
+  await expect(card.locator('[role="alert"]')).toBeVisible();
+  expect(await leftovers(page), 'turning two-factor off with a wrong password').toEqual([]);
+  // The icon preferences: the brand and monogram style by default, then the other two and the sizes.
+  const icons = page.getByTestId('icons-card');
+  await icons.locator('.seg').first().locator('button').nth(1).click();
+  await icons.locator('.seg').nth(1).locator('button').nth(1).click();
+  expect(await leftovers(page), 'monograms, small').toEqual([]);
+  await icons.locator('.seg').first().locator('button').nth(2).click();
+  await expect(icons.locator('.seg').nth(1).locator('button').first()).toBeDisabled();
+  expect(await leftovers(page), 'icons off').toEqual([]);
+  await clean(page, sent);
+});
+
+test('api_012 pseudo locale leaves no literal text: settings, API tokens of both kinds, a new token and a refusal', async ({ page }) => {
+  const sent = await watch(page);
+  let items: Record<string, unknown>[] = [
+    ST_TOKEN({}),
+    ST_TOKEN({ id: 'd4e5f6', name: 'ops-bot', kind: 'agent', scopes: ['analytics:read', 'config:read'], group: 'kids', lastUsedUnixSeconds: null, expiresUnixSeconds: NOW + 86_400 * 30 }),
+    ST_TOKEN({ id: 'j0k1l2', name: 'deploy', scope: 'admin', expiresUnixSeconds: NOW - 3600 }),
+  ];
+  let refuse = false;
+  await page.route('**/api/v1/tokens', (r) => {
+    if (r.request().method() === 'POST') {
+      if (refuse) return r.fulfill(coded(422, 'invalid_request', 'a token with this name exists'));
+      return r.fulfill({ json: { info: ST_TOKEN({ id: 'q6r7s8', name: 'dashboards' }), token: 'tt_q6r7s8_V3ryS3cretT0kenValueNobodyKnows01' } });
+    }
+    return r.fulfill({ json: { items } });
+  });
+  await page.route('**/api/v1/tokens/*', (r) => r.fulfill({ status: 204 }));
+  await signIn(page);
+  await open(page, '/settings?tab=tokens', 'table');
+  expect(await leftovers(page), 'tokens of every kind, the form for my scripts').toEqual([]);
+  const form = page.locator('form.row').first();
+  await form.locator('select').first().selectOption('agent');
+  await expect(page.locator('fieldset.agent-scopes')).toBeVisible();
+  expect(await leftovers(page), 'the form for an AI agent and its scopes').toEqual([]);
+  await form.locator('input').first().fill('dashboards');
+  await form.locator('button.primary').click();
+  await expect(page.locator('.new-token')).toBeVisible();
+  expect(await leftovers(page), 'the new token').toEqual([]);
+  await page.locator('.new-token button').first().click();
+  await page.locator('.new-token button.link').click();
+  refuse = true;
+  await form.locator('input').first().fill('grafana');
+  await form.locator('button.primary').click();
+  await expect(page.locator('[role="alert"]').first()).toBeVisible();
+  expect(await leftovers(page), 'a token refused').toEqual([]);
+  items = [];
+  await page.locator('table button.danger').first().click();
+  await expect(page.locator('p.empty')).toBeVisible();
+  expect(await leftovers(page), 'no tokens yet').toEqual([]);
+  await clean(page, sent);
+});
+
+test('api_012 pseudo locale leaves no literal text: settings, users, where passwords are allowed, their tokens and a refusal', async ({ page }) => {
+  const sent = await watch(page);
+  const user = (o: Record<string, unknown>) => ({ allowBasicApi: false, createdUnixSeconds: NOW - 86_400 * 30, disabled: false, id: 1, oidcProvider: null, role: 'viewer', totpEnabled: false, username: 'admin', ...o });
+  const users = [
+    user({ id: 1, username: 'admin', role: 'admin', totpEnabled: true }),
+    user({ id: 2, username: 'ada', role: 'operator', allowBasicApi: true, oidcProvider: 'Keycloak' }),
+    user({ id: 3, username: 'bob', disabled: true }),
+  ];
+  const pl = (o: Record<string, unknown>) => ({ coversWholeNetworks: false, includesLoopback: false, loopbackIsTrustedProxy: false, networks: ['192.168.1.10/32'], restricted: true, ...o });
+  let passwordLogin: Record<string, unknown> | undefined = pl({ coversWholeNetworks: true, networks: ['192.168.1.0/24', '10.0.0.0/8'] });
+  let refuse = false;
+  await page.route('**/api/v1/users**', (r) => {
+    const req = r.request();
+    const path = new URL(req.url()).pathname;
+    if (req.method() === 'GET' && path.endsWith('/tokens')) return r.fulfill({ json: { items: path.includes('/users/2/') ? [ST_TOKEN({}), ST_TOKEN({ id: 'd4e5f6', name: 'ops-bot', kind: 'agent', scopes: ['analytics:read'] })] : [] } });
+    if (req.method() === 'GET') return r.fulfill({ json: { items: users, ...(passwordLogin ? { passwordLogin } : {}) } });
+    if (refuse) return r.fulfill(coded(409, 'conflict', 'the last admin cannot be changed this way'));
+    return r.fulfill(req.method() === 'POST' ? { json: user({ id: 9, username: 'dee' }) } : req.method() === 'DELETE' ? { status: 204 } : { json: users[1] });
+  });
+  await signIn(page);
+  await page.route('**/api/v1/auth/status', (r) => r.fulfill({ json: ST_ADMIN({ totpEnabled: true }) }));
+  await open(page, '/settings?tab=users', '[data-testid="password-sign-in"]');
+  expect(await leftovers(page), 'users, password sign-in limited to whole networks').toEqual([]);
+  const toggle = page.locator('td.num button[aria-expanded]');
+  await toggle.nth(1).click();
+  await expect(page.locator('tr.user-tokens table')).toBeVisible();
+  expect(await leftovers(page), 'the tokens of a user').toEqual([]);
+  await toggle.nth(2).click();
+  await expect(page.locator('tr.user-tokens table')).toHaveCount(0);
+  await expect(page.locator('tr.user-tokens span.muted')).toBeVisible();
+  expect(await leftovers(page), 'a user without tokens').toEqual([]);
+  await page.locator('td.num button.danger').first().click();
+  expect(await leftovers(page), 'a delete that waits for a second click').toEqual([]);
+  await page.locator('td.num button.danger').first().click();
+  await page.locator('tbody td button.link.small').first().click();
+  await page.locator('tbody tr:not(.user-tokens) td:nth-child(5) button.link').first().click();
+  for (const [name, change] of [
+    ['single machines', {}],
+    ['a reverse proxy on this machine', { includesLoopback: true, networks: ['127.0.0.1/32', '192.168.1.10/32'] }],
+    ['a trusted reverse proxy', { includesLoopback: true, loopbackIsTrustedProxy: true, networks: ['127.0.0.1/32'] }],
+    ['no network', { networks: [] }],
+  ] as [string, Record<string, unknown>][]) {
+    passwordLogin = pl(change);
+    await reopen(page, '[data-testid="password-sign-in"]');
+    expect(await leftovers(page), name).toEqual([]);
+  }
+  passwordLogin = undefined;
+  await reopen(page, 'form.add-user');
+  await expect(page.getByTestId('password-sign-in')).toHaveCount(0);
+  await page.locator('form.add-user input[autocomplete="off"]').fill('dee');
+  await page.locator('form.add-user input[type="password"]').fill('a long enough password');
+  await page.locator('form.add-user select').selectOption('operator');
+  await page.locator('form.add-user button.primary').click();
+  refuse = true;
+  await page.locator('form.add-user input[autocomplete="off"]').fill('eve');
+  await page.locator('form.add-user input[type="password"]').fill('another long password');
+  await page.locator('form.add-user button.primary').click();
+  await expect(page.locator('[role="alert"]').first()).toBeVisible();
+  expect(await leftovers(page), 'a user refused').toEqual([]);
+  await clean(page, sent);
+});
+
+test('api_012 pseudo locale leaves no literal text: settings, the audit log and the staged rollouts of a cluster', async ({ page }) => {
+  const sent = await watch(page);
+  await page.addInitScript(() => localStorage.setItem('telltale.mode.admin', 'advanced'));
+  const aud = (seq: number, o: Record<string, unknown>) => ({
+    action: 'user.create', actor: 'admin', actorKind: 'user', detail: { username: 'ada', role: 'viewer' }, hash: 'f'.repeat(64), reason: null, remote: '192.168.1.20', seq, target: 'ada', time: T0, tsUnixSeconds: NOW - 600 * seq, ...o,
+  });
+  let items = [
+    aud(9, { action: 'config.apply', actor: 'agent:ops-bot', actorKind: 'agent', detail: { section: { from: 'a', to: 'b' }, lists: ['ads', 'trackers'], flag: true, empty: null }, reason: 'block a noisy tracker', remote: null }),
+    aud(8, { action: 'auth.login', actor: 'ada', actorKind: 'oidc', detail: {} }),
+  ];
+  let verify: Record<string, unknown> = { entries: 128, headHash: 'abcdef0123456789abcdef0123456789', ok: true };
+  await page.route('**/api/v1/audit**', (r) => r.fulfill({ json: { items, nextCursor: items.length ? 'c-6' : null } }));
+  await page.route('**/api/v1/audit/verify', (r) => r.fulfill({ json: verify }));
+  await signIn(page);
+  await open(page, '/settings?tab=audit', 'table.audit');
+  expect(await leftovers(page), 'the audit log, with an older page').toEqual([]);
+  await page.locator('.card-head .row button').click();
+  await expect(page.locator('.verify-result')).toBeVisible();
+  expect(await leftovers(page), 'a chain that is intact').toEqual([]);
+  verify = { entries: 128, firstBadSeq: 77, headHash: 'abcdef0123456789abcdef0123456789', ok: false };
+  await page.locator('.card-head .row button').click();
+  await expect(page.locator('.verify-result.bad')).toBeVisible();
+  expect(await leftovers(page), 'a chain that is broken').toEqual([]);
+  await page.locator('.card-head select').selectOption('auth.');
+  items = [];
+  await page.locator('.card-head select').selectOption('user.');
+  await expect(page.locator('p.empty')).toBeVisible();
+  expect(await leftovers(page), 'no entries').toEqual([]);
+  // Staged rollouts: a cluster that is off, then a cluster of nodes, sites and pods, with the editor.
+  const nd = (o: Record<string, unknown>) => ({ ...node({}), ...o });
+  let cluster: Record<string, unknown> = { ...CLUSTER, enabled: false, nodes: [] };
+  const entry = (definition: Record<string, unknown> | null, source = 'added', name = 'rollout-settings') => ({ kind: 'rollout', name, source, definition, credentials: null });
+  let rollout = [entry({ canaries: ['n-bbbb2222'], bake_secs: 300 })];
+  await page.route('**/api/v1/cluster', (r) => r.fulfill({ json: cluster }));
+  await page.route('**/api/v1/config/entries?kind=rollout', (r) => r.fulfill({ json: { items: rollout } }));
+  await page.route('**/api/v1/cluster/rollout-settings/**', (r) => r.fulfill({ json: { applied: !r.request().url().includes('dryRun=true'), configVersion: 7, impact: 'Changes these settings.', keepInGit: null, warnings: ['a canary that is gone is ignored'], recentQueries: 0 } }));
+  await open(page, '/settings?tab=cluster', 'h1');
+  await expect(page.locator('p.empty').first()).toBeVisible();
+  await expect(page.getByTestId('editor-rollout')).toHaveCount(0);
+  expect(await leftovers(page), 'a node on its own').toEqual([]);
+  cluster = {
+    ...CLUSTER,
+    nodes: [
+      nd({ nodeId: 'n-aaaa1111', site: 'homelab', role: 'primary', thisNode: true }),
+      nd({ nodeId: 'n-bbbb2222', site: 'pi', role: 'secondary' }),
+      nd({ nodeId: 'n-cccc3333', site: 'attic', role: 'witness', witness: true }),
+      nd({ nodeId: 'n-dddd4444', site: 'k8s', role: 'secondary', ephemeral: true, pod: 'resolver-0' }),
+    ],
+  };
+  await reopen(page, '[data-testid="editor-rollout"] [data-testid="entry-row"]');
+  expect(await leftovers(page), 'staged rollouts with one canary').toEqual([]);
+  await page.locator('[data-testid="editor-rollout"] [data-testid="entry-row"] button.link').first().click();
+  await expect(page.locator('form.form')).toBeVisible();
+  await page.locator('form.form .multi label.check input').nth(2).check();
+  await page.locator('form.form input[type="number"]').first().fill('90');
+  await expect(page.getByTestId('editor-note')).toBeVisible();
+  expect(await leftovers(page), 'the rollout editor, with its note in seconds').toEqual([]);
+  await page.locator('form.form input[type="number"]').first().fill('240');
+  await page.locator('form.form button.primary').click();
+  await expect(page.getByTestId('entry-preview')).toBeVisible();
+  expect(await leftovers(page), 'the rollout editor, with its note in minutes and a check').toEqual([]);
+  rollout = [entry({ canaries: [] }), entry({ canaries: ['n-bbbb2222', 'ephemeral'], bake_secs: 120 }, 'override', 'rollout-two')];
+  await reopen(page, '[data-testid="editor-rollout"] [data-testid="entry-row"]');
+  expect(await leftovers(page), 'no canaries, and two with a bake of two minutes').toEqual([]);
+  await clean(page, sent);
+});
+
+test('api_012 pseudo locale leaves no literal text: settings, the system tab with its probes, changes and updates', async ({ page }) => {
+  const sent = await watch(page);
+  const upd = (o: Record<string, unknown>) => ({ checkedUnixSeconds: NOW - 7200, error: null, how: 'Pull the new image and restart the container.', latest: '0.9.1', latestCommit: 'def5678', latestDate: '2026-11-25', notesUrl: 'https://example.com/releases/0.9.1', state: 'available', ...o });
+  const info = (o: Record<string, unknown>) => ({
+    build: { channel: 'edge', commit: 'abc1234', date: '2026-11-24', install: 'container', target: 'x86_64-unknown-linux-gnu', version: '0.9.0' }, clientIpsMasked: null, cluster: null, filterNames: 1_250_000,
+    filterSnapshot: 42, listeners: ['0.0.0.0:53', '[::]:53'], maintenance: null, node: 'lab', queryLog: true, role: 'primary', startedAt: T0, starts: 3, uncleanStarts: 1, update: upd({}), uptimeSeconds: 90_061, version: '0.9.0', ...o,
+  });
+  const probe = (target: string, o: Record<string, unknown>) => ({ certNames: [], checkedUnixSeconds: NOW - 5, consecutiveFailures: 0, error: null, latencyMs: 1.24, listener: true, node: null, ok: true, proto: 'udp', skipped: null, target, ...o });
+  let probes: Record<string, unknown>[] | null = [
+    probe('192.168.1.2:53', { node: 'lab' }),
+    probe('192.168.1.2:853', { node: 'pi', proto: 'dot', certDaysLeft: 40, certNames: ['dns.home.arpa'], certSha256: 'ab:cd:ef:01:23:45:67:89', certSelfSigned: false }),
+    probe('192.168.1.2:8053', { proto: 'api', certDaysLeft: 5, certSelfSigned: false }),
+    probe('192.168.1.2:9953', { proto: 'doh', certDaysLeft: -3, certSelfSigned: false }),
+    probe('192.168.1.2:8443', { proto: 'doh', certDaysLeft: 90_000, certSelfSigned: true }),
+    probe('192.168.1.2:4443', { proto: 'dot', certDaysLeft: null, certError: 'the certificate could not be read' }),
+    probe('1.1.1.1:53', { listener: false, ok: false, consecutiveFailures: 1, latencyMs: null, error: 'timed out' }),
+    probe('[::1]:53', { ok: false, consecutiveFailures: 3, latencyMs: null, error: 'connection refused' }),
+    probe('192.168.1.2:5353', { skipped: 'the listener is off', ok: false, latencyMs: null }),
+  ];
+  let state: Record<string, unknown> = info({});
+  let changes: Record<string, unknown> = {
+    items: [
+      { actor: 'admin', kind: 'config.applied', node: 'lab', summary: 'Configuration version 40 applied', t: T0, tUnixMs: NOW * 1000 },
+      { actor: null, kind: 'note', node: 'pi', source: 'api', summary: 'moved the access point', t: T0, tUnixMs: (NOW - 900) * 1000, href: '#/queries' },
+    ],
+    missingNodes: ['attic'],
+    truncated: false,
+  };
+  let check: Answer = { json: upd({ state: 'up_to_date', latest: '0.9.0' }) };
+  await page.route('**/api/v1/system/info', (r) => r.fulfill({ json: state }));
+  await page.route('**/api/v1/system/probes', (r) => r.fulfill({ json: { items: probes ?? [] } }));
+  await page.route('**/api/v1/annotations?**', (r) => r.fulfill({ json: changes }));
+  await page.route('**/api/v1/system/update-check', (r) => r.fulfill(check));
+  await signIn(page);
+  await open(page, '/settings?tab=system', '[data-testid="updates"]');
+  await expect(page.locator('[data-testid="probes"] table')).toBeVisible();
+  await expect(page.locator('[data-testid="changes-list"] table')).toBeVisible();
+  expect(await leftovers(page), 'system: restarts after a crash, every probe result and certificate, the changes, an update available').toEqual([]);
+  await page.getByTestId('check-updates').click();
+  await expect(page.getByTestId('updates').locator('.badge.warn')).toHaveCount(0);
+  expect(await leftovers(page), 'up to date, checked now').toEqual([]);
+  check = coded(502, 'unavailable', 'the release index did not answer');
+  state = info({ update: upd({ state: 'unknown', error: 'the release index could not be reached', latest: null }) });
+  await reopen(page, '[data-testid="updates"]');
+  await page.getByTestId('check-updates').click();
+  await expect(page.getByTestId('updates').locator('[role="alert"]')).toBeVisible();
+  expect(await leftovers(page), 'not known yet, a check that fails').toEqual([]);
+  for (const [name, update, rest] of [
+    ['newer than the published build', upd({ state: 'newer', latest: '0.8.9' }), {}],
+    ['newer, no version', upd({ state: 'newer', latest: null }), {}],
+    ['updates off', upd({ state: 'off', checkedUnixSeconds: null }), {}],
+    ['not known yet', upd({ state: 'unknown', error: null, latest: null, checkedUnixSeconds: null }), {}],
+    ['available, without a date or notes', upd({ latestDate: null, notesUrl: null }), { starts: 1, uncleanStarts: 0, filterSnapshot: null, queryLog: false }],
+    ['a restart that was not a crash', upd({ state: 'up_to_date' }), { starts: 2, uncleanStarts: 0 }],
+  ] as [string, Record<string, unknown>, Record<string, unknown>][]) {
+    state = info({ update, ...rest });
+    await reopen(page, '[data-testid="updates"]');
+    expect(await leftovers(page), name).toEqual([]);
+  }
+  // The changes: filtered by kind and by text, with nothing that matches, and none at all.
+  await page.getByTestId('changes-list').locator('select').selectOption('note');
+  await page.getByTestId('changes-list').locator('input[type="search"]').fill('zzzz');
+  await expect(page.getByTestId('changes-list').locator('p.empty')).toBeVisible();
+  expect(await leftovers(page), 'no change that matches').toEqual([]);
+  changes = { items: [], truncated: false };
+  probes = [];
+  await reopen(page, '[data-testid="changes-list"] p.empty');
+  expect(await leftovers(page), 'no changes and no probe results').toEqual([]);
+  await clean(page, sent);
+});
+
+test('api_012 pseudo locale leaves no literal text: settings, query handling with its three editors', async ({ page }) => {
+  const sent = await watch(page);
+  await page.addInitScript(() => localStorage.setItem('telltale.mode.admin', 'advanced'));
+  const entry = (kind: string, name: string, source: string, definition: Record<string, unknown> | null) => ({ kind, name, source, definition, credentials: null });
+  let sets: Record<string, unknown[]> = {
+    ratelimit: [entry('ratelimit', 'ratelimit', 'added', { enabled: true, queries: 1000, window_secs: 60, action: 'refused', exempt: ['127.0.0.0/8'] })],
+    exclusions: [entry('exclusions', 'exclusions', 'added', { enabled: true, names: ['ntp.org'], clients: ['192.168.1.10'] })],
+    simulate: [entry('simulate', 'simulate-settings', 'added', { enabled: true, plans_by_default: true, default_window: '12h' })],
+  };
+  let refuse = false;
+  await page.route('**/api/v1/config/entries?kind=*', (r) => {
+    const kind = new URL(r.request().url()).searchParams.get('kind') ?? '';
+    return r.fulfill({ json: { items: sets[kind] ?? [] } });
+  });
+  await page.route(/\/api\/v1\/(ratelimit|exclusions|simulate-settings)\/[^/]+(\?.*)?$/, (r) => {
+    if (refuse) return r.fulfill(coded(422, 'invalid_request', 'the value is out of range'));
+    return r.fulfill({ json: { applied: !r.request().url().includes('dryRun=true'), configVersion: 7, impact: 'Changes this setting.', keepInGit: null, warnings: ['a dropped query is never answered'], recentQueries: 0 } });
+  });
+  await signIn(page);
+  await open(page, '/settings?tab=queries', '[data-testid="editor-ratelimit"] [data-testid="entry-row"]');
+  expect(await leftovers(page), 'query handling: everything on').toEqual([]);
+  for (const kind of ['ratelimit', 'exclusions', 'simulate']) {
+    await page.locator(`[data-testid="editor-${kind}"] [data-testid="entry-row"] button.link`).first().click();
+    await expect(page.locator('form.form')).toBeVisible();
+    await page.locator('form.form button.primary').click();
+    await expect(page.getByTestId('entry-preview')).toBeVisible();
+    expect(await leftovers(page), `the ${kind} editor, checked`).toEqual([]);
+    refuse = kind === 'simulate';
+    if (refuse) {
+      await page.locator('form.form button:not(.primary)').first().click();
+      await page.locator('form.form button.primary').click();
+      await expect(page.locator('form.form [role="alert"]')).toBeVisible();
+      expect(await leftovers(page), 'a setting refused').toEqual([]);
+      refuse = false;
+    }
+    await page.locator('.drawer button[aria-label]').first().click();
+  }
+  sets = {
+    ratelimit: [entry('ratelimit', 'ratelimit', 'override', { enabled: false })],
+    exclusions: [entry('exclusions', 'exclusions', 'file', { enabled: false, names: ['ntp.org'], clients: ['192.168.1.10', '10.20.0.0/24'] })],
+    simulate: [entry('simulate', 'simulate-settings', 'file', { enabled: false })],
+  };
+  await reopen(page, '[data-testid="editor-ratelimit"] [data-testid="entry-row"]');
+  expect(await leftovers(page), 'query handling: everything off').toEqual([]);
+  sets = {
+    ratelimit: [entry('ratelimit', 'ratelimit', 'hidden', null)],
+    exclusions: [entry('exclusions', 'exclusions', 'file', {})],
+    simulate: [entry('simulate', 'simulate-settings', 'added', { enabled: true, plans_by_default: false })],
+  };
+  await reopen(page, '[data-testid="editor-ratelimit"] [data-testid="entry-row"]');
+  expect(await leftovers(page), 'query handling: one left out, one with nothing, plans that wait to be asked').toEqual([]);
+  sets = { ratelimit: [], exclusions: [], simulate: [] };
+  await reopen(page, '[data-testid="editor-ratelimit"] p.empty');
+  expect(await leftovers(page), 'query handling: none yet').toEqual([]);
+  await clean(page, sent);
+});
