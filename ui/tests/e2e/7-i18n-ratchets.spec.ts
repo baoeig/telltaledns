@@ -217,6 +217,35 @@ test('api_012 a whole sentence per variant conserves from the file own fragments
   expect(lib.conserve(after(p1.replace("'{n} voters left'", "'{n} voterss left'")), pe, [forms[0], { sentence: '{n} voterss left', fragments: ['voter', 's', 's', 'left'] }]).join('\n')).toContain('"s" is not in this file\'s ledger entry');
 });
 
+test('api_012 an exception no message takes is reported', () => {
+  const head = "<script lang=\"ts\">\n  import { tr } from '../lib/i18n';\n  import T from '../lib/i18n/T.svelte';\n  const { t } = tr('x');\n</script>\n";
+  const after = (src: string) => lib.analyzeFile('pages/X.svelte', src, 'x');
+  const before = lib.analyzeFile('pages/X.svelte', '<h1>Holds</h1>\n<p>Muted by <b>{who}</b>: not counted</p>\n', 'x');
+  const entry = { markup: [...before.ledger.markup].sort(), script: [...before.ledger.script].sort() };
+  const sentence = 'Muted by <b>{who}</b>: not counted';
+  const merged = { sentence, fragments: ['Muted by', ': not counted'] };
+  const sentenceOf = (problems: string[]) => problems.filter((p) => p.startsWith('exception '));
+  const kept = `${head}<h1>{t('Holds')}</h1>\n<p><T ctx="x" msg={'${sentence}'} params={{ who }}>{#snippet b(s)}<b>{s}</b>{/snippet}</T></p>\n`;
+  expect(lib.conserve(after(kept), entry, [merged])).toEqual([]);
+  // A migration drops the paragraph and leaves its exception: the sentence is in the ledger test's
+  // bag, no message takes it, and the test says so (it used to stay green).
+  const dropped = `${head}<h1>{t('Holds')}</h1>\n`;
+  expect(lib.conserve(after(dropped), entry, [merged])).toEqual([`exception "${sentence}": no message of this file has this English (an exception whose text the file no longer shows)`]);
+  expect(lib.ledgerProblems([after(dropped)], { 'pages/X.svelte': entry }, { 'pages/X.svelte': [merged] })).toEqual([
+    `pages/X.svelte: exception "${sentence}": no message of this file has this English (an exception whose text the file no longer shows)`,
+  ]);
+  // The same sentence twice with one message: one of the two is unused.
+  expect(sentenceOf(lib.conserve(after(kept), entry, [merged, merged]))).toHaveLength(1);
+  // A sentence that is also one of the file's own strings: the message takes the own string, so the
+  // exception is the one that no message takes.
+  const own = lib.analyzeFile('pages/X.svelte', '<script lang="ts">\n  const a = $state(0);\n  const same = `Muted by ${a}: not counted`;\n</script>\n<p>{same}</p>\n<p>Muted by</p>\n<p>: not counted</p>\n', 'x');
+  const ownEntry = { markup: [...own.ledger.markup].sort(), script: [...own.ledger.script].sort() };
+  const msgs = `${head}<script lang="ts">\n  const a = $state(0);\n</script>\n<p>{t('Muted by {a}: not counted', { a })}</p>\n`;
+  expect(sentenceOf(lib.conserve(after(msgs), ownEntry, [{ sentence: 'Muted by {a}: not counted', fragments: ['Muted by', ': not counted'] }]))).toHaveLength(1);
+  // A sentence with only placeholders in it has nothing to take.
+  expect(lib.conserve(after(kept), entry, [merged, { sentence: '{n}', fragments: [] }])).toEqual([]);
+});
+
 test('api_012 no new physical css properties', () => {
   const r = checkUi();
   expect(fails(r).filter((f) => f.rule === 'physical-css')).toEqual([]);

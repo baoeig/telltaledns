@@ -1200,7 +1200,9 @@ function joined(want, got) {
  * in; its fragments, in order, must make the sentence's pieces. A fragment is one of the file's
  * ledger strings, or a piece of one (a plural's suffix sits between two pieces of one string). A
  * string an earlier exception took may be used again: each variant of a sentence with an {#if} in
- * it is a whole message of its own.
+ * it is a whole message of its own. A sentence no message of the file takes is reported (the
+ * exception hides text the file no longer shows), after the file's own strings, so a sentence that
+ * is also one of the file's own strings is reported when only one message has it.
  * Returns a list of problems (empty: conserved).
  */
 export function conserve(analysis, entry, exceptions = []) {
@@ -1213,6 +1215,9 @@ export function conserve(analysis, entry, exceptions = []) {
   };
   const markup = [...entry.markup];
   const script = [...entry.script];
+  // The masked sentence of each exception, apart from the file's own strings: a message takes an own
+  // string first, and what no message takes is reported below.
+  const sentences = [];
   const own = [...entry.markup, ...entry.script];
   // A piece belongs to a string this sentence or an earlier one already uses, before any other.
   const ownerOf = (f, mine) => own.find((s) => s === f) ?? [...mine, ...taken, ...own].find((s) => pieces(s).includes(f));
@@ -1231,16 +1236,24 @@ export function conserve(analysis, entry, exceptions = []) {
     }
     taken.push(...mine);
     const m = masked(x.sentence);
-    if (m !== null) script.push(m);
+    if (m !== null) sentences.push({ m, sentence: x.sentence });
   }
-  for (const s of analysis.markupNow) if (!take(markup, s) && !take(script, s)) problems.push(`template text "${s}" is not in the ledger (changed or new English)`);
+  const left = sentences.map((x) => x.m);
+  for (const s of analysis.markupNow) if (!take(markup, s) && !take(script, s) && !take(left, s)) problems.push(`template text "${s}" is not in the ledger (changed or new English)`);
   for (const msg of analysis.messages) {
     for (const e of Array.isArray(msg.english) ? msg.english : [msg.english]) {
       const m = masked(e);
-      if (m !== null && !take(markup, m) && !take(script, m)) problems.push(`message "${e}" (line ${msg.line}) is not English this file had`);
+      if (m !== null && !take(markup, m) && !take(script, m) && !take(left, m)) problems.push(`message "${e}" (line ${msg.line}) is not English this file had`);
     }
   }
   for (const s of markup) problems.push(`template text "${s}" is gone`);
+  // `left` is `sentences` less what was taken: the sentences no message of the file has.
+  for (const x of sentences) {
+    const i = left.indexOf(x.m);
+    if (i < 0) continue;
+    left.splice(i, 1);
+    problems.push(`exception "${x.sentence}": no message of this file has this English (an exception whose text the file no longer shows)`);
+  }
   return problems;
 }
 
