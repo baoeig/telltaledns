@@ -78,14 +78,17 @@ test('api_012 migrated files hold no literal text', () => {
 test('api_012 a new removed or renamed file leaves the ratchets green', () => {
   const r0 = checkUi();
   expect(ratchetProblems(UI, r0)).toEqual([]);
-  // Files that hold text and an Intl call or a physical property, not on the layer.
+  // Files that hold an Intl call or a physical property: one that still holds text and is not on the
+  // layer if there is one, any other once the pages have moved (one with no exception of the ledger test:
+  // a file's exceptions are checked against the files that are there).
   const pick = (p: (f: Result['files'][number]) => boolean, not = '') => {
-    const f = r0.files.find((x) => !x.usesLayer && x.rel !== not && x.literal.length > 0 && p(x));
+    const any = r0.files.filter((x) => x.rel !== not && !Object.hasOwn(EXCEPTIONS, x.rel) && p(x));
+    const f = any.find((x) => !x.usesLayer && x.literal.length > 0) ?? any[0];
     if (!f) throw new Error('no such file in the UI');
     return f.rel;
   };
-  const removed = pick((f) => f.physical > 0);
-  const moved = pick((f) => f.intl > 0, removed);
+  const moved = pick((f) => f.intl > 0);
+  const removed = pick((f) => f.physical > 0, moved);
   const cases: [string, (d: string) => void][] = [
     ['a new file without text', (d) => put(d, 'src/lib/components/Spark.svelte', '<svg viewBox="0 0 8 8"><path d="M0 8 L8 0" /></svg>\n')],
     [`${removed} removed`, (d) => rmSync(join(d, 'src', removed))],
