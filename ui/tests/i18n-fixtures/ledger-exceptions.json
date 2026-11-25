@@ -1,4 +1,285 @@
 {
+  "lib/components/ClientChip.svelte": [
+    {
+      "fragments": [
+        "Kubernetes workload {}{}",
+        "(pod {}, {})"
+      ],
+      "sentence": "Kubernetes workload {name} (pod {pod}, {ip})"
+    },
+    {
+      "fragments": [
+        "Kubernetes workload {}{}",
+        "(pods: {})"
+      ],
+      "sentence": "Kubernetes workload {name} (pods: {pods})"
+    },
+    {
+      "fragments": [
+        "Kubernetes workload {}{}"
+      ],
+      "sentence": "Kubernetes workload {name}"
+    },
+    {
+      "fragments": [
+        "is a Kubernetes workload: its name comes from Kubernetes."
+      ],
+      "sentence": "<b>{name}</b> is a Kubernetes workload: its name comes from Kubernetes."
+    },
+    {
+      "fragments": [
+        "This adds a rule for exactly this workload; a",
+        "telltaledns.io/group",
+        "label on its pods or namespace still wins, and is the way to do it from Git."
+      ],
+      "sentence": "This adds a rule for exactly this workload; a <code>telltaledns.io/group</code> label on its pods or namespace still wins, and is the way to do it from Git."
+    },
+    {
+      "fragments": [
+        "is defined in the configuration file, so it's changed there, not here."
+      ],
+      "sentence": "<b>{name}</b> is defined in the configuration file, so it's changed there, not here."
+    },
+    {
+      "fragments": [
+        "Queries from",
+        "this device (",
+        ", now at",
+        ")",
+        "will show this name everywhere, including past ones. The device is recognized by {}."
+      ],
+      "sentence": "Queries from this device (<code>{mac}</code>, now at <code>{ip}</code>) will show this name everywhere, including past ones. The device is recognized by {keys}."
+    },
+    {
+      "fragments": [
+        "Queries from",
+        "will show this name everywhere, including past ones. The device is recognized by {}."
+      ],
+      "sentence": "Queries from <code>{ip}</code> will show this name everywhere, including past ones. The device is recognized by {keys}."
+    },
+    {
+      "fragments": [
+        "Its MAC address,",
+        "({}): follows the device when its address changes, while {}"
+      ],
+      "sentence": "Its MAC address, <code>{mac}</code> <muted>({source}): follows the device when its address changes, while {vouch}</muted>"
+    },
+    {
+      "fragments": [
+        "This address,",
+        ": stops matching if the device gets another address (a DHCP reservation in your router keeps it)"
+      ],
+      "sentence": "This address, <code>{ip}</code><muted>: stops matching if the device gets another address (a DHCP reservation in your router keeps it)</muted>"
+    },
+    {
+      "fragments": [
+        "Looks like",
+        "an",
+        "(",
+        ")."
+      ],
+      "sentence": "Looks like an {product} ({level})."
+    },
+    {
+      "fragments": [
+        "Looks like",
+        "a",
+        "(",
+        ")."
+      ],
+      "sentence": "Looks like a {product} ({level})."
+    }
+  ],
+  "lib/components/ConfigEditor.svelte": [
+    {
+      "fragments": [
+        "What this will do:"
+      ],
+      "sentence": "<b>What this will do:</b> {impact}"
+    }
+  ],
+  "lib/components/DrillForm.svelte": [
+    {
+      "fragments": [
+        "Run a failover drill on {}?",
+        "For a short time it stops answering the devices you choose, while the other nodes keep serving. Devices with a working second DNS server switch to it; a report then shows who followed and who was stuck."
+      ],
+      "sentence": "<strong>Run a failover drill on {label}?</strong> For a short time it stops answering the devices you choose, while the other nodes keep serving. Devices with a working second DNS server switch to it; a report then shows who followed and who was stuck."
+    }
+  ],
+  "lib/components/MaintenanceForm.svelte": [
+    {
+      "fragments": [
+        "Put {} in maintenance?",
+        "It reports not ready, so load balancers and Kubernetes stop sending it new queries, but it keeps answering every query that still arrives. Its alerts and health conditions are left out until the window ends."
+      ],
+      "sentence": "<strong>Put {label} in maintenance?</strong> It reports not ready, so load balancers and Kubernetes stop sending it new queries, but it keeps answering every query that still arrives. Its alerts and health conditions are left out until the window ends."
+    }
+  ],
+  "lib/components/MuteForm.svelte": [
+    {
+      "fragments": [
+        "Stop counting the kinds below for this device. The findings are still recorded and listed (turn on",
+        "Show muted",
+        "), and every other device is still checked."
+      ],
+      "sentence": "Stop counting the kinds below for this device. The findings are still recorded and listed (turn on <b>Show muted</b>), and every other device is still checked."
+    },
+    {
+      "fragments": [
+        "What this will do:"
+      ],
+      "sentence": "<b>What this will do:</b> {impact}"
+    },
+    {
+      "fragments": [
+        "This finding",
+        "{} in the period shown would have been muted."
+      ],
+      "sentence": "This finding in the period shown would have been muted."
+    },
+    {
+      "fragments": [
+        "These {} findings",
+        "{} in the period shown would have been muted."
+      ],
+      "sentence": "These {n} findings in the period shown would have been muted."
+    },
+    {
+      "fragments": [
+        "These {} findings",
+        "{} in the period shown would have been muted."
+      ],
+      "sentence": "These {n} findings in the period shown would have been muted."
+    }
+  ],
+  "lib/components/NodeRemoveForm.svelte": [
+    {
+      "fragments": [
+        "Remove {} from the cluster?",
+        "It stops counting as a voter, disappears from this page, and the cluster refuses it afterwards, even while its certificate is valid. Its own data isn't touched."
+      ],
+      "sentence": "<strong>Remove {site} from the cluster?</strong> It stops counting as a voter, disappears from this page, and the cluster refuses it afterwards, even while its certificate is valid. Its own data isn't touched."
+    },
+    {
+      "fragments": [
+        "{} voter{} left",
+        "{}; automatic failover stays on."
+      ],
+      "sentence": "{n} voter left; automatic failover stays on."
+    },
+    {
+      "fragments": [
+        "voter",
+        "s",
+        "left",
+        "{}; automatic failover stays on."
+      ],
+      "sentence": "{n} voters left; automatic failover stays on."
+    },
+    {
+      "fragments": [
+        "{} voter{} left",
+        "{}; automatic failover turns into manual."
+      ],
+      "sentence": "{n} voter left; automatic failover turns into manual."
+    },
+    {
+      "fragments": [
+        "voter",
+        "s",
+        "left",
+        "{}; automatic failover turns into manual."
+      ],
+      "sentence": "{n} voters left; automatic failover turns into manual."
+    },
+    {
+      "fragments": [
+        "{} voter{} left",
+        "{}; automatic failover stays off (it needs 3)."
+      ],
+      "sentence": "{n} voter left; automatic failover stays off (it needs 3)."
+    },
+    {
+      "fragments": [
+        "voter",
+        "s",
+        "left",
+        "{}; automatic failover stays off (it needs 3)."
+      ],
+      "sentence": "{n} voters left; automatic failover stays off (it needs 3)."
+    }
+  ],
+  "lib/components/QuickRuleForm.svelte": [
+    {
+      "fragments": [
+        "is a Kubernetes workload and its pods come and go, so this rule is for its group,",
+        "({}): every device in it. For one address instead, choose “a device”."
+      ],
+      "sentence": "<bdi>{workload}</bdi> is a Kubernetes workload and its pods come and go, so this rule is for its group, <bdi>{group}</bdi> ({origin}): every device in it. For one address instead, choose “a device”."
+    },
+    {
+      "fragments": [
+        "is a Kubernetes workload whose group is",
+        ". This rule is for",
+        ": every device in it."
+      ],
+      "sentence": "<bdi>{workload}</bdi> is a Kubernetes workload whose group is <bdi>{group}</bdi>. This rule is for <bdi>{which}</bdi>: every device in it."
+    },
+    {
+      "fragments": [
+        "This rule is for",
+        ": every device in it."
+      ],
+      "sentence": "This rule is for <bdi>{which}</bdi>: every device in it."
+    },
+    {
+      "fragments": [
+        "{} is one pod of",
+        ", and a pod's address changes whenever it restarts."
+      ],
+      "sentence": "{address} is one pod of <bdi>{workload}</bdi>, and a pod's address changes whenever it restarts."
+    },
+    {
+      "fragments": [
+        "{} is your device “",
+        "”."
+      ],
+      "sentence": "{address} is your device “<bdi>{device}</bdi>”."
+    },
+    {
+      "fragments": [
+        "{} (shown in the log as",
+        ")."
+      ],
+      "sentence": "{address} (shown in the log as <bdi>{seen}</bdi>)."
+    }
+  ],
+  "lib/components/SupportPackage.svelte": [
+    {
+      "fragments": [
+        "Saved",
+        "({} before compression). Look it over before you attach it: log lines are redacted by pattern, which is best effort."
+      ],
+      "sentence": "Saved <mono>{name}</mono> ({size} before compression). Look it over before you attach it: log lines are redacted by pattern, which is best effort."
+    },
+    {
+      "fragments": [
+        "It lists what each pseudonym stands for, so it has your real names and addresses: keep it to yourself, and tell a maintainer what",
+        "device-3",
+        "was only if you want to."
+      ],
+      "sentence": "It lists what each pseudonym stands for, so it has your real names and addresses: keep it to yourself, and tell a maintainer what <mono>device-3</mono> was only if you want to."
+    }
+  ],
+  "lib/components/WallDisplays.svelte": [
+    {
+      "fragments": [
+        ": open this on the wall's browser. It's shown only now."
+      ],
+      "sentence": "<strong>{name}</strong>: open this on the wall's browser. It's shown only now."
+    }
+  ],
   "lib/dash/TopList.svelte": [
     {
       "fragments": [

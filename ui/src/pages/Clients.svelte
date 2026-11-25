@@ -296,7 +296,7 @@
                 <td class="mono nowrap" title={kindText[w.kind] ?? w.kind}><ClientChip ip={w.key} name={w.name} onchanged={load} /></td>
                 <td class="small nowrap">
                   {#if w.group}<span class="group-chip" style:--gc={groupColor(w.group)}>{w.group}</span>{/if}
-                  <div class="muted" data-testid="group-from">{groupFromText[w.groupFrom] ?? w.groupFrom}</div>
+                  <div class="muted" data-testid="group-from">{groupFromText(w.groupFrom)}</div>
                 </td>
                 <td class="num" title={w.pods.map((p) => `${p.name} ${p.addresses.join(' ')}${p.terminating ? ' (terminating)' : ''}`).join('\n')}>{w.pods.filter((p) => !p.terminating).length}</td>
                 <td class="num">{num(w.queries24h)}</td>
