@@ -7,7 +7,7 @@
   import { href, navigate, route } from '../lib/router.svelte';
   import { clock, num } from '../lib/format';
   import { poll } from '../lib/poll';
-  import { STAGES, STAGE_LABEL, fold, layout, share, type FlowLink, type FlowNode, type PlacedLink, type PlacedNode } from '../lib/sankey';
+  import { STAGES, stageLabel, fold, layout, share, type FlowLink, type FlowNode, type PlacedLink, type PlacedNode } from '../lib/sankey';
   import ErrorNote from '../lib/components/ErrorNote.svelte';
   import HelpButton from '../lib/components/HelpButton.svelte';
 
@@ -132,7 +132,7 @@
   function nodeText(n: PlacedNode): string {
     const pct = data?.total ? ` (${((100 * n.count) / data.total).toFixed(1)} %)` : '';
     const dead = n.deadEnd ? ` · ${num(n.deadEnd)} end here` : '';
-    return `${STAGE_LABEL[n.stage]} ${n.name}: ${num(n.count)}${pct}${dead}`;
+    return `${stageLabel(n.stage)} ${n.name}: ${num(n.count)}${pct}${dead}`;
   }
   function at(e: MouseEvent): { x: number; y: number } {
     const r = (e.currentTarget as Element).closest('.flow-wrap')?.getBoundingClientRect();
@@ -225,8 +225,8 @@
           <tbody>
             {#each rows as r, i (i)}
               <tr class:fail={r.failure}>
-                <td>{STAGE_LABEL[r.from?.stage ?? '']} {r.from?.name}</td>
-                <td>{STAGE_LABEL[r.to?.stage ?? '']} {r.to?.name}</td>
+                <td>{stageLabel(r.from?.stage ?? '')} {r.from?.name}</td>
+                <td>{stageLabel(r.to?.stage ?? '')} {r.to?.name}</td>
                 <td class="num">{num(r.count)}</td>
                 <td class="num">{share(r, data.total, r.from)}</td>
               </tr>
@@ -238,7 +238,7 @@
     <div class="flow-wrap" bind:this={wrap} bind:clientWidth={width} hidden={!data || !data.total || showTable}>
       {#if lay}
         {#if !vertical}
-          <div class="stages" aria-hidden="true">{#each STAGES as s (s)}<span>{STAGE_LABEL[s]}</span>{/each}</div>
+          <div class="stages" aria-hidden="true">{#each STAGES as s (s)}<span>{stageLabel(s)}</span>{/each}</div>
         {/if}
         <svg
           width={width}
@@ -290,7 +290,7 @@
           </g>
           {#if vertical}
             {#each STAGES as s, i (s)}
-              <text class="stage" x={width - 4} y={i * ((height - 24 - 14) / 3) + 11} text-anchor="end">{STAGE_LABEL[s]}</text>
+              <text class="stage" x={width - 4} y={i * ((height - 24 - 14) / 3) + 11} text-anchor="end">{stageLabel(s)}</text>
             {/each}
           {/if}
         </svg>

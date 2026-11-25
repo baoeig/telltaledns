@@ -11,6 +11,7 @@
   import { navigate, route } from '../lib/router.svelte';
   import { clock } from '../lib/format';
   import { session } from '../lib/session.svelte';
+  import { tk } from '../lib/i18n';
   import Logo from '../lib/components/Logo.svelte';
   import LatencyHeatmap from '../lib/components/LatencyHeatmap.svelte';
   import WallMap from '../lib/components/wall/WallMap.svelte';
@@ -177,7 +178,7 @@
     {#if paused}<span class="paused" data-testid="wall-paused">paused</span>{/if}
   </div>
   {#if single && hero}
-    <h1 class="title" class:fade={motion && !titleShown} class:gone={!motion && !titleShown}>{PANEL_TITLE[hero]}</h1>
+    <h1 class="title" class:fade={motion && !titleShown} class:gone={!motion && !titleShown}>{tk(PANEL_TITLE[hero])}</h1>
   {/if}
   <div class="area" bind:clientWidth={aw} bind:clientHeight={ah} data-testid="wall-area">
     {#each layout.slots as s, i (i)}
@@ -193,7 +194,7 @@
         data-panel={p}
         data-rotates={s.panels.length > 1 ? 'yes' : 'no'}
       >
-        {#if !single && p}<h2 class="caption">{PANEL_TITLE[p]}</h2>{/if}
+        {#if !single && p}<h2 class="caption">{tk(PANEL_TITLE[p])}</h2>{/if}
         <div class="panel" data-testid="wall-panel-{p}">
           {#key p}
             {#if p === 'map'}<WallMap {motion} />

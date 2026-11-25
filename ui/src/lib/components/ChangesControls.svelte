@@ -5,6 +5,7 @@
   import { api } from '../api';
   import { can } from '../session.svelte';
   import { changes, KINDS } from '../annotations.svelte';
+  import { tk } from '../i18n';
   import ErrorNote from './ErrorNote.svelte';
   import HelpButton from './HelpButton.svelte';
 
@@ -85,7 +86,7 @@
         type="button"
         class="chip"
         aria-pressed={!changes.hidden.includes(k.id)}
-        onclick={() => changes.setKind(k.id, changes.hidden.includes(k.id))}>{k.label}</button
+        onclick={() => changes.setKind(k.id, changes.hidden.includes(k.id))}>{tk(k.label)}</button
       >
     {/each}
   </div>

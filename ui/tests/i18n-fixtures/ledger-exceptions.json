@@ -1,1 +1,17 @@
-{}
+{
+  "lib/sankey.ts": [
+    {
+      "fragments": [
+        "{} of all{}"
+      ],
+      "sentence": "{all} of all"
+    },
+    {
+      "fragments": [
+        "{} of all{}",
+        "· {} of {}"
+      ],
+      "sentence": "{all} of all · {part} of {name}"
+    }
+  ]
+}
