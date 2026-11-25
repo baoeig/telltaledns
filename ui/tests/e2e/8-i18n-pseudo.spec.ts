@@ -496,7 +496,7 @@ const ROLLOUT = {
   secondsLeft: 420, skipped: 'no canary node was online', stable: '3.130', stage: 'canary', started: T0, version: '3.131', waitingSince: null,
   nodes: [rnode('n-aaaa1111', {}), rnode('n-bbbb2222', { canary: true }), rnode('n-cccc3333', { canary: true, ready: false, appliedSeq: 130 }), rnode('n-dddd4444', { connected: false, ready: false })],
 };
-const version = (v: string, outcome: string, o: Record<string, unknown>) => ({ by: 'this node', created: T0, current: false, filterVersion: 4, outcome, pinnable: true, pinnedTo: null, readings: null, reason: null, version: v, ...o });
+const version = (v: string, outcome: string, o: Record<string, unknown>) => ({ by: 'homelab', created: T0, current: false, filterVersion: 4, outcome, pinnable: true, pinnedTo: null, readings: null, reason: null, version: v, ...o });
 const VERSIONS = { history: 8, items: [version('3.131', 'canary', { current: true, pinnable: false }), version('3.130', 'stable'), version('3.129', 'canary_failed', { readings: { afterPercent: 6, answers: 90, beforePercent: 0.4, reason: 'SERVFAIL rose on the canaries' } }), version('3.128', 'pinned_to', { pinnedTo: '3.124', reason: 'by hand', pinnable: false }), version('3.127', 'new-outcome', {})] };
 
 test('api_012 pseudo locale leaves no literal text: topology, comparison and rollouts', async ({ page }) => {
@@ -1360,5 +1360,330 @@ test('api_012 pseudo locale leaves no literal text: names on my network, its zon
   await page.reload();
   await expect(page.locator('.empty').first()).toBeVisible();
   expect(await leftovers(page), 'nothing yet').toEqual([]);
+  await clean(page, sent);
+});
+
+// A1g: the screens before sign-in (the status answer is made up), the shell with its banners and badges,
+// the wall display with a live tail, and the pages of the System group in the states a one-node test
+// server cannot show (a cluster with a witness, pods, a gone node and a pin; a standalone node in
+// maintenance; destinations and rules of alerts; plans in every state; the cache of seven nodes).
+type Answer = NonNullable<Parameters<Route['fulfill']>[0]>;
+const STATUS = (o: Record<string, unknown> = {}) => ({ csrfToken: null, localLogin: true, oidc: [], passwordLoginRestricted: false, setupRequired: false, user: null, ...o });
+const PROVIDERS = [{ id: 'kc', name: 'Keycloak' }, { id: 'ak', name: 'Authentik' }];
+const coded = (status: number, code: string, detail: string): Answer => ({ status, json: { type: 'about:blank', title: detail, status, code, detail } });
+
+test('api_012 pseudo locale leaves no literal text: the sign-in screens, first-run setup and the display link', async ({ page }) => {
+  const sent = await watch(page);
+  let status: Answer = { json: STATUS({ oidc: PROVIDERS }) };
+  let login: Answer = coded(401, 'invalid_credentials', 'the user name or the password is not right');
+  let gate: Promise<void> = Promise.resolve();
+  let displayGate: Promise<void> = Promise.resolve();
+  await page.route('**/api/v1/auth/status', async (r) => {
+    await gate;
+    await r.fulfill(status);
+  });
+  await page.route('**/api/v1/auth/login', (r) => r.fulfill(login));
+  await page.route('**/api/v1/auth/setup', (r) => r.fulfill(coded(400, 'invalid_request', 'the setup token is not right')));
+  await page.route('**/api/v1/auth/display', async (r) => {
+    await displayGate;
+    await r.fulfill(coded(401, 'unauthorized', 'this display code is used or has expired'));
+  });
+  // The provider buttons, and a provider's refusal in the address.
+  await page.goto('/?lang=en-XA#/?loginError=Your%20account%20is%20in%20no%20group%20the%20server%20maps%20to%20a%20role.');
+  await expect(page.locator('html')).toHaveAttribute('lang', 'en-XA');
+  await expect(page.locator('.provider-error')).toBeVisible();
+  expect(await leftovers(page), 'sign in: the providers, a refusal and the password form').toEqual([]);
+  status = { json: STATUS({ oidc: PROVIDERS, passwordLoginRestricted: true }) };
+  await page.reload();
+  await expect(page.getByTestId('password-restricted')).toBeVisible();
+  expect(await leftovers(page), 'password sign-in limited to admins on trusted networks').toEqual([]);
+  status = { json: STATUS({ oidc: PROVIDERS, localLogin: false }) };
+  await page.reload();
+  await expect(page.locator('.providers')).toBeVisible();
+  await expect(page.locator('form')).toHaveCount(0);
+  expect(await leftovers(page), 'password sign-in turned off').toEqual([]);
+  // The password form: a wrong password, then the two code steps.
+  status = { json: STATUS() };
+  await page.reload();
+  await page.locator('input[name="username"]').fill('ada');
+  await page.locator('input[name="password"]').fill('not the password');
+  await page.locator('button[type="submit"]').click();
+  await expect(page.locator('[role="alert"]:not(.provider-error)')).toBeVisible();
+  expect(await leftovers(page), 'a wrong password').toEqual([]);
+  login = coded(401, 'totp_required', 'a code is needed');
+  await page.locator('button[type="submit"]').click();
+  await expect(page.locator('input[name="totp"]')).toBeVisible();
+  expect(await leftovers(page), 'the code step').toEqual([]);
+  await page.locator('button.link').click();
+  await expect(page.locator('input[name="recovery"]')).toBeVisible();
+  expect(await leftovers(page), 'the recovery code step').toEqual([]);
+  // First run: the passwords differ, then the server refuses the token.
+  status = { json: STATUS({ setupRequired: true }) };
+  await page.reload();
+  await expect(page.locator('input[name="setupToken"]')).toBeVisible();
+  expect(await leftovers(page), 'first-run setup').toEqual([]);
+  await page.locator('input[name="setupToken"]').fill('tok');
+  await page.locator('input[name="password"]').fill('long enough password');
+  await page.locator('input[name="confirm"]').fill('another long password');
+  await page.locator('button[type="submit"]').click();
+  await expect(page.locator('[role="alert"]:not(.provider-error)')).toBeVisible();
+  expect(await leftovers(page), 'the passwords differ').toEqual([]);
+  await page.locator('input[name="confirm"]').fill('long enough password');
+  await page.locator('button[type="submit"]').click();
+  await expect(page.getByText('the setup token is not right')).toBeVisible();
+  expect(await leftovers(page), 'a refused setup token').toEqual([]);
+  // The server cannot be reached; the first answer still to come.
+  status = coded(502, 'bad_gateway', 'the server did not answer');
+  await page.reload();
+  await expect(page.locator('main.center .notice')).toBeVisible();
+  expect(await leftovers(page), 'the server cannot be reached').toEqual([]);
+  status = { json: STATUS() };
+  let release!: () => void;
+  gate = new Promise<void>((resolve) => (release = resolve));
+  await page.reload();
+  await expect(page.locator('p.empty')).toBeVisible();
+  expect(await leftovers(page), 'the page is loading').toEqual([]);
+  release();
+  await expect(page.locator('input[name="username"]')).toBeVisible();
+  // A display link with no code, with a code that is still being exchanged, and one that is refused.
+  await page.goto('/?lang=en-XA#/display');
+  await expect(page.getByTestId('display-error')).toBeVisible();
+  expect(await leftovers(page), 'a display link without its code').toEqual([]);
+  let opened!: () => void;
+  displayGate = new Promise<void>((resolve) => (opened = resolve));
+  await page.goto('/?lang=en-XA#/display?code=abcd');
+  await page.reload();
+  await expect(page.locator('[data-testid="display-open"] p.muted')).toBeVisible();
+  expect(await leftovers(page), 'the wall is opening').toEqual([]);
+  opened();
+  await expect(page.getByTestId('display-error')).toBeVisible();
+  expect(await leftovers(page), 'a display code that is refused').toEqual([]);
+  await clean(page, sent);
+});
+
+const SHELL_INFO = (o: Record<string, unknown> = {}) => ({
+  build: { commit: 'abc1234', date: '2026-11-24', profile: 'release', target: 'x86_64-unknown-linux-gnu', version: '0.9.0' },
+  clientIpsMasked: { queries: 5000, sharePercent: 92, sources: ['10.42.0.1', '172.17.0.1'] }, cluster: { name: 'home', primary: true, site: 'homelab' }, filterNames: 1, filterSnapshot: 1, listeners: [],
+  maintenance: { by: 'admin', node: 'homelab', reason: 'SD card swap', secondsLeft: 1800, since: T0, until: T0 }, node: 'homelab', queryLog: false, role: 'primary', startedAt: T0, starts: 1,
+  uncleanStarts: 0, update: { state: 'available' }, uptimeSeconds: 100, version: '0.9.0', ...o,
+});
+
+test('api_012 pseudo locale leaves no literal text: the shell, its banners, its phone menu and its badges', async ({ page }) => {
+  const sent = await watch(page);
+  let info: Record<string, unknown> = SHELL_INFO();
+  await page.addInitScript(() => {
+    localStorage.setItem('telltale.mode.admin', 'advanced');
+    localStorage.setItem('theme', 'dark');
+  });
+  await page.route('**/api/v1/system/info', (r) => r.fulfill({ json: info }));
+  await page.route('**/api/v1/system/health', (r) => r.fulfill({ json: HEALTH }));
+  await page.route('**/api/v1/analytics/anomalies?**', (r) => r.fulfill({ json: FINDINGS }));
+  await page.route('**/api/v1/lists', (r) => r.fulfill({ json: { items: [{ name: 'ads', state: 'failed' }] } }));
+  await signIn(page);
+  await open(page, '/rules', '[data-testid="build-footer"]');
+  await expect(page.getByTestId('masked-banner')).toBeVisible();
+  await expect(page.getByTestId('maintenance-app-banner')).toBeVisible();
+  await expect(page.locator('nav.side b.count').first()).toBeVisible();
+  expect(await leftovers(page), 'the build footer of a primary with an update, the banners, the badges and the wall button').toEqual([]);
+  info = SHELL_INFO({ cluster: { name: 'home', primary: false, site: 'pi' }, maintenance: null, clientIpsMasked: null, queryLog: true, update: { state: 'none' } });
+  await page.evaluate(() => window.dispatchEvent(new Event('telltale:maintenance-changed')));
+  await expect(page.getByTestId('maintenance-app-banner')).toHaveCount(0);
+  await expect(page.locator('[data-testid="node-role"]:not(.primary)')).toBeVisible();
+  expect(await leftovers(page), 'a replica').toEqual([]);
+  await page.setViewportSize({ width: 390, height: 800 });
+  await page.locator('button.icon-btn.menu').click();
+  await expect(page.getByTestId('menu-scrim')).toBeVisible();
+  await expect(page.getByTestId('menu-health-dot')).toBeVisible();
+  expect(await leftovers(page), 'the phone menu: its scrim, detail level and health dot').toEqual([]);
+  await clean(page, sent);
+});
+
+test('api_012 pseudo locale leaves no literal text: the wall display, paused, with a live tail and every panel', async ({ page }) => {
+  const sent = await watch(page);
+  const tail = `retry: 86400000\n\nevent: query\ndata: ${JSON.stringify(QROW(1, {}))}\n\n`;
+  await page.route('**/api/v1/queries/stream', (r) => r.fulfill({ status: 200, headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' }, body: tail }));
+  await signIn(page);
+  await open(page, '/wall?panels=map,flow,slo,latency,heat,kpi&layout=grid', '[data-testid="wall-area"]');
+  await expect(page.locator('.tail .item').first()).toBeVisible();
+  expect(await leftovers(page), 'the wall with every panel and a live tail').toEqual([]);
+  await page.keyboard.press('Space');
+  await expect(page.getByTestId('wall-paused')).toBeVisible();
+  expect(await leftovers(page), 'the wall paused').toEqual([]);
+  await page.setViewportSize({ width: 390, height: 800 });
+  await open(page, '/wall?panels=slo,kpi', '[data-testid="wall-area"]');
+  await expect(page.locator('h1.title')).toBeVisible();
+  expect(await leftovers(page), 'a phone: one panel and its title').toEqual([]);
+  await clean(page, sent);
+});
+
+const EVENT_KINDS = [
+  'joined', 'connected', 'disconnected', 'published', 'applied', 'sync_failed', 'rejected', 'restarted', 'expired', 'left', 'voted', 'cert_issued', 'ca_rotation', 'maintenance', 'maintenance_ended',
+  'handover', 'handover_failed', 'lease_released', 'stepped_down', 'rollout_started', 'rollout_promoted', 'rollout_failed', 'pinned', 'unpinned', 'brand_new',
+];
+const MAINT = (node: string) => ({ by: 'admin', node, reason: 'SD card swap', secondsLeft: 600, since: T0, until: T0 });
+const BIG = {
+  ...CLUSTER, healthy: false, authority: 'gitops', host: null,
+  events: EVENT_KINDS.map((kind, i) => ({ at: new Date(Date.now() - i * 60_000).toISOString(), detail: `${kind} happened`, kind, nodeId: i % 3 === 0 ? 'n-zzzz9999' : 'n-bbbb2222' })),
+  checks: [{ id: 'sync', ok: true, summary: 'Every node is on the newest version.' }, { id: 'link', ok: false, summary: 'The link to pi is down.', fix: 'Check the cable of pi.' }, { id: 'bare', ok: false, summary: 'One more check failed.' }],
+  conflicts: [{ changed: ['group.kids', 'list.ads'], detectedAt: T0, epoch: 3, newPrimary: 'n-bbbb2222', publishedAt: T0, seq: 41 }, { changed: [], detectedAt: T0, epoch: 3, newPrimary: 'n-bbbb2222', publishedAt: T0, seq: 40 }],
+  source: { author: 'Ada', checkedAt: T0, commit: 'abcdef1234567890', committedAt: T0, error: 'could not fetch the repository', gitRef: 'main', path: 'telltale.toml', refused: false, repo: 'git@example.com:me/dns.git', signedBy: 'Ada', subject: 'Block more ads' },
+  rollout: { stage: 'canary', canaries: ['n-bbbb2222'], version: '3.131', pinned: { by: 'admin', reason: 'hold for the weekend', since: T0, to: '3.130' } },
+  nodes: [
+    node({ nodeId: 'n-aaaa1111', site: 'homelab', role: 'primary', thisNode: true, rttMs: null, configSource: 'gitops', sourceCommit: 'abcdef1234', restarts: 1, certExpiresAt: T0, host: HOST }),
+    node({ nodeId: 'n-bbbb2222', site: 'pi', role: 'secondary', up: false, ready: false, configLag: 3, behindSeconds: 90, lastSeenSecondsAgo: 125, maintenance: MAINT('n-bbbb2222'), cacheEntries: null, cacheHitPercent: null, querySharePercent: null, upstreamP90Ms: 0, restarts: 2 }),
+    node({ nodeId: 'n-cccc3333', site: 'attic', role: 'witness', witness: true }),
+    node({ nodeId: 'n-dddd4444', site: 'k8s', role: 'secondary', ephemeral: true, pod: 'resolver-0', kubeNode: 'worker-1', cacheHitPercent: 60 }),
+    node({ nodeId: 'n-eeee5555', site: 'k8s', role: 'secondary', ephemeral: true, pod: 'resolver-1', kubeNode: null, cacheHitPercent: null, configLag: 1 }),
+  ],
+};
+const REPLICA = (o: Record<string, unknown>) => ({
+  ...CLUSTER, failover: { active: false, leaseHeld: false, leaseSecondsLeft: null, mode: 'auto', reachableVoters: 2, votedEpoch: 0, votedFor: null, voters: 2 },
+  nodes: [node({ nodeId: 'n-aaaa1111', site: 'homelab', role: 'primary', up: false, configSource: 'gitops' }), node({ nodeId: 'n-bbbb2222', site: 'pi', role: 'replica', thisNode: true, rttMs: null, configSource: 'file' })],
+  ...o,
+});
+
+test('api_012 pseudo locale leaves no literal text: the cluster of a witness, pods, a gone node and a pin, a promotion and a standalone node', async ({ page }) => {
+  const sent = await watch(page);
+  let view: Record<string, unknown> = BIG;
+  let info: Record<string, unknown> = SHELL_INFO({ clientIpsMasked: null, queryLog: true, maintenance: null, update: { state: 'none' } });
+  await page.route('**/api/v1/cluster', (r) => r.fulfill({ json: view }));
+  await page.route('**/api/v1/system/info', (r) => r.fulfill({ json: info }));
+  await page.route('**/api/v1/nodes/*/maintenance', (r) => r.fulfill({ json: { note: 'This node is in service again.' } }));
+  await signIn(page);
+  await open(page, '/cluster', '[data-testid="cluster-node"]');
+  await expect(page.getByTestId('pin-note')).toBeVisible();
+  await expect(page.getByTestId('cluster-pods')).toBeVisible();
+  await page.locator('[data-testid="cluster-pods"] button.link').click();
+  await expect(page.getByTestId('cluster-node-pod').first()).toBeVisible();
+  expect(await leftovers(page), 'nodes: a primary with its commit, a gone node in maintenance, a witness, pods, a pin and a source that failed').toEqual([]);
+  await open(page, '/cluster?tab=health', '[data-testid="cluster-check"]');
+  await expect(page.getByTestId('cluster-conflicts')).toBeVisible();
+  expect(await leftovers(page), 'health: checks that fail with a fix, conflicts, machines').toEqual([]);
+  await open(page, '/cluster?tab=events', '[data-testid="cluster-churn"]');
+  expect(await leftovers(page), 'events of every kind and one this page does not know').toEqual([]);
+  view = REPLICA({ authority: 'gitops' });
+  await page.reload();
+  await open(page, '/cluster', '[data-testid="cluster-node"]');
+  await page.locator('.promote button').first().click();
+  await expect(page.locator('[role="alertdialog"]')).toBeVisible();
+  expect(await leftovers(page), 'promote this node, with the emergency choice').toEqual([]);
+  view = REPLICA({ authority: 'gitops', nodes: [node({ nodeId: 'n-aaaa1111', site: 'homelab', role: 'emergency primary', configSource: 'file' }), node({ nodeId: 'n-bbbb2222', site: 'pi', role: 'replica', thisNode: true, rttMs: null, configSource: 'gitops' })] });
+  await page.reload();
+  await open(page, '/cluster', '[data-testid="cluster-node"]');
+  await page.locator('.promote button').first().click();
+  await expect(page.locator('[role="alertdialog"]')).toBeVisible();
+  expect(await leftovers(page), 'take over from the emergency primary').toEqual([]);
+  view = { ...CLUSTER, enabled: false, host: HOST, nodes: [] };
+  info = SHELL_INFO({ clientIpsMasked: null, queryLog: true });
+  await page.reload();
+  await open(page, '/cluster', '[data-testid="cluster-standalone"]');
+  await expect(page.getByTestId('maintenance-banner')).toBeVisible();
+  await page.getByTestId('maintenance-end-banner').click();
+  await expect(page.getByTestId('maintenance-note')).toBeVisible();
+  expect(await leftovers(page), 'a standalone node in maintenance, then back in service').toEqual([]);
+  await clean(page, sent);
+});
+
+test('api_012 pseudo locale leaves no literal text: alerts, with destinations and rules, and the plans of agents in every state', async ({ page }) => {
+  const sent = await watch(page);
+  entriesOf.alert_destination = [ENTRY('alert_destination', 'mail', 'added', { type: 'email', to: ['you@gmail.com'], url: 'smtp://smtp.gmail.com:587' }), ENTRY('alert_destination', 'push', 'file', { type: 'ntfy', url: 'https://ntfy.sh/x' })];
+  entriesOf.alert_rule = [ENTRY('alert_rule', 'down', 'added', { when: 'upstream_down', to: ['mail'], enabled: false }), ENTRY('alert_rule', 'lag', 'file', { when: 'sync_lag', to: ['mail', 'push'] })];
+  await editors(page);
+  await page.route(/\/api\/v1\/alerts$/, (r) =>
+    r.fulfill({
+      json: {
+        evaluating: true,
+        firing: [{ rule: 'upstream_down', subject: 'quad9', summary: 'Upstream quad9 does not answer.' }],
+        maintenance: [MAINT('pi')],
+        deliveries: [{ destination: 'mail', ok: true, unixSeconds: 1_764_021_600, error: null }, { destination: 'push', ok: false, unixSeconds: 1_764_021_000, error: 'the server answered 503' }],
+      },
+    }),
+  );
+  await page.route('**/api/v1/alerts/destinations/*/test', (r) => r.fulfill({ json: { ok: true, error: null } }));
+  await signIn(page);
+  await open(page, '/alerts', '[data-testid="alerts-now"]');
+  await expect(page.getByTestId('alerts-maintenance')).toBeVisible();
+  await page.locator('[data-testid="editor-alert_destination"] [data-testid="entry-row"] button.link').first().click();
+  await expect(page.getByTestId('row-action-result')).toBeVisible();
+  await page.locator('[data-testid="editor-alert_destination"] button:not(.link):not([data-help])').first().click();
+  await expect(page.locator('form.form').first()).toBeVisible();
+  expect(await leftovers(page), 'alerts that fire, a node in maintenance, deliveries, the destinations and rules, the add form and a test').toEqual([]);
+  await page.route(/\/api\/v1\/alerts$/, (r) => r.fulfill({ json: { evaluating: false, firing: [], maintenance: [], deliveries: [] } }));
+  await page.reload();
+  await open(page, '/alerts', '[data-testid="alerts-now"]');
+  await expect(page.locator('[data-testid="alerts-now"] p.muted')).toBeVisible();
+  expect(await leftovers(page), 'alerts checked on the primary').toEqual([]);
+  // The plans of agents: every state, a preview with a simulation, the buttons of one that waits.
+  const plan = (id: string, state: string, o: Record<string, unknown> = {}) => ({
+    id, state, summary: `Change ${id}`, tool: 'rules', method: 'PUT', path: `/api/v1/rules/${id}`, reason: 'a test', requestedBy: 'agent', needsApproval: true, configVersion: 3, createdUnixSeconds: Date.parse(T0) / 1000 - 90,
+    expiresUnixSeconds: Date.parse(T0) / 1000 + 400, preview: {}, ...o,
+  });
+  const plans = [
+    plan('p-1', 'pending', { preview: { impact: 'Blocks game.example.com for everyone.', warnings: ['It also blocks a name a device asked for an hour ago.'], before: null, after: { domain: 'game.example.com' }, simulation: SIMULATION(null) } }),
+    plan('p-2', 'ready'), plan('p-3', 'approved', { decidedBy: 'admin' }), plan('p-4', 'rejected', { decidedBy: 'admin' }), plan('p-5', 'applying'), plan('p-6', 'applied'),
+    plan('p-7', 'stale'), plan('p-8', 'failed'), plan('p-9', 'discarded'), plan('p-10', 'expired'), plan('p-11', 'brand_new'),
+  ];
+  let decided = '';
+  await page.route('**/api/v1/plans', (r) => r.fulfill({ json: { items: plans } }));
+  await page.route('**/api/v1/plans/*/approve', (r) => {
+    decided = 'approved';
+    return r.fulfill({ json: plan('p-1', 'approved') });
+  });
+  await open(page, '/agent-changes', '[data-testid="plan"]');
+  await expect(page.getByTestId('plan')).toHaveCount(11);
+  expect(await leftovers(page), 'plans in every state, with a preview, warnings and a simulation').toEqual([]);
+  await page.locator('[data-testid="plan"] button.primary').first().click();
+  await expect.poll(() => decided).toBe('approved');
+  await clean(page, sent);
+});
+
+const CSET = {
+  maxBytes: 64e6, maxEntries: 50_000, maxTtlSeconds: 86_400, minTtlSeconds: 30, negativeTtlMaxSeconds: 3600, persist: true, prefetch: true, prefetchMinHits: 3, prefetchThresholdPercent: 10, serveStale: true,
+  servfailTtlSeconds: 60, staleAnswerWaitMs: 1800, staleMaxAgeSeconds: 86_400,
+};
+const CPOINT = (i: number) => ({ answeredPercent: 80, at: new Date(Date.parse(T0) - (6 - i) * 15_000).toISOString(), bytes: 1e6, entries: 100, evictions: 1, hitPercent: 70, lookups: 50, prefetches: 2, staleServed: 3 });
+const CSTAT = (node: string | null, o: Record<string, unknown> = {}) => ({
+  answeredPercent: 82, bytes: 2e7, entries: 1200, evictions: 3, hitPercent: 80, hits: 900, inserts: 500, misses: 100, node, prefetches: 9, staleServed: 4, uncacheable: 0, settings: CSET,
+  sizing: { advice: 'The cache is a little small.', lookups: 1000, peakBytes: 3e7, steps: [{ extraBytes: 1e7, extraHitPercent: 1.5, extraHits: 15, sizePercent: 150 }, { extraBytes: 2e7, extraHitPercent: 2.5, extraHits: 25, sizePercent: 200 }], verdict: 'grow' },
+  warmStart: { at: T0, loaded: 1, note: null }, history: [0, 1, 2, 3, 4, 5].map(CPOINT), ...o,
+});
+const CMAKE = (o: Record<string, unknown> = {}) => ({ nodata: 3, nxdomain: 20, positive: 100, servfail: 1, stale: 4, validated: 50, ...o });
+const CENTRY = (name: string, o: Record<string, unknown> = {}) => ({ ageSeconds: 5, answers: 2, authentic: true, bytes: 120, dnssecOk: false, hits: 9, name, qtype: 'A', rcode: 'NOERROR', ttlLeftSeconds: 120, ...o });
+
+test('api_012 pseudo locale leaves no literal text: the cache of seven nodes, their settings and what they hold', async ({ page }) => {
+  const sent = await watch(page);
+  const names = ['homelab', 'pi', 'attic', 'cellar', 'den', 'loft', 'shed'];
+  const stats = [
+    CSTAT('homelab'),
+    CSTAT('pi', { settings: { ...CSET, persist: false, serveStale: false, prefetch: false, maxEntries: null }, sizing: { ...CSTAT(null).sizing, verdict: 'learning', steps: [] }, warmStart: null, answeredPercent: 80, hitPercent: 80 }),
+    CSTAT('attic', { settings: { ...CSET, staleAnswerWaitMs: 0 }, sizing: { ...CSTAT(null).sizing, verdict: 'ok' }, warmStart: { at: T0, loaded: null, note: 'no saved cache was found' } }),
+    CSTAT('cellar', { settings: { ...CSET, staleAnswerWaitMs: null }, sizing: { ...CSTAT(null).sizing, verdict: 'shrink' }, warmStart: { at: T0, loaded: 3, note: null }, answeredPercent: null, hitPercent: null }),
+    CSTAT('den', { sizing: null, settings: null, history: [] }),
+    CSTAT('loft', { sizing: { ...CSTAT(null).sizing, verdict: 'brand_new' } }),
+    CSTAT('shed'),
+  ];
+  const held = (node: string, o: Record<string, unknown> = {}) => ({ node, makeup: CMAKE(), entries: [CENTRY('a.example'), CENTRY('b.example', { qtype: 'AAAA', dnssecOk: true, rcode: 'NXDOMAIN', answers: 0, ttlLeftSeconds: -30, authentic: false }), CENTRY(`${node}.example`, { hits: 1 })], ...o });
+  let entries: Record<string, unknown>[] = names.map((n) => held(n));
+  entries[1] = { node: 'pi', error: 'the node did not answer', makeup: CMAKE({ positive: 0, nxdomain: 0, nodata: 0, servfail: 0 }), entries: [] };
+  entries[2] = held('attic', { makeup: CMAKE({ positive: 1, nxdomain: 1, nodata: 1, servfail: 1 }) });
+  await page.route('**/api/v1/cache/stats', (r) => r.fulfill({ json: { items: stats } }));
+  await page.route('**/api/v1/cache/entries?**', (r) => r.fulfill({ json: { items: entries } }));
+  await signIn(page);
+  await open(page, '/cache', '[data-testid="cache-top"]');
+  await expect(page.getByTestId('cache-node')).toHaveCount(7);
+  await page.locator('div.table-wrap + button.link.small').click();
+  await page.locator('[data-testid="cache-top"] td button[aria-expanded]').first().click();
+  await expect(page.locator('ul.per-node')).toBeVisible();
+  await page.locator('[data-testid="cache-node"] details summary').first().click();
+  expect(await leftovers(page), 'seven nodes: every warm start, size verdict and serve-stale line, their settings, the makeup and the merged names').toEqual([]);
+  await page.locator('.head-row select').first().selectOption('expiring');
+  entries = [held('homelab', { entries: [] })];
+  await page.route('**/api/v1/cache/entries?**', (r) => r.fulfill({ json: { items: entries } }));
+  await page.locator('.head-row select').first().selectOption('bytes');
+  await expect(page.locator('.empty').first()).toBeVisible();
+  expect(await leftovers(page), 'nothing cached').toEqual([]);
+  await page.locator('.head-row select').first().selectOption('expiring');
+  await expect(page.locator('.empty').first()).toBeVisible();
+  expect(await leftovers(page), 'nothing cached that is still fresh').toEqual([]);
   await clean(page, sent);
 });
