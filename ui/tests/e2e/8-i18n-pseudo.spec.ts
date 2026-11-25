@@ -8,53 +8,23 @@
 // the layer has (the English ledger says which file had what). A piece passes when it carries a
 // pseudo character, or sits under translate="no". Text nodes, the attributes a reader sees or hears,
 // and canvas text (fillText/strokeText, hooked) are read. Once every file is on the layer this is
-// the design's whole-page rule.
+// the design's whole-page rule. The rule itself is i18n-pseudo-rule.ts (held to fixtures, with no
+// browser, by 7-i18n-pseudo-rule.spec.ts).
 import { expect, test, type Page, type Route } from '@playwright/test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import * as lib from '../../scripts/i18n-lib.mjs';
-import { LOWER, UPPER } from '../../src/lib/i18n/pseudo';
+import { DATA, PSEUDO, SERVER_WORDS, makeRule, type Ledger } from './i18n-pseudo-rule';
 import { UI } from './i18n-fixture';
 
 const ADMIN = { user: 'admin', pass: 'correct horse battery' };
-const PSEUDO = new RegExp(`[${[...LOWER, ...UPPER].join('')}]`);
-const LEDGER: Record<string, { markup: string[]; script: string[] }> = JSON.parse(readFileSync(join(UI, 'tests/i18n-fixtures/english-ledger.json'), 'utf8'));
-const LAYER = new Set(lib.check(UI, { ratchets: false }).files.filter((f: { usesLayer: boolean }) => f.usesLayer).map((f: { rel: string }) => f.rel));
+const LEDGER: Ledger = JSON.parse(readFileSync(join(UI, 'tests/i18n-fixtures/english-ledger.json'), 'utf8'));
+const LAYER = new Set<string>(lib.check(UI, { ratchets: false }).files.filter((f: { usesLayer: boolean }) => f.usesLayer).map((f: { rel: string }) => f.rel));
 // The help glossary is English data outside the layer (ADR-189: help stays English in part A).
 const HELP: string[] = JSON.parse(readFileSync(join(UI, '../docs/help/topics.json'), 'utf8')).topics.flatMap((t: Record<string, unknown>) =>
   Object.values(t).filter((v): v is string => typeof v === 'string'),
 );
-const OFF = new Set([...Object.entries(LEDGER).filter(([rel]) => !LAYER.has(rel)).flatMap(([, e]) => [...e.markup, ...e.script]), ...HELP]);
-// Values the test server holds that read like English a file on the layer had: the note
-// 1-ui.spec.ts adds (the note form's example text), the support manifest's "unknown" and the health
-// level "severe" the wall shows as it is (words the layer only compares with). They are data on the
-// page, not text of the layer.
-const DATA = new Set([
-  'moved the access point to the hallway',
-  'unknown',
-  'severe',
-]);
-// A1e: words of the server's own vocabulary (a status, a response code) that a shared file shows as it
-// is: the wall's flow panel (WallFlow.svelte, A1d) writes a node's name in its SVG, which the mocked
-// flow of the wall test names `cached`, `forwarded` and `NOERROR`. The same words are the Monitor
-// pages' English since those pages moved to the layer. Text nodes only.
-const SERVER_WORDS = new Set(['cached', 'forwarded', 'NOERROR']);
-const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-const letters = (s: string) => (s.replace(/\{\}/g, '').match(/[A-Za-z]/g) ?? []).length;
-/** A path, a key, a type or a format: one token with a separator in it, no space. */
-const CODE = /^[^\s]*[./:_=-][^\s]*$/;
-/** The English only files on the layer had, each as a whole-text pattern (`{}`: anything). A
- * pattern with a placeholder needs words of its own (eight letters), or it would match any text. */
-const OWN = Object.entries(LEDGER)
-  .filter(([rel]) => LAYER.has(rel))
-  .flatMap(([rel, e]) => [...e.markup, ...e.script].map((s) => ({ s, rel })))
-  .filter(({ s }) => !OFF.has(s) && !CODE.test(s) && /[A-Za-z]{2}/.test(s.replace(/\{\}/g, '')) && (!s.includes('{}') || letters(s) >= 8))
-  .map(({ s, rel }) => ({ re: new RegExp(`^${s.split('{}').map(escape).join('[\\s\\S]*?')}$`), from: `${rel}: ${JSON.stringify(s)}` }));
-/** The English of files off the layer, as the same patterns: a piece that is that English belongs to
- * those files, whatever pattern of a layer file it also matches. */
-const OFF_PATTERNS = [...OFF]
-  .filter((s) => s.includes('{}') && !CODE.test(s) && letters(s) >= 8)
-  .map((s) => new RegExp(`^${s.split('{}').map(escape).join('[\\s\\S]*?')}$`));
+const RULE = makeRule({ ledger: LEDGER, layer: LAYER, help: HELP, data: DATA, serverWords: SERVER_WORDS });
 
 async function signIn(page: Page) {
   await page.goto('/');
@@ -107,19 +77,7 @@ async function leftovers(page: Page): Promise<string[]> {
     }
     return { text: out, other: [...attrs, ...(window as unknown as { __i18aCanvas: string[] }).__i18aCanvas.map(tidy)] };
   });
-  const found: string[] = [];
-  for (const p of new Set([...text, ...other])) {
-    // A piece an off-layer file has belongs to that file, whatever pattern of a layer file it also
-    // matches (`{}query log {}` matched whole sentences of the Settings and Heatmap pages, and
-    // `{}% of the budget left` the wall's "{}: {} % of the budget left").
-    if (PSEUDO.test(p) || OFF.has(p) || DATA.has(p)) continue;
-    // A server's word the page shows as it is, as a text node only (an attribute or canvas text is
-    // the page's own).
-    if (SERVER_WORDS.has(p) && text.includes(p) && !other.includes(p)) continue;
-    const m = OWN.find((o) => o.re.test(p));
-    if (m && !OFF_PATTERNS.some((re) => re.test(p))) found.push(`${JSON.stringify(p)} (${m.from})`);
-  }
-  return found;
+  return RULE.found(text, other);
 }
 
 /** Nothing the page sent or stored holds pseudo text. */
