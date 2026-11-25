@@ -27,9 +27,17 @@ const HELP: string[] = JSON.parse(readFileSync(join(UI, '../docs/help/topics.jso
 const OFF = new Set([...Object.entries(LEDGER).filter(([rel]) => !LAYER.has(rel)).flatMap(([, e]) => [...e.markup, ...e.script]), ...HELP]);
 // Values the test server holds that read like English a file on the layer had: the note
 // 1-ui.spec.ts adds (the note form's example text), the support manifest's "unknown" and the health
-// level "severe" the wall shows as it is (words the layer only compares with). They are data on the
-// page, not text of the layer.
-const DATA = new Set(['moved the access point to the hallway', 'unknown', 'severe']);
+// level "severe" the wall shows as it is (words the layer only compares with), and (A1d) the tooltip
+// DashboardLegacy.svelte, a file off the layer, joins at run time from two of its own sentences (a
+// path's, and " Over " plus a protocol's): no literal of that file is the whole text, and its pieces
+// read like the pattern of SimulationCard.svelte's old "{} quer{}, {} device{}{}". They are data on
+// the page, not text of the layer.
+const DATA = new Set([
+  'moved the access point to the hallway',
+  'unknown',
+  'severe',
+  "Answered without looking anything up: blocked names, refused or rate-limited queries, malformed ones, and special names (like Firefox's DNS-over-HTTPS canary). Over plain DNS over UDP, what most devices use.",
+]);
 const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const letters = (s: string) => (s.replace(/\{\}/g, '').match(/[A-Za-z]/g) ?? []).length;
 /** A path, a key, a type or a format: one token with a separator in it, no space. */
@@ -416,6 +424,226 @@ test('api_012 pseudo locale leaves no literal text: a device and a change kept i
   await page.locator('form.form button.primary').click();
   await expect(page.getByTestId('keep-in-git')).toBeVisible();
   expect(await leftovers(page), 'a change to keep in Git').toEqual([]);
+  await clean(page, sent);
+});
+
+// A1d: what the service level, the latency heatmap, the wall's panels, the cluster's topology,
+// comparison and rollouts, the pause control, the simulation card and the rhythm strip show only with
+// data a test server does not have.
+const NOW = Math.floor(Date.now() / 1000);
+const BOUNDS = [250, 500, 1000, 2000, 4000, 8000, 16_000, 32_000, 64_000, 125_000, 250_000, 500_000, 1_000_000, 2_000_000, 3_000_000, 5_000_000];
+const HEAT_STARTS = Array.from({ length: 30 }, (_, i) => NOW - (30 - i) * 60);
+const HEAT = (by: string, names: string[]) => ({
+  boundsUs: BOUNDS, by, from: T0, missingNodes: ['attic'], partial: true, step: 'minute', to: T0, starts: HEAT_STARTS,
+  series: Object.fromEntries(names.map((n, k) => [n, HEAT_STARTS.map((_, c) => Array.from({ length: 17 }, (__, r) => Math.max(0, Math.round(40 * Math.exp(-((r - 3 - 2 * k) ** 2) / 5) * (1.2 + Math.sin(c / 4)))))) ])),
+});
+const EXEMPLARS = { missingNodes: [], items: [{ latencyUs: 120_000, node: null, path: 'upstream', time: T0, traceId: 'a'.repeat(32), tsUnixMicros: (NOW - 600) * 1e6, upstream: 'quad9' }, { latencyUs: 900, node: null, path: 'cache', time: T0, traceId: 'b'.repeat(32), tsUnixMicros: (NOW - 300) * 1e6, upstream: null }] };
+const burn = (window: string, rate: number | null) => ({ window, rate, bad: 12, total: rate == null ? 0 : 1000 });
+const objective = (o: Record<string, unknown>) => ({ alert: null, budgetRemainingPercent: 62.4, name: 'availability', good: 99_900, goodMeans: "answers that aren't SERVFAIL", latencyMs: null, sliPercent: 99.912, summary: 'x', targetPercent: 99.9, total: 100_000, burnRates: [burn('5m', 0.4), burn('1h', 1.2), burn('3d', null)], ...o });
+const SLO = {
+  enabled: true, windowDays: 30, missingNodes: ['attic'],
+  objectives: [objective({ alert: 'fast', budgetRemainingPercent: 12.5 }), objective({ name: 'latency', alert: 'ticket', budgetRemainingPercent: -3, latencyMs: 50 }), objective({ name: 'other', alert: 'slow', budgetRemainingPercent: null, sliPercent: null, total: 0 })],
+};
+const SUMMARY = (to: boolean) => ({ activeClients: 12, blocked: 5000, blockedPercent: 20, cacheHitPercent: 62, cached: 12_000, forwarded: 8000, fromUnixSeconds: NOW - 3600, latency: [], missingNodes: [], nxdomain: 300, queries: to ? 10 : 25_000, refreshed: 100, servfail: 40, toUnixSeconds: NOW });
+const ATTRIBUTION = {
+  objective: 'availability', step: '1h', from: T0, to: T0, note: null, missingNodes: [], budget: { allowedBad: 500, answered: 100_000, bad: 300, remainingPct: 40, targetPct: 99.5 },
+  byClient: [{ key: '192.168.1.20', bad: 3000, sharePct: 53.6, exact: true, errorMax: null, name: 'laptop' }], byName: [], byNode: [], byRcode: [], byStatus: [], byUpstream: [],
+  coverage: { approximate: false, hidden: [], partialNodes: [], topListsFromHours: 24 }, timeline: [],
+};
+const fnode = (stage: string, name: string, count: number) => ({ count, deadEnd: 0, id: `${stage}:${name}`, name, stage });
+const flink = (a: string, b: string, count: number, failure = false) => ({ count, failure, source: a, target: b });
+const FLOW = {
+  from: T0, to: T0, total: 1200, missingNodes: [],
+  nodes: [fnode('group', 'default', 1000), fnode('group', 'tv', 2), fnode('status', 'cached', 500), fnode('status', 'forwarded', 600), fnode('upstream', 'quad9', 400), fnode('rcode', 'NOERROR', 1100), fnode('rcode', 'SERVFAIL', 20)],
+  links: [flink('group:default', 'status:cached', 400), flink('group:default', 'status:forwarded', 600), flink('group:tv', 'status:cached', 2), flink('status:forwarded', 'upstream:quad9', 400), flink('upstream:quad9', 'rcode:NOERROR', 380), flink('upstream:quad9', 'rcode:SERVFAIL', 20, true), flink('status:cached', 'rcode:NOERROR', 500)],
+};
+
+test('api_012 pseudo locale leaves no literal text: service level, latency heatmap and the wall', async ({ page }) => {
+  const sent = await watch(page);
+  await page.addInitScript(() => localStorage.setItem('telltale.mode.admin', 'advanced'));
+  await page.route(/\/api\/v1\/stats\/slo(\?.*)?$/, (r) => r.fulfill({ json: SLO }));
+  await page.route('**/api/v1/stats/slo/attribution?**', (r) => r.fulfill({ json: ATTRIBUTION }));
+  await page.route('**/api/v1/stats/summary?**', (r) => r.fulfill({ json: SUMMARY(new URL(r.request().url()).searchParams.has('to')) }));
+  await page.route('**/api/v1/stats/latency/heatmap?**', (r) => r.fulfill({ json: HEAT('path', ['cache', 'upstream', 'local', 'synthesized']) }));
+  await page.route('**/api/v1/stats/latency/exemplars?**', (r) => r.fulfill({ json: EXEMPLARS }));
+  await page.route('**/api/v1/stats/flow?**', (r) => r.fulfill({ json: FLOW }));
+  await signIn(page);
+  const drawn = () => page.evaluate(() => (window as unknown as { __i18aCanvas: string[] }).__i18aCanvas.length);
+  await open(page, '/?view=legacy', '[data-testid="slo-card"]');
+  await expect(page.getByTestId('slo-availability')).toBeVisible();
+  expect(await leftovers(page), 'the tiles with a change, and the service level card').toEqual([]);
+  const before = await drawn();
+  await page.getByTestId('time-heatmap-tab').click();
+  await expect(page.getByTestId('exemplar').first()).toBeVisible();
+  await expect.poll(drawn).toBeGreaterThan(before);
+  await page.getByTestId('latency-heatmap-canvas').hover({ position: { x: 300, y: 40 } });
+  await expect(page.locator('[data-testid="latency-heatmap"] .tip')).toBeVisible();
+  expect(await leftovers(page), 'the latency heatmap, its canvas text, a tip and the dots').toEqual([]);
+  await page.locator('[data-testid="latency-heatmap"] button.link').click();
+  await expect(page.getByTestId('latency-heatmap-table')).toBeVisible();
+  expect(await leftovers(page), 'the latency heatmap as a table').toEqual([]);
+  const ready: Record<string, string> = {
+    flow: '[data-testid="wall-flow"] svg text',
+    slo: '[data-testid="wall-slo"] .who',
+    kpi: '[data-testid="wall-kpi"] .tile',
+    latency: '[data-testid="wall-latency-canvas"]',
+  };
+  for (const p of ['flow', 'slo', 'kpi', 'latency']) {
+    const had = await drawn();
+    await open(page, `/wall?layout=single&panels=${p}`, `[data-testid="wall-panel-${p}"]`);
+    await expect(page.locator(ready[p]).first()).toBeVisible();
+    if (p === 'latency') await expect.poll(drawn).toBeGreaterThan(had);
+    if (p === 'kpi') await expect(page.locator('[data-testid="wall-kpi"] .value').first()).not.toHaveText('–');
+    expect(await leftovers(page), `the wall's ${p} panel`).toEqual([]);
+  }
+  await clean(page, sent);
+});
+
+const pnode = (o: Record<string, unknown>) => ({ ...node({}), ...o });
+const CLUSTER3 = {
+  ...CLUSTER,
+  rollout: { canaries: ['n-bbbb2222'], stage: 'canary', version: '3.131', pinned: null },
+  nodes: [
+    pnode({ nodeId: 'n-aaaa1111', site: 'homelab', role: 'primary', thisNode: true, rttMs: null }),
+    pnode({ nodeId: 'n-bbbb2222', site: 'homelab', role: 'secondary', ready: false, maintenance: { by: 'admin', node: 'pi', reason: 'SD card swap', secondsLeft: 1800, since: T0, until: T0 } }),
+    pnode({ nodeId: 'n-cccc3333', site: 'attic', role: 'secondary', up: false, connected: false, restarts: 3, configLag: 2 }),
+    pnode({ nodeId: 'n-dddd4444', site: 'cloud', role: 'secondary', witness: true }),
+    pnode({ nodeId: 'n-ffff6666', site: 'cloud', role: 'emergency primary' }),
+    ...Array.from({ length: 8 }, (_, i) => pnode({ nodeId: `n-pod${i}`, site: 'k8s', role: 'secondary', ephemeral: true, pod: `telltaledns-756965cdc7-p${i}`, kubeNode: i < 7 ? 'kube-1' : null })),
+  ],
+};
+const series = (f: (i: number) => number | null) => Array.from({ length: 6 }, (_, i) => f(i));
+const compareNode = (o: Record<string, unknown>) => ({
+  answered: 120_000, fromCache: 70_000, fromCachePct: 58.3, intervals: { servfailPct: [0.1, 0.4], slowPct: [0.02, 0.2], fromCachePct: [58, 58.6], upstreamFailPct: [0.5, 2.1] },
+  label: 'homelab', nodeId: 'n-aaaa1111', p50Us: 800, p99Us: 45_000, qps: 33.4, servfail: 240, servfailPct: 0.2, slow: 120, slowPct: 0.1, thisNode: true, upstreamFailPct: 1.2, upstreamFailures: 12, upstreamQueries: 1000,
+  series: { fromCachePct: series((i) => 55 + i), p99Us: series((i) => (i === 2 ? null : 40_000 + i)), qps: series((i) => 30 + i), servfailPct: series(() => 0.2), slowPct: series(() => 0.1), start: series((i) => NOW - i * 300), upstreamFailPct: series((i) => i) },
+  ...o,
+});
+const COMPARE = {
+  findings: [
+    { detail: 'SERVFAIL 4.2 % against 0.2 % on the other nodes, since 21:05', label: 'pi', level: 'odd', metric: 'servfailPct', nodeId: 'n-bbbb2222', observed: 4.2, others: 0.2, spread: 0.5, oddSince: T0 },
+    { detail: 'Upstream failures 12 % looks worse only because it asked upstream 25 times', label: 'attic', level: 'note', metric: 'upstreamFailPct', nodeId: 'n-cccc3333', observed: 12, others: 1.2, spread: 1, oddSince: null },
+  ],
+  from: T0, to: T0, missingNodes: ['cloud'], partial: true, step: 'hour',
+  nodes: [compareNode({}), compareNode({ label: 'pi', nodeId: 'n-bbbb2222', thisNode: false, servfailPct: 4.2, p50Us: null, p99Us: null }), compareNode({ label: 'attic', nodeId: 'n-cccc3333', thisNode: false, answered: 0, intervals: {}, upstreamFailPct: 12 })],
+};
+const rnode = (n: string, o: Record<string, unknown>) => ({ appliedSeq: 131, canary: false, connected: true, node: n, ready: true, servfailPercent: 0.3, site: 'x', ...o });
+const ROLLOUT = {
+  bakeEnds: null, bakeSecs: 600, canaries: ['site:pi'], fromPrimary: true, pinned: null, readings: { afterPercent: 0.6, answers: 1200, beforePercent: null, reason: null }, rolloutCanaries: ['n-bbbb2222'],
+  secondsLeft: 420, skipped: 'no canary node was online', stable: '3.130', stage: 'canary', started: T0, version: '3.131', waitingSince: null,
+  nodes: [rnode('n-aaaa1111', {}), rnode('n-bbbb2222', { canary: true }), rnode('n-cccc3333', { canary: true, ready: false, appliedSeq: 130 }), rnode('n-dddd4444', { connected: false, ready: false })],
+};
+const version = (v: string, outcome: string, o: Record<string, unknown>) => ({ by: 'this node', created: T0, current: false, filterVersion: 4, outcome, pinnable: true, pinnedTo: null, readings: null, reason: null, version: v, ...o });
+const VERSIONS = { history: 8, items: [version('3.131', 'canary', { current: true, pinnable: false }), version('3.130', 'stable'), version('3.129', 'canary_failed', { readings: { afterPercent: 6, answers: 90, beforePercent: 0.4, reason: 'SERVFAIL rose on the canaries' } }), version('3.128', 'pinned_to', { pinnedTo: '3.124', reason: 'by hand', pinnable: false }), version('3.127', 'new-outcome', {})] };
+
+test('api_012 pseudo locale leaves no literal text: topology, comparison and rollouts', async ({ page }) => {
+  const sent = await watch(page);
+  let pinned = false;
+  await page.route('**/api/v1/cluster', (r) => r.fulfill({ json: CLUSTER3 }));
+  await page.route('**/api/v1/cluster/compare?**', (r) => r.fulfill({ json: COMPARE }));
+  await page.route('**/api/v1/cluster/rollout', (r) =>
+    r.fulfill({
+      json: pinned
+        ? { ...ROLLOUT, stage: 'pinned', version: null, pinned: { by: 'admin', changes: ['lists: changed'], diff: [], reason: 'broke banking', since: T0, to: '3.124' }, readings: { afterPercent: null, answers: 0, beforePercent: null, reason: 'SERVFAIL rose' } }
+        : ROLLOUT,
+    }),
+  );
+  await page.route('**/api/v1/cluster/versions', (r) => r.fulfill({ json: VERSIONS }));
+  await page.route('**/api/v1/cluster/versions/*/pin?**', (r) => r.fulfill({ json: { changes: ['lists: changed'], configVersion: 1, done: 'would pin', dryRun: true } }));
+  await page.route('**/api/v1/cluster/pin?**', (r) => r.fulfill({ json: { changes: [], configVersion: 1, done: 'would unpin', dryRun: true } }));
+  await signIn(page);
+  await open(page, '/cluster', '[data-testid="cluster-topology"]');
+  expect(await leftovers(page), 'the topology, with pods, a witness, a node in maintenance and a node that is down').toEqual([]);
+  await open(page, '/cluster?tab=compare', '[data-testid="compare-grid"]');
+  expect(await leftovers(page), 'the comparison').toEqual([]);
+  await page.getByTestId('compare-table-toggle').click();
+  await expect(page.getByTestId('compare-table')).toBeVisible();
+  expect(await leftovers(page), 'the comparison as a table').toEqual([]);
+  await open(page, '/cluster?tab=rollouts', '[data-testid="rollout-baking"]');
+  expect(await leftovers(page), 'a version baking').toEqual([]);
+  await page.getByTestId('pin-open').first().click();
+  await page.getByTestId('pin-form').locator('input').fill('i18n pseudo');
+  await page.getByTestId('pin-check').click();
+  await expect(page.getByTestId('pin-preview')).toBeVisible();
+  expect(await leftovers(page), 'a pin checked').toEqual([]);
+  pinned = true;
+  await open(page, '/cluster', '[data-testid="cluster-topology"]');
+  await open(page, '/cluster?tab=rollouts', '[data-testid="pin-banner"]');
+  await page.getByTestId('unpin').click();
+  await expect(page.getByTestId('unpin-confirm')).toBeVisible();
+  expect(await leftovers(page), 'the pin banner and an unpin checked').toEqual([]);
+  await clean(page, sent);
+});
+
+const SIMULATION = (reason: string | null, available = true) => ({
+  applicable: true, available, from: T0, to: T0, rows: 12_345, partial: true, unchanged: 12_000, undetermined: 1, missingNodes: ['attic'], reason, notes: ['identity_from_event', 'something_new'],
+  newlyBlocked: { devices: 1, queries: 300, topNames: [{ devices: 1, list: 'ads', name: 'ads.example.com', queries: 200 }, { devices: 1, list: null, name: 'one.example.net', queries: 1 }] },
+  newlyAllowed: { devices: 3, queries: 40, topNames: [] }, changedRoute: { devices: 2, queries: 2, topNames: [] }, changedAnswer: { devices: 0, queries: 0, topNames: [] },
+  byDevice: [{ changedAnswer: 0, changedRoute: 1, client: '192.168.1.20', name: 'laptop', newlyAllowed: 20, newlyBlocked: 100 }, { changedAnswer: 3, changedRoute: 0, client: '192.168.1.21', name: null, newlyAllowed: 0, newlyBlocked: 0 }], byGroup: [],
+});
+const BEACON = (id: string, kind: string) => ({
+  acknowledged: null, baseline: 40, client: '127.0.1.11', clientName: null, detail: 'Asks for beacon.example.net every 38 seconds.', domain: 'beacon.example.net', id, informational: false, kind,
+  mutedBy: null, nodes: [], observed: 900, rhythm: Array.from({ length: 24 }, (_, i) => Math.round(200 * Math.exp(-((i - 9) ** 2)))), spread: 12, stormMute: null, threshold: 200, windowSeconds: 3600, windowStart: T0,
+});
+const rdom = (domain: string, o: Record<string, unknown>) => ({
+  domain, dominantBin: 9, dominantSharePct: 62, hour: Array.from({ length: 24 }, (_, i) => Math.round(30 * Math.exp(-((i - 9) ** 2)))), knownPeriodic: false, meanPerHour: 60, nodes: [], period: 'every 38 s',
+  recent: Array.from({ length: 24 }, (_, i) => Math.round(300 * Math.exp(-((i - 9) ** 2)))), regularHours: 0, since: T0, ...o,
+});
+const RHYTHM = {
+  available: true, client: '127.0.1.11', missingNodes: [], reason: null,
+  binsS: [1, 1.5, 2.2, 3.3, 5, 7.5, 11, 17, 25, 38, 56, 84, 126, 190, 285, 427, 640, 960, 1440, 2160, 3240, 4860, 7290],
+  domains: [rdom('time.example.com', { knownPeriodic: true }), rdom('beacon.example.net', { regularHours: 5 }), rdom('www.example.org', { period: null })],
+};
+
+test('api_012 pseudo locale leaves no literal text: pause, simulation and rhythm', async ({ page }) => {
+  const sent = await watch(page);
+  await page.route('**/api/v1/analytics/anomalies?**', (r) => r.fulfill({ json: { items: [BEACON('f-b', 'beacon'), BEACON('f-c', 'chatty_loop')] } }));
+  await page.route('**/api/v1/clients/*/rhythm', (r) => r.fulfill({ json: RHYTHM }));
+  const reasons = ['disabled', 'privacy_level', 'no_query_log', 'busy', 'local_file', 'download_limit', 'unheard_of', null];
+  let call = 0;
+  await page.route('**/api/v1/rules/*?**', (r) => {
+    const url = new URL(r.request().url());
+    if (r.request().method() !== 'PUT' || !url.searchParams.has('simulate')) return r.fallback();
+    const n = call++;
+    return r.fulfill({ json: { applied: false, preview: null, simulation: n === 0 ? SIMULATION(null) : SIMULATION(reasons[(n - 1) % reasons.length], false), warnings: [] } });
+  });
+  await signIn(page);
+  await open(page, '/', '[data-testid="stat-queries"]');
+  await page.locator('.pause-menu button.icon-btn').click();
+  await expect(page.locator('.pause-menu [role="menu"]')).toBeVisible();
+  expect(await leftovers(page), 'the pause menu').toEqual([]);
+  // The control reads the pauses when it starts (and every 15 s): each state is a new page load.
+  const paused = async (pauses: { group: string | null; secondsLeft: number }[], ready: string, what: string) => {
+    await page.unroute('**/api/v1/blocking');
+    await page.route('**/api/v1/blocking', (r) => r.fulfill({ json: { items: [{ node: 'pi', pauses: pauses.map((p) => ({ ...p, until: T0 })) }] } }));
+    await page.reload();
+    await expect(page.locator(ready)).toBeVisible();
+    expect(await leftovers(page), what).toEqual([]);
+  };
+  await paused([{ group: 'kids', secondsLeft: 900 }, { group: 'guests', secondsLeft: 900 }], '[data-testid="groups-paused"]', 'two groups paused');
+  await paused([{ group: 'kids', secondsLeft: 900 }], '[data-testid="groups-paused"]', 'one group paused');
+  for (const secs of [30, 1500, 5400]) await paused([{ group: null, secondsLeft: secs }], '[data-testid="blocking-paused"]', `everyone paused for ${secs} s`);
+  await page.unroute('**/api/v1/blocking');
+  await page.reload();
+  await expect(page.locator('.pause-menu button.icon-btn')).toBeVisible();
+  await open(page, '/rules', '[data-testid="quick-rule-form"]');
+  await page.locator('[data-testid="quick-rule-form"] input.mono').fill('i18n-sim.example.com');
+  await page.getByTestId('simulate-button').click();
+  await expect(page.getByTestId('simulation-card')).toBeVisible();
+  expect(await leftovers(page), 'a simulation').toEqual([]);
+  for (let i = 0; i < reasons.length; i++) {
+    await page.getByTestId('simulate-button').click();
+    await expect(page.getByTestId('simulation-unavailable')).toBeVisible();
+    expect(await leftovers(page), `a simulation that could not run (${reasons[i]})`).toEqual([]);
+  }
+  await open(page, '/anomalies', '[data-testid="rhythm"]');
+  expect(await leftovers(page), "a beacon's rhythm").toEqual([]);
+  await open(page, '/clients?device=127.0.1.11', '[data-testid="rhythm-row"]');
+  expect(await leftovers(page), "a device's rhythm").toEqual([]);
+  await page.locator('[data-testid="rhythm"] .seg button').last().click();
+  await page.getByTestId('rhythm-table-toggle').click();
+  await expect(page.getByTestId('rhythm-table')).toBeVisible();
+  expect(await leftovers(page), "a device's rhythm as a table").toEqual([]);
   await clean(page, sent);
 });
 
