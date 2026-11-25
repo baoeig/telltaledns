@@ -5,10 +5,9 @@
   import { api } from '../api';
   import { can } from '../session.svelte';
   import { changes, KINDS } from '../annotations.svelte';
-  import { tk } from '../i18n';
+  import { tk, tr } from '../i18n';
   import ErrorNote from './ErrorNote.svelte';
   import HelpButton from './HelpButton.svelte';
-  import { tr } from '../i18n';
   const { t } = tr('changesControls');
 
   let { part = 'head', advanced = false }: { part?: 'head' | 'body'; advanced?: boolean } = $props();

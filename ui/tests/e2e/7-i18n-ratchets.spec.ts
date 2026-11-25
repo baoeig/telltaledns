@@ -175,7 +175,7 @@ test('api_012 migrated files conserve their english strings', () => {
   expect(lib.ledgerProblems([mod('Holds')], ledger, { new: { 'lib/other.ts': ['x'] } })).toEqual(['"new" English for "lib/other.ts": only for a file on the layer without a ledger entry']);
 });
 
-test('api_012 a whole sentence per variant conserves from the file own fragments', () => {
+test("api_012 a whole sentence per variant conserves from the file's own fragments", () => {
   const head = "<script lang=\"ts\">\n  import { tr } from '../lib/i18n';\n  import T from '../lib/i18n/T.svelte';\n  const { t, tn } = tr('x');\n</script>\n";
   const entryOf = (src: string) => {
     const a = lib.analyzeFile('pages/X.svelte', src, 'x');
