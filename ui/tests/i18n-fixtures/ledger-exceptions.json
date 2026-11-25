@@ -1,4 +1,27 @@
 {
+  "lib/dash/TopList.svelte": [
+    {
+      "fragments": [
+        "Pods asked for",
+        "with each of their DNS search suffixes added, so it's one question that looks like {}:"
+      ],
+      "sentence": "Pods asked for <b>{name}</b> with each of their DNS search suffixes added, so it's one question that looks like {n}:"
+    },
+    {
+      "fragments": [
+        "{} queries · {} of this list ·",
+        "Show its queries"
+      ],
+      "sentence": "{n} queries · {share} of this list · <a>Show its queries</a>"
+    },
+    {
+      "fragments": [
+        "{} queries · {} of this list ·",
+        "Show in the query log"
+      ],
+      "sentence": "{n} queries · {share} of this list · <a>Show in the query log</a>"
+    }
+  ],
   "lib/sankey.ts": [
     {
       "fragments": [

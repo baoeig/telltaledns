@@ -8,6 +8,7 @@
   import { api, type S } from '../lib/api';
   import { changes } from '../lib/annotations.svelte';
   import { change, DashData, remember } from '../lib/dash/data.svelte';
+  import { tk } from '../lib/i18n';
   import DashHead from '../lib/dash/DashHead.svelte';
   import SmoothChart from '../lib/dash/SmoothChart.svelte';
   import Stat from '../lib/dash/Stat.svelte';
@@ -156,13 +157,13 @@
   <DashHead {d} />
 
   <div class="stats">
-    <div class="cell" data-testid="stat-queries"><Stat label="Queries" value={short(s?.queries)} delta={change(s?.queries, d.previous?.queries)} sub={`last ${d.range.label}${d.scope ? ` · ${scopeLabel}` : ''}`} /></div>
+    <div class="cell" data-testid="stat-queries"><Stat label="Queries" value={short(s?.queries)} delta={change(s?.queries, d.previous?.queries)} sub={`last ${tk(d.range.label)}${d.scope ? ` · ${scopeLabel}` : ''}`} /></div>
     <div class="cell" data-testid="stat-blocked"><Stat label="Blocked" value={pct(s?.blockedPercent)} delta={change(s?.blockedPercent, d.previous?.blockedPercent)} sub={`${short(s?.blocked)} queries`} /></div>
     <div class="cell" data-testid="stat-cache"><Stat label="Cache hits" value={pct(s?.cacheHitPercent)} delta={change(s?.cacheHitPercent, d.previous?.cacheHitPercent)} good="up" sub={cacheSub} /></div>
     <div class="cell" data-testid="stat-upstream"><Stat label="Upstream p90" value={ms(d.upstreamP90?.p90Ms)} sub={d.cacheP50 ? `cache p50 ${ms(d.cacheP50.p50Ms)}` : 'this hour'} delta={change(d.upstreamP90?.p90Ms, d.prevP90?.p90Ms)} good="down" /></div>
     <div class="cell" data-testid="stat-clients"><Stat label="Active clients" value={num(s?.activeClients)} sub={d.rangeLabel} /></div>
   </div>
-  <p class="fine muted small">{short(s?.nxdomain)} NXDOMAIN · {short(s?.servfail)} SERVFAIL in the last {d.range.label}</p>
+  <p class="fine muted small">{short(s?.nxdomain)} NXDOMAIN · {short(s?.servfail)} SERVFAIL in the last {tk(d.range.label)}</p>
 
   {#if d.advanced}
     <section class="slo sec" data-testid="slo-card" aria-label="Service level">
