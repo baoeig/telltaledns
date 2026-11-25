@@ -1070,5 +1070,22 @@
       ],
       "sentence": "last {range}"
     }
+  ],
+  "pages/Queries.svelte": [
+    {
+      "fragments": [
+        "Explains how this query would be handled now; lists or settings may have changed since {}. Logged as",
+        "{}."
+      ],
+      "sentence": "Explains how this query would be handled now; lists or settings may have changed since {time}. Logged as <strong>{status}</strong>."
+    },
+    {
+      "fragments": [
+        "Explains how this query would be handled now; lists or settings may have changed since {}. Logged as",
+        "by {}",
+        "{}."
+      ],
+      "sentence": "Explains how this query would be handled now; lists or settings may have changed since {time}. Logged as <strong>{status}</strong> by {list}."
+    }
   ]
 }
