@@ -1033,6 +1033,69 @@
       "sentence": "{all} of all · {part} of {name}"
     }
   ],
+  "pages/Anomalies.svelte": [
+    {
+      "fragments": [
+        "mutes",
+        "Burst of failed lookups",
+        "for this device. Before 0.9 a sweep counted as one, so that mute was probably made for it: it now hides only this device's real bursts. Mute the sweep, then remove",
+        "if the sweep was its only reason."
+      ],
+      "sentence": "<b>{name}</b> mutes <i>Burst of failed lookups</i> for this device. Before 0.9 a sweep counted as one, so that mute was probably made for it: it now hides only this device's real bursts. Mute the sweep, then remove <b>{name}</b> if the sweep was its only reason."
+    },
+    {
+      "fragments": [
+        "by",
+        ": not counted in the badge, the alerts or the metrics",
+        ": “{}”"
+      ],
+      "sentence": "by <b>{by}</b>: not counted in the badge, the alerts or the metrics: “{note}”"
+    },
+    {
+      "fragments": [
+        "by",
+        ": not counted in the badge, the alerts or the metrics"
+      ],
+      "sentence": "by <b>{by}</b>: not counted in the badge, the alerts or the metrics"
+    },
+    {
+      "fragments": [
+        "by {}, {}",
+        ": “{}”"
+      ],
+      "sentence": "by {by}, {when}: “{note}”"
+    },
+    {
+      "fragments": [
+        "by {}, {}"
+      ],
+      "sentence": "by {by}, {when}"
+    },
+    {
+      "fragments": [
+        "Nothing unusual:",
+        "muted",
+        "finding is",
+        "hidden."
+      ],
+      "sentence": "Nothing unusual: {n} muted finding is hidden."
+    },
+    {
+      "fragments": [
+        "Nothing unusual:",
+        "muted",
+        "findings are",
+        "hidden."
+      ],
+      "sentence": "Nothing unusual: {n} muted findings are hidden."
+    },
+    {
+      "fragments": [
+        "ended"
+      ],
+      "sentence": "ended {when}"
+    }
+  ],
   "pages/DashboardCalm.svelte": [
     {
       "fragments": [

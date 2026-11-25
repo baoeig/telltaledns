@@ -204,7 +204,7 @@
     "pages/AgentChanges.svelte": 19,
     "pages/Alerts.svelte": 14,
     "pages/Analyze.svelte": 0,
-    "pages/Anomalies.svelte": 59,
+    "pages/Anomalies.svelte": 0,
     "pages/AuthShell.svelte": 1,
     "pages/Cache.svelte": 63,
     "pages/Clients.svelte": 66,
