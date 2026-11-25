@@ -40,7 +40,7 @@
           {#each rows as r (r.key)}
             {@const to = link?.(r)}
             <tr>
-              <td class="key">{#if to}<a href={to}>{label(r)}</a>{:else}{label(r)}{/if}</td>
+              <td class="key" translate="no">{#if to}<a href={to}>{label(r)}</a>{:else}{label(r)}{/if}</td>
               <td class="num">{num(r.bad)}</td>
               <td class="num">{r.sharePct}%</td>
               {#if rows.some((x) => !x.exact)}<td class="num">{r.exact ? '' : num(r.errorMax ?? 0)}</td>{/if}
@@ -55,7 +55,7 @@
         {@const to = link?.(r)}
         <li>
           <div class="row">
-            <span class="key">{#if to}<a href={to}>{label(r)}</a>{:else}{label(r)}{/if}</span>
+            <span class="key" translate="no">{#if to}<a href={to}>{label(r)}</a>{:else}{label(r)}{/if}</span>
             <span class="spacer"></span>
             <span class="muted small">{num(r.bad)} · {r.sharePct}%{#if !r.exact && r.errorMax} {t('(± up to {max})', { max: num(r.errorMax) })}{/if}</span>
           </div>

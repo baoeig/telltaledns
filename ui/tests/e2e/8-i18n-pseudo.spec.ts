@@ -255,7 +255,7 @@ const row = (key: string, bad: number, exact = true) => ({ key, bad, sharePct: 5
 const BUDGET = {
   objective: 'availability', step: '1h', from: '2026-11-24T10:00:00Z', to: T0, note: null, missingNodes: ['attic'],
   budget: { allowedBad: 500, answered: 100_000, bad: 560, remainingPct: -12, targetPct: 99.5 },
-  byClient: [row('192.168.1.20', 300, false)], byName: [row('ads.example.com', 200, false)], byNode: [], byRcode: [row('SERVFAIL', 560)], byStatus: [row('servfail', 560)], byUpstream: [row('quad9', 400)],
+  byClient: [row('192.168.1.20', 300, false)], byName: [row('ads.example.com', 200, false)], byNode: [], byRcode: [row('SERVFAIL', 560)], byStatus: [row('servfail', 560)], byUpstream: [row('quad9', 400), row('none', 160)],
   coverage: { approximate: true, hidden: ['names_hidden'], partialNodes: ['pi'], topListsFromHours: 24 },
   timeline: ['homelab', 'pi'].flatMap((node) => [0, 1, 2].map((i) => ({ answered: 1000, bad: 10, budgetSpentPct: 2, node, start: T0, startUnixSeconds: 1_764_021_600 + i * 3600 }))),
 };
@@ -329,9 +329,12 @@ test('api_012 pseudo locale leaves no literal text: cache explain and the error 
   await open(page, '/explain?name=ads.e2e.test&client=127.0.0.1', '[data-testid="explain-flow"]');
   expect(await leftovers(page), 'an explanation and its diagram').toEqual([]);
   await open(page, '/analyze?tab=budget', '[data-testid="budget-summary"]');
+  // The lists show the server's words (a status, an answer code, the upstream a query had none of) as they are.
+  expect(await leftovers(page), 'the error budget with its lists as bars').toEqual([]);
   await page.locator('[data-testid="by-client"] button.link').click();
+  await page.locator('[data-testid="by-upstream"] button.link').click();
   await page.locator('[data-testid="budget-attribution"] section.chart .card-head button.link').first().click();
-  expect(await leftovers(page), 'the error budget, a list and a chart as tables').toEqual([]);
+  expect(await leftovers(page), 'the error budget, two lists and a chart as tables').toEqual([]);
   await clean(page, sent);
 });
 

@@ -57,13 +57,6 @@ export const DATA: Readonly<Record<string, string>> = {
   // The health level the wall's tile shows as it is (WallKpi.svelte). HealthIcon.svelte compares with
   // the same word.
   severe: 'lib/components/wall/WallKpi.svelte',
-  // The keys the error budget's lists show as they are (BudgetAttribution.svelte through BarList.svelte): a
-  // status (`servfail`), an answer code (`SERVFAIL`) and the upstream a query had none of (`none`). Cache.svelte
-  // and Cluster.svelte have the same words as messages; their text nodes are held to the rule only as far as
-  // another word of theirs is, until BarList marks its keys as data.
-  none: 'lib/components/BudgetAttribution.svelte',
-  servfail: 'lib/components/BudgetAttribution.svelte',
-  SERVFAIL: 'lib/components/BudgetAttribution.svelte',
 };
 
 export type RuleInput = {
