@@ -720,11 +720,12 @@ test('api_012 formats moved into format.ts keep their english', () => {
   // DeviceTimeline.svelte, BudgetAttribution.svelte; A1d: Kpi.svelte, Tabs.svelte, and the counts of
   // RolloutPanel.svelte and SimulationCard.svelte (`toLocaleString()`), LatencyHeatmap.svelte's axis
   // date (A1b's monthDay expression), NodeCompare.svelte's weekday and time, SimulationCard.svelte's
-  // window start), copied as they were, with the locale as a parameter where they used `[]` (or
-  // nothing).
+  // window start; A1e: Traffic.svelte's "updated" time), copied as they were, with the locale as a
+  // parameter where they used `[]` (or nothing).
   const old = (locale: string | undefined) => {
     const at = locale ?? [];
     return {
+      trafficUpdated: (d: Date) => d.toLocaleTimeString(locale),
       monthDay: (t: number) => new Date(t * 1000).toLocaleDateString(at, { month: 'short', day: 'numeric' }),
       weekdayDate: (t: number) => new Date(t * 1000).toLocaleDateString(at, { weekday: 'short', month: 'short', day: 'numeric' }),
       clock: (t: number, withSec: boolean) => new Date(t * 1000).toLocaleTimeString(at, { hour: '2-digit', minute: '2-digit', second: withSec ? '2-digit' : undefined }),
@@ -754,6 +755,7 @@ test('api_012 formats moved into format.ts keep their english', () => {
         expect(got.logDate(rfc), `${tag} budget since ${rfc}`).toBe(want.budgetSince(rfc));
         expect(got.weekdayTime(rfc), `${tag} node odd since ${rfc}`).toBe(want.nodeSince(rfc));
         expect(got.dateTime(Date.parse(rfc) / 1000), `${tag} simulation window ${rfc}`).toBe(want.simulationFrom(rfc));
+        expect(got.timeOfDay(new Date(t * 1000 + 789)), `${tag} traffic map updated ${t}`).toBe(want.trafficUpdated(new Date(t * 1000 + 789)));
       }
       for (const p of [100, 100.4, 999.5, 1234.4, 98_765.6]) expect(got.num(Math.round(p)), `${tag} whole ${p}`).toBe(want.whole(p));
       for (const n of [0, 7, 999, 1000, 1234, 1_234_567, 12_345_678]) expect(got.num(n), `${tag} count ${n}`).toBe(want.count(n));
