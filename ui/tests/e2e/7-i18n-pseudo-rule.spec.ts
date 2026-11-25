@@ -12,7 +12,7 @@ import { compile } from 'svelte/compiler';
 import { render } from 'svelte/server';
 import * as lib from '../../scripts/i18n-lib.mjs';
 import { install, tr } from '../../src/lib/i18n';
-import { DATA, PSEUDO, SERVER_WORDS, isCode, makeRule, type Ledger } from './i18n-pseudo-rule';
+import { DATA, PSEUDO, isCode, makeRule, type Ledger } from './i18n-pseudo-rule';
 import { UI, checkUi, cleanup } from './i18n-fixture';
 
 test.afterAll(cleanup);
@@ -81,7 +81,6 @@ const RULE = makeRule({
   layer: new Set([REL]),
   help: [],
   data: { 'moved the access point to the hallway': 'pages/Notes.svelte' },
-  serverWords: new Set(),
 });
 
 test('api_012 pseudo rule: a word that ends in a full stop or a colon is text, a token with a separator is code', () => {
@@ -90,7 +89,7 @@ test('api_012 pseudo rule: a word that ends in a full stop or a colon is text, a
   // The ledger of the UI itself: strings the rule newly holds the page to.
   const ledger: Ledger = JSON.parse(readFileSync(join(UI, 'tests/i18n-fixtures/english-ledger.json'), 'utf8'));
   const layer = new Set<string>(checkUi().files.filter((f) => f.usesLayer).map((f) => f.rel));
-  const own = new Set(makeRule({ ledger, layer, help: [], data: {}, serverWords: new Set() }).own.map((o) => o.s));
+  const own = new Set(makeRule({ ledger, layer, help: [], data: {} }).own.map((o) => o.s));
   for (const s of ['Saved.', 'Canaries:', 'Partial:', 'left.']) expect(own.has(s), s).toBe(true);
   for (const s of ['data-theme', '2-digit', 'x-csrf-token']) expect(own.has(s), s).toBe(false);
 });
@@ -121,13 +120,12 @@ test('api_012 pseudo rule: server data excuses a text node and never an attribut
   // The same words as an attribute, or as an attribute and a text node: the layer's own.
   expect(RULE.found([], [note])).toEqual([expect.stringContaining(note)]);
   expect(RULE.found([note], [note])).toEqual([expect.stringContaining(note)]);
-  // Every entry of the page test's list names a file of the ledger, and the server words are text
-  // nodes only.
+  // Every entry of the page test's list names a file of the ledger, and is data in a text node only.
   const ledger: Ledger = JSON.parse(readFileSync(join(UI, 'tests/i18n-fixtures/english-ledger.json'), 'utf8'));
   for (const [text, file] of Object.entries(DATA)) expect(Object.hasOwn(ledger, file), `${text}: ${file}`).toBe(true);
-  const real = makeRule({ ledger, layer: new Set(checkUi().files.filter((f) => f.usesLayer).map((f) => f.rel)), help: [], data: DATA, serverWords: SERVER_WORDS });
-  for (const word of SERVER_WORDS) {
-    expect(real.found([word], []), word).toEqual([]);
-    expect(real.found([], [word]).length, word).toBeGreaterThan(0);
+  const real = makeRule({ ledger, layer: new Set(checkUi().files.filter((f) => f.usesLayer).map((f) => f.rel)), help: [], data: DATA });
+  for (const text of Object.keys(DATA)) {
+    expect(real.found([text], []), text).toEqual([]);
+    if (real.own.some((o) => o.s === text)) expect(real.found([], [text]).length, text).toBeGreaterThan(0);
   }
 });

@@ -39,12 +39,6 @@ export const DATA: Readonly<Record<string, string>> = {
   severe: 'lib/components/wall/WallKpi.svelte',
 };
 
-/** A1e: words of the server's own vocabulary (a status, a response code) that a shared file shows as
- * it is: the wall's flow panel (WallFlow.svelte, A1d) writes a node's name in its SVG, which the
- * mocked flow of the wall test names `cached`, `forwarded` and `NOERROR`. The same words are the
- * Monitor pages' English since those pages moved to the layer. Text nodes only. */
-export const SERVER_WORDS: ReadonlySet<string> = new Set(['cached', 'forwarded', 'NOERROR']);
-
 export type RuleInput = {
   /** The English ledger: per file, the template text and script strings it had before part A. */
   ledger: Ledger;
@@ -55,8 +49,6 @@ export type RuleInput = {
   /** Values the test server holds that read like English a file on the layer had: each, by its text,
    * names the file it stands for. They are data in text nodes only, never in an attribute. */
   data: Readonly<Record<string, string>>;
-  /** Words of the server's own vocabulary a shared file shows as it is (text nodes only). */
-  serverWords: ReadonlySet<string>;
 };
 
 export type Rule = {
@@ -69,7 +61,7 @@ export type Rule = {
   found(text: readonly string[], other: readonly string[]): string[];
 };
 
-export function makeRule({ ledger, layer, help, data, serverWords }: RuleInput): Rule {
+export function makeRule({ ledger, layer, help, data }: RuleInput): Rule {
   const off = new Set([...Object.entries(ledger).filter(([rel]) => !layer.has(rel)).flatMap(([, e]) => [...e.markup, ...e.script]), ...help]);
   // Each as a whole-text pattern. A pattern with a placeholder needs words of its own (eight
   // letters), or it would match any text.
@@ -91,9 +83,8 @@ export function makeRule({ ledger, layer, help, data, serverWords }: RuleInput):
         // also matches (`{}query log {}` matched whole sentences of the Settings and Heatmap pages,
         // and `{}% of the budget left` the wall's "{}: {} % of the budget left").
         if (PSEUDO.test(p) || off.has(p)) continue;
-        // Data, and a server's word the page shows as it is: as a text node only (an attribute or
-        // canvas text is the page's own).
-        if ((Object.hasOwn(data, p) || serverWords.has(p)) && text.includes(p) && !other.includes(p)) continue;
+        // Data: as a text node only (an attribute or canvas text is the page's own).
+        if (Object.hasOwn(data, p) && text.includes(p) && !other.includes(p)) continue;
         const m = patterns.find((o) => o.re.test(p));
         if (m && !offPatterns.some((re) => re.test(p))) found.push(`${JSON.stringify(p)} (${m.from})`);
       }

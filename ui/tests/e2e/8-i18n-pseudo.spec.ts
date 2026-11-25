@@ -14,7 +14,7 @@ import { expect, test, type Page, type Route } from '@playwright/test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import * as lib from '../../scripts/i18n-lib.mjs';
-import { DATA, PSEUDO, SERVER_WORDS, makeRule, type Ledger } from './i18n-pseudo-rule';
+import { DATA, PSEUDO, makeRule, type Ledger } from './i18n-pseudo-rule';
 import { UI } from './i18n-fixture';
 
 const ADMIN = { user: 'admin', pass: 'correct horse battery' };
@@ -24,7 +24,7 @@ const LAYER = new Set<string>(lib.check(UI, { ratchets: false }).files.filter((f
 const HELP: string[] = JSON.parse(readFileSync(join(UI, '../docs/help/topics.json'), 'utf8')).topics.flatMap((t: Record<string, unknown>) =>
   Object.values(t).filter((v): v is string => typeof v === 'string'),
 );
-const RULE = makeRule({ ledger: LEDGER, layer: LAYER, help: HELP, data: DATA, serverWords: SERVER_WORDS });
+const RULE = makeRule({ ledger: LEDGER, layer: LAYER, help: HELP, data: DATA });
 
 async function signIn(page: Page) {
   await page.goto('/');

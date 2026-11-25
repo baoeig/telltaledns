@@ -78,7 +78,7 @@
       {#each placed.nodes as n (n.id)}
         <rect x={n.x} y={n.y} width={n.w} height={Math.max(1, n.h)} class="node" />
         {#if n.h > 14 && w >= 600}
-          <text x={n.col < 2 ? n.x + n.w + 6 : n.x - 6} y={n.y + n.h / 2} text-anchor={n.col < 2 ? 'start' : 'end'}>{n.name}</text>
+          <text x={n.col < 2 ? n.x + n.w + 6 : n.x - 6} y={n.y + n.h / 2} text-anchor={n.col < 2 ? 'start' : 'end'} translate="no">{n.name}</text>
         {/if}
       {/each}
       {#each dots as d, i (i)}
