@@ -1094,6 +1094,52 @@
       "sentence": "ended {when}"
     }
   ],
+  "pages/Clients.svelte": [
+    {
+      "fragments": [
+        "No devices yet. Click an address anywhere (here, the dashboard, or the query log) and choose “Name this device…”, or add",
+        "entries to the config file."
+      ],
+      "sentence": "No devices yet. Click an address anywhere (here, the dashboard, or the query log) and choose “Name this device…”, or add <cliententry/> entries to the config file."
+    },
+    {
+      "fragments": [
+        "Each workload is one device, whichever pods it runs: its queries, anomalies, and timeline survive rollouts. Its group comes from a",
+        "label on its pods or namespace, a rule, or the default group. Counts cover the last 24 hours."
+      ],
+      "sentence": "Each workload is one device, whichever pods it runs: its queries, anomalies, and timeline survive rollouts. Its group comes from a <groupkey/> label on its pods or namespace, a rule, or the default group. Counts cover the last 24 hours."
+    },
+    {
+      "fragments": [
+        "Names your router's DHCP knows (",
+        ": UniFi, OPNsense), or that devices announced themselves over mDNS (",
+        "). Unnamed devices already show these names; click an address to keep one, change it, or put the device in a group."
+      ],
+      "sentence": "Names your router's DHCP knows (<routerentry/>: UniFi, OPNsense), or that devices announced themselves over mDNS (<mdnskey/>). Unnamed devices already show these names; click an address to keep one, change it, or put the device in a group."
+    },
+    {
+      "fragments": [
+        "Nothing discovered yet. Connect your router under",
+        "Routers",
+        ", below, or set",
+        "."
+      ],
+      "sentence": "Nothing discovered yet. Connect your router under <strong>Routers</strong>, below, or set <mdnson/>."
+    },
+    {
+      "fragments": [
+        "The anomaly engine is off (",
+        "), so nothing measures the rhythm."
+      ],
+      "sentence": "The anomaly engine is off (<anomalykey/>), so nothing measures the rhythm."
+    },
+    {
+      "fragments": [
+        "(terminating)"
+      ],
+      "sentence": "{name} {addresses} (terminating)"
+    }
+  ],
   "pages/DashboardCalm.svelte": [
     {
       "fragments": [
@@ -1152,6 +1198,35 @@
         "red bands end in a SERVFAIL."
       ],
       "sentence": "Band width = answers, each counted for exactly that pair; <span/> red bands end in a SERVFAIL."
+    }
+  ],
+  "pages/Groups.svelte": [
+    {
+      "fragments": [
+        "Safe search on",
+        "(not YouTube)"
+      ],
+      "sentence": "Safe search on (not YouTube)"
+    },
+    {
+      "fragments": [
+        "Safe search on",
+        "(YouTube moderate)"
+      ],
+      "sentence": "Safe search on (YouTube moderate)"
+    },
+    {
+      "fragments": [
+        "Safe search on"
+      ],
+      "sentence": "Safe search on"
+    },
+    {
+      "fragments": [
+        "DNS64 on (",
+        ")"
+      ],
+      "sentence": "DNS64 on (<mono>{prefix}</mono>)"
     }
   ],
   "pages/Heatmap.svelte": [
