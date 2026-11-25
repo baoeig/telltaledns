@@ -1071,6 +1071,145 @@
       "sentence": "last {range}"
     }
   ],
+  "pages/Flow.svelte": [
+    {
+      "fragments": [
+        "· {} answers{}",
+        ", from the query log"
+      ],
+      "sentence": "· {n} answers, from the query log"
+    },
+    {
+      "fragments": [
+        "· {} answers{}"
+      ],
+      "sentence": "· {n} answers"
+    },
+    {
+      "fragments": [
+        "Band width = answers, each counted for exactly that pair;",
+        "red bands end in a SERVFAIL."
+      ],
+      "sentence": "Band width = answers, each counted for exactly that pair; <span/> red bands end in a SERVFAIL."
+    }
+  ],
+  "pages/Heatmap.svelte": [
+    {
+      "fragments": [
+        "{} · {} {}",
+        "queries"
+      ],
+      "sentence": "{when} · {n} queries"
+    },
+    {
+      "fragments": [
+        "{} · {} {}",
+        "blocked queries"
+      ],
+      "sentence": "{when} · {n} blocked queries"
+    },
+    {
+      "fragments": [
+        "{} · below this hour's top list"
+      ],
+      "sentence": "{when} · below this hour's top list"
+    },
+    {
+      "fragments": [
+        "{} · no data"
+      ],
+      "sentence": "{when} · no data"
+    },
+    {
+      "fragments": [
+        "·",
+        "queries",
+        "on average over",
+        "day"
+      ],
+      "sentence": "{when} · {n} queries on average over {days} day"
+    },
+    {
+      "fragments": [
+        "·",
+        "queries",
+        "on average over",
+        "day",
+        "s"
+      ],
+      "sentence": "{when} · {n} queries on average over {days} days"
+    },
+    {
+      "fragments": [
+        "·",
+        "blocked queries",
+        "on average over",
+        "day"
+      ],
+      "sentence": "{when} · {n} blocked queries on average over {days} day"
+    },
+    {
+      "fragments": [
+        "·",
+        "blocked queries",
+        "on average over",
+        "day",
+        "s"
+      ],
+      "sentence": "{when} · {n} blocked queries on average over {days} days"
+    },
+    {
+      "fragments": [
+        "Counts come from each hour's top 100:",
+        "hatched hours had this one below the list."
+      ],
+      "sentence": "Counts come from each hour's top 100: <span/> hatched hours had this one below the list."
+    },
+    {
+      "fragments": [
+        "Pick a {}",
+        "device"
+      ],
+      "sentence": "Pick a device"
+    },
+    {
+      "fragments": [
+        "Pick a {}",
+        "name"
+      ],
+      "sentence": "Pick a name"
+    },
+    {
+      "fragments": [
+        "·",
+        "15-minute",
+        "slots, your local time"
+      ],
+      "sentence": "· 15-minute slots, your local time"
+    },
+    {
+      "fragments": [
+        "· {} slots, your local time"
+      ],
+      "sentence": "· {grain} slots, your local time"
+    },
+    {
+      "fragments": [
+        "Stronger colour = more",
+        "blocked queries",
+        "; bars at the right and bottom sum each row and column."
+      ],
+      "sentence": "Stronger colour = more blocked queries; bars at the right and bottom sum each row and column."
+    },
+    {
+      "fragments": [
+        "Stronger colour = more",
+        "queries",
+        "; bars at the right and bottom sum each row and column."
+      ],
+      "sentence": "Stronger colour = more queries; bars at the right and bottom sum each row and column."
+    }
+  ],
   "pages/Queries.svelte": [
     {
       "fragments": [
@@ -1086,6 +1225,73 @@
         "{}."
       ],
       "sentence": "Explains how this query would be handled now; lists or settings may have changed since {time}. Logged as <strong>{status}</strong> by {list}."
+    }
+  ],
+  "pages/Traffic.svelte": [
+    {
+      "fragments": [
+        "{} queries · {} of what's shown",
+        "· +{} in the last {} s"
+      ],
+      "sentence": "{n} queries · {share} of what's shown· +{delta} in the last {secs} s"
+    },
+    {
+      "fragments": [
+        "{} queries · {} of what's shown"
+      ],
+      "sentence": "{n} queries · {share} of what's shown"
+    },
+    {
+      "fragments": [
+        "The busiest",
+        "names and",
+        "blocked names",
+        "this hour",
+        ", every node; counts are approximate",
+        ". Updated",
+        "."
+      ],
+      "sentence": "The busiest {limit} names and {limit} blocked names this hour, every node; counts are approximate. Updated {time}."
+    },
+    {
+      "fragments": [
+        "The busiest",
+        "names and",
+        "blocked names",
+        "this hour",
+        ", every node; counts are approximate",
+        "."
+      ],
+      "sentence": "The busiest {limit} names and {limit} blocked names this hour, every node; counts are approximate."
+    },
+    {
+      "fragments": [
+        "The busiest",
+        "names and",
+        "blocked names",
+        "in the previous clock hour",
+        ", every node; counts are approximate",
+        ". Updated",
+        "."
+      ],
+      "sentence": "The busiest {limit} names and {limit} blocked names in the previous clock hour, every node; counts are approximate. Updated {time}."
+    },
+    {
+      "fragments": [
+        "The busiest",
+        "names and",
+        "blocked names",
+        "in the previous clock hour",
+        ", every node; counts are approximate",
+        "."
+      ],
+      "sentence": "The busiest {limit} names and {limit} blocked names in the previous clock hour, every node; counts are approximate."
+    },
+    {
+      "fragments": [
+        "this hour"
+      ],
+      "sentence": "this hour"
     }
   ]
 }
