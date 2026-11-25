@@ -12,7 +12,6 @@ export type Ledger = Record<string, { markup: string[]; script: string[] }>;
 
 export const PSEUDO = new RegExp(`[${[...LOWER, ...UPPER].join('')}]`);
 
-const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const letters = (s: string) => (s.replace(/\{\}/g, '').match(/[A-Za-z]/g) ?? []).length;
 
 /** A path, a key, a type or a format: one token with a separator between two other characters
@@ -21,8 +20,29 @@ const letters = (s: string) => (s.replace(/\{\}/g, '').match(/[A-Za-z]/g) ?? [])
 const CODE = /^\S*[^\s.:][./:_=-][^\s.:]\S*$/;
 export const isCode = (s: string): boolean => CODE.test(s.replace(/[.:]+$/, ''));
 
-/** A pattern for English with `{}` for a placeholder: the whole text, a placeholder is any text. */
-const whole = (s: string) => new RegExp(`^${s.split('{}').map(escape).join('[\\s\\S]*?')}$`);
+/** Whether a text is the English `s` with `{}` for a placeholder: the whole text, a placeholder is any
+ * text (also none). The pieces between the placeholders are looked for in order, the first at the
+ * start and the last at the end: in linear time, however long the text (a pattern of `[\s\S]*?` gaps
+ * took seconds on the few thousand characters of the dashboard's list of changes). */
+export function isEnglish(s: string, text: string): boolean {
+  return fits(s.split('{}'), text);
+}
+function fits(parts: readonly string[], text: string): boolean {
+  if (parts.length === 1) return text === parts[0];
+  const first = parts[0];
+  const last = parts[parts.length - 1];
+  if (!text.startsWith(first) || !text.endsWith(last) || first.length + last.length > text.length) return false;
+  const end = text.length - last.length;
+  let at = first.length;
+  for (let i = 1; i < parts.length - 1; i++) {
+    const p = parts[i];
+    if (p === '') continue;
+    const k = text.indexOf(p, at);
+    if (k < 0 || k + p.length > end) return false;
+    at = k + p.length;
+  }
+  return true;
+}
 
 /** Values the test server holds that read like English a file on the layer had: data on the page,
  * not text of the layer. Each, by its text, names the file that shows it. Text nodes only: an
@@ -69,10 +89,10 @@ export function makeRule({ ledger, layer, help, data }: RuleInput): Rule {
     .filter(([rel]) => layer.has(rel))
     .flatMap(([rel, e]) => [...e.markup, ...e.script].map((s) => ({ s, rel })))
     .filter(({ s }) => !off.has(s) && !isCode(s) && /[A-Za-z]{2}/.test(s.replace(/\{\}/g, '')) && (!s.includes('{}') || letters(s) >= 8));
-  const patterns = own.map(({ s, rel }) => ({ re: whole(s), from: `${rel}: ${JSON.stringify(s)}` }));
+  const patterns = own.map(({ s, rel }) => ({ parts: s.split('{}'), from: `${rel}: ${JSON.stringify(s)}` }));
   // The English of files off the layer, as the same patterns: a piece that is that English belongs
   // to those files, whatever pattern of a layer file it also matches.
-  const offPatterns = [...off].filter((s) => s.includes('{}') && !isCode(s) && letters(s) >= 8).map(whole);
+  const offPatterns = [...off].filter((s) => s.includes('{}') && !isCode(s) && letters(s) >= 8).map((s) => s.split('{}'));
   return {
     own,
     off,
@@ -85,8 +105,8 @@ export function makeRule({ ledger, layer, help, data }: RuleInput): Rule {
         if (PSEUDO.test(p) || off.has(p)) continue;
         // Data: as a text node only (an attribute or canvas text is the page's own).
         if (Object.hasOwn(data, p) && text.includes(p) && !other.includes(p)) continue;
-        const m = patterns.find((o) => o.re.test(p));
-        if (m && !offPatterns.some((re) => re.test(p))) found.push(`${JSON.stringify(p)} (${m.from})`);
+        const m = patterns.find((o) => fits(o.parts, p));
+        if (m && !offPatterns.some((parts) => fits(parts, p))) found.push(`${JSON.stringify(p)} (${m.from})`);
       }
       return found;
     },

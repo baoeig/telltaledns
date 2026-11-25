@@ -12,7 +12,7 @@ import { compile } from 'svelte/compiler';
 import { render } from 'svelte/server';
 import * as lib from '../../scripts/i18n-lib.mjs';
 import { install, tr } from '../../src/lib/i18n';
-import { DATA, PSEUDO, isCode, makeRule, type Ledger } from './i18n-pseudo-rule';
+import { DATA, PSEUDO, isCode, isEnglish, makeRule, type Ledger } from './i18n-pseudo-rule';
 import { UI, checkUi, cleanup } from './i18n-fixture';
 
 test.afterAll(cleanup);
@@ -128,4 +128,24 @@ test('api_012 pseudo rule: server data excuses a text node and never an attribut
     expect(real.found([text], []), text).toEqual([]);
     if (real.own.some((o) => o.s === text)) expect(real.found([], [text]).length, text).toBeGreaterThan(0);
   }
+});
+
+test('api_012 pseudo rule: a long text is judged in linear time', () => {
+  // A pattern with adjacent placeholders, and a text of many short pieces: as a regular expression of lazy
+  // gaps it took seconds on the few thousand characters of the dashboard's list of changes, and never ends
+  // on this one.
+  const hot: Ledger = { 'lib/Hot.svelte': { markup: ['Open {}{}{}{} at {}: open this query now'], script: [] } };
+  const rule = makeRule({ ledger: hot, layer: new Set(['lib/Hot.svelte']), help: [], data: {} });
+  const long = `Open ${Array.from({ length: 3000 }, (_, i) => `at ${i}: a`).join(' ')}`;
+  expect(long.length).toBeGreaterThan(20_000);
+  expect(rule.found([long], [])).toEqual([]);
+  expect(rule.found([`${long}: open this query now`], [])).toHaveLength(1);
+});
+
+test('api_012 pseudo rule: a text fits an English with placeholders as the lazy pattern said', () => {
+  const escape = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const lazy = (s: string) => new RegExp(`^${s.split('{}').map(escape).join('[\\s\\S]*?')}$`);
+  const english = ['Saved.', '{} items', 'Open {}', '{}{} x {}', 'a {} b {} c', '{}', 'a{}b', '{}a{}', 'x {}{}', 'a{}a', 'Hello {} and {}!'];
+  const texts = ['', 'Saved.', 'Saved. ', ' 5 items', 'items', 'Open', 'Open ', 'Open it', ' x ', 'q x z', 'x  x ', 'a b c', 'a  b  c', 'a b b c', 'ab', 'aXb', 'a', 'aa', 'aXa', 'Hello 1 and 2!', 'Hello and !', 'Hello 1 and 2', 'Hello and  and !', 'line\nbreak items', 'items items'];
+  for (const s of english) for (const t of texts) expect(isEnglish(s, t), `${JSON.stringify(s)} / ${JSON.stringify(t)}`).toBe(lazy(s).test(t));
 });
