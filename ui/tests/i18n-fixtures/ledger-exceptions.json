@@ -1130,6 +1130,122 @@
       "sentence": "ended {when}"
     }
   ],
+  "pages/Cache.svelte": [
+    {
+      "fragments": [
+        "Change these under",
+        "in the configuration."
+      ],
+      "sentence": "Change these under <cachekey/> in the configuration."
+    },
+    {
+      "fragments": [
+        "answer"
+      ],
+      "sentence": "{n} answer"
+    },
+    {
+      "fragments": [
+        "answers"
+      ],
+      "sentence": "{n} answers"
+    },
+    {
+      "fragments": [
+        "hit"
+      ],
+      "sentence": "{n} hit"
+    },
+    {
+      "fragments": [
+        "hits"
+      ],
+      "sentence": "{n} hits"
+    },
+    {
+      "fragments": [
+        "no such name"
+      ],
+      "sentence": "{n} no such name"
+    },
+    {
+      "fragments": [
+        "no data"
+      ],
+      "sentence": "{n} no data"
+    },
+    {
+      "fragments": [
+        "SERVFAIL"
+      ],
+      "sentence": "{n} SERVFAIL"
+    },
+    {
+      "fragments": [
+        "lookup",
+        "{} · {} prefetched · {} stale served · {} evicted"
+      ],
+      "sentence": "{n} lookup · {prefetched} prefetched · {stale} stale served · {evicted} evicted"
+    },
+    {
+      "fragments": [
+        "lookups",
+        "{} · {} prefetched · {} stale served · {} evicted"
+      ],
+      "sentence": "{n} lookups · {prefetched} prefetched · {stale} stale served · {evicted} evicted"
+    },
+    {
+      "fragments": [
+        "warm:",
+        "answer",
+        "reloaded,"
+      ],
+      "sentence": "warm: {n} answer reloaded, {date} {time}"
+    },
+    {
+      "fragments": [
+        "warm:",
+        "answers",
+        "reloaded,"
+      ],
+      "sentence": "warm: {n} answers reloaded, {date} {time}"
+    },
+    {
+      "fragments": [
+        "{}{}% → +{}% hits"
+      ],
+      "sentence": "{size}% → +{extra}% hits"
+    },
+    {
+      "fragments": [
+        "when upstreams don't answer",
+        "within {} s",
+        ", for up to",
+        "after expiry"
+      ],
+      "sentence": "when upstreams don't answer within {wait} s, for up to {age} after expiry"
+    },
+    {
+      "fragments": [
+        "when upstreams don't answer{}, for up to {} after expiry"
+      ],
+      "sentence": "when upstreams don't answer, for up to {age} after expiry"
+    },
+    {
+      "fragments": [
+        "Nothing cached{}."
+      ],
+      "sentence": "Nothing cached."
+    },
+    {
+      "fragments": [
+        "Nothing cached",
+        "that is still fresh",
+        "."
+      ],
+      "sentence": "Nothing cached that is still fresh."
+    }
+  ],
   "pages/Clients.svelte": [
     {
       "fragments": [

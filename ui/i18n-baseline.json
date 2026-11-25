@@ -206,7 +206,7 @@
     "pages/Analyze.svelte": 0,
     "pages/Anomalies.svelte": 0,
     "pages/AuthShell.svelte": 0,
-    "pages/Cache.svelte": 63,
+    "pages/Cache.svelte": 0,
     "pages/Clients.svelte": 0,
     "pages/Cluster.svelte": 0,
     "pages/Dashboard.svelte": 0,
