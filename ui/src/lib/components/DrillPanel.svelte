@@ -92,7 +92,7 @@
     <h2>{t('Drill running on {node}', { node: d.node })}<HelpButton id="failover-drill" /></h2>
     <p>
       <T ctx="drillPanel" msg={'Not answering <strong>{targets}</strong> ({reason}).'} params={{ targets: d.targets, reason: d.reason }}
-        >{#snippet strong(x: string)}<strong>{x}</strong>{/snippet}</T
+        >{#snippet strong(x: string)}<strong translate="no">{x}</strong>{/snippet}</T
       >
       {#if a}
         <span data-testid="drill-counters"
