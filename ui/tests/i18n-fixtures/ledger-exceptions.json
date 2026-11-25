@@ -1490,6 +1490,15 @@
       "sentence": "Explains how this query would be handled now; lists or settings may have changed since {time}. Logged as <strong>{status}</strong> by {list}."
     }
   ],
+  "pages/Setup.svelte": [
+    {
+      "fragments": [
+        "Create the first admin.",
+        "prints the setup token (the server log says which file holds it)."
+      ],
+      "sentence": "Create the first admin. <setuptokencmd/> prints the setup token (the server log says which file holds it)."
+    }
+  ],
   "pages/Traffic.svelte": [
     {
       "fragments": [
