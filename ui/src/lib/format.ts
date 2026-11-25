@@ -84,6 +84,14 @@ export function makeFormat(locale: string | undefined, bind: Bind) {
     return new Date(unixSeconds * 1000).toLocaleString(locale);
   }
 
+  function monthDay(unixSeconds: number): string {
+    return new Date(unixSeconds * 1000).toLocaleDateString(at, { month: 'short', day: 'numeric' });
+  }
+
+  function weekdayDate(unixSeconds: number): string {
+    return new Date(unixSeconds * 1000).toLocaleDateString(at, { weekday: 'short', month: 'short', day: 'numeric' });
+  }
+
   function logTime(rfc3339: string): string {
     const d = new Date(rfc3339);
     const time = d.toLocaleTimeString(at, { hour12: false });
@@ -101,7 +109,7 @@ export function makeFormat(locale: string | undefined, bind: Bind) {
     return d.toDateString() === new Date().toDateString() ? time : t('{day} {time}', { day: d.toLocaleDateString(at, { weekday: 'short' }), time });
   }
 
-  return { num, rate, short, pct, ms, bytes, duration, ago, clock, dateTime, logTime, logDate, endsAt };
+  return { num, rate, short, pct, ms, bytes, duration, ago, clock, dateTime, monthDay, weekdayDate, logTime, logDate, endsAt };
 }
 
 export type Format = ReturnType<typeof makeFormat>;
@@ -142,6 +150,16 @@ export function clock(unixSeconds: number, withSeconds = false): string {
 
 export function dateTime(unixSeconds: number): string {
   return f.dateTime(unixSeconds);
+}
+
+/** REQ: API-012 — "Nov 24" from Unix seconds (a chart's axis and tooltip). */
+export function monthDay(unixSeconds: number): string {
+  return f.monthDay(unixSeconds);
+}
+
+/** REQ: API-012 — "Mon, Nov 24" from Unix seconds (a heatmap's row). */
+export function weekdayDate(unixSeconds: number): string {
+  return f.weekdayDate(unixSeconds);
 }
 
 /** Query-log time (RFC 3339 with ms) → local "HH:MM:SS.mmm". */

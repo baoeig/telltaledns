@@ -713,3 +713,32 @@ test('api_012 english formats match the frozen functions', () => {
     globalThis.Date = Real;
   }
 });
+
+test('api_012 formats moved into format.ts keep their english', () => {
+  // The expressions other files held (A1b: lib/dash/smooth.ts, SmoothChart.svelte, Stat.svelte,
+  // lib/heatmap.ts), copied as they were, with the locale as a parameter where they used `[]`.
+  const old = (locale: string | undefined) => {
+    const at = locale ?? [];
+    return {
+      monthDay: (t: number) => new Date(t * 1000).toLocaleDateString(at, { month: 'short', day: 'numeric' }),
+      weekdayDate: (t: number) => new Date(t * 1000).toLocaleDateString(at, { weekday: 'short', month: 'short', day: 'numeric' }),
+      clock: (t: number, withSec: boolean) => new Date(t * 1000).toLocaleTimeString(at, { hour: '2-digit', minute: '2-digit', second: withSec ? '2-digit' : undefined }),
+      whole: (p: number) => Math.round(p).toLocaleString(locale),
+    };
+  };
+  const at = [Date.UTC(2026, 10, 24, 12, 34, 56) / 1000, Date.UTC(2026, 0, 1, 0, 0, 0) / 1000, Date.UTC(2025, 6, 4, 23, 59, 59) / 1000];
+  for (const locale of [undefined, 'en-US', 'de-DE', 'fr-FR']) {
+    const want = old(locale);
+    const instances: [string, ReturnType<typeof makeFormat>][] = [['the runtime instance', makeFormat(locale, (ctx) => tr(ctx))]];
+    if (locale === undefined) instances.push(['the exports', fmt]);
+    for (const [name, got] of instances) {
+      const tag = `${locale ?? 'default'} ${name}`;
+      for (const t of at) {
+        expect(got.monthDay(t), `${tag} monthDay ${t}`).toBe(want.monthDay(t));
+        expect(got.weekdayDate(t), `${tag} weekdayDate ${t}`).toBe(want.weekdayDate(t));
+        for (const s of [false, true]) expect(got.clock(t, s), `${tag} clock ${t} ${s}`).toBe(want.clock(t, s));
+      }
+      for (const p of [100, 100.4, 999.5, 1234.4, 98_765.6]) expect(got.num(Math.round(p)), `${tag} whole ${p}`).toBe(want.whole(p));
+    }
+  }
+});
