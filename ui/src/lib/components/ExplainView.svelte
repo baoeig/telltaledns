@@ -61,7 +61,7 @@
   );
 </script>
 
-{#snippet strong(s: string)}<strong>{s}</strong>{/snippet}
+{#snippet strong(s: string)}<strong translate="no">{s}</strong>{/snippet}
 
 <div class="explain">
   <div class="notice {x.outcome === 'blocked' || x.outcome === 'refused' ? 'bad' : 'ok'}">
@@ -87,9 +87,9 @@
       <dt>{t('Device')}</dt>
       <dd>{x.client.device ?? t('not a configured device')} <span class="muted small" data-testid="explain-identified-by">{t('(by {by})', { by })}</span></dd>
       <dt>{t('Groups')}</dt>
-      <dd>{x.client.groups.join(', ') || '–'}</dd>
+      <dd translate="no">{x.client.groups.join(', ') || '–'}</dd>
       <dt>{t('Query')}</dt>
-      <dd><span class="mono" translate="no">{x.name}</span> {x.qtype}</dd>
+      <dd translate="no"><span class="mono" translate="no">{x.name}</span> {x.qtype}</dd>
     </dl>
   </section>
 

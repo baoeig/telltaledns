@@ -292,7 +292,7 @@
         <Icon name={theme === 'dark' ? 'moon' : theme === 'light' ? 'sun' : 'auto'} />
       </button>
       <span class="who">
-        <span class="avatar" aria-hidden="true">{initials}</span>
+        <span class="avatar" aria-hidden="true" translate="no">{initials}</span>
         <span class="who-text"><strong translate="no">{session.user.username}</strong><span class="role muted small" translate="no">{session.user.role}</span></span>
       </span>
       <button class="icon-btn" onclick={signOut} title={t('Sign out')} aria-label={t('Sign out')}><Icon name="logout" /></button>

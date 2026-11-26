@@ -297,6 +297,7 @@
             data-kind={p.marks[0].kind}
             style:left={`${p.x}px`}
             aria-label={markLabel(p.marks)}
+            translate="no"
             onmouseenter={() => (tip = p)}
             onmouseleave={() => (tip = null)}
             onfocus={() => (tip = p)}

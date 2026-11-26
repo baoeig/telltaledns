@@ -121,7 +121,7 @@
             {#each found.entries as e, i (i)}
               <tr>
                 <td>{e.node ?? t('this node')}</td>
-                <td>{e.qtype}{#if e.dnssecOk}<span class="muted small" translate="no"> (DO)</span>{/if}</td>
+                <td translate="no">{e.qtype}{#if e.dnssecOk}<span class="muted small" translate="no"> (DO)</span>{/if}</td>
                 <td>{tn('{rcode} · {n} answer', '{rcode} · {n} answers', e.answers, { rcode: e.rcode, n: e.answers })}{#if e.authentic}<span class="badge ok">{t('validated')}</span>{/if}</td>
                 <td class="small">{ttl(e.ttlLeftSeconds)}</td>
                 <td class="num">{num(e.hits)}</td>

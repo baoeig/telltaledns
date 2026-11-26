@@ -199,7 +199,7 @@
                   <td class="small">
                     {#if d.returned === true}{t('came back')}{:else if d.returned === false}{on ? t('stayed on {nodes}', { nodes: on }) : t('stayed on the other node')}{:else if d.verdict === 'followed'}<span class="muted">{t('checked 15 min after')}</span>{/if}
                   </td>
-                  <td class="small">{d.group ?? ''}</td>
+                  <td class="small" translate="no">{d.group ?? ''}</td>
                 </tr>
               {/each}
             </tbody>

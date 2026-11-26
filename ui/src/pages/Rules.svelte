@@ -100,7 +100,7 @@
                   {#if r.expiresInSeconds == null}{words.never}{:else if r.expiresInSeconds === 0}{words.expired}{:else}{t('in {time}', { time: duration(r.expiresInSeconds) })}<div class="muted">{t('at {time}', { time: endsAt(r.expires) })}</div>{/if}
                 </td>
                 <td class="small" translate="no">{r.note ?? ''}</td>
-                <td class="small muted">{r.createdBy ?? (r.source === 'file' ? words.byFile : '')}{#if r.created}<div>{logDate(r.created)}</div>{/if}</td>
+                <td class="small muted">{#if r.createdBy != null}<span translate="no">{r.createdBy}</span>{:else if r.source === 'file'}{words.byFile}{/if}{#if r.created}<div>{logDate(r.created)}</div>{/if}</td>
                 <td>
                   {#if r.source === 'api' && writable}
                     {#if fitsForm(r) && r.expiresInSeconds !== 0}

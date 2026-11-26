@@ -361,7 +361,7 @@
         <label class="field">{t('Group')}
           <select name="group" bind:value={group} onchange={() => search()}>
             <option value="">{t('any')}</option>
-            {#each groups as g (g.name)}<option value={g.name}>{g.name}</option>{/each}
+            {#each groups as g (g.name)}<option value={g.name} translate="no">{g.name}</option>{/each}
           </select>
         </label>
       {/if}
@@ -405,7 +405,7 @@
                 </td>
                 <td class="nowrap">
                   <ClientChip ip={r.client} name={r.clientName} onchanged={(n) => renamed(r.client, n)} />
-                  {#if r.group}<div class="group-chip small" style:--gc={groupColor(r.group)}>{r.group}</div>{/if}
+                  {#if r.group}<div class="group-chip small" style:--gc={groupColor(r.group)} translate="no">{r.group}</div>{/if}
                 </td>
                 <td class="name mono"><span class="nmi"><DomainIcon name={r.name} quiet={r.status === 'blocked'} /><span>{r.name}</span></span></td>
                 <td translate="no">{r.qtype}</td>

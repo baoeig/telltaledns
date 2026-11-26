@@ -207,7 +207,7 @@
                   <td class="small">
                     {#if f.status === 'missing'}<span class="badge warn">{t('missing')}</span> {f.note}
                     {:else if f.status === 'truncated'}<span class="badge warn">{t('cut')}</span> {f.note}
-                    {:else}{counts(f.redactions)}{/if}
+                    {:else}<span translate="no">{counts(f.redactions)}</span>{/if}
                   </td>
                 </tr>
               {/each}

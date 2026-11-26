@@ -311,7 +311,7 @@
           <thead><tr><th>{tx('Changed')}</th><th>{tx('What')}</th></tr></thead>
           <tbody>
             {#each inRange as m, i (i)}
-              <tr><td>{clock(m.time)}</td><td>{m.summary}{#if m.actor} · {m.actor}{/if}{#if m.nodes.length} · {m.nodes.join(', ')}{/if}</td></tr>
+              <tr><td>{clock(m.time)}</td><td translate="no">{m.summary}{#if m.actor} · {m.actor}{/if}{#if m.nodes.length} · {m.nodes.join(', ')}{/if}</td></tr>
             {/each}
           </tbody>
         </table>
@@ -337,6 +337,7 @@
             data-kind={p.marks[0].kind}
             style:left={`${p.x}px`}
             aria-label={markLabel(p.marks)}
+            translate="no"
             onmouseenter={() => (mtip = p)}
             onmouseleave={() => (mtip = null)}
             onfocus={() => (mtip = p)}
