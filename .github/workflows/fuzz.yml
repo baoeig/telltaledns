@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [parse_query, parse_response, cache_response, differential, parse_list, qlog_segment, support_redact]
+        target: [parse_query, parse_response, cache_response, differential, parse_list, qlog_segment, support_redact, anomaly_observe]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -27,7 +27,7 @@ jobs:
         with: { workspaces: fuzz }
       - run: cargo install cargo-fuzz --locked
       - name: Restore corpus
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}

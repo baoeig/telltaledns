@@ -9,6 +9,17 @@
   import ErrorNote from '../lib/components/ErrorNote.svelte';
   import HelpButton from '../lib/components/HelpButton.svelte';
   import StatusBadge from '../lib/components/StatusBadge.svelte';
+  import { tr } from '../lib/i18n';
+  import T from '../lib/i18n/T.svelte';
+
+  const { t } = tr('dnsRoutes');
+  const words = {
+    stale: t('Using last good'),
+    byUi: t('the UI / API'),
+    byFile: t('config file'),
+    edit: t('Edit'),
+    remove: t('Remove'),
+  };
 
   type Forward = S['ForwardInfo'];
   type Editor = { name: string; url: string; servers: string; upstreamGroup?: string; useAddresses: boolean; editing: boolean };
@@ -94,46 +105,49 @@
   }
 </script>
 
+{#snippet data(text: string)}<span translate="no">{text}</span>{/snippet}
+{#snippet local()}<a href={href('/local-dns')}>{t('Names on my network')}</a>{/snippet}
+
 <div class="page">
   <div class="page-head">
-    <h1>DNS Routes<HelpButton id="route-subscriptions" /></h1>
+    <h1>{t('DNS Routes')}<HelpButton id="route-subscriptions" /></h1>
     {#if canEdit}
-      <button class="primary" onclick={() => openEditor()}>Add a route subscription</button>
+      <button class="primary" onclick={() => openEditor()}>{t('Add a route subscription')}</button>
     {/if}
   </div>
   <ErrorNote {error} />
   <section class="card">
-    <h2>Route subscriptions</h2>
+    <h2>{t('Route subscriptions')}</h2>
     {#if subscriptions === null}
-      {#if !error}<p class="muted">Loading route subscriptions…</p>{/if}
+      {#if !error}<p class="muted">{t('Loading route subscriptions…')}</p>{/if}
     {:else if subscriptions.length === 0}
-      <p class="empty">Add a subscription to send matching domains to a dedicated DNS server.</p>
+      <p class="empty">{t('Add a subscription to send matching domains to a dedicated DNS server.')}</p>
     {:else}
       <div class="table-wrap">
         <table>
-          <thead><tr><th>List</th><th>State</th><th class="num">Names used</th><th class="num">Exceptions</th><th>DNS servers</th><th>Defined in</th><th></th></tr></thead>
+          <thead><tr><th>{t('List')}</th><th>{t('State')}</th><th class="num">{t('Names used')}</th><th class="num">{t('Exceptions')}</th><th>{t('DNS servers')}</th><th>{t('Defined in')}</th><th></th></tr></thead>
           <tbody>
             {#each subscriptions as forward (forward.domain)}
               {@const status = forward.subscriptionStatus}
               {@const state = listState(status)}
               <tr>
                 <td>
-                  <strong>{forward.domain}</strong>
-                  <div class="muted small source">{forward.subscriptionUrl}</div>
-                  {#if status?.error}<div class="small err">{status.error}</div>{/if}
+                  <strong translate="no">{forward.domain}</strong>
+                  <div class="muted small source" translate="no">{forward.subscriptionUrl}</div>
+                  {#if status?.error}<div class="small err" translate="no">{status.error}</div>{/if}
                 </td>
-                <td><StatusBadge value={state} label={state === 'stale' ? 'Using last good' : undefined} /></td>
+                <td><StatusBadge value={state} label={state === 'stale' ? words.stale : undefined} /></td>
                 <td class="num">{status?.namesUsed == null ? '–' : num(status.namesUsed)}</td>
                 <td class="num">{status?.exceptions == null ? '–' : num(status.exceptions)}</td>
                 <td>
-                  <div class="mono small source">{forward.servers.join(', ')}</div>
-                  {#if forward.upstreamGroup}<div class="muted small">Group {forward.upstreamGroup}</div>{/if}
+                  <div class="mono small source" translate="no">{forward.servers.join(', ')}</div>
+                  {#if forward.upstreamGroup}<div class="muted small"><T ctx="dnsRoutes" msg={'Group <data>{group}</data>'} params={{ group: forward.upstreamGroup }} {data} /></div>{/if}
                 </td>
-                <td class="small">{forward.source === 'api' ? 'the UI / API' : 'config file'}</td>
+                <td class="small">{forward.source === 'api' ? words.byUi : words.byFile}</td>
                 <td class="num nowrap">
                   {#if canEdit && forward.source === 'api'}
-                    <button class="link small" onclick={() => openEditor(forward)}>Edit</button>
-                    <button class="link small" onclick={() => remove(forward.domain)} aria-label={`Remove ${forward.domain}`}>Remove</button>
+                    <button class="link small" onclick={() => openEditor(forward)}>{words.edit}</button>
+                    <button class="link small" onclick={() => remove(forward.domain)} aria-label={t('Remove {name}', { name: forward.domain })}>{words.remove}</button>
                   {/if}
                 </td>
               </tr>
@@ -141,29 +155,29 @@
           </tbody>
         </table>
       </div>
-      <p class="muted small">“Names used” counts the domain suffixes in the active subscription. “Exceptions” counts suffixes exempt from this route.</p>
+      <p class="muted small">{t('“Names used” counts the domain suffixes in the active subscription. “Exceptions” counts suffixes exempt from this route.')}</p>
     {/if}
   </section>
-  <p class="muted small">For single-domain forwarding, see <a href={href('/local-dns')}>Names on my network</a>.</p>
+  <p class="muted small"><T ctx="dnsRoutes" msg={'For single-domain forwarding, see <local/>.'} {local} /></p>
 </div>
 
 {#if editor}
-  <Drawer title={editor.editing ? 'Edit route subscription' : 'Add a route subscription'} onclose={() => (editor = null)}>
+  <Drawer title={editor.editing ? t('Edit route subscription') : t('Add a route subscription')} onclose={() => (editor = null)}>
     <form class="stack" onsubmit={save}>
-      <label>Subscription name <input bind:value={editor.name} placeholder="gfwlist" pattern="[a-z0-9_\-]+" maxlength="64" required readonly={editor.editing} /></label>
-      <label>GFWList URL <input type="url" bind:value={editor.url} placeholder="https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt" required /></label>
+      <label>{t('Subscription name')} <input bind:value={editor.name} placeholder={t('gfwlist')} pattern="[a-z0-9_\-]+" maxlength="64" required readonly={editor.editing} /></label>
+      <label>{t('GFWList URL')} <input type="url" bind:value={editor.url} placeholder={t('https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt')} required /></label>
       {#if editor.upstreamGroup}
         <label class="row">
-          <input type="checkbox" bind:checked={editor.useAddresses} /> Replace group {editor.upstreamGroup} with manual addresses
+          <input type="checkbox" bind:checked={editor.useAddresses} /> <T ctx="dnsRoutes" msg={'Replace group <data>{group}</data> with manual addresses'} params={{ group: editor.upstreamGroup }} {data} />
         </label>
       {/if}
-      <label>Server address <input bind:value={editor.servers} placeholder="https://cloudflare-dns.com/dns-query" disabled={!editor.useAddresses} required={editor.useAddresses} /></label>
+      <label>{t('Server address')} <input bind:value={editor.servers} placeholder={t('https://cloudflare-dns.com/dns-query')} disabled={!editor.useAddresses} required={editor.useAddresses} /></label>
       {#if editor.useAddresses}
-        <p class="muted small">Separate multiple servers with spaces or commas. They are tried in order.</p>
+        <p class="muted small">{t('Separate multiple servers with spaces or commas. They are tried in order.')}</p>
       {/if}
       <ErrorNote error={formError} />
-      {#if saved}<p class="notice ok" role="status">Subscription saved. The list will refresh in the background.</p>{/if}
-      <div class="row"><button type="submit" class="primary" disabled={busy || !destinationReady}>{busy ? 'Saving…' : 'Save'}</button></div>
+      {#if saved}<p class="notice ok" role="status">{t('Subscription saved. The list will refresh in the background.')}</p>{/if}
+      <div class="row"><button type="submit" class="primary" disabled={busy || !destinationReady}>{busy ? t('Saving…') : t('Save')}</button></div>
     </form>
   </Drawer>
 {/if}

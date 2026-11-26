@@ -1113,9 +1113,10 @@ pub(crate) async fn delete_router(
 ///
 /// The body has the same fields as `[[anomaly_mute]]` (the name comes from the path):
 /// `devices` (device names, IPs or CIDRs) and/or `groups`, `kinds` (`rate_spike`,
-/// `domain_volume`, `drift`, `beacon`, `nxdomain_storm`, `dga`, `chatty_loop`), and optionally
+/// `domain_volume`, `drift`, `beacon`, `nxdomain_storm`, `dga`, `chatty_loop`, `reverse_sweep`;
+/// a mute of `nxdomain_storm` doesn't cover `reverse_sweep`), and optionally
 /// `expires` (RFC 3339) and `note`, e.g. `{"devices": ["lg-tv-living"], "kinds":
-/// ["nxdomain_storm"], "expires": "2026-12-31T00:00:00Z", "note": "hourly PTR sweep"}`. A finding
+/// ["reverse_sweep"], "expires": "2026-12-31T00:00:00Z", "note": "hourly PTR sweep"}`. A finding
 /// a mute matches when it is created is still recorded and listed (`GET
 /// /analytics/anomalies?muted=true`, with `mutedBy`), but isn't counted in
 /// `telltale_anomalies_total`, the badge, the `anomaly` alert rule, or the health level
@@ -1935,6 +1936,11 @@ pub(crate) async fn delete_forward(
 /// given), before any list: a device rule beats a group rule beats an everyone rule; within one
 /// scope the longer domain wins, then allow. With `expires` or `forMinutes` it stops applying
 /// then (and is removed). It takes effect on the next query, without recompiling the lists.
+/// `devices` takes the names of configured devices, IPs, or CIDRs; the name a router or mDNS gives
+/// an address (a query's `clientName` for a device nobody named) is refused (422, with a hint):
+/// use the address, or name the device first. A rule for an address stops matching when the
+/// address changes (a Kubernetes pod's does with every restart: use `groups`, with the group an
+/// operator placed the workload in).
 /// Rules from the config files are read-only here (409). Needs the operator role (or the
 /// `config:write:rules` agent scope, with a reason).
 #[utoipa::path(put, path = "/api/v1/rules/{id}", tag = "config",
@@ -1944,7 +1950,7 @@ pub(crate) async fn delete_forward(
         (status = 200, body = ConfigChange, description = "Applied (or, with dryRun, what would change)."),
         (status = 409, body = Problem, description = "Defined in the config files, or an Idempotency-Key reused; or the Idempotency-Key's first request is still running (`change_in_progress`, with `Retry-After`: retry shortly for its answer)."),
         (status = 412, body = Problem, description = "The configuration changed since the If-Match version: re-read it and retry."),
-        (status = 422, body = Problem, description = "An unknown device or group, a bad domain, or an expiry in the past."),
+        (status = 422, body = Problem, description = "A device that isn't a configured device's name, an IP, or a CIDR (the hint says what to do; a name a router or mDNS gives an address is one), an unknown group, a bad domain, or an expiry in the past."),
         (status = 503, body = Problem, description = "Too many configuration changes are running at once (`Retry-After`: retry shortly)."),
     ))]
 pub(crate) async fn put_rule(

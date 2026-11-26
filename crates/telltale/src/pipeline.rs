@@ -30,6 +30,20 @@ use telltale_telemetry::{Hub, Metrics, Proto, QueryEvent, Rule, RuleKind, Status
 use telltale_upstream::{Question, Router};
 use tokio::sync::Semaphore;
 
+/// REQ: DNS-019, UPS-007 (ADR-187) — the labels of `resolver.arpa`.
+const RESOLVER_ARPA_LABELS: usize = 2;
+
+/// REQ: DNS-019, UPS-007 (ADR-187) — whether a name in `resolver.arpa` is answered here, given the
+/// label count of the suffix that chose its route (`Selection::suffix_labels`; `None` without an
+/// upstream group). It is forwarded only by a route for `resolver.arpa` or a name below it: a
+/// suffix of at least `resolver.arpa`'s two labels that covers the name. A route for `arpa` (one
+/// label, every reverse lookup) or `.`, and a route without a suffix (a group's own upstreams,
+/// `match_group`, `match_qtype`), don't forward it. The pipeline, explain and the change
+/// simulation decide with this one function.
+pub(crate) fn resolver_arpa_answered_here(suffix_labels: Option<usize>) -> bool {
+    suffix_labels.is_none_or(|n| n < RESOLVER_ARPA_LABELS)
+}
+
 /// Settings derived from config.
 #[derive(Debug, Clone)]
 pub(crate) struct Settings {
@@ -247,7 +261,7 @@ pub(crate) struct Who {
 /// Drops a swapped-out value on a background thread after a grace period (T2.7). Readers
 /// hold short-lived guards, so after the pause this is the last reference, and freeing a
 /// large snapshot (tens of MB of FST and index) never lands on a DNS worker mid-query.
-fn retire<T: Send + 'static>(old: T) {
+pub(crate) fn retire<T: Send + 'static>(old: T) {
     let spawned = std::thread::Builder::new()
         .name("telltale-retire".into())
         .spawn(move || {
@@ -578,6 +592,10 @@ pub(crate) struct Pipeline {
     /// REQ: CLU-002 (ADR-125) — the names other nodes' routers and mDNS know (after this
     /// node's own).
     pub(crate) peer_names: arc_swap::ArcSwap<crate::devices::Names>,
+    /// REQ: FLT-006, CLU-002 (ADR-183) — the address-to-MAC bindings the other full members'
+    /// routers report (from answers that carry `vetted`, at most 15 minutes old), and the
+    /// addresses they withhold. Written by the `devices` task, read by the MAC table task.
+    pub(crate) peer_router_macs: arc_swap::ArcSwap<crate::devices::PeerMacs>,
     /// REQ: CLU-013 — while the cluster is pinned, the snapshot the primary serves: no other
     /// snapshot (a list refresh's) may replace it. Never read on the query path.
     pub(crate) filter_pin: ArcSwapOption<std::path::PathBuf>,
@@ -666,6 +684,7 @@ impl Pipeline {
             router_leases: Arc::default(),
             mdns_names: Arc::default(),
             peer_names: arc_swap::ArcSwap::default(),
+            peer_router_macs: arc_swap::ArcSwap::default(),
             filter_pin: ArcSwapOption::empty(),
             flights: Singleflight::new(),
             seed: rand::random(),
@@ -1487,9 +1506,10 @@ impl Pipeline {
         let orig = req.to_vec();
         let target = *target;
         let transport = meta.transport;
-        // A private reverse name stays local (RFC 6303), as when asked directly (T9.10).
+        // A private reverse name stays local (RFC 6303), as when asked directly (T9.10); so does
+        // a name in `resolver.arpa` (DNS-019, ADR-187).
         let special = telltale_policy::classify(&tq, &self.state.load().policy.special)
-            .filter(|s| *s == Special::PrivatePtr);
+            .filter(|s| matches!(s, Special::PrivatePtr | Special::LocallyServed));
         match self.resolve_or_defer(&treq, &tq, special, groups, who, meta, out, start, oc) {
             Response::Ready(n) => {
                 let resp = out[..n].to_vec();
@@ -1651,6 +1671,14 @@ impl Pipeline {
         if special == Some(Special::PrivatePtr) && !selection.is_some_and(|s| s.routed) {
             return self.simple(&q, out, rcode::NXDOMAIN, None, meta);
         }
+        // REQ: DNS-019, UPS-007 (ADR-187) — RFC 9462 §6.4: `resolver.arpa` is a locally served
+        // zone: NOERROR with no records (no AD; never cached, validated or forwarded), unless a
+        // route for `resolver.arpa` or a name below it forwards it (§6.1).
+        if special == Some(Special::LocallyServed)
+            && resolver_arpa_answered_here(selection.map(|s| s.suffix_labels))
+        {
+            return self.simple(&q, out, rcode::NOERROR, None, meta);
+        }
         let Some(sel) = selection else {
             // No upstream group applies (none configured): we can't resolve this.
             oc.status = Status::Refused;
@@ -1749,8 +1777,10 @@ impl Pipeline {
         }
     }
 
-    /// Answers with `rc` and no records; NXDOMAIN/NOERROR carry a synthetic SOA so clients can
-    /// cache the negative answer briefly.
+    /// Answers with `rc` and no records. Only NXDOMAIN carries a synthetic SOA (with AA), so
+    /// clients can cache it briefly; NOERROR and the other codes carry none. That SOA is owned by
+    /// the query name: a NOERROR answer that ever needs one (`resolver.arpa`'s, ADR-187) must use
+    /// an SOA owned by its zone (`resolver.arpa`), with AA, not this one.
     fn simple(
         &self,
         q: &Query<'_>,
@@ -3316,6 +3346,383 @@ groups = ["kids"]
         );
     }
 
+    const TABLET_MAC: [u8; 6] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01];
+    const STRANGER_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0x99];
+
+    /// Devices for the MAC tests: `tablet` named by its MAC, in the group `kids`, which blocks the
+    /// list `ads` with NXDOMAIN (the compiled snapshot names its one list "ads"); `guest` named by
+    /// the address 10.0.0.9, in `default`, which has no lists. No upstream: what isn't blocked ends
+    /// in REFUSED. `extra` is more configuration.
+    fn mac_pipeline(extra: &str) -> Arc<Pipeline> {
+        use telltale_filter::matcher::Lookup;
+        let cfg: telltale_config::Config = telltale_config::Loader::new()
+            .toml_str(
+                "t.toml",
+                format!(
+                    r#"
+{extra}
+[[list]]
+name = "ads"
+rules = ["||x^"]
+
+[[group]]
+name = "default"
+lists = []
+
+[[group]]
+name = "kids"
+lists = ["ads"]
+block_mode = "nxdomain"
+
+[[client]]
+name = "tablet"
+match = ["aa:bb:cc:dd:ee:01"]
+groups = ["kids"]
+
+[[client]]
+name = "guest"
+match = ["10.0.0.9"]
+groups = ["default"]
+"#
+                ),
+            )
+            .env(Vec::<(String, String)>::new())
+            .load()
+            .unwrap()
+            .config;
+        let p = Pipeline::new(
+            Settings::default(),
+            Arc::new(Cache::new(CachePolicy::default())),
+            Arc::new(Router::default()),
+            Policy {
+                allowed: Policy::open().allowed,
+                ..Policy::from_config(&cfg, LocalData::default())
+            },
+        );
+        install_filter(&p, "||ads.example.com^\n", Lookup::Indexed);
+        p
+    }
+
+    /// The answer code for `ads.example.com` asked from `peer` (an address without a port).
+    fn ads_from(p: &Arc<Pipeline>, peer: &str) -> u16 {
+        let mut out = [0u8; 4096];
+        let meta = RequestMeta {
+            peer: format!("{peer}:1000").parse().unwrap(),
+            local: None,
+            transport: Transport::Udp,
+            client_id: None,
+        };
+        match Handler(Arc::clone(p)).handle(
+            &query("ads.example.com", rtype::A, true),
+            &meta,
+            &mut out,
+        ) {
+            Response::Ready(len) => summarize(&out[..len]).unwrap().rcode,
+            _ => u16::MAX,
+        }
+    }
+
+    fn router_lease(last: u8, mac: &str, unsure: bool) -> crate::devices::Lease {
+        crate::devices::Lease {
+            mac: mac.into(),
+            ip: std::net::Ipv4Addr::new(10, 0, 0, last),
+            hostname: Some("x".into()),
+            expires: 0,
+            offline: false,
+            unsure,
+            stale: false,
+        }
+    }
+
+    /// Gives the pipeline this node's routers' view and the members' bindings and fills the MAC
+    /// table the way the table task does: the kernel's entries, then the routers', then the members'.
+    fn fill_mac_table(
+        p: &Arc<Pipeline>,
+        kernel: &[(IpAddr, [u8; 6])],
+        own: &[crate::devices::Lease],
+        peers: &[(u8, [u8; 6])],
+    ) {
+        p.router_leases
+            .store(Arc::new(own.iter().map(|l| (l.ip, l.clone())).collect()));
+        p.peer_router_macs.store(Arc::new(crate::devices::PeerMacs {
+            macs: peers
+                .iter()
+                .map(|(last, mac)| (std::net::Ipv4Addr::new(10, 0, 0, *last), *mac))
+                .collect(),
+            ..Default::default()
+        }));
+        drop(crate::server::rebuild_now(
+            p,
+            kernel,
+            &crate::server::MacInputs::load(p),
+        ));
+    }
+
+    // REQ: FLT-006 (ADR-183) — a MAC this node's router reports for an address identifies the
+    // device named by it there: its group and lists apply, at an address nobody named.
+    #[test]
+    fn flt_006_router_lease_mac_identifies_named_device() {
+        let p = mac_pipeline("");
+        assert_eq!(
+            ads_from(&p, "10.0.0.77"),
+            rcode::REFUSED,
+            "an unknown device"
+        );
+        fill_mac_table(
+            &p,
+            &[],
+            &[router_lease(77, "aa:bb:cc:dd:ee:01", false)],
+            &[],
+        );
+        assert_eq!(
+            ads_from(&p, "10.0.0.77"),
+            rcode::NXDOMAIN,
+            "the tablet's lists"
+        );
+        assert_eq!(ads_from(&p, "10.0.0.78"), rcode::REFUSED, "another address");
+    }
+
+    // REQ: FLT-006 (ADR-183) — the kernel's entry for an address wins over a router's: what the
+    // host saw on its own link is what is there now.
+    #[test]
+    fn flt_006_kernel_neighbor_wins_over_router_lease() {
+        let p = mac_pipeline("");
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        fill_mac_table(
+            &p,
+            &[
+                (ip("10.0.0.77"), STRANGER_MAC),
+                (ip("10.0.0.78"), TABLET_MAC),
+            ],
+            &[
+                router_lease(77, "aa:bb:cc:dd:ee:01", false),
+                router_lease(78, "02:00:00:00:00:99", false),
+            ],
+            &[],
+        );
+        assert_eq!(
+            ads_from(&p, "10.0.0.77"),
+            rcode::REFUSED,
+            "the kernel saw another device; the router's tablet doesn't count"
+        );
+        assert_eq!(
+            ads_from(&p, "10.0.0.78"),
+            rcode::NXDOMAIN,
+            "the kernel saw the tablet; the router's stranger doesn't count"
+        );
+    }
+
+    // REQ: FLT-006, CLU-010 (ADR-183) — with `[clients] router_macs = false` the routers' MACs
+    // identify nothing, and the device named by the exact address is the device.
+    #[test]
+    fn flt_006_router_macs_off_keeps_ip_identification() {
+        // The tablet's MAC at one address at a time (at two it would be shared and identify none).
+        let at_77 = [router_lease(77, "aa:bb:cc:dd:ee:01", false)];
+        let at_9 = [router_lease(9, "aa:bb:cc:dd:ee:01", false)];
+        let on = mac_pipeline("");
+        fill_mac_table(&on, &[], &at_77, &[]);
+        assert_eq!(ads_from(&on, "10.0.0.77"), rcode::NXDOMAIN);
+        fill_mac_table(&on, &[], &at_9, &[]);
+        assert_eq!(
+            ads_from(&on, "10.0.0.9"),
+            rcode::NXDOMAIN,
+            "the MAC beats the guest named by this address"
+        );
+
+        let off = mac_pipeline("[clients]\nrouter_macs = false\n");
+        fill_mac_table(&off, &[], &at_77, &[]);
+        assert_eq!(off.neighbors.router_len(), 0);
+        assert_eq!(ads_from(&off, "10.0.0.77"), rcode::REFUSED);
+        fill_mac_table(&off, &[], &at_9, &[]);
+        assert_eq!(
+            ads_from(&off, "10.0.0.9"),
+            rcode::REFUSED,
+            "the guest, by its address, in `default`"
+        );
+    }
+
+    // REQ: FLT-006, CLU-002 (ADR-183) — a binding another full member's router reports identifies
+    // the device the same way.
+    #[test]
+    fn flt_006_peer_router_macs_identify() {
+        let p = mac_pipeline("");
+        fill_mac_table(&p, &[], &[], &[(78, TABLET_MAC)]);
+        assert_eq!((p.neighbors.router_len(), p.neighbors.peer_len()), (0, 1));
+        assert_eq!(ads_from(&p, "10.0.0.78"), rcode::NXDOMAIN);
+        assert_eq!(ads_from(&p, "10.0.0.79"), rcode::REFUSED);
+    }
+
+    // REQ: FLT-006 (ADR-183) — an address this node's own view isn't sure of is not filled by a
+    // member's binding: a router here disagreed, or is silent, and the member doesn't see that.
+    #[test]
+    fn flt_006_own_unsure_address_is_not_filled_by_a_peer() {
+        let p = mac_pipeline("");
+        fill_mac_table(
+            &p,
+            &[],
+            &[router_lease(79, "aa:bb:cc:dd:ee:01", true)],
+            &[(79, TABLET_MAC), (80, TABLET_MAC)],
+        );
+        assert_eq!(
+            ads_from(&p, "10.0.0.79"),
+            rcode::REFUSED,
+            "this node isn't sure of .79"
+        );
+        assert_eq!(
+            ads_from(&p, "10.0.0.80"),
+            rcode::REFUSED,
+            "the member puts the same MAC at .79 and .80, and this node's router at .79: a MAC at two addresses, wherever one of them is withheld"
+        );
+        assert_eq!(
+            (
+                p.neighbors.router_len(),
+                p.neighbors.peer_len(),
+                p.neighbors.unsure_len()
+            ),
+            (0, 0, 2),
+            "one tombstone and one shared address"
+        );
+        // With the member's binding for .80 alone, it is the member's.
+        fill_mac_table(
+            &p,
+            &[],
+            &[router_lease(79, "aa:bb:cc:dd:ee:09", true)],
+            &[(79, STRANGER_MAC), (80, TABLET_MAC)],
+        );
+        assert_eq!(ads_from(&p, "10.0.0.79"), rcode::REFUSED);
+        assert_eq!(
+            ads_from(&p, "10.0.0.80"),
+            rcode::NXDOMAIN,
+            "an address this node has no doubt about is the member's"
+        );
+    }
+
+    // REQ: FLT-006 (ADR-183) — where the binding is withheld (unsure), the device named by the exact
+    // address is the device again.
+    #[test]
+    fn flt_006_exact_ip_device_wins_again_when_the_binding_is_unsure() {
+        let p = mac_pipeline("");
+        fill_mac_table(&p, &[], &[router_lease(9, "aa:bb:cc:dd:ee:01", false)], &[]);
+        assert_eq!(ads_from(&p, "10.0.0.9"), rcode::NXDOMAIN, "a sure binding");
+        fill_mac_table(&p, &[], &[router_lease(9, "aa:bb:cc:dd:ee:01", true)], &[]);
+        assert_eq!(
+            ads_from(&p, "10.0.0.9"),
+            rcode::REFUSED,
+            "an unsure one: the guest, by its address, in `default`"
+        );
+    }
+
+    // REQ: FLT-006 (ADR-183) — one MAC at two addresses, across this node's routers and the
+    // members', identifies a device at neither.
+    #[test]
+    fn flt_006_one_mac_at_two_addresses_does_not_identify() {
+        let p = mac_pipeline("");
+        fill_mac_table(
+            &p,
+            &[],
+            &[router_lease(80, "aa:bb:cc:dd:ee:01", false)],
+            &[(81, TABLET_MAC)],
+        );
+        assert_eq!(ads_from(&p, "10.0.0.80"), rcode::REFUSED);
+        assert_eq!(ads_from(&p, "10.0.0.81"), rcode::REFUSED);
+        assert_eq!(
+            (
+                p.neighbors.router_len(),
+                p.neighbors.peer_len(),
+                p.neighbors.unsure_len()
+            ),
+            (0, 0, 2),
+            "both are counted as withheld"
+        );
+        // Alone at one address, it identifies.
+        fill_mac_table(
+            &p,
+            &[],
+            &[router_lease(80, "aa:bb:cc:dd:ee:01", false)],
+            &[],
+        );
+        assert_eq!(ads_from(&p, "10.0.0.80"), rcode::NXDOMAIN);
+    }
+
+    // REQ: FLT-005, FLT-006 (ADR-183) — a quick rule for a device named by its MAC follows the
+    // device when its address changes: the router reports the MAC at another address, and the rule
+    // applies there and no longer at the old one.
+    #[test]
+    fn flt_005_quick_rule_follows_mac_device_across_ip_change() {
+        use telltale_filter::matcher::Lookup;
+        let cfg: telltale_config::Config = telltale_config::Loader::new()
+            .toml_str(
+                "t.toml",
+                r#"
+[[list]]
+name = "ads"
+rules = ["||x^"]
+
+[[group]]
+name = "default"
+lists = ["ads"]
+block_mode = "nxdomain"
+
+[[client]]
+name = "tablet"
+match = ["aa:bb:cc:dd:ee:01"]
+
+[[rule]]
+id = "tablet-ads"
+action = "allow"
+domain = "ads.example.com"
+devices = ["tablet"]
+"#,
+            )
+            .env(Vec::<(String, String)>::new())
+            .load()
+            .unwrap()
+            .config;
+        let p = Pipeline::new(
+            Settings::default(),
+            Arc::new(Cache::new(CachePolicy::default())),
+            Arc::new(Router::default()),
+            Policy {
+                allowed: Policy::open().allowed,
+                ..Policy::from_config(&cfg, LocalData::default())
+            },
+        );
+        install_filter(&p, "||ads.example.com^\n", Lookup::Indexed);
+        assert_eq!(
+            ads_from(&p, "10.0.0.77"),
+            rcode::NXDOMAIN,
+            "blocked for anyone"
+        );
+        fill_mac_table(
+            &p,
+            &[],
+            &[router_lease(77, "aa:bb:cc:dd:ee:01", false)],
+            &[],
+        );
+        assert_eq!(
+            ads_from(&p, "10.0.0.77"),
+            rcode::REFUSED,
+            "the tablet's allow beats the list (no upstream: REFUSED)"
+        );
+        // The router now reports the tablet at .88.
+        fill_mac_table(
+            &p,
+            &[],
+            &[router_lease(88, "aa:bb:cc:dd:ee:01", false)],
+            &[],
+        );
+        assert_eq!(
+            ads_from(&p, "10.0.0.88"),
+            rcode::REFUSED,
+            "the rule followed it"
+        );
+        assert_eq!(
+            ads_from(&p, "10.0.0.77"),
+            rcode::NXDOMAIN,
+            "and its old address is blocked again"
+        );
+    }
+
     /// A pipeline with the given config's clients/groups, a never-contacted upstream (so the
     /// cache path runs), and `rules` installed as list "ads".
     fn pipeline_with(cfg_toml: &str, rules: &str) -> Arc<Pipeline> {
@@ -4406,6 +4813,372 @@ groups = ["kids"]
             ),
             (1, 1)
         );
+    }
+
+    /// REQ: DNS-019 (ADR-187, GitHub issue #77) — RFC 9462 §6.4: `resolver.arpa` is a locally
+    /// served zone. `_dns.resolver.arpa` (SVCB and A) and the apex get NOERROR with no records and
+    /// no AD, from a validating client too, and the upstream isn't asked. Before, it was forwarded,
+    /// and a forwarder answers it from its own data, which can never validate (the signed `arpa.`
+    /// zone denies `resolver.arpa`). Local records still answer first, as for private reverse
+    /// names; a rewrite to a name in it stays local too; a `[[route]]` for it forwards it (§6.1:
+    /// the owner's choice); and `[special] resolver_arpa = false` forwards it as before.
+    #[tokio::test]
+    async fn dns_019_resolver_arpa_answered_locally_in_pipeline() {
+        use std::sync::atomic::Ordering;
+
+        /// `(rcode, answers, AD)` when answered here; `None` when forwarded (its answer awaited).
+        async fn ask(p: &Arc<Pipeline>, name: &str, qtype: u16) -> Option<(u16, u16, bool)> {
+            let mut buf = [0u8; 512];
+            let n = NameBuf::from_presentation(name).unwrap();
+            let edns = EdnsOut {
+                udp_payload: 1232,
+                dnssec_ok: true,
+                ede: None,
+            };
+            let len = build_query(&mut buf, 9, &n, qtype, 1, true, Some(edns)).unwrap();
+            buf[3] |= 0x20; // AD: a validating stub asks for it
+            let meta = RequestMeta {
+                peer: "192.168.1.20:1000".parse().unwrap(),
+                local: None,
+                transport: Transport::Udp,
+                client_id: None,
+            };
+            let mut out = [0u8; 4096];
+            match Handler(Arc::clone(p)).handle(&buf[..len], &meta, &mut out) {
+                Response::Ready(l) => {
+                    let s = summarize(&out[..l]).unwrap();
+                    Some((s.rcode, s.answers, out[3] & 0x20 != 0))
+                }
+                Response::Deferred(f) => {
+                    assert!(f.await.is_some(), "{name}: the upstream answered");
+                    None
+                }
+                Response::Drop | Response::Close => panic!("{name}: no answer at all"),
+            }
+        }
+
+        let (public, at_public) = counting_upstream().await;
+        let (chosen, at_chosen) = counting_upstream().await;
+        let base = format!(
+            "[[upstream]]\nname = \"public\"\nurl = \"udp://{public}\"\n\
+             [[upstream_group]]\nname = \"default\"\nmembers = [\"public\"]\n\
+             [[record]]\nname = \"mine.resolver.arpa\"\ntype = \"A\"\nvalue = \"192.168.1.53\"\n\
+             [[group]]\nname = \"default\"\n\
+             rewrite = [{{ domain = \"ddr.example\", answer = \"_dns.resolver.arpa\" }}]\n"
+        );
+        let build = |extra: &str| {
+            let cfg = telltale_config::Loader::new()
+                .toml_str("t.toml", format!("{base}{extra}"))
+                .env(Vec::<(String, String)>::new())
+                .load()
+                .unwrap()
+                .config;
+            let (local, report) = telltale_policy::LocalData::from_config(&cfg);
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            Pipeline::new(
+                Settings::default(),
+                Arc::new(Cache::new(CachePolicy::default())),
+                Arc::new(Router::from_config(&cfg).unwrap()),
+                Policy::from_config(&cfg, local),
+            )
+        };
+        let asked = || {
+            (
+                at_public.load(Ordering::SeqCst),
+                at_chosen.load(Ordering::SeqCst),
+            )
+        };
+
+        let p = build("");
+        for (name, qtype) in [
+            ("_dns.resolver.arpa", rtype::SVCB),
+            ("_dns.resolver.arpa", rtype::A),
+            ("resolver.arpa", rtype::A),
+        ] {
+            assert_eq!(
+                ask(&p, name, qtype).await,
+                Some((rcode::NOERROR, 0, false)),
+                "{name} type {qtype}: answered here with no records and no AD (upstream asked {} time(s))",
+                asked().0
+            );
+        }
+        assert_eq!(asked(), (0, 0), "the upstream wasn't asked");
+        // Local data answers first.
+        assert_eq!(
+            ask(&p, "mine.resolver.arpa", rtype::A).await,
+            Some((rcode::NOERROR, 1, false))
+        );
+        // A rewrite to a name in it: the CNAME, and the target stays local.
+        assert_eq!(
+            ask(&p, "ddr.example", rtype::A).await,
+            Some((rcode::NOERROR, 1, false))
+        );
+        assert_eq!(asked(), (0, 0));
+        // An ordinary name still goes upstream (the counter counts).
+        assert_eq!(ask(&p, "example.com", rtype::A).await, None);
+        assert_eq!(asked(), (1, 0));
+
+        // RFC 9462 §6.1: a route the owner chose forwards it.
+        let routed = build(&format!(
+            "[[upstream]]\nname = \"chosen\"\nurl = \"udp://{chosen}\"\n\
+             [[upstream_group]]\nname = \"ddr\"\nmembers = [\"chosen\"]\n\
+             [[route]]\nmatch_suffix = [\"resolver.arpa\"]\nupstream_group = \"ddr\"\n"
+        ));
+        assert_eq!(
+            ask(&routed, "_dns.resolver.arpa", rtype::SVCB).await,
+            None,
+            "routed: forwarded"
+        );
+        assert_eq!(asked(), (1, 1));
+
+        // Off: forwarded to the default group, as before.
+        let off = build("[special]\nresolver_arpa = false\n");
+        assert_eq!(ask(&off, "_dns.resolver.arpa", rtype::SVCB).await, None);
+        assert_eq!(asked(), (2, 1));
+    }
+
+    /// REQ: DNS-019, UPS-007 (ADR-187) — `resolver.arpa` is forwarded only by a route whose
+    /// suffix is `resolver.arpa` (in any case, with or without the final dot) or a name below it
+    /// that covers the name asked. Any other route leaves `_dns.resolver.arpa` answered here
+    /// while it sends the device's other names to its upstream group: a route for `arpa` (every
+    /// reverse lookup), a route for `.`, and routes without a suffix (a group's own `upstreams`, a
+    /// `match_group` or `match_qtype` route). A route for `resolver.arpa` and a group forwards it
+    /// for that group's devices only, and it wins over the group's own upstreams and over a
+    /// route for `arpa`.
+    // `too_many_lines`: one table of cases. (Kept off the attribute lines, where spec/trace.py
+    // looks for the test's name.)
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn dns_019_resolver_arpa_forwarded_only_by_a_route_for_it_or_below() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const TABLET: &str = "192.168.1.20"; // in `kids`
+        const OTHER: &str = "192.168.1.30"; // in no group of its own
+        /// Where a query went: answered here (rcode and answer count), or which upstream was
+        /// asked (and answered).
+        #[derive(Debug, PartialEq)]
+        enum Went {
+            Here(u16, u16),
+            Public,
+            Chosen,
+            Nowhere,
+        }
+        use Went::{Chosen, Here, Public};
+        const LOCAL: Went = Here(rcode::NOERROR, 0);
+        /// How many times each upstream (public, chosen) was asked.
+        type Counts = (Arc<AtomicUsize>, Arc<AtomicUsize>);
+        /// The questions of one case: (client, name, qtype, where it goes).
+        type Asks = Vec<(&'static str, &'static str, u16, Went)>;
+
+        async fn ask(
+            pipeline: &Arc<Pipeline>,
+            counts: &Counts,
+            peer: &str,
+            name: &str,
+            qtype: u16,
+        ) -> Went {
+            let asked = || {
+                (
+                    counts.0.load(Ordering::SeqCst),
+                    counts.1.load(Ordering::SeqCst),
+                )
+            };
+            let mut buf = [0u8; 512];
+            let qname = NameBuf::from_presentation(name).unwrap();
+            let len = build_query(
+                &mut buf,
+                9,
+                &qname,
+                qtype,
+                1,
+                true,
+                Some(EdnsOut::new(1232)),
+            )
+            .unwrap();
+            let meta = RequestMeta {
+                peer: format!("{peer}:1000").parse().unwrap(),
+                local: None,
+                transport: Transport::Udp,
+                client_id: None,
+            };
+            let before = asked();
+            let mut out = [0u8; 4096];
+            match Handler(Arc::clone(pipeline)).handle(&buf[..len], &meta, &mut out) {
+                Response::Ready(len) => {
+                    let summary = summarize(&out[..len]).unwrap();
+                    Here(summary.rcode, summary.answers)
+                }
+                Response::Deferred(answer) => {
+                    let answered = answer.await.is_some();
+                    let after = asked();
+                    if !answered {
+                        Went::Nowhere
+                    } else if after == (before.0 + 1, before.1) {
+                        Public
+                    } else if after == (before.0, before.1 + 1) {
+                        Chosen
+                    } else {
+                        Went::Nowhere
+                    }
+                }
+                Response::Drop | Response::Close => Went::Nowhere,
+            }
+        }
+
+        let (public, at_public) = counting_upstream().await;
+        let (chosen, at_chosen) = counting_upstream().await;
+        let counts: Counts = (at_public, at_chosen);
+        let base = format!(
+            "[[upstream]]\nname = \"public\"\nurl = \"udp://{public}\"\n\
+             [[upstream]]\nname = \"chosen\"\nurl = \"udp://{chosen}\"\n\
+             [[upstream_group]]\nname = \"default\"\nmembers = [\"public\"]\n\
+             [[upstream_group]]\nname = \"ddr\"\nmembers = [\"chosen\"]\n\
+             [[client]]\nname = \"tablet\"\nmatch = [\"{TABLET}\"]\ngroups = [\"kids\"]\n"
+        );
+        let build = |extra: &str| {
+            let cfg = telltale_config::Loader::new()
+                .toml_str("t.toml", format!("{base}{extra}"))
+                .env(Vec::<(String, String)>::new())
+                .load()
+                .unwrap()
+                .config;
+            let (local, report) = telltale_policy::LocalData::from_config(&cfg);
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            Pipeline::new(
+                Settings::default(),
+                Arc::new(Cache::new(CachePolicy::default())),
+                Arc::new(Router::from_config(&cfg).unwrap()),
+                Policy::from_config(&cfg, local),
+            )
+        };
+        let kids = "[[group]]\nname = \"kids\"\n";
+        let ddr = "_dns.resolver.arpa";
+        let (svcb, a, ptr) = (rtype::SVCB, rtype::A, rtype::PTR);
+        // (what, the configuration added, its questions)
+        let cases: Vec<(&str, String, Asks)> = vec![
+            (
+                "the group's own upstreams",
+                "[[group]]\nname = \"kids\"\nupstreams = \"ddr\"\n".into(),
+                vec![
+                    (TABLET, "example.com", a, Chosen),
+                    (TABLET, ddr, svcb, LOCAL),
+                    (TABLET, "resolver.arpa", a, LOCAL),
+                    (OTHER, ddr, svcb, LOCAL),
+                ],
+            ),
+            (
+                "a match_group route without a suffix",
+                format!("{kids}[[route]]\nmatch_group = [\"kids\"]\nupstream_group = \"ddr\"\n"),
+                vec![
+                    (TABLET, "example.com", a, Chosen),
+                    (TABLET, ddr, svcb, LOCAL),
+                    (OTHER, ddr, svcb, LOCAL),
+                ],
+            ),
+            (
+                "a match_qtype route without a suffix",
+                format!("{kids}[[route]]\nmatch_qtype = [\"SVCB\"]\nupstream_group = \"ddr\"\n"),
+                vec![
+                    (OTHER, "example.com", svcb, Chosen),
+                    (OTHER, "example.com", a, Public),
+                    (TABLET, ddr, svcb, LOCAL),
+                    (OTHER, ddr, svcb, LOCAL),
+                ],
+            ),
+            (
+                "a route for `.`",
+                format!("{kids}[[route]]\nmatch_suffix = [\".\"]\nupstream_group = \"ddr\"\n"),
+                vec![
+                    (OTHER, "example.com", a, Chosen),
+                    (TABLET, ddr, svcb, LOCAL),
+                    (OTHER, ddr, a, LOCAL),
+                ],
+            ),
+            (
+                "a route for resolver.arpa, written in capitals with the final dot",
+                format!(
+                    "{kids}[[route]]\nmatch_suffix = [\"Resolver.ARPA.\"]\nupstream_group = \"ddr\"\n"
+                ),
+                vec![
+                    (TABLET, ddr, svcb, Chosen),
+                    (OTHER, ddr, svcb, Chosen),
+                    (OTHER, "resolver.arpa", a, Chosen),
+                    (OTHER, "example.com", a, Public),
+                ],
+            ),
+            (
+                "a route for _dns.resolver.arpa only",
+                format!(
+                    "{kids}[[route]]\nmatch_suffix = [\"_dns.resolver.arpa\"]\nupstream_group = \"ddr\"\n"
+                ),
+                vec![
+                    (OTHER, ddr, svcb, Chosen),
+                    (OTHER, "resolver.arpa", a, LOCAL),
+                ],
+            ),
+            (
+                "a route for arpa (every reverse lookup)",
+                format!("{kids}[[route]]\nmatch_suffix = [\"arpa\"]\nupstream_group = \"ddr\"\n"),
+                vec![
+                    (OTHER, "8.8.8.8.in-addr.arpa", ptr, Chosen),
+                    (TABLET, ddr, svcb, LOCAL),
+                    (OTHER, ddr, svcb, LOCAL),
+                    (OTHER, "resolver.arpa", a, LOCAL),
+                ],
+            ),
+            (
+                "a route for arpa and one for resolver.arpa to another group",
+                format!(
+                    "{kids}[[route]]\nmatch_suffix = [\"arpa\"]\nupstream_group = \"ddr\"\n\
+                     [[route]]\nmatch_suffix = [\"resolver.arpa\"]\nupstream_group = \"default\"\n"
+                ),
+                vec![
+                    (OTHER, "8.8.8.8.in-addr.arpa", ptr, Chosen),
+                    (OTHER, ddr, svcb, Public),
+                ],
+            ),
+            (
+                "a route for `.` and resolver.arpa together",
+                format!(
+                    "{kids}[[route]]\nmatch_suffix = [\".\", \"resolver.arpa\"]\nupstream_group = \"ddr\"\n"
+                ),
+                vec![
+                    (OTHER, "example.com", a, Chosen),
+                    (OTHER, ddr, svcb, Chosen),
+                ],
+            ),
+            (
+                "a route for resolver.arpa and the group kids",
+                format!(
+                    "{kids}[[route]]\nmatch_suffix = [\"resolver.arpa\"]\nmatch_group = [\"kids\"]\nupstream_group = \"ddr\"\n"
+                ),
+                vec![(TABLET, ddr, svcb, Chosen), (OTHER, ddr, svcb, LOCAL)],
+            ),
+            (
+                "the group's own upstreams and a route for resolver.arpa to another group",
+                "[[group]]\nname = \"kids\"\nupstreams = \"ddr\"\n\
+                 [[route]]\nmatch_suffix = [\"resolver.arpa\"]\nupstream_group = \"default\"\n"
+                    .into(),
+                vec![
+                    (TABLET, "example.com", a, Chosen),
+                    (TABLET, ddr, svcb, Public),
+                ],
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (what, extra, asks) in cases {
+            for (peer, name, qtype, want) in asks {
+                // A pipeline (and cache) of its own for each question: no answer is from a cache.
+                let pipeline = build(&extra);
+                let got = ask(&pipeline, &counts, peer, name, qtype).await;
+                if got != want {
+                    wrong.push(format!(
+                        "{what}: {name} type {qtype} from {peer}: {got:?}, expected {want:?}"
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// REQ: DNS-007 — with `stale_answer_client_timeout_ms = 0`, an expired entry is answered

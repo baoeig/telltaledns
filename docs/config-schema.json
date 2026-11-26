@@ -925,6 +925,11 @@
           "description": "A steady fast rhythm to one domain (informational).",
           "type": "string",
           "const": "chatty_loop"
+        },
+        {
+          "description": "A sweep of the reverse names of private addresses (scanning the local network). A mute of\n`nxdomain_storm` doesn't cover it.",
+          "type": "string",
+          "const": "reverse_sweep"
         }
       ]
     },
@@ -1348,6 +1353,10 @@
           "description": "Read the kernel neighbor table (ARP/NDP) to recognize clients by MAC. Needs host\nnetworking to see real devices (inside a bridge network only the gateway shows up).",
           "type": "boolean",
           "default": true
+        },
+        "router_macs": {
+          "description": "REQ: FLT-006 (ADR-183) — recognize a device named by its MAC address (`[[client]]`\n`match = [\"aa:bb:cc:dd:ee:ff\"]`) from the client lists of the routers (`[[router]]`) as\nwell as from this host's neighbor table: the MAC a router reports for an address, on this\nnode and on the cluster's other full members. That is what lets a device named by its MAC\nkeep its name, groups and rules when its address changes, also in a Docker bridge, a\nKubernetes pod or another VLAN, where the neighbor table sees nothing. On by default;\n`false` keeps to the neighbor table and trusted EDNS MACs. The cluster shares it, so every\nnode identifies devices the same way, and it is not written while it is on: set it to\n`false` only once every node runs this version (an older node refuses the key). While it\nis on and a device is named by its MAC, each router is read at least every 10 minutes\n(600 seconds), whatever its `interval_secs`, and a router silent for 15 minutes\nidentifies nothing.",
+          "type": "boolean"
         },
         "trust_edns_mac_from": {
           "description": "Forwarders whose EDNS MAC option (dnsmasq `add-mac`) is trusted. Empty = ignore the\noption: any client could send it and claim another device's identity.",
@@ -3226,7 +3235,7 @@
           "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
         },
         "interval_secs": {
-          "description": "Seconds between reads.",
+          "description": "Seconds between reads. While a device is named by its MAC address and `[clients]\nrouter_macs` is on, the MACs a router lists identify devices, so it is read at least\nevery 600 seconds whatever this says (a list older than 900 seconds doesn't say who\nholds an address, and a read that fails is asked again within that time).",
           "type": "integer",
           "format": "uint32",
           "default": 300,
@@ -3804,6 +3813,10 @@
           "description": "CHAOS-class `version.bind`, `id.server`, ... → REFUSED.",
           "type": "boolean",
           "default": true
+        },
+        "resolver_arpa": {
+          "description": "REQ: DNS-019 (ADR-187) — `resolver.arpa` and the names below it, such as\n`_dns.resolver.arpa` (encrypted-DNS discovery, RFC 9462) → NOERROR with no records, never\nforwarded (RFC 9462 §6.4: a locally served zone), unless a local record or a route for\n`resolver.arpa` or a name below it covers them (a route for `arpa` doesn't). On by default.\nThe cluster shares it, and it is not written while it is on. Don't write this key, `true` or\n`false`, until every node runs this version: an older node refuses it in its own file, and\nin a shared configuration (where only `false` is written).",
+          "type": "boolean"
         }
       },
       "additionalProperties": false
