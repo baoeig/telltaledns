@@ -1616,6 +1616,12 @@ test('api_012 pseudo locale leaves no literal text: the cluster of a witness, po
   await page.locator('.promote button').first().click();
   await expect(page.locator('[role="alertdialog"]')).toBeVisible();
   expect(await leftovers(page), 'take over from the emergency primary').toEqual([]);
+  // A cluster where no node is a primary any more: the summary names none (the pseudo text of `none`).
+  view = REPLICA({ nodes: [node({ nodeId: 'n-bbbb2222', site: 'pi', role: 'replica', thisNode: true, rttMs: null, configSource: 'file' })] });
+  await page.reload();
+  await open(page, '/cluster', '[data-testid="cluster-node"]');
+  await expect(page.locator('dl.facts')).toContainText('ñóñé');
+  expect(await leftovers(page), 'a cluster with no primary').toEqual([]);
   view = { ...CLUSTER, enabled: false, host: HOST, nodes: [] };
   info = SHELL_INFO({ clientIpsMasked: null, queryLog: true });
   await page.reload();
