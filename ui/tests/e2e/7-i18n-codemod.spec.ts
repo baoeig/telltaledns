@@ -13,7 +13,7 @@ import { render } from 'svelte/server';
 import * as cm from '../../scripts/i18n-codemod.mjs';
 import * as lib from '../../scripts/i18n-lib.mjs';
 import { tr } from '../../src/lib/i18n';
-import { UI, cleanup, failRules, project, put, run } from './i18n-fixture';
+import { UI, cleanup, failRules, fails, project, put, run } from './i18n-fixture';
 
 test.afterAll(cleanup);
 
@@ -243,16 +243,18 @@ test('api_012 the codemod output passes the languages check', () => {
   const after = readFileSync(join(dir, 'src/pages/Shop.svelte'), 'utf8');
   expect(after).toContain("const { t } = tr('shop');");
   const check = run(dir);
-  expect(failRules(check)).toEqual([]);
+  // Nothing fails but the literal text the codemod lists for the hand (a file the baseline does not list holds none)...
+  expect(failRules(check).filter((rule) => rule !== 'literal-text')).toEqual([]);
+  // ...and that is this page's, at the lines the codemod listed (the move added the import and the context: two lines;
+  // a listed script string or plural is no literal text, the lint does not read it as one).
+  const shop = check.files.find((f) => f.rel === 'pages/Shop.svelte') as unknown as { usesLayer: boolean; literal: number[]; messages: { ctx: string; english: string }[] };
+  expect(fails(check).filter((f) => f.rule === 'literal-text').map((f) => f.file)).toEqual(['src/pages/Shop.svelte']);
+  const shift = after.split('\n').length - SHOP.split('\n').length;
+  expect(shift).toBe(2);
+  expect([...new Set(shop.literal.map((n) => n - shift))]).toEqual(res[0].listed.filter((l: { class: string }) => !['script', 'plural'].includes(l.class)).map((l: { line: number }) => l.line));
   // Every moved text is a message of the file's context, as the check extracts it.
-  const shop = check.files.find((f) => f.rel === 'pages/Shop.svelte') as unknown as { usesLayer: boolean; messages: { ctx: string; english: string }[] };
   expect(shop.usesLayer).toBe(true);
   expect(shop.messages.map((m) => `${m.ctx} ${m.english}`).sort()).toEqual(res[0].handled.map((h: { english: string }) => `shop ${h.english}`).sort());
-  // The English ledger of the page before the codemod holds every message after it, and every text
-  // it had is still there.
-  const ledgerDir = project((d) => put(d, 'src/pages/Shop.svelte', SHOP));
-  const ledger = lib.ledgerEntries(ledgerDir, ['pages/Shop.svelte']);
-  expect(lib.ledgerProblems(check.files.filter((f) => f.rel === 'pages/Shop.svelte'), ledger, {})).toEqual([]);
   // A second run moves nothing.
   expect(cm.run(dir, ['pages/Shop.svelte'], { write: true })[0].handled).toEqual([]);
   expect(readFileSync(join(dir, 'src/pages/Shop.svelte'), 'utf8')).toBe(after);

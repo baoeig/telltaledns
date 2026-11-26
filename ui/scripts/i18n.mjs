@@ -9,7 +9,6 @@
 //                                            left-over pairs to "~leftover" (or deletes them)
 //   node scripts/i18n.mjs carry <context> --from "<old>" --to "<new>"   for maintainers: an English
 //                                            edit that keeps the meaning keeps its translations
-//   node scripts/i18n.mjs ledger <file>... | --all   rewrites english-ledger.json entries from the tree
 //   node scripts/i18n.mjs baseline           lowers i18n-baseline.json's counts to the tree's (and
 //                                            lists new files at zero); never raises one
 //   node scripts/i18n.mjs plurals            for maintainers, once and reviewed: rewrites
@@ -24,10 +23,9 @@ if (!process.features.typescript) {
   console.error(`scripts/i18n.mjs needs Node 24 (or 22.18 and later), which strips TypeScript types; this is Node ${process.version}`);
   process.exit(2);
 }
-const { baselineOf, carry, check, formatReport, ledgerEntries, pluralTable, prebuild, serializeJson, summaryMarkdown, sync } = await import('./i18n-lib.mjs');
+const { baselineOf, carry, check, formatReport, pluralTable, prebuild, serializeJson, summaryMarkdown, sync } = await import('./i18n-lib.mjs');
 
 const ROOT = join(import.meta.dirname, '..');
-const LEDGER = join(ROOT, 'tests', 'i18n-fixtures', 'english-ledger.json');
 const [cmd, ...args] = process.argv.slice(2);
 
 /** Each locale file one commit back (HEAD^1: a pull request's base in CI's merge commit), or null. */
@@ -80,14 +78,6 @@ switch (cmd) {
     console.log(`i18n carry: ${carry(ROOT, ctx, from, to)} pair(s) rewritten`);
     break;
   }
-  case 'ledger': {
-    const all = args.includes('--all');
-    const fresh = ledgerEntries(ROOT, all ? null : args);
-    const old = existsSync(LEDGER) && !all ? JSON.parse(readFileSync(LEDGER, 'utf8')) : {};
-    writeFileSync(LEDGER, serializeJson({ ...old, ...fresh }));
-    console.log(`i18n ledger: ${Object.keys(fresh).length} file(s) written`);
-    break;
-  }
   case 'plurals': {
     const table = pluralTable();
     writeFileSync(join(ROOT, 'src', 'locales', 'plurals.json'), serializeJson(table));
@@ -104,6 +94,6 @@ switch (cmd) {
     break;
   }
   default:
-    console.error('usage: node scripts/i18n.mjs check | report [--summary] | prebuild | sync <tag> [--prune] | carry <context> --from <old> --to <new> | ledger <file>... | --all | baseline | plurals');
+    console.error('usage: node scripts/i18n.mjs check | report [--summary] | prebuild | sync <tag> [--prune] | carry <context> --from <old> --to <new> | baseline | plurals');
     process.exit(2);
 }

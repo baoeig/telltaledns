@@ -103,27 +103,28 @@ file `i18n-baseline.json` holds at zero (in the markup, or in an attribute a rea
 `aria-valuetext`, `aria-placeholder`, and `label` on `<optgroup>`), a new `Intl` call outside
 `lib/format.ts`, and a new physical CSS property (`margin-left`, `text-align: right`; use logical
 ones). It reports, and never fails on, missing, outdated and left-over translations. A change to
-English alone never fails a language. Until part A of ADR-189 ends, literal text, an `Intl` call or
-a physical property in a file the baseline does not list (one added or moved since) is reported, not
-failed, so adding, removing or moving a file needs no baseline change. Part A's last commit makes it
-a failure: from then on a new file holds none of the three, and a moved file that still holds some
-keeps its counts only if its entries in `i18n-baseline.json` are renamed to the new path by hand.
-After removing text, an `Intl` call or a physical property, `node scripts/i18n.mjs baseline` lowers
-that file's count (it never raises one, and lists a new file only at zero).
+English alone never fails a language. A file `i18n-baseline.json` does not list (one added or moved
+since) holds none of the three: literal text, an `Intl` call or a physical property in it fails, and a
+moved file that still holds some keeps its counts only if its entries in `i18n-baseline.json` are
+renamed to the new path by hand. After removing text, an `Intl` call or a physical property,
+`node scripts/i18n.mjs baseline` lowers that file's count (it never raises one, and lists a new file
+only at zero). Every file holds no literal text and no `Intl` call outside `lib/format.ts`; the
+physical CSS properties of the files that have them are kept at their counts and are converted
+with the right-to-left work.
 
-**An intended English edit** in a file already on the layer: until part A ends, regenerate that
-file's English ledger entry in the same commit, `node scripts/i18n.mjs ledger <file>` (the path under
-`src/`, for example `lib/format.ts`), and say so in the commit message. A file on the layer moved to
-another folder takes its ledger entry with it (rename the key); a new file on the layer shows only
-English some entry already has, or lists its new English under `new` in
-`tests/i18n-fixtures/ledger-exceptions.json` (`{"new": {"lib/x.ts": ["English"]}}`). A sentence the
-migration joins from several pieces of a file (around an inline element, an `{#if}`, a plural's
-suffix) is listed there under the file as `{"sentence": …, "fragments": […]}`: in order, each one of
-the file's ledger strings or a piece of one; the variants of one sentence may share fragments. A
-message of the file must take each sentence: the test reports an exception that none does. A join
-may be glued or spaced (`Queries from` and `this device (`; a plural's `voter` and `s`), and the
-ledger does not decide which, since it cannot see the space at a join, beside a placeholder or
-around a tag: the snapshots of the page's English decide it, in the states they reach.
+**The pseudo-locale tests** (`tests/e2e/8-i18n-pseudo.spec.ts`, the rule in
+`tests/e2e/i18n-pseudo-rule.ts`) read every page under `?lang=en-XA`: each text node outside
+`translate="no"`, each attribute a reader sees or hears, the value of a button and the canvas text
+must carry a pseudo character, have no letters, be code, be a formatted date, time or compact number,
+or be data of the test (a name or value its mocks or the server sent). A name or value the page
+shows as it was given and that is also the English of a message (`default`, `admin`, a status word)
+needs `translate="no"` on the element that shows it. Two excuses are kept to the place they name: the
+help glossary (`docs/help/topics.json`, English in part A) only inside the help panel and the drawer
+that holds it, and the shared table in `i18n-pseudo-rule.ts` (`DATA`: the series label that uPlot writes
+itself in a chart legend) only as a text node at its place. A piece that is a message's English, or fits
+one that has a letter of its own (one word for each placeholder), fails even beside data (`1 odd` where
+`odd` is a value); a value counts as whole words; and a message with a placeholder that code joined to
+pseudo text with ` · ` in English (`you · 4.2 q/s`) fails too.
 
 **Moving a file to the layer** (part A): `node scripts/i18n-codemod.mjs <file under src/>` (or
 `--all`) prints, per file, what it can move and what it leaves for the hand; `--write` rewrites the

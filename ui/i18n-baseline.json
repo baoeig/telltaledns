@@ -68,6 +68,7 @@
     "lib/health.svelte.ts": 0,
     "lib/heatmap.ts": 0,
     "lib/help.ts": 0,
+    "lib/i18n/T.svelte": 0,
     "lib/icons/DomainIcon.svelte": 0,
     "lib/icons/brands.svelte.ts": 0,
     "lib/icons/map.ts": 0,
@@ -76,6 +77,7 @@
     "lib/macKeys.ts": 0,
     "lib/markers.ts": 0,
     "lib/mode.svelte.ts": 0,
+    "lib/objectives.ts": 0,
     "lib/plainHttp.ts": 0,
     "lib/poll.ts": 0,
     "lib/router.svelte.ts": 0,
@@ -111,7 +113,8 @@
     "pages/Setup.svelte": 0,
     "pages/Traffic.svelte": 0,
     "pages/Upstreams.svelte": 0,
-    "pages/Wall.svelte": 0
+    "pages/Wall.svelte": 0,
+    "svelte-elements.d.ts": 0
   },
   "literal": {
     "App.svelte": 0,
@@ -183,6 +186,7 @@
     "lib/health.svelte.ts": 0,
     "lib/heatmap.ts": 0,
     "lib/help.ts": 0,
+    "lib/i18n/T.svelte": 0,
     "lib/icons/DomainIcon.svelte": 0,
     "lib/icons/brands.svelte.ts": 0,
     "lib/icons/map.ts": 0,
@@ -191,6 +195,7 @@
     "lib/macKeys.ts": 0,
     "lib/markers.ts": 0,
     "lib/mode.svelte.ts": 0,
+    "lib/objectives.ts": 0,
     "lib/plainHttp.ts": 0,
     "lib/poll.ts": 0,
     "lib/router.svelte.ts": 0,
@@ -226,7 +231,8 @@
     "pages/Setup.svelte": 0,
     "pages/Traffic.svelte": 0,
     "pages/Upstreams.svelte": 0,
-    "pages/Wall.svelte": 0
+    "pages/Wall.svelte": 0,
+    "svelte-elements.d.ts": 0
   },
   "physical": {
     "App.svelte": 5,
@@ -299,6 +305,7 @@
     "lib/health.svelte.ts": 0,
     "lib/heatmap.ts": 0,
     "lib/help.ts": 0,
+    "lib/i18n/T.svelte": 0,
     "lib/icons/DomainIcon.svelte": 0,
     "lib/icons/brands.svelte.ts": 0,
     "lib/icons/map.ts": 0,
@@ -307,6 +314,7 @@
     "lib/macKeys.ts": 0,
     "lib/markers.ts": 0,
     "lib/mode.svelte.ts": 0,
+    "lib/objectives.ts": 0,
     "lib/plainHttp.ts": 0,
     "lib/poll.ts": 0,
     "lib/router.svelte.ts": 0,
@@ -342,6 +350,7 @@
     "pages/Setup.svelte": 0,
     "pages/Traffic.svelte": 1,
     "pages/Upstreams.svelte": 1,
-    "pages/Wall.svelte": 4
+    "pages/Wall.svelte": 4,
+    "svelte-elements.d.ts": 0
   }
 }

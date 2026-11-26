@@ -124,9 +124,6 @@ export type Datum = {
  * each, with the reason and the place, as a text node only (an attribute with the same text is the layer's
  * own). Keep it empty where an element can carry `translate="no"` instead. */
 export const DATA: Readonly<Record<string, Datum>> = {
-  // The label uPlot gives the x series of a chart that Chart.svelte names none (the legend's first row).
-  // Chart.svelte gives it a message in part A's last commit, and this entry goes with it.
-  Time: { reason: 'lib/components/Chart.svelte: the legend of the uPlot x series', where: /\bu-label\b/ },
   // The name of the built-in group, which the legend of a chart that draws one series per group shows: uPlot
   // writes a series' label as text of its own, which cannot carry the mark.
   default: { reason: "the server's built-in group, as the label of a series in a uPlot legend (lib/components/Chart.svelte)", where: /\bu-label\b/ },

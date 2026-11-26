@@ -25,10 +25,14 @@ export const COMMON_MAX = 40;
 export const LOCALE_BUDGET = 80 * 1024;
 export const LOCALES_BUDGET = 400 * 1024;
 /** The attributes whose text a reader sees or hears, on any element (and `label` on `<optgroup>`):
- * read by the literal-text lint, the English ledger, and the codemod's inputs. */
+ * read by the literal-text lint and the codemod's inputs. */
 export const TEXT_ATTRS = ['aria-label', 'title', 'placeholder', 'alt', 'aria-roledescription', 'aria-description', 'aria-valuetext', 'aria-placeholder'];
 const isTextAttr = (element, attr) => TEXT_ATTRS.includes(attr) || (element === 'optgroup' && attr === 'label');
 const NOT_TEXT_ATTRS = ['translate', 'lang', 'dir'];
+/** The props of the app's components that hold text a reader sees (`<Kpi label="Queries" />`, `empty="Nothing yet"`):
+ * a literal one with letters is literal text, as a literal title or placeholder on an element is. */
+export const TEXT_PROPS = ['label', 'title', 'empty', 'noun', 'summary', 'hint', 'placeholder'];
+const isComponentNode = (n) => n.type === 'Component' || n.type === 'SvelteComponent' || n.type === 'SvelteSelf';
 // Languages written in more than one script: a catalog names the script (`zh-Hans`, `sr-Latn`). The
 // matcher also takes a catalog only for a request of the same likely script, list or not.
 const MULTI_SCRIPT = ['az', 'bs', 'ha', 'kk', 'ks', 'ku', 'mn', 'pa', 'sd', 'sr', 'uz', 'zh'];
@@ -79,14 +83,15 @@ function* walk(dir) {
 const slash = (p) => p.split('\\').join('/');
 const GENERATED = /^\s*(?:\/\/|\/\*)[^\n]*(?:GENERATED|auto-generated)/;
 
-/** The source files the layer applies to: `.svelte` and `.ts` under `src/`, without the layer
- * itself (`lib/i18n/`) and without generated files. Paths are relative to `src/`. */
+/** The source files the layer applies to: `.svelte` and `.ts` under `src/`, without the layer's own
+ * modules (the `.ts` files of `lib/i18n/`: they hold the machinery, not text a reader sees; a component
+ * placed there is held like any other) and without generated files. Paths are relative to `src/`. */
 export function sourceFiles(root) {
   const src = join(root, 'src');
   const out = [];
   for (const p of walk(src)) {
     const rel = slash(relative(src, p));
-    if (!/\.(svelte|ts)$/.test(rel) || rel.startsWith('lib/i18n/') || rel.startsWith('locales/')) continue;
+    if (!/\.(svelte|ts)$/.test(rel) || (rel.startsWith('lib/i18n/') && rel.endsWith('.ts')) || rel.startsWith('locales/')) continue;
     const text = readFileSync(p, 'utf8');
     if (GENERATED.test(text.slice(0, 400))) continue;
     out.push({ rel, text });
@@ -114,8 +119,8 @@ const lineAt = (text) => {
 
 const SPACE = /[ \t\n\r\f]+/g;
 const PLACEHOLDER = /\{[A-Za-z_][A-Za-z0-9_]*\}/g;
-/** A string as the ledger compares it: placeholders masked as `{}`, whitespace runs collapsed (as
- * the browser shows text), trimmed. Empty, or nothing but placeholders: null. */
+/** A string as the lint reads it: placeholders masked as `{}`, whitespace runs collapsed (as the
+ * browser shows text), trimmed. Empty, or nothing but placeholders: null. */
 export function masked(s) {
   const m = s.replace(PLACEHOLDER, '{}').replace(SPACE, ' ').trim();
   return m.replace(/\{\}/g, '').trim() === '' ? null : m;
@@ -196,7 +201,7 @@ const unwrap = (n) => {
   return n;
 };
 
-/** Everything the check, the lints and the ledger need from one source file. */
+/** Everything the check and the lints need from one source file. */
 export function analyzeFile(rel, text, context) {
   const line = lineAt(text);
   const out = {
@@ -207,8 +212,6 @@ export function analyzeFile(rel, text, context) {
     fails: [], // { rule, line, msg }
     literal: [], // lines of literal template text (the lint)
     scriptText: [], // lines of script strings of two or more words (warn level)
-    ledger: { markup: [], script: [] },
-    markupNow: [], // template text and attributes as the ledger reads them
     intl: 0,
     physical: 0,
   };
@@ -395,7 +398,6 @@ export function analyzeFile(rel, text, context) {
     const raw = ts.isTemplateExpression(n) ? n.head.text + n.templateSpans.map((s) => `{}${s.literal.text}`).join('') : n.text;
     const m = masked(raw);
     if (m === null) return;
-    out.ledger.script.push(m);
     const isMessage = ts.isCallExpression(p) && messageCall(p);
     if (!isMessage && TWO_WORDS.test(raw)) out.scriptText.push(line(at(n)));
   };
@@ -412,7 +414,6 @@ export function analyzeFile(rel, text, context) {
     for (const s of scripts) collect(parseUnit(text.slice(s.content.start, s.content.end), s.content.start, s.context === 'module', true));
     const exprs = [];
     const expr = (node) => node && typeof node.start === 'number' && exprs.push(node);
-    const isComponentNode = (n) => n.type === 'Component' || n.type === 'SvelteComponent' || n.type === 'SvelteSelf';
     const attrText = (value) => (Array.isArray(value) ? value.map((v) => (v.type === 'Text' ? v.data : '{}')).join('') : null);
     // A literal attribute value: plain text without `{…}` (Svelte would substitute those itself), or
     // a string literal as the expression (`msg={'Muted by <b>{who}</b>'}`).
@@ -430,8 +431,6 @@ export function analyzeFile(rel, text, context) {
       const raw = nodes.map((n) => (n.type === 'Text' ? n.data : '{}')).join('');
       const m = masked(raw);
       if (m === null) return;
-      out.ledger.markup.push(m);
-      out.markupNow.push(m);
       if (!st.translateNo && LETTER.test(m.replace(/\{\}/g, ''))) out.literal.push(line(nodes[0].start));
     };
     const element = (n, st) => {
@@ -454,14 +453,7 @@ export function analyzeFile(rel, text, context) {
           if (s === null || NOT_TEXT_ATTRS.includes(a.name)) continue;
           const m = masked(s);
           if (m === null) continue;
-          if (isTextAttr(n.name, a.name)) {
-            out.ledger.markup.push(m);
-            out.markupNow.push(m);
-            if (!st.translateNo && LETTER.test(m.replace(/\{\}/g, ''))) out.literal.push(line(a.start));
-          } else if (isComponentNode(n)) {
-            out.ledger.markup.push(m);
-            out.markupNow.push(m);
-          }
+          if ((isTextAttr(n.name, a.name) || (isComponentNode(n) && TEXT_PROPS.includes(a.name))) && !st.translateNo && LETTER.test(m.replace(/\{\}/g, ''))) out.literal.push(line(a.start));
         } else if (a.type === 'StyleDirective') {
           if (physical(a.name, '')) out.physical++;
           const parts = a.value === true ? [] : Array.isArray(a.value) ? a.value : [a.value];
@@ -831,12 +823,9 @@ export function check(root, { previous = null, ratchets = true } = {}) {
   return { findings, entries, shipped, files, data };
 }
 
-/** Until part A ends, a ratchet count above zero in a file that `i18n-baseline.json` does not list
- * (a file new, or moved, since the baseline was written) is reported, not failed; part A's last
- * commit sets this to true. */
-export const NEW_FILES_STRICT = false;
-
-/** The ratchets: literal text, Intl outside format.ts, physical CSS. */
+/** The ratchets: literal text, Intl outside format.ts, physical CSS. A count above zero in a file that
+ * `i18n-baseline.json` does not list (a file new, or moved, since the baseline was written) fails, as it does
+ * in a file the baseline lists at zero. */
 function ratchetFindings(root, files, add) {
   const src = (rel) => `src/${rel}`;
   let base = {};
@@ -859,17 +848,17 @@ function ratchetFindings(root, files, add) {
         const lines = `lines ${f?.literal.join(', ')}`;
         if (n > 0 && listed && b === 0) add({ level: 'fail', rule: 'literal-text', file: src(rel), line: f?.literal[0], msg: `${n} literal text${n === 1 ? '' : 's'} in a file the baseline holds at zero: use t() (${lines})` });
         else if (n > 0 && !listed)
-          add({ level: NEW_FILES_STRICT ? 'fail' : 'report', rule: 'literal-text', file: src(rel), line: f?.literal[0], msg: `${n} literal text${n === 1 ? '' : 's'} in a file i18n-baseline.json does not list: use t() (${lines})` });
+          add({ level: 'fail', rule: 'literal-text', file: src(rel), line: f?.literal[0], msg: `${n} literal text${n === 1 ? '' : 's'} in a file i18n-baseline.json does not list: use t() (${lines})` });
       } else if (n > b) {
         const what = kind === 'intl' ? `${n} Intl/toLocale call sites, ${b} allowed: format in lib/format.ts` : `${n} physical CSS properties, ${b} allowed: use logical ones (margin-inline-start, text-align: start)`;
-        add({ level: listed || NEW_FILES_STRICT ? 'fail' : 'report', rule: kind === 'intl' ? 'intl' : 'physical-css', file: kind === 'physical' && rel === 'app.css' ? 'src/app.css' : src(rel), msg: listed ? what : `${what} (a file i18n-baseline.json does not list)` });
+        add({ level: 'fail', rule: kind === 'intl' ? 'intl' : 'physical-css', file: kind === 'physical' && rel === 'app.css' ? 'src/app.css' : src(rel), msg: listed ? what : `${what} (a file i18n-baseline.json does not list)` });
       }
       if (kind === 'intl' && n > 0 && f?.usesLayer && rel !== 'lib/format.ts') add({ level: 'fail', rule: 'intl', file: src(rel), msg: 'a file on the translation layer formats through lib/format.ts only' });
       if (n < b) add({ level: 'report', rule: 'baseline', file: 'i18n-baseline.json', msg: `${kind} ${JSON.stringify(rel)}: ${n}, baseline ${b} (lower it: node scripts/i18n.mjs baseline)` });
     }
   }
   const above = Object.values(counts.literal).filter((n) => n > 0).length;
-  add({ level: 'report', rule: 'literal-text', file: 'i18n-baseline.json', msg: `${above} files still hold literal text (they move to the layer file by file)` });
+  add({ level: 'report', rule: 'literal-text', file: 'i18n-baseline.json', msg: `${above} files hold literal text` });
   for (const f of files) {
     if (f.usesLayer && f.scriptText.length) add({ level: 'report', rule: 'script-text', file: src(f.rel), msg: `script strings of two or more words on lines ${f.scriptText.join(', ')}: text the reader sees goes through t()` });
   }
@@ -1011,8 +1000,8 @@ export function ratchetCounts(root, files) {
  * baseline`). Each ratchet lists every file, zeros too, so a file the baseline does not list is new
  * (or moved) since it was written. A listed file keeps the lower of its two counts: a count is
  * lowered, never raised. A file not listed is added only at zero (one that holds text, an Intl call
- * or a physical property stays unlisted: reported until part A ends). A file that is gone is
- * dropped. Without a baseline before it, every count is written as it is.
+ * or a physical property stays unlisted, and the check fails it). A file that is gone is dropped.
+ * Without a baseline before it, every count is written as it is.
  */
 export function baselineOf(root, files, previous = null) {
   const counts = ratchetCounts(root, files);
@@ -1145,150 +1134,4 @@ export function carry(root, ctx, from, to) {
     writeFileSync(p, serializeCatalog(cat, f === 'notes.json' || f === 'verbatim.json' ? 'data' : 'locale'));
   }
   return n;
-}
-
-/** The ledger entries of some files, from the current tree: per file, the template text and the
- * four attributes (`markup`) and the script strings (`script`), as the browser shows them. */
-export function ledgerEntries(root, rels) {
-  const contexts = existsSync(join(root, 'src', 'locales', 'contexts.json')) ? readJson(join(root, 'src', 'locales', 'contexts.json')) : {};
-  const out = {};
-  for (const f of sourceFiles(root)) {
-    if (rels && !rels.includes(f.rel)) continue;
-    const a = analyzeFile(f.rel, f.text, contexts[f.rel] ?? contextName(f.rel));
-    out[f.rel] = { markup: [...a.ledger.markup].sort(cmp), script: [...a.ledger.script].sort(cmp) };
-  }
-  return out;
-}
-
-// ---------------------------------------------------------------------------------------------
-// String conservation (the ledger test)
-
-const TAGS = /<\/?[a-z][a-z0-9]*\/?>/g;
-/** The pieces of a message between its placeholders and tags, trimmed. */
-export function pieces(s) {
-  return s
-    .replace(PLACEHOLDER, '\u0000')
-    .replace(/\{\}/g, '\u0000')
-    .replace(TAGS, '\u0000')
-    .split('\u0000')
-    .map((x) => x.replace(SPACE, ' ').trim())
-    .filter(Boolean);
-}
-
-/** Whether each piece of a sentence is the next pieces of its fragments, run together or one space
- * apart (`Queries from` + `this device (`; a plural's `voter` + `s`), all of them, in order. */
-function joined(want, got) {
-  let i = 0;
-  for (const p of want) {
-    let s = got[i++] ?? null;
-    while (s !== null && s !== p && i < got.length) {
-      const next = [`${s} ${got[i]}`, `${s}${got[i]}`].find((c) => p.startsWith(c));
-      if (next === undefined) break;
-      s = next;
-      i++;
-    }
-    if (s !== p) return false;
-  }
-  return i === got.length;
-}
-
-/**
- * Whether a file on the layer still shows the English of its ledger entry. Template text left as
- * it is must be ledger text, and every ledger text must still be there: as template text or as a
- * message. Every message must be English the file had (template text or a script string). An
- * exception `{ sentence, fragments }` takes the fragments out of the entry and puts the sentence
- * in; its fragments, in order, must make the sentence's pieces. A fragment is one of the file's
- * ledger strings, or a piece of one (a plural's suffix sits between two pieces of one string). A
- * string an earlier exception took may be used again: each variant of a sentence with an {#if} in
- * it is a whole message of its own. A sentence no message of the file takes is reported (the
- * exception hides text the file no longer shows), after the file's own strings, so a sentence that
- * is also one of the file's own strings is reported when only one message has it.
- * Returns a list of problems (empty: conserved).
- */
-export function conserve(analysis, entry, exceptions = []) {
-  const problems = [];
-  const take = (bag, s) => {
-    const i = bag.indexOf(s);
-    if (i < 0) return false;
-    bag.splice(i, 1);
-    return true;
-  };
-  const markup = [...entry.markup];
-  const script = [...entry.script];
-  // The masked sentence of each exception, apart from the file's own strings: a message takes an own
-  // string first, and what no message takes is reported below.
-  const sentences = [];
-  const own = [...entry.markup, ...entry.script];
-  // A piece belongs to a string this sentence or an earlier one already uses, before any other.
-  const ownerOf = (f, mine) => own.find((s) => s === f) ?? [...mine, ...taken, ...own].find((s) => pieces(s).includes(f));
-  const taken = [];
-  for (const x of exceptions) {
-    if (typeof x?.sentence !== 'string' || !Array.isArray(x.fragments)) {
-      problems.push(`malformed exception ${JSON.stringify(x)}`);
-      continue;
-    }
-    if (!joined(pieces(x.sentence), x.fragments.flatMap((f) => pieces(f)))) problems.push(`exception "${x.sentence}": its fragments are not the sentence's pieces`);
-    const mine = [];
-    for (const f of x.fragments) {
-      const s = ownerOf(f, mine);
-      const ok = s !== undefined && (take(markup, s) || take(script, s) ? mine.push(s) > 0 : taken.includes(s) || (s !== f && mine.includes(s)));
-      if (!ok) problems.push(`exception "${x.sentence}": "${f}" is not in this file's ledger entry`);
-    }
-    taken.push(...mine);
-    const m = masked(x.sentence);
-    if (m !== null) sentences.push({ m, sentence: x.sentence });
-  }
-  const left = sentences.map((x) => x.m);
-  for (const s of analysis.markupNow) if (!take(markup, s) && !take(script, s) && !take(left, s)) problems.push(`template text "${s}" is not in the ledger (changed or new English)`);
-  for (const msg of analysis.messages) {
-    for (const e of Array.isArray(msg.english) ? msg.english : [msg.english]) {
-      const m = masked(e);
-      if (m !== null && !take(markup, m) && !take(script, m) && !take(left, m)) problems.push(`message "${e}" (line ${msg.line}) is not English this file had`);
-    }
-  }
-  for (const s of markup) problems.push(`template text "${s}" is gone`);
-  // `left` is `sentences` less what was taken: the sentences no message of the file has.
-  for (const x of sentences) {
-    const i = left.indexOf(x.m);
-    if (i < 0) continue;
-    left.splice(i, 1);
-    problems.push(`exception "${x.sentence}": no message of this file has this English (an exception whose text the file no longer shows)`);
-  }
-  return problems;
-}
-
-/**
- * The ledger test over the whole tree (`files`: the check's per-file analyses). A file on the layer
- * with a ledger entry conserves it (`conserve`). A file on the layer without one is new, or moved:
- * - when an entry whose file is gone has its file name (a move to another folder), the entry moves
- *   with it (renamed in the ledger, where the diff shows it);
- * - otherwise each message must be English that some ledger entry had, or be listed for that file
- *   under `new` in ledger-exceptions.json.
- * A removed file, or a moved file not on the layer, needs nothing. Returns a list of problems.
- */
-export function ledgerProblems(files, ledger, exceptions = {}) {
-  const problems = [];
-  const here = new Set(files.map((f) => f.rel));
-  const migrated = files.filter((f) => f.usesLayer);
-  const fresh = exceptions.new ?? {};
-  const known = new Set(Object.values(ledger).flatMap((e) => [...e.markup, ...e.script]));
-  const gone = Object.keys(ledger).filter((k) => !here.has(k));
-  for (const f of migrated) {
-    if (Object.hasOwn(ledger, f.rel)) {
-      for (const p of conserve(f, ledger[f.rel], exceptions[f.rel] ?? [])) problems.push(`${f.rel}: ${p}`);
-      continue;
-    }
-    const from = gone.filter((k) => basename(k) === basename(f.rel));
-    for (const k of from) problems.push(`${f.rel}: the ledger entry of ${JSON.stringify(k)}, which is no longer a source file, has its name: rename that entry to ${JSON.stringify(f.rel)}`);
-    if (from.length) continue;
-    const english = f.messages.flatMap((m) => (Array.isArray(m.english) ? m.english : [m.english])).map(masked).filter((m) => m !== null);
-    const listed = Array.isArray(fresh[f.rel]) ? fresh[f.rel] : [];
-    for (const m of english) if (!known.has(m) && !listed.includes(m)) problems.push(`${f.rel}: message ${JSON.stringify(m)} is not English any ledger entry had: list it under "new" in ledger-exceptions.json`);
-  }
-  for (const rel of Object.keys(exceptions)) {
-    if (rel === 'new') continue;
-    if (!migrated.some((f) => f.rel === rel)) problems.push(`exception for ${JSON.stringify(rel)}: not a file on the layer`);
-  }
-  for (const rel of Object.keys(fresh)) if (!migrated.some((f) => f.rel === rel) || Object.hasOwn(ledger, rel)) problems.push(`"new" English for ${JSON.stringify(rel)}: only for a file on the layer without a ledger entry`);
-  return problems;
 }

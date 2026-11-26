@@ -197,7 +197,7 @@
         },
       ],
       series: [
-        { value: (_u, v) => (v == null ? tx('total') : clock(v, true)) },
+        { label: tx('Time'), value: (_u, v) => (v == null ? tx('total') : clock(v, true)) },
         ...order.map((i) => {
           const c = color(series[i].color);
           return {

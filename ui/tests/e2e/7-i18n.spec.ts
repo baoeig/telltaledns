@@ -1,7 +1,7 @@
 // REQ: API-012 (ADR-189) — languages in the web UI, the layer itself, without a browser: messages,
 // plurals, matching, the agreement rule, the pseudo-locale, the runtime's tables, the catalog step,
-// the pair files and the formats. The languages tool is 7-i18n-check.spec.ts, the ratchets and the
-// English ledger 7-i18n-ratchets.spec.ts, the pages 8-i18n-pages.spec.ts.
+// the pair files and the formats. The languages tool is 7-i18n-check.spec.ts, the ratchets
+// 7-i18n-ratchets.spec.ts, the pages 8-i18n-pages.spec.ts.
 import { expect, test } from '@playwright/test';
 import { interpolate, parts, plural } from '../../src/lib/i18n/message';
 import { candidates, canonical, match, type Request } from '../../src/lib/i18n/match';
