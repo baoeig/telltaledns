@@ -1620,8 +1620,8 @@ test('api_012 pseudo locale leaves no literal text: the cluster of a witness, po
   view = REPLICA({ nodes: [node({ nodeId: 'n-bbbb2222', site: 'pi', role: 'replica', thisNode: true, rttMs: null, configSource: 'file' })] });
   await page.reload();
   await open(page, '/cluster', '[data-testid="cluster-node"]');
-  await expect(page.locator('dl.facts')).toContainText('ñóñé');
   expect(await leftovers(page), 'a cluster with no primary').toEqual([]);
+  await expect(page.locator('dl.facts')).toContainText('ñóñé');
   view = { ...CLUSTER, enabled: false, host: HOST, nodes: [] };
   info = SHELL_INFO({ clientIpsMasked: null, queryLog: true });
   await page.reload();
