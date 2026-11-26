@@ -26,9 +26,14 @@ export const hasLetters = (s: string): boolean => LETTER.test(s);
 const CODE = /^\S*[^\s.:][./:_=-][^\s.:]\S*$/;
 /** Letters, a hyphen between two letters, and nothing else: a word (`Git-managed`, `Read-only`). */
 const HYPHENATED_WORD = /^\p{L}+(?:-\p{L}+)+$/u;
+/** Letters and slashes and nothing else (`Queries/s`, `and/or`, `q/s`). */
+const SLASHED_WORDS = /^\p{L}+(?:\/\p{L}+)+$/u;
 export const isCode = (s: string): boolean => {
   const word = s.replace(/[.:]+$/, '');
-  return CODE.test(word) && !HYPHENATED_WORD.test(word);
+  if (!CODE.test(word) || HYPHENATED_WORD.test(word)) return false;
+  // Words joined by a slash are text when a side is a word of two letters or more (`Queries/s`); `a/b` and `q/s`
+  // have none, and read as code (a unit like `q/s` cannot be told from a path).
+  return !(SLASHED_WORDS.test(word) && word.split('/').some((w) => [...w].length >= 2));
 };
 
 /** The words a date or a time formatted in English by the browser (the suite pins en-US) is made of. */
@@ -66,18 +71,47 @@ function fits(parts: readonly string[], text: string): boolean {
 }
 
 const letterCount = (s: string) => (s.replace(/\{\}/g, '').match(/\p{L}/gu) ?? []).length;
+/** The letters of a pattern that no placeholder touches: `{n} odd` has three, `{s}s` none (the placeholder could take that
+ * letter too, and the pattern would fit any word that ends in it). */
+const freeLetters = (s: string) => {
+  const c = [...s.replace(/\{\}/g, '\u0000')];
+  return c.filter((ch, i) => LETTER.test(ch) && c[i - 1] !== '\u0000' && c[i + 1] !== '\u0000').length;
+};
+
+const WORD_CHAR = /[\p{L}\p{N}]/u;
+/** Where `value` stands in `piece` as whole words: not inside a longer word or number (`name` is not in
+ * `username`). A value that starts or ends with a sign needs no boundary on that side. */
+function wholeAt(piece: string, value: string): number[] {
+  const out: number[] = [];
+  const first = WORD_CHAR.test(value[0] ?? '');
+  const last = WORD_CHAR.test(value[value.length - 1] ?? '');
+  for (let i = piece.indexOf(value); i >= 0; i = piece.indexOf(value, i + 1)) {
+    if (first && i > 0 && WORD_CHAR.test(piece[i - 1])) continue;
+    const end = i + value.length;
+    if (last && end < piece.length && WORD_CHAR.test(piece[end])) continue;
+    out.push(i);
+  }
+  return out;
+}
 
 /** Whether a piece is made of the test's own data: one value (or a pattern with `{}`), or several of them
- * with only signs, numbers and code between (`work-pc (127.0.0.1)`, `unifi · https://192.168.0.1`). */
+ * with only signs, numbers and code between (`work-pc (127.0.0.1)`, `unifi · https://192.168.0.1`). A value
+ * counts as whole words only. */
 export function covered(piece: string, own: Iterable<string>): boolean {
-  const values = [...own].filter((v) => v.length >= 2 && (v.includes('{}') ? isEnglish(v, piece) : piece.includes(v)));
+  const values = [...own].filter((v) => v.length >= 2 && (v.includes('{}') ? isEnglish(v, piece) : wholeAt(piece, v).length > 0));
   if (values.some((v) => v.includes('{}') || v === piece)) return true;
   let rest = piece;
-  for (const v of values.sort((a, b) => b.length - a.length)) rest = rest.split(v).join(' ');
+  for (const v of values.sort((a, b) => b.length - a.length)) {
+    for (const i of wholeAt(rest, v).reverse()) rest = `${rest.slice(0, i)}${' '.repeat(v.length)}${rest.slice(i + v.length)}`;
+  }
   // What is left between the values: signs, numbers, code, and (beside a number) the words of a time (`06:37 PM: …`).
   const clock = /\d/.test(piece);
   return rest.split(/\s+/).every((word) => !hasLetters(word) || isCode(word) || (clock && DATE_WORDS.has(word.replace(/[^\p{L}]/gu, ''))));
 }
+
+/** Whether a piece is one value of the test's data, whole (or fits a pattern of its own with `{}`): the data and nothing
+ * else, which no message can be hiding behind (`by hand`, the value of a field, is not the message `by {by}`). */
+export const isWhole = (piece: string, own: Iterable<string>): boolean => [...own].some((v) => v.length >= 2 && (v.includes('{}') ? isEnglish(v, piece) : v === piece));
 
 export type Datum = {
   /** Why the text is data and the UI cannot mark it. */
@@ -103,6 +137,9 @@ export type RuleInput = {
   data: Readonly<Record<string, Datum>>;
   /** English the help panel shows from docs/help/topics.json (ADR-189: help stays English in part A). Only in the help panel. */
   help: readonly string[];
+  /** The English of the layer's messages (`{name}` for a placeholder). With them, a piece that is a message's English, or fits
+   * a message that has a letter of its own, is that message gone back to English, whatever data it also shows. */
+  messages?: readonly string[];
 };
 
 export type Rule = {
@@ -112,16 +149,29 @@ export type Rule = {
   found(text: readonly string[], other: readonly string[], own?: Iterable<string>, help?: readonly string[], places?: ReadonlyMap<string, readonly string[]>): string[];
 };
 
-export function makeRule({ data, help }: RuleInput): Rule {
+/** The separator code puts between the parts of a piece it builds (`3 rules · off`). */
+const JOIN = ' · ';
+
+export function makeRule({ data, help, messages }: RuleInput): Rule {
   const helpSet = new Set(help);
+  // A message of the layer that a piece is, or fits with a letter of its own (one word for each placeholder).
+  const messageOf = messages ? makeCollides(messages, 1, true) : () => undefined;
   return {
     found(text, other, own = [], inHelp = [], places) {
       const ownList = [...own];
       const found: string[] = [];
+      /** A part of a piece that code joined: a message with a placeholder gone back to English (`4.2 q/s`, `3 rules`), which no
+       * data of the test says whole. A part that is a single word (`primary`, `block`: the server's, or a message's) is not told apart. */
+      const englishPart = (s: string) => !hasPseudo(s) && hasLetters(s) && !isCode(s) && !isFormatted(s) && !isWhole(s, ownList) && (messageOf(s) ?? '').includes('{');
       for (const p of new Set([...text, ...other, ...inHelp])) {
-        if (hasPseudo(p) || !hasLetters(p) || isCode(p) || isFormatted(p)) continue;
-        // The test's own data: its mocks' and the server's names and values, in a text node or an attribute.
-        if (covered(p, ownList)) continue;
+        if (!hasLetters(p) || isCode(p) || isFormatted(p)) continue;
+        // One pseudo character excuses a piece, but not a message with a placeholder that code joined to it in English
+        // (`you · 4.2 q/s`).
+        if (p.includes(JOIN) && p.split(JOIN).some(englishPart)) {
+          found.push(JSON.stringify(p));
+          continue;
+        }
+        if (hasPseudo(p)) continue;
         const elsewhere = text.includes(p) || other.includes(p);
         // Shared data: as a text node only (an attribute or canvas text is the page's own), at the places it names.
         const d = Object.hasOwn(data, p) ? data[p] : undefined;
@@ -129,6 +179,10 @@ export function makeRule({ data, help }: RuleInput): Rule {
         if (d && text.includes(p) && !other.includes(p) && (!d.where || (at.length > 0 && at.every((w) => d.where?.test(w))))) continue;
         // The help glossary: English in part A, where the help panel shows it (and nowhere else).
         if (helpSet.has(p) && !elsewhere) continue;
+        // The test's own data: its mocks' and the server's names and values, in a text node or an attribute. A piece that is
+        // a message's English, or fits a message, is that message gone back to English, whatever data it also holds; a piece
+        // that is one value of the data and nothing else is data.
+        if (isWhole(p, ownList) || (!messageOf(p) && covered(p, ownList))) continue;
         found.push(JSON.stringify(p));
       }
       return found;
@@ -139,21 +193,33 @@ export function makeRule({ data, help }: RuleInput): Rule {
 /** The English message a data string would hide, if any: a test may take as data only what no message
  * says. `messages` are the English of the layer's messages, with `{name}` for a placeholder; a pattern
  * with a placeholder counts when it has eight letters of its own (a shorter one would fit any name). */
-export function collides(value: string, messages: readonly string[]): string | undefined {
+export function collides(value: string, messages: readonly string[], minLetters = 8, free = false): string | undefined {
   return messages.find((m) => {
     const s = m.replace(/\{[A-Za-z_][A-Za-z0-9_]*\}/g, '{}');
-    return (s.includes('{}') ? letterCount(s) >= 8 && isEnglish(s, value) : s === value) || (value.includes('{}') && isEnglish(value, s));
+    if (!s.includes('{}')) return s === value || (value.includes('{}') && isEnglish(value, s));
+    const own = free ? freeLetters(s) : letterCount(s);
+    // A pattern read for a piece takes one word for each placeholder (`{n} odd` fits `1 odd`, not `first query to odd`).
+    const fits = free ? fitsWords(s, value) : isEnglish(s, value);
+    return (own >= minLetters && fits) || (value.includes('{}') && isEnglish(value, s));
   });
 }
 
-/** `collides` for many values: one lookup for the messages without a placeholder, and the answer kept. */
-export function makeCollides(messages: readonly string[]): (value: string) => string | undefined {
+/** Whether a text is the English `s` (placeholders `{}`) with one word, or none, for each placeholder. */
+function fitsWords(s: string, text: string): boolean {
+  if (text.length > 400) return false;
+  return new RegExp(`^${s.split('{}').map((x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\S*')}$`, 'u').test(text);
+}
+
+/** `collides` for many values: one lookup for the messages without a placeholder, and the answer kept. A value of the
+ * data is held to patterns with eight letters of their own; a piece of a page, to patterns with one letter that no
+ * placeholder touches (`minLetters` 1, `free`). */
+export function makeCollides(messages: readonly string[], minLetters = 8, free = false): (value: string) => string | undefined {
   const exact = new Set(messages.filter((m) => !/\{[A-Za-z_][A-Za-z0-9_]*\}/.test(m)));
   const patterns = messages.filter((m) => /\{[A-Za-z_][A-Za-z0-9_]*\}/.test(m));
   const known = new Map<string, string | undefined>();
   return (value) => {
     if (known.has(value)) return known.get(value);
-    const hit = exact.has(value) ? value : collides(value, patterns);
+    const hit = exact.has(value) ? value : collides(value, patterns, minLetters, free);
     known.set(value, hit);
     return hit;
   };
@@ -243,8 +309,16 @@ export function readPage(): Read {
     seen.add(`${s}\u0000${place}`);
     at.push([s, place]);
   };
-  // The help panel: a drawer that holds the topic (English data in part A).
-  const inHelp = (el: Element) => el.closest('.drawer')?.querySelector('[data-testid="help-panel"]') != null;
+  // The help panel (English data in part A): what is inside it, and what else its own drawer holds (the topic's title,
+  // the close button). A drawer that only holds another drawer with a help panel (a "?" button renders its drawer
+  // inline) is not help: the closest drawer of the element must be the panel's own.
+  const panels = [...document.querySelectorAll('[data-testid="help-panel"]')];
+  const helpDrawers = new Set(panels.map((p) => p.closest('.drawer')).filter((d): d is Element => d !== null));
+  const inHelp = (el: Element) => {
+    if (panels.some((p) => p.contains(el))) return true;
+    const drawer = el.closest('.drawer');
+    return drawer !== null && helpDrawers.has(drawer);
+  };
   const walk = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
   for (let n: Node | null = walk.currentNode; n; n = walk.nextNode()) {
     if (n.nodeType === Node.TEXT_NODE) {

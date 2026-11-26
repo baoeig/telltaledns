@@ -1,8 +1,10 @@
 // REQ: API-012 (ADR-189) — the whole-page rule of the pseudo-locale page tests (i18n-pseudo-rule.ts)
 // held to fixtures, without a browser: a text node, a title, an aria-label, a placeholder, the value of a
 // button or an alt that is English fails it, so does a hyphenated word, a one-word label with a colon and
-// a short pattern such as `3 behind`; pseudo text, data marked translate="no", code, text without letters
-// and the data a test declares pass. The fixture is a small component rendered on the server under the
+// a short pattern such as `3 behind`, a message beside data (`1 odd` where `odd` is a value), a word that holds
+// a value (`username` for `user`, `name`), slash text (`Queries/s`) and the English part of a joined piece
+// (`Ĥéļļó · 4.2 q/s`); pseudo text, data marked translate="no", code, text without letters and the data a test
+// declares pass. The fixture is a small component rendered on the server under the
 // pseudo-locale, read as the page tests read a page (the same text nodes, attributes and marks).
 import { expect, test } from '@playwright/test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -74,7 +76,11 @@ const found = async (edit: (s: string) => string) => {
 
 test('api_012 pseudo rule: a word that ends in a full stop or a colon is text, a hyphenated word is text, a token with a separator is code', () => {
   for (const word of ['Saved.', 'Canaries:', 'left.', 'Partial:', 'node:', 'wait:', '/annotations', '/auth/', 'Git-managed', 'Read-only', 'Sign-in.', 'e-mail', 'Add-ons:', 'Git-managed-by']) expect(isCode(word), word).toBe(false);
-  for (const token of ['data-theme-2', '2-digit', 'a/b', 'application/json', 'telltale-support.tar.gz', '--surface-2', 'neighbor_mac', 'node:{}', '/cache/stats', 'Queries/s', 'ads.example.com', 'n-aaaa1111', 'v0.9.0-edge.437', 'x-1', '10.0.0.1:53']) expect(isCode(token), token).toBe(true);
+  // Words joined by a slash are text when a side is a word of two letters or more (`Queries/s`).
+  // (A lowercase pair such as `application/json` is judged as text too: it passes as the data of the page that received it.)
+  for (const word of ['Queries/s', 'and/or', 'Read/write', 'km/h', 'Allow/Block:', 'application/json']) expect(isCode(word), word).toBe(false);
+  // One-letter sides (`q/s`, `a/b`), paths and keys stay code.
+  for (const token of ['data-theme-2', '2-digit', 'a/b', 'q/s', 'telltale-support.tar.gz', '--surface-2', 'neighbor_mac', 'node:{}', '/cache/stats', 'ads.example.com', 'n-aaaa1111', 'v0.9.0-edge.437', 'x-1', '10.0.0.1:53', 'a/b/c', 'v1/s', 'on/off1']) expect(isCode(token), token).toBe(true);
   // Text without letters is not text: numbers, signs, units made of signs.
   for (const s of ['12.5', '—', '%', '1,234 · 5', '3 / 7', '99 %', '×', '']) expect(hasLetters(s), s).toBe(false);
   for (const s of ['ms', 'A', '5 s', 'Saved.', 'Ünï', '日本語']) expect(hasLetters(s), s).toBe(true);
@@ -96,7 +102,7 @@ test('api_012 pseudo rule: the page after its migration holds', async () => {
   expect(RULE.found(page.text, page.other)).toEqual(['"kids-tv"']);
 });
 
-test('api_012 pseudo rule: a site reverted to its literal english fails it, whatever the English is', async () => {
+test('api_012 pseudo rule: a site reverted to its literal english fails it when the English has letters and is no code or date', async () => {
   const cases: [string, string, string, string][] = [
     ['a text node', "{t('Saved.')}", 'Saved.', 'Saved.'],
     ['a one-word label with a colon', "{t('Canaries:')}", 'Canaries:', 'Canaries:'],
@@ -180,6 +186,70 @@ test('api_012 pseudo rule: the data of a test excuses a text node and an attribu
     expect(strict.found([], [text], [], [], there), text).toEqual([JSON.stringify(text)]);
     expect(strict.found([text], [], [], [], new Map([[text, ['text of td']]])), text).toEqual([JSON.stringify(text)]);
   }
+});
+
+test('api_012 pseudo rule: a message that is English again is found beside the data of the page', () => {
+  const messages = ['{n} odd', 'Queries/s', '{rate} q/s', '{n} rules', 'e.g. kids', 'Sign in with {name}', 'Reason: {reason}', '{n} of {total}'];
+  const rule = makeRule({ data: {}, help: [], messages });
+  // The page received `odd`, `kids` and `rules` as values: a piece of the UI's own words is still the message.
+  expect(rule.found(['1 odd', '3 rules'], [], ['odd', 'rules'])).toEqual(['"1 odd"', '"3 rules"']);
+  expect(rule.found([], ['e.g. kids'], ['kids'])).toEqual(['"e.g. kids"']);
+  expect(rule.found(['4.2 q/s', 'Queries/s'], [], ['s'])).toEqual(['"4.2 q/s"', '"Queries/s"']);
+  // A pattern with a letter of its own (`of`) fits a count.
+  expect(rule.found(['3 of 9'], [], ['of'])).toEqual(['"3 of 9"']);
+  // Data that no message says stays data, in a text node and in an attribute, alone and beside other data.
+  expect(rule.found(['odd', 'work-pc (127.0.0.1)', 'kids · odd'], ['kids'], ['odd', 'kids', 'work-pc'])).toEqual([]);
+  // A pattern that fits with no letter of its own is not a message: a count is data.
+  expect(rule.found(['3'], [], [])).toEqual([]);
+  // Nor is one whose only letters touch a placeholder (`{s}s`, seconds): it would fit every name that ends in `s`.
+  expect(makeRule({ data: {}, help: [], messages: ['{s}s', '{m}m', '{n} s'] }).found(['kids', 'homelab'], [], ['kids', 'homelab'])).toEqual([]);
+  expect(makeRule({ data: {}, help: [], messages: ['{s}s', '{n} s'] }).found(['5 s'], [], ['s'])).toEqual(['"5 s"']);
+  // A short pattern takes one word for each placeholder: `{from} to {to}` is not the text `first query to example.com`.
+  const words = makeRule({ data: {}, help: [], messages: ['{from} to {to}', '{n} s', '{n} rules'] });
+  expect(words.found(['06:37 AM: first query to example.com'], [], ['first query to example.com'])).toEqual([]);
+  expect(words.found(['5 to 9', '5 s', '3 rules'], [], ['first query to example.com'])).toEqual(['"5 to 9"', '"5 s"', '"3 rules"']);
+  // A piece that is one value of the data and nothing else is data, though a short message fits it (`by {by}`, `{n} s`).
+  const short = makeRule({ data: {}, help: [], messages: ['by {by}', '{n} s'] });
+  expect(short.found(['by hand', 'every 5 s', 'Ĥéļļó · by hand'], [], ['by hand', 'every 5 s'])).toEqual([]);
+  expect(short.found(['by hand', 'by hand today'], [], ['hand'])).toEqual(['"by hand"', '"by hand today"']);
+  // Without the messages the rule cannot tell, and the data hides it: the page tests give it the layer's messages.
+  expect(makeRule({ data: {}, help: [] }).found(['1 odd', '3 rules'], [], ['odd', 'rules'])).toEqual([]);
+});
+
+test('api_012 pseudo rule: a value of the data counts as whole words only', () => {
+  const rule = makeRule({ data: {}, help: [] });
+  // `user` and `name` are values; `username` is a word of the UI's own.
+  expect(rule.found([], ['username'], ['user', 'name'])).toEqual(['"username"']);
+  expect(rule.found(['users', 'user2', 'rename'], [], ['user', 'name'])).toEqual(['"users"', '"user2"', '"rename"']);
+  // Each value is a whole word beside signs, numbers and spaces; and a value that begins or ends with a sign needs no boundary there.
+  expect(rule.found(['user name', 'user, name', '(user)', 'user-name', 'user2 user', '· user'], [], ['user', 'name', 'user2'])).toEqual([]);
+  expect(rule.found(['Done user'], [], ['user'])).toEqual(['"Done user"']);
+  expect(rule.found(['@main,'], [], ['@main'])).toEqual([]);
+});
+
+test('api_012 pseudo rule: a message with a placeholder that code joined to pseudo text in English is found', async () => {
+  // `{[t('Close'), '4.2 q/s'].join(' · ')}` draws one text node with pseudo text in front and English behind it.
+  const rule = makeRule({ data: {}, help: [], messages: ['{rate} q/s', 'Close'] });
+  const joined = async (parts: string) => {
+    const page = await drawn(AFTER.replace('<p>kids-tv</p>', `<p>kids-tv</p><p>{[${parts}].join(' · ')}</p>`));
+    return { page, found: rule.found(page.text, page.other, DECLARED) };
+  };
+  const english = await joined("t('Close'), '4.2 q/s'");
+  expect(english.page.text.filter((s) => s.endsWith(' · 4.2 q/s') && PSEUDO.test(s))).toHaveLength(1);
+  expect(english.found).toHaveLength(1);
+  expect(english.found[0]).toContain(' · 4.2 q/s');
+  // Not held: a part that is a single word or a sentence is not told from a word of the server's (`primary`, `block`).
+  expect(RULE.found(['Ĥéļļó · moved to the hallway'], [])).toEqual([]);
+  // The same with a part that is data, a part without letters and a part that is code: all pass.
+  for (const parts of ["t('Close'), 'kids-tv'", "t('Close'), '4.2'", "t('Close'), '/cache/stats'", "'kids-tv', t('Save'), '12K'"]) expect((await joined(parts)).found, parts).toEqual([]);
+  // A message with a placeholder gone back to English as a part is found, also when its words are data.
+  const rules = makeRule({ data: {}, help: [], messages: ['{n} rules', '{n} odd', '{since} · up {uptime}'] });
+  expect(rules.found(['block · 3 rules · off', 'Ĥéļļó · 3 rules'], [], ['block', 'off', 'rules'])).toEqual(['"block · 3 rules · off"', '"Ĥéļļó · 3 rules"']);
+  expect(rules.found(['block · ŕúļéş · off', 'Ĥéļļó · ŵöŕļď', 'kids · odd'], [], ['block', 'off', 'kids', 'odd'])).toEqual([]);
+  // A message that holds the separator itself is found whole, also when its words are data.
+  expect(rules.found(['3d · up 2h'], [], ['3d', 'up', '2h'])).toEqual(['"3d · up 2h"']);
+  // A server's sentence that holds the separator is one piece of data.
+  expect(rules.found(['audit · admin · drill'], [], ['audit · admin · drill'])).toEqual([]);
 });
 
 test('api_012 pseudo rule: a test may declare only what no message says', () => {

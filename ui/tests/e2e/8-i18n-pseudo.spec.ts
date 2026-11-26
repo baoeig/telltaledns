@@ -21,11 +21,12 @@ const ADMIN = { user: 'admin', pass: 'correct horse battery' };
 const HELP: string[] = JSON.parse(readFileSync(join(UI, '../docs/help/topics.json'), 'utf8')).topics.flatMap((t: Record<string, unknown>) =>
   Object.values(t).filter((v): v is string => typeof v === 'string'),
 );
-const RULE = makeRule({ data: DATA, help: HELP });
-// The English of every message of the UI, for the check that data is not one of them.
+// The English of every message of the UI, for the check that data is not one of them, and for the rule: a piece that is
+// a message's English is that message gone back to English, whatever data the piece also shows.
 // (A plural message has its forms as a list.)
 const MESSAGES: string[] = [...(lib.check(UI, { ratchets: false }).entries as Map<string, { english: string | string[] }>).values()].flatMap((e) => (Array.isArray(e.english) ? e.english : [e.english]));
 const collides = makeCollides(MESSAGES);
+const RULE = makeRule({ data: DATA, help: HELP, messages: MESSAGES });
 
 /** The data of this test: what its mocks and the server sent and what it typed (`received`), and what it declares. */
 const received = new Set<string>();
@@ -2106,4 +2107,25 @@ test('api_012 pseudo locale leaves no literal text: settings, query handling wit
   await reopen(page, '[data-testid="editor-ratelimit"] p.empty');
   expect(await leftovers(page), 'query handling: none yet').toEqual([]);
   await clean(page, sent);
+});
+
+test('api_012 pseudo locale reads the help panel and the drawer it stands in as help, not a drawer that holds another drawer', async ({ page }) => {
+  // A "?" button renders its drawer inline, so the drawer of a device holds the drawer of a help panel.
+  await page.setContent(`
+    <div class="drawer">
+      <h2 title="Device title">Device</h2>
+      <p>Groups</p>
+      <button data-help title="Help">?</button>
+      <div class="drawer">
+        <h2 title="Topic title">How it works</h2>
+        <div data-testid="help-panel"><p>Glossary words</p><button aria-label="Close help"></button></div>
+        <span title="Drawer button">Own drawer</span>
+      </div>
+    </div>
+    <div class="drawer"><p>A drawer with no help</p></div>
+    <div data-testid="help-panel"><p>A panel in no drawer</p></div>`);
+  const read = await page.evaluate(readPage);
+  expect(read.text.sort()).toEqual(['?', 'A drawer with no help', 'Device', 'Groups']);
+  expect(read.other.sort()).toEqual(['Device title']);
+  expect(read.help.sort()).toEqual(['A panel in no drawer', 'Close help', 'Drawer button', 'Glossary words', 'Help', 'How it works', 'Own drawer', 'Topic title']);
 });
