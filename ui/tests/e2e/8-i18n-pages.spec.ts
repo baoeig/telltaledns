@@ -63,3 +63,51 @@ test('api_012 lang parameter applies to one page load and stores nothing', async
   await expect(rows.first()).toBeVisible();
   expect(await storage()).toEqual(before);
 });
+
+// A count of 0, 1 and 2 on pages whose text comes from tn(): the English plural rule gives `0 answers`,
+// `1 answer`, `2 answers` whatever language the browser asks for (French counts 0 as one; Japanese has one
+// form; Russian has few and many).
+test('api_012 english plurals ignore the browser language', async ({ browser }) => {
+  const baseURL = test.info().project.use.baseURL;
+  const lookup = { name: 'i18n.example', entries: [0, 1, 2].map((answers) => ({ ageSeconds: 1, answers, authentic: false, bytes: 90, checkingDisabled: false, dnssecOk: false, hits: 2, node: null, qtype: 'A', rcode: 'NOERROR', ttlLeftSeconds: 30 })) };
+  const plan = (i: number) => ({ id: `p-${i}`, state: 'pending', summary: 's', tool: 't', method: 'POST', path: '/api/v1/rules', reason: 'r', requestedBy: 'agent', needsApproval: true, preview: {}, configVersion: 1, createdUnixSeconds: 0, expiresUnixSeconds: 0 });
+  const read: Record<string, string[]> = {};
+  for (const locale of ['en-US', 'fr-FR', 'ja-JP', 'ru-RU']) {
+    const context = await browser.newContext({ baseURL, locale });
+    const page = await context.newPage();
+    let removed = [0, 1, 2];
+    let waiting = 1;
+    await page.route('**/api/v1/cache/lookup?**', (r) => r.fulfill({ json: lookup }));
+    await page.route('**/api/v1/cache/flush', (r) => r.fulfill({ json: { totalRemoved: removed.shift() ?? 2, nodes: [] } }));
+    await page.route('**/api/v1/plans', (r) => r.fulfill({ json: { items: Array.from({ length: waiting }, (_, i) => plan(i)) } }));
+    await signIn(page);
+    // The agent inbox of the header: one and two changes.
+    const inbox = page.getByTestId('agent-inbox');
+    const pill: string[] = [];
+    for (const n of [1, 2]) {
+      waiting = n;
+      await page.reload();
+      await expect(inbox).toBeVisible();
+      await expect(inbox).toContainText(`${n} agent change`);
+      pill.push((await inbox.innerText()).trim());
+    }
+    // The cache card: three answers counts in one lookup, then three flushes that removed 0, 1 and 2 entries.
+    await page.goto('/#/cache');
+    const card = page.getByTestId('cache-card');
+    await card.locator('form input').fill('i18n.example');
+    await card.locator('form button').click();
+    await expect(page.getByTestId('cache-entries')).toBeVisible();
+    const answers = (await page.locator('[data-testid="cache-entries"] tbody tr td:nth-child(3)').allInnerTexts()).map((s) => s.trim());
+    const flushed: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      await card.locator('div.row button').first().click();
+      await expect(page.getByTestId('cache-flushed')).toContainText(`Removed ${i} `);
+      flushed.push((await page.getByTestId('cache-flushed').innerText()).trim());
+    }
+    await expect(page.locator('html')).toHaveAttribute('lang', 'en');
+    read[locale] = [...pill, ...answers, ...flushed];
+    await context.close();
+  }
+  const english = ['1 agent change to review', '2 agent changes to review', 'NOERROR · 0 answers', 'NOERROR · 1 answer', 'NOERROR · 2 answers', 'Removed 0 entries.', 'Removed 1 entry.', 'Removed 2 entries.'];
+  for (const [locale, texts] of Object.entries(read)) expect(texts, locale).toEqual(english);
+});
