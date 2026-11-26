@@ -1,24 +1,45 @@
-// REQ: API-012 (ADR-189) — the attribution rule of the pseudo-locale page tests (8-i18n-pseudo.spec.ts),
-// as a function of data, so a test without a browser can hold it to fixtures (7-i18n-pseudo-rule.spec.ts).
+// REQ: API-012 (ADR-189) — the whole-page rule of the pseudo-locale page tests (8-i18n-pseudo.spec.ts),
+// as functions of data, so a test without a browser can hold it to fixtures (7-i18n-pseudo-rule.spec.ts).
 //
-// While part A moves files to the layer one stage at a time, a page holds text of both kinds, so a
-// piece of text is held to the rule when it is English that a file on the layer had and no file off
-// the layer has (the English ledger says which file had what). A piece passes when it carries a
-// pseudo character, or sits under translate="no" (the page test reads only what is not under one).
-// Once every file is on the layer this is the design's whole-page rule.
+// On a page under the pseudo-locale, every piece of visible text (the text nodes outside
+// translate="no", the attributes a reader sees or hears, and the canvas text) carries a pseudo
+// character, or has no letters, or is code (a path, a key, a host name, a format), or is a formatted
+// date or time, or is data of the test: the names and values its mocks and the server sent, and
+// what it typed, each checked never to be the English of a message. Nothing depends on where a text
+// came from, or on which file wrote it.
 import { LOWER, UPPER } from '../../src/lib/i18n/pseudo';
 
-export type Ledger = Record<string, { markup: string[]; script: string[] }>;
-
+/** A pseudo character: the accented letters the pseudo-locale draws every ASCII letter with. */
 export const PSEUDO = new RegExp(`[${[...LOWER, ...UPPER].join('')}]`);
+/** The dots the pseudo-locale pads a message with (a third of its letters): a message that wraps a
+ * parameter (`<b>What this will do:</b> {impact}`) leaves them after the parameter's text. */
+const PADDING = /·{3,}$/;
+export const hasPseudo = (s: string): boolean => PSEUDO.test(s) || PADDING.test(s);
 
-const letters = (s: string) => (s.replace(/\{\}/g, '').match(/[A-Za-z]/g) ?? []).length;
+const LETTER = /\p{L}/u;
+/** Whether a text has letters at all: numbers, units without letters and signs are not text. */
+export const hasLetters = (s: string): boolean => LETTER.test(s);
 
-/** A path, a key, a type or a format: one token with a separator between two other characters
- * (`a/b`, `data-theme`, `2-digit`). A word with a full stop or a colon after it (`Saved.`,
- * `Canaries:`) is text, so the stop and the colon at the end do not count. */
+/** A path, a key, a host name or a format: one token with a separator between two other characters
+ * (`a/b`, `data-theme`, `2-digit`, `ads.example.com`). A word with a full stop or a colon after it
+ * (`Saved.`, `Canaries:`) is text, so the stop and the colon at the end do not count. */
 const CODE = /^\S*[^\s.:][./:_=-][^\s.:]\S*$/;
-export const isCode = (s: string): boolean => CODE.test(s.replace(/[.:]+$/, ''));
+/** Letters, a hyphen between two letters, and nothing else: a word (`Git-managed`, `Read-only`). */
+const HYPHENATED_WORD = /^\p{L}+(?:-\p{L}+)+$/u;
+export const isCode = (s: string): boolean => {
+  const word = s.replace(/[.:]+$/, '');
+  return CODE.test(word) && !HYPHENATED_WORD.test(word);
+};
+
+/** The words a date or a time formatted in English by the browser (the suite pins en-US) is made of. */
+const DATE_WORDS = new Set(
+  'AM PM am pm UTC GMT Jan Feb Mar Apr Jun Jul Aug Sep Sept Oct Nov Dec January February March April May June July August September October November December Mon Tue Tues Wed Thu Thur Thurs Fri Sat Sun Monday Tuesday Wednesday Thursday Friday Saturday Sunday'.split(' '),
+);
+/** A date or a time formatted by `lib/format.ts` (`06:37 PM`, `Wed, Nov 25`, `11/24/2026, 5:00:00 PM`): it
+ * has a digit and no word but those of a date. A word alone (`Mon`, `May`) is a message, not a date. A number
+ * the browser formats compactly (`12K`, `1.5M`) is not a message either. */
+export const isFormatted = (s: string): boolean =>
+  (/\d/.test(s) && s.split(/[^\p{L}]+/u).filter(Boolean).every((w) => DATE_WORDS.has(w))) || /^-?[\d.,]+[KMBT]$/.test(s);
 
 /** Whether a text is the English `s` with `{}` for a placeholder: the whole text, a placeholder is any
  * text (also none). The pieces between the placeholders are looked for in order, the first at the
@@ -44,77 +65,211 @@ function fits(parts: readonly string[], text: string): boolean {
   return true;
 }
 
-/** Values the test server holds that read like English a file on the layer had: data on the page,
- * not text of the layer. Each, by its text, names the file that shows it. Text nodes only: an
- * attribute with the same text is the layer's own. */
-export const DATA: Readonly<Record<string, string>> = {
-  // The note 1-ui.spec.ts adds, which the dashboard's chart markers list. ChangesControls.svelte
-  // has the same words as the note field's placeholder (an attribute: held to the rule).
-  'moved the access point to the hallway': 'lib/components/ChangesControls.svelte',
-  // The support manifest's value for a field the server could not read, which SupportPackage.svelte
-  // shows as it is. ClientChip.svelte and IdentityLine.svelte compare with the same word.
-  unknown: 'lib/components/SupportPackage.svelte',
-  // The health level the wall's tile shows as it is (WallKpi.svelte). HealthIcon.svelte compares with
-  // the same word.
-  severe: 'lib/components/wall/WallKpi.svelte',
-  // The name of the user who made a quick rule, which the rules table shows beside the rule (Rules.svelte, in
-  // the same cell as its own words). Settings.svelte has the same word as a role.
-  admin: 'pages/Rules.svelte',
+const letterCount = (s: string) => (s.replace(/\{\}/g, '').match(/\p{L}/gu) ?? []).length;
+
+/** Whether a piece is made of the test's own data: one value (or a pattern with `{}`), or several of them
+ * with only signs, numbers and code between (`work-pc (127.0.0.1)`, `unifi · https://192.168.0.1`). */
+export function covered(piece: string, own: Iterable<string>): boolean {
+  const values = [...own].filter((v) => v.length >= 2 && (v.includes('{}') ? isEnglish(v, piece) : piece.includes(v)));
+  if (values.some((v) => v.includes('{}') || v === piece)) return true;
+  let rest = piece;
+  for (const v of values.sort((a, b) => b.length - a.length)) rest = rest.split(v).join(' ');
+  // What is left between the values: signs, numbers, code, and (beside a number) the words of a time (`06:37 PM: …`).
+  const clock = /\d/.test(piece);
+  return rest.split(/\s+/).every((word) => !hasLetters(word) || isCode(word) || (clock && DATE_WORDS.has(word.replace(/[^\p{L}]/gu, ''))));
+}
+
+export type Datum = {
+  /** Why the text is data and the UI cannot mark it. */
+  reason: string;
+  /** Where it may stand: every place the text is read at must match (a place reads like `text of div.u-label`). */
+  where?: RegExp;
+};
+
+/** Values the real server shows that the UI cannot mark as data, and that read like English: one entry
+ * each, with the reason and the place, as a text node only (an attribute with the same text is the layer's
+ * own). Keep it empty where an element can carry `translate="no"` instead. */
+export const DATA: Readonly<Record<string, Datum>> = {
   // The label uPlot gives the x series of a chart that Chart.svelte names none (the legend's first row).
-  // Settings.svelte has the same word as a column header.
-  Time: 'lib/components/Chart.svelte',
+  // Chart.svelte gives it a message in part A's last commit, and this entry goes with it.
+  Time: { reason: 'lib/components/Chart.svelte: the legend of the uPlot x series', where: /\bu-label\b/ },
+  // The name of the built-in group, which the legend of a chart that draws one series per group shows: uPlot
+  // writes a series' label as text of its own, which cannot carry the mark.
+  default: { reason: "the server's built-in group, as the label of a series in a uPlot legend (lib/components/Chart.svelte)", where: /\bu-label\b/ },
 };
 
 export type RuleInput = {
-  /** The English ledger: per file, the template text and script strings it had before part A. */
-  ledger: Ledger;
-  /** The files on the layer. */
-  layer: ReadonlySet<string>;
-  /** English data outside the layer (the help glossary). */
+  /** Shared data: see DATA. Text nodes only, at the places they name. */
+  data: Readonly<Record<string, Datum>>;
+  /** English the help panel shows from docs/help/topics.json (ADR-189: help stays English in part A). Only in the help panel. */
   help: readonly string[];
-  /** Values the test server holds that read like English a file on the layer had: each, by its text,
-   * names the file it stands for. They are data in text nodes only, never in an attribute. */
-  data: Readonly<Record<string, string>>;
 };
 
 export type Rule = {
-  /** The English only files on the layer had that the rule holds the page to. */
-  own: { s: string; rel: string }[];
-  /** The English of the files off the layer. */
-  off: ReadonlySet<string>;
-  /** The pieces of the page that are English only files on the layer had (empty: the rule holds):
-   * `text` the text nodes, `other` the attributes a reader sees or hears and the canvas text. */
-  found(text: readonly string[], other: readonly string[]): string[];
+  /** The pieces of the page that are English (empty: the rule holds). `text` the text nodes, `other`
+   * the attributes a reader sees or hears and the canvas text, `own` the test's data (values, or patterns
+   * with `{}`), `help` the pieces inside the help panel and the titles of help buttons. */
+  found(text: readonly string[], other: readonly string[], own?: Iterable<string>, help?: readonly string[], places?: ReadonlyMap<string, readonly string[]>): string[];
 };
 
-export function makeRule({ ledger, layer, help, data }: RuleInput): Rule {
-  const off = new Set([...Object.entries(ledger).filter(([rel]) => !layer.has(rel)).flatMap(([, e]) => [...e.markup, ...e.script]), ...help]);
-  // Each as a whole-text pattern. A pattern with a placeholder needs words of its own (eight
-  // letters), or it would match any text.
-  const own = Object.entries(ledger)
-    .filter(([rel]) => layer.has(rel))
-    .flatMap(([rel, e]) => [...e.markup, ...e.script].map((s) => ({ s, rel })))
-    .filter(({ s }) => !off.has(s) && !isCode(s) && /[A-Za-z]{2}/.test(s.replace(/\{\}/g, '')) && (!s.includes('{}') || letters(s) >= 8));
-  const patterns = own.map(({ s, rel }) => ({ parts: s.split('{}'), from: `${rel}: ${JSON.stringify(s)}` }));
-  // The English of files off the layer, as the same patterns: a piece that is that English belongs
-  // to those files, whatever pattern of a layer file it also matches.
-  const offPatterns = [...off].filter((s) => s.includes('{}') && !isCode(s) && letters(s) >= 8).map((s) => s.split('{}'));
+export function makeRule({ data, help }: RuleInput): Rule {
+  const helpSet = new Set(help);
   return {
-    own,
-    off,
-    found(text, other) {
+    found(text, other, own = [], inHelp = [], places) {
+      const ownList = [...own];
       const found: string[] = [];
-      for (const p of new Set([...text, ...other])) {
-        // A piece an off-layer file has belongs to that file, whatever pattern of a layer file it
-        // also matches (`{}query log {}` matched whole sentences of the Settings and Heatmap pages,
-        // and `{}% of the budget left` the wall's "{}: {} % of the budget left").
-        if (PSEUDO.test(p) || off.has(p)) continue;
-        // Data: as a text node only (an attribute or canvas text is the page's own).
-        if (Object.hasOwn(data, p) && text.includes(p) && !other.includes(p)) continue;
-        const m = patterns.find((o) => fits(o.parts, p));
-        if (m && !offPatterns.some((parts) => fits(parts, p))) found.push(`${JSON.stringify(p)} (${m.from})`);
+      for (const p of new Set([...text, ...other, ...inHelp])) {
+        if (hasPseudo(p) || !hasLetters(p) || isCode(p) || isFormatted(p)) continue;
+        // The test's own data: its mocks' and the server's names and values, in a text node or an attribute.
+        if (covered(p, ownList)) continue;
+        const elsewhere = text.includes(p) || other.includes(p);
+        // Shared data: as a text node only (an attribute or canvas text is the page's own), at the places it names.
+        const d = Object.hasOwn(data, p) ? data[p] : undefined;
+        const at = places?.get(p) ?? [];
+        if (d && text.includes(p) && !other.includes(p) && (!d.where || (at.length > 0 && at.every((w) => d.where?.test(w))))) continue;
+        // The help glossary: English in part A, where the help panel shows it (and nowhere else).
+        if (helpSet.has(p) && !elsewhere) continue;
+        found.push(JSON.stringify(p));
       }
       return found;
     },
   };
+}
+
+/** The English message a data string would hide, if any: a test may take as data only what no message
+ * says. `messages` are the English of the layer's messages, with `{name}` for a placeholder; a pattern
+ * with a placeholder counts when it has eight letters of its own (a shorter one would fit any name). */
+export function collides(value: string, messages: readonly string[]): string | undefined {
+  return messages.find((m) => {
+    const s = m.replace(/\{[A-Za-z_][A-Za-z0-9_]*\}/g, '{}');
+    return (s.includes('{}') ? letterCount(s) >= 8 && isEnglish(s, value) : s === value) || (value.includes('{}') && isEnglish(value, s));
+  });
+}
+
+/** `collides` for many values: one lookup for the messages without a placeholder, and the answer kept. */
+export function makeCollides(messages: readonly string[]): (value: string) => string | undefined {
+  const exact = new Set(messages.filter((m) => !/\{[A-Za-z_][A-Za-z0-9_]*\}/.test(m)));
+  const patterns = messages.filter((m) => /\{[A-Za-z_][A-Za-z0-9_]*\}/.test(m));
+  const known = new Map<string, string | undefined>();
+  return (value) => {
+    if (known.has(value)) return known.get(value);
+    const hit = exact.has(value) ? value : collides(value, patterns);
+    known.set(value, hit);
+    return hit;
+  };
+}
+
+/** Every string value of a JSON document (what a mock or the server sent, what a test typed). */
+export function jsonStrings(v: unknown, out: Set<string> = new Set()): Set<string> {
+  if (typeof v === 'string') out.add(v);
+  else if (Array.isArray(v)) for (const x of v) jsonStrings(x, out);
+  else if (v && typeof v === 'object') for (const x of Object.values(v)) jsonStrings(x, out);
+  return out;
+}
+
+/** The attributes a reader sees or hears. */
+export const ATTRS = ['aria-label', 'title', 'placeholder', 'alt', 'aria-roledescription', 'aria-description', 'aria-valuetext', 'aria-placeholder'];
+
+export type Read = { text: string[]; other: string[]; help: string[]; at: [string, string][] };
+
+const VOID = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'source', 'track', 'wbr']);
+const ENTITIES: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+const decode = (s: string) => s.replace(/&(#x[0-9a-fA-F]+|#[0-9]+|[a-z]+);/g, (whole, e: string) => (e[0] === '#' ? String.fromCodePoint(e[1] === 'x' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10)) : (ENTITIES[e] ?? whole)));
+
+/** What `readPage` reads, from the HTML of a page rendered on the server (the fixtures of the rule, with no
+ * browser): the same text nodes, attributes and `translate="no"` subtrees, from the markup. */
+export function collectHtml(html: string): Read {
+  const text: string[] = [];
+  const other: string[] = [];
+  const at: [string, string][] = [];
+  const stack: { name: string; no: boolean }[] = [];
+  const tidy = (s: string) => s.replace(/\s+/g, ' ').trim();
+  for (const m of html.matchAll(/<!--[\s\S]*?-->|<\/([a-zA-Z][^\s>]*)\s*>|<([a-zA-Z][^\s/>]*)((?:"[^"]*"|'[^']*'|[^>"'])*)>|[^<]+/g)) {
+    if (m[0].startsWith('<!--')) continue;
+    if (m[1] !== undefined) {
+      const name = m[1].toLowerCase();
+      const i = stack.map((e) => e.name).lastIndexOf(name);
+      if (i >= 0) stack.length = i;
+    } else if (m[2] !== undefined) {
+      const name = m[2].toLowerCase();
+      const attrs = new Map<string, string>();
+      for (const a of m[3].matchAll(/([^\s=/>"']+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g)) attrs.set(a[1].toLowerCase(), decode(a[2] ?? a[3] ?? a[4] ?? ''));
+      const no = (stack.at(-1)?.no ?? false) || attrs.get('translate') === 'no' || name === 'script' || name === 'style' || name === 'noscript';
+      if (!no) {
+        const read = (k: string) => {
+          const s = tidy(attrs.get(k) ?? '');
+          other.push(s);
+          at.push([s, `${k} of ${name}`]);
+        };
+        for (const a of ATTRS) if (attrs.has(a)) read(a);
+        if (name === 'optgroup' && attrs.has('label')) read('label');
+        if (name === 'input' && ['button', 'submit', 'reset'].includes(attrs.get('type') ?? '') && attrs.has('value')) read('value');
+      }
+      if (!VOID.has(name) && !m[0].endsWith('/>')) stack.push({ name, no });
+    } else if (!(stack.at(-1)?.no ?? false)) {
+      const s = tidy(decode(m[0]));
+      if (s) {
+        text.push(s);
+        at.push([s, `text of ${stack.at(-1)?.name ?? 'the page'}`]);
+      }
+    }
+  }
+  return { text, other, help: [], at };
+}
+
+/** Run in the page (it takes no argument and uses nothing outside itself): every text node outside
+ * translate="no", the attributes a reader sees or hears (and the `label` of an optgroup and the `value`
+ * of a button), and the canvas text the init script of `watch` collected; `at` names where each was first
+ * seen. What sits in the help panel (and the title of a help button) is returned in `help` instead. */
+export function readPage(): Read {
+  const ATTR_LIST = ['aria-label', 'title', 'placeholder', 'alt', 'aria-roledescription', 'aria-description', 'aria-valuetext', 'aria-placeholder'];
+  const text: string[] = [];
+  const other: string[] = [];
+  const help: string[] = [];
+  const at: [string, string][] = [];
+  const seen = new Set<string>();
+  // The reader does not see a <noscript> of a page that runs.
+  const free = (el: Element) => !el.closest('[translate="no"], script, style, noscript');
+  const tidy = (s: string) => s.replace(/\s+/g, ' ').trim();
+  const where = (el: Element | null, what: string) => {
+    if (!el) return what;
+    const id = el.closest('[data-testid]')?.getAttribute('data-testid');
+    const cls = typeof el.className === 'string' && el.className.trim() ? `.${el.className.trim().split(/\s+/).join('.')}` : '';
+    return `${what} of ${el.localName}${cls}${id ? ` in [data-testid=${id}]` : ''}`;
+  };
+  const note = (s: string, el: Element | null, what: string) => {
+    const place = where(el, what);
+    if (seen.has(`${s}\u0000${place}`)) return;
+    seen.add(`${s}\u0000${place}`);
+    at.push([s, place]);
+  };
+  // The help panel: a drawer that holds the topic (English data in part A).
+  const inHelp = (el: Element) => el.closest('.drawer')?.querySelector('[data-testid="help-panel"]') != null;
+  const walk = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+  for (let n: Node | null = walk.currentNode; n; n = walk.nextNode()) {
+    if (n.nodeType === Node.TEXT_NODE) {
+      const s = tidy(n.textContent ?? '');
+      if (n.parentElement && free(n.parentElement) && s) {
+        (inHelp(n.parentElement) ? help : text).push(s);
+        note(s, n.parentElement, 'text');
+      }
+    } else if (n instanceof Element && free(n)) {
+      const read = (name: string) => {
+        const s = tidy(n.getAttribute(name) ?? '');
+        // The title of a help button, and every attribute inside the help drawer (its label is the topic's title).
+        (inHelp(n) || (name === 'title' && n.matches('button[data-help]')) ? help : other).push(s);
+        note(s, n, name);
+      };
+      for (const a of ATTR_LIST) if (n.hasAttribute(a)) read(a);
+      if (n.localName === 'optgroup' && n.hasAttribute('label')) read('label');
+      if (n.localName === 'input' && ['button', 'submit', 'reset'].includes((n as HTMLInputElement).type) && n.hasAttribute('value')) read('value');
+    }
+  }
+  const canvas: string[] = (window as unknown as { __i18aCanvas?: string[] }).__i18aCanvas ?? [];
+  for (const c of canvas) {
+    const s = tidy(c);
+    other.push(s);
+    note(s, null, 'canvas text');
+  }
+  return { text, other, help, at };
 }

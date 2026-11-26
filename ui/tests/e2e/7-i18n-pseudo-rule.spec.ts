@@ -1,19 +1,19 @@
-// REQ: API-012 (ADR-189) — the attribution rule of the pseudo-locale page tests (i18n-pseudo-rule.ts)
-// held to fixtures, without a browser: a site reverted to its literal English fails it, a word that
-// ends in a full stop or a colon is text and not code, and server data excuses text nodes only.
-// The fixture is a small component with the shape of ClientChip's buttons, rendered on the server
-// under the pseudo-locale.
+// REQ: API-012 (ADR-189) — the whole-page rule of the pseudo-locale page tests (i18n-pseudo-rule.ts)
+// held to fixtures, without a browser: a text node, a title, an aria-label, a placeholder, the value of a
+// button or an alt that is English fails it, so does a hyphenated word, a one-word label with a colon and
+// a short pattern such as `3 behind`; pseudo text, data marked translate="no", code, text without letters
+// and the data a test declares pass. The fixture is a small component rendered on the server under the
+// pseudo-locale, read as the page tests read a page (the same text nodes, attributes and marks).
 import { expect, test } from '@playwright/test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { compile } from 'svelte/compiler';
 import { render } from 'svelte/server';
-import * as lib from '../../scripts/i18n-lib.mjs';
 import { install, tr } from '../../src/lib/i18n';
-import { DATA, PSEUDO, isCode, isEnglish, makeRule, type Ledger } from './i18n-pseudo-rule';
-import { UI, checkUi, cleanup } from './i18n-fixture';
+import { DATA, PSEUDO, collectHtml, collides, hasLetters, isCode, isEnglish, isFormatted, jsonStrings, makeRule, type Read } from './i18n-pseudo-rule';
+import { cleanup } from './i18n-fixture';
 
 test.afterAll(cleanup);
 const temps: string[] = [];
@@ -21,35 +21,32 @@ test.afterAll(() => {
   for (const d of temps.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
-const REL = 'lib/components/Chip.svelte';
-/** The component as it was before its migration: the English the ledger records. */
-const BEFORE = [
-  '<script lang="ts">',
-  '  let { busy = false }: { busy?: boolean } = $props();',
-  "  const label = busy ? 'Saving…' : 'Save';",
-  '</script>',
-  '<button type="button">{label}</button>',
-  '<p>Saved.</p>',
-  '<p>Canaries:</p>',
-  '<input placeholder="moved the access point to the hallway" />',
-  '',
-].join('\n');
-/** The same after it: every text through `t()`. */
+/** A page of every kind of text the rule reads, all through `t()` or marked as data. */
 const AFTER = [
   '<script lang="ts">',
   "  import { tr } from '../lib/i18n';",
   "  const { t } = tr('chip');",
-  '  let { busy = false }: { busy?: boolean } = $props();',
   '</script>',
-  "<button type=\"button\">{busy ? t('Saving…') : t('Save')}</button>",
+  "<button type=\"button\" title={t('Close this panel')} aria-label={t('Close')}>{t('Save')}</button>",
   "<p>{t('Saved.')}</p>",
   "<p>{t('Canaries:')}</p>",
+  "<p>{t('Loading…')}</p>",
+  "<p>{t('Git-managed')}</p>",
+  "<p>{t('Read-only')}</p>",
+  "<p>{t('{n} behind', { n: 3 })}</p>",
   "<input placeholder={t('moved the access point to the hallway')} />",
+  "<input type=\"button\" value={t('Apply')} />",
+  "<img alt={t('A sparkline')} src=\"x.svg\" />",
+  '<p translate="no">laptop</p>',
+  '<div translate="no"><span title="hidden">inside</span> <b>mark</b></div>',
+  '<code translate="no">ads.example.com</code>',
+  '<p><span>12.5</span> <span>—</span> <span>%</span> <span>1,234 · 5</span> <span>3 / 7</span></p>',
+  '<p>kids-tv</p>',
   '',
 ].join('\n');
 
-/** The page's text nodes, and its attributes a reader sees or hears, as the pseudo-locale draws it. */
-async function drawn(source: string): Promise<{ text: string[]; other: string[] }> {
+/** The page as the pseudo-locale draws it, read as the page tests read it. */
+async function drawn(source: string): Promise<Read> {
   const js = compile(source, { generate: 'server', filename: 'Chip.svelte' }).js.code
     .replace(/from ['"](svelte(?:\/[^'"]*)?)['"]/g, (_, spec) => `from ${JSON.stringify(import.meta.resolve(spec))}`)
     .replace(/import \{ tr \} from ['"][^'"]+['"];/, 'const { tr } = globalThis.__i18aRule;');
@@ -60,86 +57,154 @@ async function drawn(source: string): Promise<{ text: string[]; other: string[] 
   const mod = await import(pathToFileURL(join(dir, 'Chip.mjs')).href);
   install({ tag: 'en-XA' });
   try {
-    const html = render(mod.default, { props: {} }).body.replace(/<!--[\s\S]*?-->/g, '');
-    const tidy = (s: string) => s.replace(/\s+/g, ' ').trim();
-    const text = html.split(/<[^>]*>/).map(tidy).filter(Boolean);
-    const other = [...html.matchAll(/\b(?:aria-label|title|placeholder|alt)="([^"]*)"/g)].map((m) => tidy(m[1]));
-    return { text, other };
+    return collectHtml(render(mod.default, { props: {} }).body);
   } finally {
     install({ tag: 'en' });
   }
 }
 
-const entry = (source: string, rel: string) => {
-  const a = lib.analyzeFile(rel, source, 'chip');
-  return { markup: [...a.ledger.markup].sort(), script: [...a.ledger.script].sort() };
+const RULE = makeRule({ data: {}, help: [] });
+// `kids-tv` is the one piece of the fixture a test declares: a mock's name that is a hyphenated word.
+const DECLARED = ['kids-tv'];
+/** What the rule finds on the page after `edit`. */
+const found = async (edit: (s: string) => string) => {
+  const page = await drawn(edit(AFTER));
+  return { page, found: RULE.found(page.text, page.other, DECLARED) };
 };
-/** The rule over a ledger with the component's English, and another file off the layer that has two
- * of its words too (`Save`, `Saving…`: words every page has). */
-const RULE = makeRule({
-  ledger: { [REL]: entry(BEFORE, REL), 'pages/Other.svelte': { markup: [], script: ['Save', 'Saving…'] } } as Ledger,
-  layer: new Set([REL]),
-  help: [],
-  data: { 'moved the access point to the hallway': 'pages/Notes.svelte' },
+
+test('api_012 pseudo rule: a word that ends in a full stop or a colon is text, a hyphenated word is text, a token with a separator is code', () => {
+  for (const word of ['Saved.', 'Canaries:', 'left.', 'Partial:', 'node:', 'wait:', '/annotations', '/auth/', 'Git-managed', 'Read-only', 'Sign-in.', 'e-mail', 'Add-ons:', 'Git-managed-by']) expect(isCode(word), word).toBe(false);
+  for (const token of ['data-theme-2', '2-digit', 'a/b', 'application/json', 'telltale-support.tar.gz', '--surface-2', 'neighbor_mac', 'node:{}', '/cache/stats', 'Queries/s', 'ads.example.com', 'n-aaaa1111', 'v0.9.0-edge.437', 'x-1', '10.0.0.1:53']) expect(isCode(token), token).toBe(true);
+  // Text without letters is not text: numbers, signs, units made of signs.
+  for (const s of ['12.5', '—', '%', '1,234 · 5', '3 / 7', '99 %', '×', '']) expect(hasLetters(s), s).toBe(false);
+  for (const s of ['ms', 'A', '5 s', 'Saved.', 'Ünï', '日本語']) expect(hasLetters(s), s).toBe(true);
 });
 
-test('api_012 pseudo rule: a word that ends in a full stop or a colon is text, a token with a separator is code', () => {
-  for (const word of ['Saved.', 'Canaries:', 'left.', 'Partial:', 'node:', 'wait:', '/annotations', '/auth/']) expect(isCode(word), word).toBe(false);
-  for (const token of ['data-theme', '2-digit', 'x-csrf-token', 'a/b', 'quick-rule-form', 'application/json', 'telltale-support.tar.gz', '--surface-2', 'neighbor_mac', 'node:{}', '/cache/stats', 'Queries/s']) expect(isCode(token), token).toBe(true);
-  // The ledger of the UI itself: strings the rule newly holds the page to.
-  const ledger: Ledger = JSON.parse(readFileSync(join(UI, 'tests/i18n-fixtures/english-ledger.json'), 'utf8'));
-  const layer = new Set<string>(checkUi().files.filter((f) => f.usesLayer).map((f) => f.rel));
-  const own = new Set(makeRule({ ledger, layer, help: [], data: {} }).own.map((o) => o.s));
-  for (const s of ['Saved.', 'Canaries:', 'Partial:', 'left.']) expect(own.has(s), s).toBe(true);
-  for (const s of ['data-theme', '2-digit', 'x-csrf-token']) expect(own.has(s), s).toBe(false);
+test('api_012 pseudo rule: the page after its migration holds', async () => {
+  const { page, found: f } = await found((s) => s);
+  // Every kind of text is on the page the rule reads: five attributes (a title, an aria-label, a placeholder, the
+  // value of a button, an alt) and the text nodes with letters (seven of them pseudo text, one a declared name).
+  expect(page.other.filter((s) => s)).toHaveLength(5);
+  expect(page.other.every((s) => PSEUDO.test(s))).toBe(true);
+  const words = page.text.filter((s) => hasLetters(s));
+  expect(words.filter((s) => PSEUDO.test(s))).toHaveLength(7);
+  expect(words.filter((s) => !PSEUDO.test(s))).toEqual(['kids-tv']);
+  // Marked data is not read at all: not its text, not an attribute inside it.
+  expect([...page.text, ...page.other].some((s) => ['laptop', 'inside', 'mark', 'hidden', 'ads.example.com'].includes(s))).toBe(false);
+  expect(f).toEqual([]);
+  // Without the declaration, the hyphenated word is English: a test declares the names its mocks make.
+  expect(RULE.found(page.text, page.other)).toEqual(['"kids-tv"']);
 });
 
-test('api_012 pseudo rule: a site reverted to its literal english fails it', async () => {
-  const clean = await drawn(AFTER);
-  expect(clean.text.every((s) => PSEUDO.test(s))).toBe(true);
-  expect(RULE.found(clean.text, clean.other)).toEqual([]);
-  // `Saved.` and `Canaries:` back as literals: English a file on the layer had, left on the page.
-  for (const word of ['Saved.', 'Canaries:']) {
-    const reverted = await drawn(AFTER.replace(`t('${word}')`, `'${word}'`));
-    expect(reverted.text, word).toContain(word);
-    expect(RULE.found(reverted.text, reverted.other), word).toEqual([expect.stringContaining(JSON.stringify(word))]);
+test('api_012 pseudo rule: a site reverted to its literal english fails it, whatever the English is', async () => {
+  const cases: [string, string, string, string][] = [
+    ['a text node', "{t('Saved.')}", 'Saved.', 'Saved.'],
+    ['a one-word label with a colon', "{t('Canaries:')}", 'Canaries:', 'Canaries:'],
+    ['a text with an ellipsis', "{t('Loading…')}", 'Loading…', 'Loading…'],
+    ['a hyphenated word', "{t('Git-managed')}", 'Git-managed', 'Git-managed'],
+    ['another hyphenated word', "{t('Read-only')}", 'Read-only', 'Read-only'],
+    ['a pattern with fewer than eight letters', "{t('{n} behind', { n: 3 })}", '{3} behind', '3 behind'],
+    ['a one-word label every page has', "{t('Save')}", 'Save', 'Save'],
+    ['a placeholder', "placeholder={t('moved the access point to the hallway')}", 'placeholder="moved the access point to the hallway"', 'moved the access point to the hallway'],
+    ['a title', "title={t('Close this panel')}", 'title="Close this panel"', 'Close this panel'],
+    ['an aria-label', "aria-label={t('Close')}", 'aria-label="Close"', 'Close'],
+    ['the value of a button', "value={t('Apply')}", 'value="Apply"', 'Apply'],
+    ['an alt', "alt={t('A sparkline')}", 'alt="A sparkline"', 'A sparkline'],
+  ];
+  for (const [what, from, to, english] of cases) {
+    expect(AFTER, what).toContain(from);
+    const { page, found: f } = await found((s) => s.replace(from, to));
+    expect([...page.text, ...page.other], what).toContain(english);
+    expect(f, what).toEqual([JSON.stringify(english)]);
   }
-  // The placeholder back as a literal attribute.
-  const placeholder = await drawn(AFTER.replace("{t('moved the access point to the hallway')}", '"moved the access point to the hallway"'));
-  expect(RULE.found(placeholder.text, placeholder.other)).toEqual([expect.stringContaining('moved the access point to the hallway')]);
-  // `Saving…` and `Save` back as literals: not caught while another file off the layer has the
-  // same words (the attribution rule's limit; the whole-page rule of the last stage closes it).
-  const shadowed = await drawn(AFTER.replace("{busy ? t('Saving…') : t('Save')}", "{busy ? 'Saving…' : 'Save'}"));
-  expect(shadowed.text).toContain('Save');
-  expect(RULE.found(shadowed.text, shadowed.other)).toEqual([]);
+  // The same word twice is found once.
+  const twice = await found((s) => s.replace("{t('Saved.')}", 'Saved.').replace("{t('Canaries:')}", 'Saved.'));
+  expect(twice.found).toEqual(['"Saved."']);
+  // Canvas text is among the pieces the rule reads, as the attributes are.
+  expect(RULE.found([], ['Sat', 'Ŝáţ'], DECLARED)).toEqual(['"Sat"']);
 });
 
-test('api_012 pseudo rule: server data excuses a text node and never an attribute', () => {
+test('api_012 pseudo rule: data marked, pseudo text, numbers, signs and code pass', async () => {
+  // Unmarked, the words of the marked data fail: the mark is what keeps them out.
+  const unmarked = await found((s) => s.replace('<p translate="no">laptop</p>', '<p>laptop</p>').replace('<div translate="no">', '<div>'));
+  expect(unmarked.found).toEqual(['"laptop"', '"inside"', '"mark"', '"hidden"']);
+  for (const ok of [['Ĥéļļó'], ['12.5'], ['—'], ['%'], ['ads.example.com'], ['192.168.1.20:53'], ['/api/v1/rules'], ['']]) expect(RULE.found(ok, []), ok.join()).toEqual([]);
+  // A pseudo character anywhere is enough; a text that is English is not. A parameter's text that a
+  // message pads with the pseudo-locale's dots passes (the padding is the message's), a lone dot does not.
+  expect(RULE.found(['Save', 'Ṡavé'], [])).toEqual(['"Save"']);
+  expect(RULE.found(['Applies to the group.·······', 'Applies to the group.·'], [])).toEqual(['"Applies to the group.·"']);
+  // A date or a time the browser formats in English is not a message; a word of a date alone is.
+  // (and a number the browser formats compactly)
+  for (const date of ['06:37 PM', 'Wed, Nov 25', '11/24/2026, 5:00:00 PM', '12:00 AM', 'Tue, Nov 24', '2026-11-26T00:04:50.997Z', '12K', '1.5M']) expect(isFormatted(date) || isCode(date), date).toBe(true);
+  for (const word of ['Mon', 'May', 'PM', 'Nov', '5 Mondays and Fridays', 'at 5 PM sharp', '5m 14.4×', 'K', '12 KB']) expect(isFormatted(word), word).toBe(false);
+  expect(RULE.found(['Mon', 'Nov 25', '12K'], [])).toEqual(['"Mon"']);
+  // A time beside data: the words of a time may stand between values.
+  expect(RULE.found(['06:37 PM: first query to example.com', 'PM: first query to example.com'], [], ['first query to example.com'])).toEqual(['"PM: first query to example.com"']);
+  // The words of a page the reader does not see: a <noscript> of a page that runs.
+  expect((await drawn(AFTER.replace('<p>kids-tv</p>', '<noscript>Needs JavaScript.</noscript><p>kids-tv</p>'))).text.join('|')).not.toContain('JavaScript');
+  // What a mock or the server sent: every string value of the JSON, at any depth.
+  expect([...jsonStrings({ a: 'one', b: ['two', { c: 'three', n: 4 }], d: null })].sort()).toEqual(['one', 'three', 'two']);
+});
+
+test('api_012 pseudo rule: the data of a test excuses a text node and an attribute, shared data a text node only, help only in its panel', () => {
   const note = 'moved the access point to the hallway';
-  expect(RULE.found([note], [])).toEqual([]);
-  // The same words as an attribute, or as an attribute and a text node: the layer's own.
-  expect(RULE.found([], [note])).toEqual([expect.stringContaining(note)]);
-  expect(RULE.found([note], [note])).toEqual([expect.stringContaining(note)]);
-  // Every entry of the page test's list names a file of the ledger, and is data in a text node only.
-  const ledger: Ledger = JSON.parse(readFileSync(join(UI, 'tests/i18n-fixtures/english-ledger.json'), 'utf8'));
-  for (const [text, file] of Object.entries(DATA)) expect(Object.hasOwn(ledger, file), `${text}: ${file}`).toBe(true);
-  const real = makeRule({ ledger, layer: new Set(checkUi().files.filter((f) => f.usesLayer).map((f) => f.rel)), help: [], data: DATA });
-  for (const text of Object.keys(DATA)) {
-    expect(real.found([text], []), text).toEqual([]);
-    if (real.own.some((o) => o.s === text)) expect(real.found([], [text]).length, text).toBeGreaterThan(0);
+  const rule = makeRule({ data: { Time: { reason: 'a reason' }, Label: { reason: 'a legend', where: /\bu-label\b/ } }, help: ['How it works'] });
+  // Shared data may name the place it stands in: every place the text is read at must be one of them.
+  expect(rule.found(['Label'], [], [], [], new Map([['Label', ['text of div.u-label']]]))).toEqual([]);
+  expect(rule.found(['Label'], [], [], [], new Map([['Label', ['text of div.u-label', 'text of td']]]))).toEqual(['"Label"']);
+  expect(rule.found(['Label'], [])).toEqual(['"Label"']);
+  expect(rule.found([note], [])).toEqual([`"${note}"`]);
+  expect(rule.found([note], [], [note])).toEqual([]);
+  expect(rule.found([], [note], new Set([note]))).toEqual([]);
+  // A pattern with {} stands for a value that changes (a number in a server's sentence); several values with only
+  // signs, numbers and code between them are data; any English word beside them is not.
+  expect(rule.found(['configuration 97 applied (ui, 1 section changed)'], [], ['configuration {} applied ({}, {} section{} changed)'])).toEqual([]);
+  expect(rule.found(['work-pc (127.0.0.1)', 'unifi · https://192.168.0.1', '@ main,', '· admin'], [], ['work-pc', 'unifi', 'main', 'admin'])).toEqual([]);
+  expect(rule.found(['work-pc and the rest', 'Open work-pc'], [], ['work-pc'])).toEqual(['"work-pc and the rest"', '"Open work-pc"']);
+  // Shared data: a text node only; the same words as an attribute are the layer's own.
+  expect(rule.found(['Time'], [])).toEqual([]);
+  expect(rule.found([], ['Time'])).toEqual(['"Time"']);
+  expect(rule.found(['Time'], ['Time'])).toEqual(['"Time"']);
+  // The help glossary is English in part A, in the help panel and the title of a help button, and nowhere else.
+  expect(rule.found([], [], [], ['How it works'])).toEqual([]);
+  expect(rule.found(['How it works'], [])).toEqual(['"How it works"']);
+  expect(rule.found(['How it works'], [], [], ['How it works'])).toEqual(['"How it works"']);
+  expect(rule.found([], [], [], ['A topic nobody wrote'])).toEqual(['"A topic nobody wrote"']);
+  // Every entry of the shared table has its reason, and excuses a text node only.
+  for (const [text, d] of Object.entries(DATA)) {
+    expect(d.reason.length, text).toBeGreaterThan(12);
+    const strict = makeRule({ data: DATA, help: [] });
+    // at its place, as a text node: excused; as an attribute, or anywhere else: not
+    const there = new Map([[text, ['text of div.u-label of a chart']]]);
+    expect(strict.found([text], [], [], [], there), text).toEqual([]);
+    expect(strict.found([], [text], [], [], there), text).toEqual([JSON.stringify(text)]);
+    expect(strict.found([text], [], [], [], new Map([[text, ['text of td']]])), text).toEqual([JSON.stringify(text)]);
   }
+});
+
+test('api_012 pseudo rule: a test may declare only what no message says', () => {
+  const messages = ['this node', 'none', 'Reason: {reason}', '{n} behind', '{n} of {total}', 'Sign in with {name}', 'Open {a}{b}{c}{d} at {e}: open this query now'];
+  // A message's own English hides a reverted site.
+  expect(collides('this node', messages)).toBe('this node');
+  expect(collides('none', messages)).toBe('none');
+  // A pattern counts when it has eight letters of its own (a shorter one would fit any name).
+  expect(collides('Sign in with Keycloak', messages)).toBe('Sign in with {name}');
+  expect(collides('Reason: moved', messages)).toBeUndefined();
+  expect(collides('3 behind', messages)).toBeUndefined();
+  expect(collides('4 of 9', messages)).toBeUndefined();
+  // Names are fine.
+  for (const name of ['homelab', 'pi', 'laptop', 'kids-tv', 'ops-bot', 'grafana', 'This node of mine']) expect(collides(name, messages), name).toBeUndefined();
 });
 
 test('api_012 pseudo rule: a long text is judged in linear time', () => {
   // A pattern with adjacent placeholders, and a text of many short pieces: as a regular expression of lazy
   // gaps it took seconds on the few thousand characters of the dashboard's list of changes, and never ends
   // on this one.
-  const hot: Ledger = { 'lib/Hot.svelte': { markup: ['Open {}{}{}{} at {}: open this query now'], script: [] } };
-  const rule = makeRule({ ledger: hot, layer: new Set(['lib/Hot.svelte']), help: [], data: {} });
+  const hot = ['Open {a}{b}{c}{d} at {e}: open this query now'];
   const long = `Open ${Array.from({ length: 3000 }, (_, i) => `at ${i}: a`).join(' ')}`;
   expect(long.length).toBeGreaterThan(20_000);
-  expect(rule.found([long], [])).toEqual([]);
-  expect(rule.found([`${long}: open this query now`], [])).toHaveLength(1);
+  expect(collides(long, hot)).toBe(undefined);
+  expect(collides(`${long}: open this query now`, hot)).toBe(hot[0]);
 });
 
 test('api_012 pseudo rule: a text fits an English with placeholders as the lazy pattern said', () => {

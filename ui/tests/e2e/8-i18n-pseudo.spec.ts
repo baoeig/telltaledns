@@ -1,30 +1,57 @@
-// REQ: API-012 (ADR-189) — the pseudo-locale on the pages that show the files on the translation
-// layer, in the browser against the real server: no English those files had is left on the page,
-// and no pseudo text reaches a request or the browser's storage. Expects the state 1-ui.spec.ts
-// leaves (the admin, some queries), as 8-i18n-pages.spec.ts does.
-//
-// While part A moves files to the layer one stage at a time, a page holds text of both kinds, so a
-// piece of text is held to the rule when it is English that a file on the layer had and no file off
-// the layer has (the English ledger says which file had what). A piece passes when it carries a
-// pseudo character, or sits under translate="no". Text nodes, the attributes a reader sees or hears,
-// and canvas text (fillText/strokeText, hooked) are read. Once every file is on the layer this is
-// the design's whole-page rule. The rule itself is i18n-pseudo-rule.ts (held to fixtures, with no
-// browser, by 7-i18n-pseudo-rule.spec.ts).
+// REQ: API-012 (ADR-189) — the pseudo-locale on every page, in the browser against the real server:
+// the whole-page rule. Every piece of text a page shows (the text nodes outside translate="no", the
+// attributes a reader sees or hears, and canvas text, fillText/strokeText hooked) carries a pseudo
+// character, has no letters, is code, is a formatted date or time, or is data of the test: the names
+// and values its mocks and the demo server sent (every string of every JSON answer the page received
+// and of every body it sent, and of its address), and the ones the test declares with `declare`. No
+// data string is ever the English of a message: such a value is left out (the page must mark it
+// translate="no"), and a declaration of one fails the test. And no pseudo text reaches a request or
+// the browser's storage. Expects the state 1-ui.spec.ts leaves (the admin, some queries), as
+// 8-i18n-pages.spec.ts does. The rule is i18n-pseudo-rule.ts (held to fixtures, with no browser, by
+// 7-i18n-pseudo-rule.spec.ts).
 import { expect, test, type Page, type Route } from '@playwright/test';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import * as lib from '../../scripts/i18n-lib.mjs';
-import { DATA, PSEUDO, makeRule, type Ledger } from './i18n-pseudo-rule';
+import { DATA, PSEUDO, jsonStrings, makeCollides, makeRule, readPage } from './i18n-pseudo-rule';
 import { UI } from './i18n-fixture';
 
 const ADMIN = { user: 'admin', pass: 'correct horse battery' };
-const LEDGER: Ledger = JSON.parse(readFileSync(join(UI, 'tests/i18n-fixtures/english-ledger.json'), 'utf8'));
-const LAYER = new Set<string>(lib.check(UI, { ratchets: false }).files.filter((f: { usesLayer: boolean }) => f.usesLayer).map((f: { rel: string }) => f.rel));
 // The help glossary is English data outside the layer (ADR-189: help stays English in part A).
 const HELP: string[] = JSON.parse(readFileSync(join(UI, '../docs/help/topics.json'), 'utf8')).topics.flatMap((t: Record<string, unknown>) =>
   Object.values(t).filter((v): v is string => typeof v === 'string'),
 );
-const RULE = makeRule({ ledger: LEDGER, layer: LAYER, help: HELP, data: DATA });
+const RULE = makeRule({ data: DATA, help: HELP });
+// The English of every message of the UI, for the check that data is not one of them.
+// (A plural message has its forms as a list.)
+const MESSAGES: string[] = [...(lib.check(UI, { ratchets: false }).entries as Map<string, { english: string | string[] }>).values()].flatMap((e) => (Array.isArray(e.english) ? e.english : [e.english]));
+const collides = makeCollides(MESSAGES);
+
+/** The data of this test: what its mocks and the server sent and what it typed (`received`), and what it declares. */
+const received = new Set<string>();
+const declared = new Set<string>();
+const pending: Promise<void>[] = [];
+test.beforeEach(() => {
+  received.clear();
+  declared.clear();
+  pending.length = 0;
+});
+/** Declares data the page shows as it was given and that no JSON answer holds (a value the test typed into a
+ * field, say). A text the UI says itself cannot be declared: it would hide a site gone back to its English. */
+function declare(...names: string[]) {
+  for (const n of names) {
+    expect(collides(n), `"${n}" is the English of a message`).toBeUndefined();
+    declared.add(n);
+  }
+}
+const takeJson = (body: string | null | undefined) => {
+  if (!body) return;
+  try {
+    jsonStrings(JSON.parse(body), received);
+  } catch {
+    // not JSON: nothing to take
+  }
+};
 
 async function signIn(page: Page) {
   await page.goto('/');
@@ -37,7 +64,13 @@ async function signIn(page: Page) {
 /** Records what the page sends and stores, and the canvas text it draws (before any page script). */
 async function watch(page: Page) {
   const sent: string[] = [];
-  page.on('request', (r) => sent.push(`${r.method()} ${r.url()} ${r.postData() ?? ''}`));
+  page.on('request', (r) => {
+    sent.push(`${r.method()} ${r.url()} ${r.postData() ?? ''}`);
+    takeJson(r.postData());
+  });
+  page.on('response', (r) => {
+    if (/json/.test(r.headers()['content-type'] ?? '')) pending.push(r.text().then(takeJson, () => undefined));
+  });
   await page.addInitScript(() => {
     const w = window as unknown as { __i18aCanvas: string[]; __i18aStored: string[] };
     w.__i18aCanvas = [];
@@ -58,26 +91,27 @@ async function watch(page: Page) {
   return sent;
 }
 
-/** Every text the page shows that is English only files on the layer had (empty: the rule holds). */
+// With I18A_PIECES set, every piece of text the tests read is written to test-results/i18a-pieces.json at the
+// end of the file: what the states reach, for the report of which messages some tested state shows.
+const PIECES = new Set<string>();
+test.afterAll(() => {
+  if (!process.env.I18A_PIECES) return;
+  mkdirSync(join(UI, 'test-results'), { recursive: true });
+  writeFileSync(join(UI, 'test-results', 'i18a-pieces.json'), JSON.stringify([...PIECES]));
+});
+
+/** Every text the page shows that is English (empty: the rule holds), each with where it is. */
 async function leftovers(page: Page): Promise<string[]> {
-  const { text, other } = await page.evaluate(() => {
-    const ATTRS = ['aria-label', 'title', 'placeholder', 'alt', 'aria-roledescription', 'aria-description', 'aria-valuetext', 'aria-placeholder'];
-    const out: string[] = [];
-    const attrs: string[] = [];
-    const free = (el: Element) => !el.closest('[translate="no"], script, style');
-    const tidy = (s: string) => s.replace(/\s+/g, ' ').trim();
-    const walk = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
-    for (let n: Node | null = walk.currentNode; n; n = walk.nextNode()) {
-      if (n.nodeType === Node.TEXT_NODE) {
-        if (n.parentElement && free(n.parentElement) && tidy(n.textContent ?? '')) out.push(tidy(n.textContent ?? ''));
-      } else if (n instanceof Element && free(n)) {
-        for (const a of ATTRS) if (n.hasAttribute(a)) attrs.push(tidy(n.getAttribute(a) ?? ''));
-        if (n.localName === 'optgroup' && n.hasAttribute('label')) attrs.push(tidy(n.getAttribute('label') ?? ''));
-      }
-    }
-    return { text: out, other: [...attrs, ...(window as unknown as { __i18aCanvas: string[] }).__i18aCanvas.map(tidy)] };
-  });
-  return RULE.found(text, other);
+  await Promise.all(pending);
+  const { text, other, help, at } = await page.evaluate(readPage);
+  if (process.env.I18A_PIECES) for (const s of [...text, ...other, ...help]) PIECES.add(s);
+  // The address of the page is data too (a refusal a provider sent back in it).
+  const url = new URL(page.url());
+  const fromUrl = [...url.searchParams.values(), ...new URLSearchParams(url.hash.split('?')[1] ?? '').values()];
+  const own = [...declared, ...[...received, ...fromUrl].filter((v) => !collides(v))];
+  const places = new Map<string, string[]>();
+  for (const [s, place] of at) places.set(s, [...(places.get(s) ?? []), place]);
+  return RULE.found(text, other, own, help, places).map((s) => `${s} (${places.get(JSON.parse(s))?.slice(0, 3).join('; ') ?? '?'})`);
 }
 
 /** Nothing the page sent or stored holds pseudo text. */
@@ -166,6 +200,7 @@ test('api_012 pseudo locale leaves no literal text: quick rules', async ({ page 
 
 test('api_012 pseudo locale leaves no literal text: groups and upstreams', async ({ page }) => {
   const sent = await watch(page);
+  declare('failover: router');
   await signIn(page);
   await open(page, '/upstreams', '[data-testid="entry-row"]');
   expect(await leftovers(page), 'upstreams').toEqual([]);
@@ -277,6 +312,8 @@ const HOST = {
     swapUsedBytes: 1e8, temperatureC: 81.5, threads: 12, throttledPercent: 12.5, unavailable: ['process', 'thermal'], warnings: ['The data disk is nearly full.'], writeBytesPerSecond: 20_480,
   },
 };
+// How the machine card writes the host's operating system, architecture and kernel: the mock's values and the word Linux.
+const HOST_LINE = `${HOST.latest.os} · ${HOST.latest.arch} · Linux ${HOST.latest.kernel}`;
 const IDENTITY = { available: true, class: 'speaker', client: '127.0.0.1', level: 'likely', product: 'Echo Dot', score: 0.8, source: 'fingerprint', suggestedGroup: 'IoT', vendor: 'Amazon' };
 const EVIDENCE = { domains: [{ name: 'amazon.com', weight: 1 }], macPrefix: 'a4:5e:60', matchedName: 'Echo-Kitchen', names: [], runnerUp: { product: 'Echo Show', productId: 'x', score: 0.4 }, seenDomains: [] };
 const DAY = (() => {
@@ -340,6 +377,7 @@ test('api_012 pseudo locale leaves no literal text: cache explain and the error 
 
 test('api_012 pseudo locale leaves no literal text: drills and a machine', async ({ page }) => {
   const sent = await watch(page);
+  declare(HOST_LINE);
   await page.route('**/api/v1/cluster', (r) => r.fulfill({ json: CLUSTER }));
   await page.route('**/api/v1/drills?**', (r) => r.fulfill({ json: DRILLS }));
   await page.route('**/api/v1/drills/d-1', (r) => r.fulfill({ json: REPORT }));
@@ -504,6 +542,7 @@ const VERSIONS = { history: 8, items: [version('3.131', 'canary', { current: tru
 
 test('api_012 pseudo locale leaves no literal text: topology, comparison and rollouts', async ({ page }) => {
   const sent = await watch(page);
+  declare('SERVFAIL 4.2 % against 0.2 % on the other nodes');
   let pinned = false;
   await page.route('**/api/v1/cluster', (r) => r.fulfill({ json: CLUSTER3 }));
   await page.route('**/api/v1/cluster/compare?**', (r) => r.fulfill({ json: COMPARE }));
@@ -1547,6 +1586,7 @@ const REPLICA = (o: Record<string, unknown>) => ({
 
 test('api_012 pseudo locale leaves no literal text: the cluster of a witness, pods, a gone node and a pin, a promotion and a standalone node', async ({ page }) => {
   const sent = await watch(page);
+  declare(HOST_LINE, '· abcdef1');
   let view: Record<string, unknown> = BIG;
   let info: Record<string, unknown> = SHELL_INFO({ clientIpsMasked: null, queryLog: true, maintenance: null, update: { state: 'none' } });
   await page.route('**/api/v1/cluster', (r) => r.fulfill({ json: view }));
@@ -2006,6 +2046,7 @@ test('api_012 pseudo locale leaves no literal text: settings, the system tab wit
 
 test('api_012 pseudo locale leaves no literal text: settings, query handling with its three editors', async ({ page }) => {
   const sent = await watch(page);
+  declare('24h');
   await page.addInitScript(() => localStorage.setItem('telltale.mode.admin', 'advanced'));
   const entry = (kind: string, name: string, source: string, definition: Record<string, unknown> | null) => ({ kind, name, source, definition, credentials: null });
   let sets: Record<string, unknown[]> = {
