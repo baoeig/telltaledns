@@ -40,6 +40,9 @@ test('api_012 only format.ts formats', () => {
   const base = JSON.parse(readFileSync(join(UI, 'i18n-baseline.json'), 'utf8'));
   const now = lib.ratchetCounts(UI, r.files).intl as Record<string, number>;
   console.log(`Intl/toLocale call sites outside format.ts: ${total(now)} in ${Object.values(now).filter((n) => n > 0).length} files (baseline ${total(base.intl)})`);
+  // The end of part A: no file outside format.ts has one, and the baseline allows none anywhere.
+  expect(Object.entries(now).filter(([, n]) => n > 0)).toEqual([]);
+  expect(Object.entries(base.intl as Record<string, number>).filter(([, n]) => n > 0)).toEqual([]);
   // Growth fails; a file on the layer is at zero; format.ts itself is the place for it.
   expect(failRules(run(project((d) => edit(d, 'src/pages/Old.svelte', (s) => s.replace('</script>', '  const n = (1).toLocaleString();\n</script>')))))).toEqual(['intl']);
   expect(failRules(run(project((d) => edit(d, 'src/lib/labels.ts', (s) => `${s}\nexport const nf = new Intl.NumberFormat();\n`))))).toEqual(['intl']);
