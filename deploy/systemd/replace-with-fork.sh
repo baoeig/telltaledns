@@ -8,8 +8,8 @@ config=/etc/telltale/telltale.toml
 service=telltale.service
 service_user=telltale
 backup_root=/var/backups/telltale
-build_commit=126ae92
-asset_ref=cf158063d7b2debc2d5ea724ae0a6eacc590cebf
+build_commit=24f2f646
+asset_ref=e1b151c152daf299fe940656a18f790aa8a176fb
 assets="https://raw.githubusercontent.com/baoeig/telltaledns/$asset_ref"
 
 work=
@@ -134,7 +134,18 @@ main() {
     work=$(mktemp -d)
     # Use a separate cache key for the manifest when a new build is published.
     fetch "$assets/SHA256SUMS?commit=$asset_ref" "$work/SHA256SUMS"
-    fetch "$assets/$asset" "$work/$asset"
+    fetch "$assets/PARTS?commit=$asset_ref" "$work/PARTS"
+    part_count=$(awk -v name="$asset" '$2 == name { print $1 }' "$work/PARTS")
+    case "$part_count" in ''|*[!0-9]*) die "invalid part count for $asset" ;; esac
+    [ "$part_count" -ge 1 ] && [ "$part_count" -le 99 ] || die "invalid part count for $asset"
+    : > "$work/$asset"
+    part=1
+    while [ "$part" -le "$part_count" ]; do
+        suffix=$(printf '%02d' "$part")
+        fetch "$assets/$asset.part-$suffix" "$work/part"
+        cat "$work/part" >> "$work/$asset"
+        part=$((part + 1))
+    done
     expected=$(awk -v name="$asset" '$2 == name { print $1 }' "$work/SHA256SUMS")
     actual=$(sha256sum "$work/$asset")
     [ "${actual%% *}" = "$expected" ] || die "checksum verification failed for $asset"
